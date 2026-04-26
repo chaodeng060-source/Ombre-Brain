@@ -49,6 +49,7 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
+from r2_storage import r2_storage
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -501,10 +502,13 @@ async def hold(
     importance: int = 5,
     pinned: bool = False,
     feel: bool = False,
-    source_bucket: str = "",    valence: float = -1,
+    source_bucket: str = "",
+    valence: float = -1,
     arousal: float = -1,
+    image_base64: str = "",
+    image_filename: str = "image",
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。"""
+    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。image_base64=可选,base64编码的图片数据,会上传到R2并把URL插入正文(允许此条记忆带图)。image_filename=图片名称提示(默认image)。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -513,6 +517,31 @@ async def hold(
 
     importance = max(1, min(10, importance))
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+    # --- Optional image upload to R2 / 可选：上传图片到 R2 ---
+    # If image_base64 provided and R2 configured, upload and prepend URL
+    # markdown to content so the image is rendered in Obsidian and
+    # surfaced when this bucket is read later.
+    # 若提供了 image_base64 且 R2 已配置，上传并在正文前部插入图片 URL，
+    # 这样 Obsidian 能直接渲染，桶被读取时图片 URL 也会跟着 content 出来。
+    image_url: str = ""
+    if image_base64 and image_base64.strip():
+        try:
+            image_url = r2_storage.upload_base64(image_base64, image_filename) or ""
+        except Exception as e:
+            logger.warning(f"R2 image upload raised / R2 上传抛错: {e}")
+            image_url = ""
+        if image_url:
+            # Prepend image markdown so dehydrator/Obsidian both see it
+            # 在正文前插入图片 markdown，dehydrator 和 Obsidian 都能识别
+            content = f"![{image_filename}]({image_url})\n\n{content}"
+            logger.info(f"Hold attached image / 附加图片: {image_url}")
+        else:
+            logger.warning(
+                "Image was provided but R2 upload returned no URL "
+                "(R2 disabled or upload failed) / "
+                "提供了图片但 R2 上传未返回 URL（R2 未启用或上传失败）"
+            )
 
     # --- Feel mode: store as feel type, minimal metadata ---
     # --- Feel 模式：存为 feel 类型，最少元数据 ---
