@@ -359,14 +359,20 @@ class BucketManager:
         if not all_buckets:
             return []
 
+        # --- 修复域过滤的脆弱迭代 ---
         if domain_filter:
-            filter_set = {d.lower() for d in domain_filter}
-            candidates = [
-                b for b in all_buckets
-                if {d.lower() for d in b["metadata"].get("domain", [])} & filter_set
-            ]
+            filter_set = {str(d).lower() for d in domain_filter}
+            candidates = []
+            for b in all_buckets:
+                b_domain = b["metadata"].get("domain", [])
+                if isinstance(b_domain, str):
+                    b_domain = [b_domain]
+                elif not isinstance(b_domain, list):
+                    b_domain = []
+                if {str(d).lower() for d in b_domain} & filter_set:
+                    candidates.append(b)
             if not candidates:
-                candidates = all_buckets
+                candidates = all_buckets  # 兜底
         else:
             candidates = all_buckets
 
@@ -407,47 +413,61 @@ class BucketManager:
         return scored[:limit]
 
     # ---------------------------------------------------------
-    # Topic relevance sub-score (REWRITTEN: MAX-WIN MECHANISM + SEGMENTATION)
-    # 彻底重写的文本相关性算法：双向切词短路 + 最高分原则
+    # Topic relevance sub-score (REWRITTEN: MAX-WIN + JIEBA SEGMENTATION + TYPE SAFETY)
+    # 彻底重写的文本相关性算法：双向切词短路 + 最高分原则 + 极致类型安全
     # ---------------------------------------------------------
     def _calc_topic_score(self, query: str, bucket: dict) -> float:
         """
         Calculate text dimension relevance score (0~1).
-        计算文本维度的相关性得分（全新最高亮机制 + 长短句双向切词短路）。
+        计算文本维度的相关性得分（强化版安全机制 + Jieba 切词）。
         """
         meta = bucket.get("metadata", {})
         query_lower = query.lower()
 
         name = meta.get("name", "")
         tags = meta.get("tags", [])
+        if isinstance(tags, str):
+            tags = [tags]
         domain = meta.get("domain", [])
-        content = bucket.get("content", "")[:1000]
+        if isinstance(domain, str):
+            domain = [domain]
+            
+        content = str(bucket.get("content", ""))[:1000]
 
-        # --- 1. 绝对命中短路机制（双向切词检测） ---
         name_lower = str(name).lower()
         tags_lower = [str(t).lower() for t in tags]
 
-        # 按空格切词，并过滤掉常见的无意义停用词，提取核心搜索词
+        # --- 0. 最强绝对命中机制（全句包含） ---
+        if query_lower in name_lower or name_lower in query_lower:
+            return 1.0
+        for t in tags_lower:
+            if query_lower in t or t in query_lower:
+                return 1.0
+
+        # --- 1. 核心词短路机制（Jieba 分词检测） ---
+        try:
+            words = list(jieba.cut(query_lower))
+        except Exception:
+            words = query_lower.split()
+
         query_parts = [
-            p.strip() for p in query_lower.split() 
+            p.strip() for p in words 
             if p.strip() and p.strip() not in self.wikilink_stopwords
         ]
-        # 如果切完没词了（比如全是语气词），就用原句兜底
         if not query_parts:
             query_parts = [query_lower]
 
-        # 核心逻辑：只要 query 的任意一个核心词命中了标题或标签（双向包含），直接满分
         for part in query_parts:
-            if name_lower and (part in name_lower or name_lower in part):
+            if name_lower and part in name_lower:
                 return 1.0
             for t in tags_lower:
-                if t and (part in t or t in part):
+                if t and part in t:
                     return 1.0
 
-        # --- 2. 模糊匹配得分独立计算 ---
-        name_score = fuzz.partial_ratio(query, name) / 100.0 if name else 0.0
-        domain_score = max([fuzz.partial_ratio(query, d) for d in domain] + [0]) / 100.0 if domain else 0.0
-        tag_score = max([fuzz.partial_ratio(query, t) for t in tags] + [0]) / 100.0 if tags else 0.0
+        # --- 2. 模糊匹配得分独立计算（强制转换为字符串，杜绝 Exception 静默拦截） ---
+        name_score = fuzz.partial_ratio(query, str(name)) / 100.0 if name else 0.0
+        domain_score = max([fuzz.partial_ratio(query, str(d)) for d in domain] + [0]) / 100.0 if domain else 0.0
+        tag_score = max([fuzz.partial_ratio(query, str(t)) for t in tags] + [0]) / 100.0 if tags else 0.0
         content_score = fuzz.partial_ratio(query, content) / 100.0 if content else 0.0
 
         # --- 3. 最高亮机制（Max-Win）替代加权平均 ---
