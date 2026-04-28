@@ -206,59 +206,55 @@ class BucketManager:
 
         try:
             post = frontmatter.load(file_path)
+            old_domain = post.get("domain", ["未分类"])
+            old_type = post.get("type", "dynamic")
+            old_pinned = post.get("pinned", False)
+
+            for key, value in kwargs.items():
+                if value is not None:
+                    post[key] = value
+
+            post["last_active"] = now_iso()
+
+            new_pinned = post.get("pinned", False)
+            new_type = post.get("type", "dynamic")
+            new_domain = post.get("domain", ["未分类"])
+
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(frontmatter.dumps(post))
+
+            need_move = False
+            target_type_dir = None
+
+            if new_pinned and not old_pinned:
+                target_type_dir = self.permanent_dir
+                need_move = True
+            elif not new_pinned and old_pinned:
+                target_type_dir = self.dynamic_dir if new_type != "feel" else self.feel_dir
+                need_move = True
+            elif new_type != old_type:
+                if new_type == "permanent":
+                    target_type_dir = self.permanent_dir
+                elif new_type == "feel":
+                    target_type_dir = self.feel_dir
+                else:
+                    target_type_dir = self.dynamic_dir
+                need_move = True
+            elif new_domain != old_domain:
+                if new_pinned or new_type == "permanent":
+                    target_type_dir = self.permanent_dir
+                elif new_type == "feel":
+                    target_type_dir = self.feel_dir
+                else:
+                    target_type_dir = self.dynamic_dir
+                need_move = True
+
+            if need_move and target_type_dir:
+                self._move_bucket(file_path, target_type_dir, new_domain)
+
         except Exception as e:
-            logger.warning(f"Failed to load bucket for update / 加载桶失败: {file_path}: {e}")
+            logger.error(f"Failed to update bucket / 更新桶失败: {bucket_id}: {e}")
             return False
-
-        is_pinned = post.get("pinned", False) or post.get("protected", False)
-        if is_pinned:
-            kwargs.pop("importance", None)
-
-        if "content" in kwargs:
-            post.content = kwargs["content"]
-        if "tags" in kwargs:
-            post["tags"] = kwargs["tags"]
-        if "importance" in kwargs:
-            post["importance"] = max(1, min(10, int(kwargs["importance"])))
-        if "domain" in kwargs:
-            post["domain"] = kwargs["domain"]
-        if "valence" in kwargs:
-            post["valence"] = max(0.0, min(1.0, float(kwargs["valence"])))
-        if "arousal" in kwargs:
-            post["arousal"] = max(0.0, min(1.0, float(kwargs["arousal"])))
-        if "name" in kwargs:
-            post["name"] = sanitize_name(kwargs["name"])
-        if "resolved" in kwargs:
-            post["resolved"] = bool(kwargs["resolved"])
-        if "pinned" in kwargs:
-            post["pinned"] = bool(kwargs["pinned"])
-            if kwargs["pinned"]:
-                post["importance"] = 10
-        if "digested" in kwargs:
-            post["digested"] = bool(kwargs["digested"])
-        if "model_valence" in kwargs:
-            post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
-
-        post["last_active"] = now_iso()
-
-        try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-        except OSError as e:
-            logger.error(f"Failed to write bucket update / 写入桶更新失败: {file_path}: {e}")
-            return False
-
-        domain = post.get("domain", ["未分类"])
-        if kwargs.get("pinned") and post.get("type") != "permanent":
-            post["type"] = "permanent"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-            self._move_bucket(file_path, self.permanent_dir, domain)
-        elif kwargs.get("resolved") and post.get("type") not in ("permanent", "feel"):
-            post["type"] = "archived"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-            self._move_bucket(file_path, self.archive_dir, domain)
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
         return True
@@ -272,9 +268,17 @@ class BucketManager:
             return False
 
         try:
+            post = frontmatter.load(file_path)
+            if post.get("protected", False):
+                logger.warning(f"Cannot delete protected bucket / 受保护的桶不可删除: {bucket_id}")
+                return False
+        except Exception as e:
+            logger.warning(f"Failed to check protection on {bucket_id}: {e}")
+
+        try:
             os.remove(file_path)
         except OSError as e:
-            logger.error(f"Failed to delete bucket file / 删除桶文件失败: {file_path}: {e}")
+            logger.error(f"Failed to delete bucket file / 删除桶文件失败: {bucket_id}: {e}")
             return False
 
         logger.info(f"Deleted bucket / 删除记忆桶: {bucket_id}")
@@ -372,7 +376,12 @@ class BucketManager:
                 if {str(d).lower() for d in b_domain} & filter_set:
                     candidates.append(b)
             if not candidates:
-                candidates = all_buckets  # 兜底
+                # domain_filter 没有匹配到任何桶时，严格返回空，
+                # 而不是退化成搜全部（避免用户以为过滤生效但实际没过滤）
+                logger.info(
+                    f"domain_filter {domain_filter} matched no buckets, returning empty"
+                )
+                return []
         else:
             candidates = all_buckets
 
