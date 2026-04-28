@@ -418,10 +418,6 @@ async def breath(
         logger.error(f"Search failed / 检索失败: {e}")
         return "检索过程出错，请稍后重试。"
 
-    # --- Exclude pinned/protected from search results (they surface in surfacing mode) ---
-    # --- 搜索模式排除钉选桶（它们在浮现模式中始终可见）---
-    matches = [b for b in matches if not (b["metadata"].get("pinned") or b["metadata"].get("protected"))]
-
     # --- Vector similarity channel: find semantically related buckets ---
     # --- 向量相似度通道：找到语义相关的桶 ---
     matched_ids = {b["id"] for b in matches}
