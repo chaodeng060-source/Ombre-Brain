@@ -36,7 +36,10 @@ import random
 import logging
 import asyncio
 import httpx
+import jieba
 
+# --- jieba 预热：避免首次 search 卡顿 / Pre-load jieba dict to avoid first-call lag ---
+jieba.initialize()
 
 # --- Ensure same-directory modules can be imported ---
 # --- 确保同目录下的模块能被正确导入 ---
