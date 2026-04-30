@@ -932,8 +932,8 @@ async function showDetail(id) {
         '<div class="field"><label>已解决</label>' + (meta.resolved ? '✓' : '—') + '</div>' +
         '<div class="field"><label>已消化</label>' + (meta.digested ? '✓' : '—') + '</div>' +
         '<div class="field"><label>钉选</label>' + (meta.pinned ? '✓' : '—') + '</div>' +
-        '<div class="field"><label>创建</label>' + (meta.created || '—') + '</div>' +
-        '<div class="field"><label>最后活跃</label>' + (meta.last_active || '—') + '</div>' +
+        '<div class="field"><label>创建</label>' + formatBJTime(meta.created) + '</div>' +
+        '<div class="field"><label>最后活跃</label>' + formatBJTime(meta.last_active) + '</div>' +
       '</div>' +
       '<div class="detail-content">' + esc(b.content) + '</div>';
   } catch (e) {
@@ -1079,9 +1079,26 @@ function esc(s) {
   return d.innerHTML;
 }
 
+function parseUTC(iso) {
+  // 后端存的是UTC时间但不带Z标记，浏览器会按本地时区解析导致偏8h
+  // 这里强制按UTC解析
+  if (!iso) return null;
+  var s = String(iso);
+  if (!s.endsWith('Z') && !s.match(/[+-]\d{2}:?\d{2}$/)) s += 'Z';
+  return new Date(s);
+}
+
+function formatBJTime(iso) {
+  if (!iso) return '—';
+  try {
+    var d = parseUTC(iso);
+    return d.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+  } catch(e) { return iso; }
+}
+
 function formatTimeAgo(iso) {
   if (!iso) return '—';
-  var d = new Date(iso);
+  var d = parseUTC(iso);
   var now = new Date();
   var hours = Math.floor((now - d) / 3600000);
   if (hours < 1) return '刚刚';
