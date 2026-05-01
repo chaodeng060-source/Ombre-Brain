@@ -151,6 +151,45 @@
     box-shadow: inset 3px 3px 6px rgba(0,0,0,0.2), inset -2px -2px 4px rgba(255,255,255,0.05);
   }
 
+  .sort-bar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+  }
+  .sort-label {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-right: 4px;
+    letter-spacing: 1px;
+  }
+  .sort-btn, .sort-order {
+    padding: 6px 14px;
+    font-size: 12px;
+    border: none;
+    border-radius: 20px;
+    background: transparent;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-family: inherit;
+    transition: all 0.18s ease;
+  }
+  .sort-btn:hover, .sort-order:hover {
+    color: var(--accent);
+    background: rgba(0,0,0,0.03);
+  }
+  .sort-btn.active {
+    color: var(--accent);
+    background: rgba(0,0,0,0.05);
+    font-weight: 500;
+  }
+  .sort-order {
+    min-width: 32px;
+    font-size: 14px;
+    margin-left: auto;
+  }
+
   .bucket-list { display: flex; flex-direction: column; gap: 8px; }
   .bucket-row {
     display: grid;
@@ -619,6 +658,15 @@
 
 <div class="content" id="list-view">
   <div class="filters" id="filters"></div>
+  <div class="sort-bar" id="sort-bar">
+    <span class="sort-label">排序</span>
+    <button class="sort-btn active" data-sort="last_active">最近活跃</button>
+    <button class="sort-btn" data-sort="created">最近创建</button>
+    <button class="sort-btn" data-sort="importance">重要度</button>
+    <button class="sort-btn" data-sort="score">浮现分</button>
+    <button class="sort-btn" data-sort="valence">情绪正负</button>
+    <button class="sort-order" id="sort-order" title="切换升降序">↓</button>
+  </div>
   <div class="bucket-list" id="bucket-list">
     <div class="loading">加载中…</div>
   </div>
@@ -782,6 +830,8 @@
 const BASE = location.origin;
 let allBuckets = [];
 let currentFilter = 'all';
+let currentSort = 'last_active';
+let currentOrder = 'desc';
 
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
@@ -857,6 +907,25 @@ function buildFilters() {
     currentFilter = btn.dataset.filter;
     renderBuckets(filterBuckets(allBuckets));
   });
+
+  var sortBar = document.getElementById('sort-bar');
+  if (sortBar && !sortBar.dataset.bound) {
+    sortBar.dataset.bound = '1';
+    sortBar.addEventListener('click', function(e) {
+      var btn = e.target.closest('.sort-btn');
+      var orderBtn = e.target.closest('#sort-order');
+      if (btn) {
+        sortBar.querySelectorAll('.sort-btn').forEach(function(b) { b.classList.remove('active'); });
+        btn.classList.add('active');
+        currentSort = btn.dataset.sort;
+        renderBuckets(filterBuckets(allBuckets));
+      } else if (orderBtn) {
+        currentOrder = currentOrder === 'desc' ? 'asc' : 'desc';
+        orderBtn.textContent = currentOrder === 'desc' ? '↓' : '↑';
+        renderBuckets(filterBuckets(allBuckets));
+      }
+    });
+  }
 }
 
 function filterBuckets(buckets) {
@@ -873,7 +942,39 @@ function filterBuckets(buckets) {
   return buckets;
 }
 
+function sortBuckets(buckets) {
+  var key = currentSort;
+  var sign = currentOrder === 'desc' ? -1 : 1;
+  var copy = buckets.slice();
+  copy.sort(function(a, b) {
+    var av, bv;
+    if (key === 'last_active') {
+      av = new Date(a.last_active || a.created).getTime();
+      bv = new Date(b.last_active || b.created).getTime();
+    } else if (key === 'created') {
+      av = new Date(a.created).getTime();
+      bv = new Date(b.created).getTime();
+    } else if (key === 'importance') {
+      av = a.importance || 0;
+      bv = b.importance || 0;
+    } else if (key === 'score') {
+      av = a.score || 0;
+      bv = b.score || 0;
+    } else if (key === 'valence') {
+      av = a.valence == null ? 0.5 : a.valence;
+      bv = b.valence == null ? 0.5 : b.valence;
+    } else {
+      av = 0; bv = 0;
+    }
+    if (av < bv) return -1 * sign;
+    if (av > bv) return 1 * sign;
+    return 0;
+  });
+  return copy;
+}
+
 function renderBuckets(buckets) {
+  buckets = sortBuckets(buckets);
   var list = document.getElementById('bucket-list');
   if (!buckets.length) {
     list.innerHTML = '<div class="loading">没有记忆桶</div>';
