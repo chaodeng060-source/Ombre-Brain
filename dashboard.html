@@ -338,6 +338,109 @@
     box-shadow: inset 3px 3px 6px var(--shadow-dark-subtle), inset -3px -3px 6px var(--shadow-light);
   }
 
+  .edit-btn {
+    position: absolute;
+    top: 16px;
+    right: 60px;
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    font-size: 16px;
+    cursor: pointer;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+  }
+  .edit-btn:hover {
+    background: var(--accent-glow);
+    color: var(--accent);
+  }
+  .edit-form { font-size: 13px; }
+  .edit-form .form-row { margin-bottom: 14px; }
+  .edit-form label {
+    display: block;
+    color: var(--text-light);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+  }
+  .edit-form input[type="text"],
+  .edit-form input[type="number"],
+  .edit-form textarea {
+    width: 100%;
+    padding: 8px 12px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+    box-sizing: border-box;
+  }
+  .edit-form textarea {
+    min-height: 200px;
+    resize: vertical;
+    line-height: 1.6;
+  }
+  .edit-form .form-row-inline {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+  .edit-form .checkbox-row {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 14px;
+  }
+  .edit-form .checkbox-row label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 12px;
+    margin-bottom: 0;
+    cursor: pointer;
+  }
+  .edit-form .form-actions {
+    display: flex;
+    gap: 12px;
+    margin-top: 20px;
+  }
+  .edit-form button {
+    padding: 10px 20px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 13px;
+    font-family: inherit;
+    transition: all 0.2s;
+  }
+  .edit-form button.primary {
+    background: var(--accent);
+    color: var(--surface-solid);
+    border-color: var(--accent);
+  }
+  .edit-form button:hover { opacity: 0.85; }
+  .edit-form .image-preview img {
+    max-width: 100%;
+    border-radius: 10px;
+    margin-top: 8px;
+  }
+  .edit-form .help-text {
+    font-size: 11px;
+    color: var(--text-light);
+    margin-top: 4px;
+  }
+
   .config-section {
     margin-bottom: 28px;
     padding: 24px;
@@ -823,6 +926,7 @@
 
 <div class="detail-panel" id="detail-panel">
   <button class="close-btn" onclick="closeDetail()">✕</button>
+  <button class="edit-btn" id="edit-toggle-btn" onclick="toggleEditMode()" title="编辑">✏️</button>
   <div id="detail-content"></div>
 </div>
 
@@ -1007,43 +1111,193 @@ async function searchBuckets(query) {
   }
 }
 
+var currentBucket = null;
+var editMode = false;
+
 async function showDetail(id) {
   var panel = document.getElementById('detail-panel');
   var content = document.getElementById('detail-content');
   content.innerHTML = '<div class="loading">加载中…</div>';
   panel.classList.add('open');
+  editMode = false;
+  document.getElementById('edit-toggle-btn').textContent = '✏️';
 
   try {
     var res = await fetch(BASE + '/api/bucket/' + id);
     var b = await res.json();
-    var meta = b.metadata || {};
-    content.innerHTML =
-      '<h2>' + esc(meta.name || id) + '</h2>' +
-      '<div class="detail-meta">' +
-        '<div class="field"><label>ID</label>' + id + '</div>' +
-        '<div class="field"><label>类型</label>' + (meta.type || 'dynamic') + '</div>' +
-        '<div class="field"><label>域</label>' + (meta.domain || []).join(', ') + '</div>' +
-        '<div class="field"><label>标签</label>' + (meta.tags || []).join(', ') + '</div>' +
-        '<div class="field"><label>事件效价</label>V' + (meta.valence || 0.5).toFixed(2) + '</div>' +
-        '<div class="field"><label>唤醒度</label>A' + (meta.arousal || 0.3).toFixed(2) + '</div>' +
-        '<div class="field"><label>模型视角</label>' + (meta.model_valence != null ? 'V' + meta.model_valence.toFixed(2) : '—') + '</div>' +
-        '<div class="field"><label>重要度</label>' + (meta.importance || 5) + '/10</div>' +
-        '<div class="field"><label>权重分</label>' + b.score.toFixed(4) + '</div>' +
-        '<div class="field"><label>激活次数</label>' + (meta.activation_count || 1) + '</div>' +
-        '<div class="field"><label>已解决</label>' + (meta.resolved ? '✓' : '—') + '</div>' +
-        '<div class="field"><label>已消化</label>' + (meta.digested ? '✓' : '—') + '</div>' +
-        '<div class="field"><label>钉选</label>' + (meta.pinned ? '✓' : '—') + '</div>' +
-        '<div class="field"><label>创建</label>' + formatBJTime(meta.created) + '</div>' +
-        '<div class="field"><label>最后活跃</label>' + formatBJTime(meta.last_active) + '</div>' +
-      '</div>' +
-      '<div class="detail-content">' + esc(b.content) + '</div>';
+    currentBucket = b;
+    renderDetailView(b);
   } catch (e) {
     content.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
   }
 }
 
+function renderDetailView(b) {
+  var content = document.getElementById('detail-content');
+  var meta = b.metadata || {};
+  content.innerHTML =
+    '<h2>' + esc(meta.name || b.id) + '</h2>' +
+    '<div class="detail-meta">' +
+      '<div class="field"><label>ID</label>' + b.id + '</div>' +
+      '<div class="field"><label>类型</label>' + (meta.type || 'dynamic') + '</div>' +
+      '<div class="field"><label>域</label>' + (meta.domain || []).join(', ') + '</div>' +
+      '<div class="field"><label>标签</label>' + (meta.tags || []).join(', ') + '</div>' +
+      '<div class="field"><label>事件效价</label>V' + (meta.valence || 0.5).toFixed(2) + '</div>' +
+      '<div class="field"><label>唤醒度</label>A' + (meta.arousal || 0.3).toFixed(2) + '</div>' +
+      '<div class="field"><label>模型视角</label>' + (meta.model_valence != null ? 'V' + meta.model_valence.toFixed(2) : '—') + '</div>' +
+      '<div class="field"><label>重要度</label>' + (meta.importance || 5) + '/10</div>' +
+      '<div class="field"><label>权重分</label>' + b.score.toFixed(4) + '</div>' +
+      '<div class="field"><label>激活次数</label>' + (meta.activation_count || 1) + '</div>' +
+      '<div class="field"><label>已解决</label>' + (meta.resolved ? '✓' : '—') + '</div>' +
+      '<div class="field"><label>已消化</label>' + (meta.digested ? '✓' : '—') + '</div>' +
+      '<div class="field"><label>钉选</label>' + (meta.pinned ? '✓' : '—') + '</div>' +
+      '<div class="field"><label>创建</label>' + formatBJTime(meta.created) + '</div>' +
+      '<div class="field"><label>最后活跃</label>' + formatBJTime(meta.last_active) + '</div>' +
+    '</div>' +
+    '<div class="detail-content">' + esc(b.content) + '</div>';
+}
+
+function renderEditForm(b) {
+  var content = document.getElementById('detail-content');
+  var meta = b.metadata || {};
+  content.innerHTML =
+    '<h2>编辑：' + esc(meta.name || b.id) + '</h2>' +
+    '<div class="edit-form">' +
+      '<div class="form-row">' +
+        '<label>名称</label>' +
+        '<input type="text" id="ef-name" value="' + esc(meta.name || '') + '">' +
+      '</div>' +
+      '<div class="form-row-inline">' +
+        '<div><label>域 (逗号分隔)</label>' +
+          '<input type="text" id="ef-domain" value="' + esc((meta.domain || []).join(', ')) + '"></div>' +
+        '<div><label>标签 (逗号分隔)</label>' +
+          '<input type="text" id="ef-tags" value="' + esc((meta.tags || []).join(', ')) + '"></div>' +
+      '</div>' +
+      '<div class="form-row-inline">' +
+        '<div><label>事件效价 (0-1)</label>' +
+          '<input type="number" id="ef-valence" min="0" max="1" step="0.1" value="' + (meta.valence != null ? meta.valence : 0.5) + '"></div>' +
+        '<div><label>唤醒度 (0-1)</label>' +
+          '<input type="number" id="ef-arousal" min="0" max="1" step="0.1" value="' + (meta.arousal != null ? meta.arousal : 0.3) + '"></div>' +
+      '</div>' +
+      '<div class="form-row">' +
+        '<label>重要度 (1-10)</label>' +
+        '<input type="number" id="ef-importance" min="1" max="10" step="1" value="' + (meta.importance || 5) + '">' +
+      '</div>' +
+      '<div class="checkbox-row">' +
+        '<label><input type="checkbox" id="ef-pinned"' + (meta.pinned ? ' checked' : '') + '> 钉选</label>' +
+        '<label><input type="checkbox" id="ef-resolved"' + (meta.resolved ? ' checked' : '') + '> 已解决</label>' +
+        '<label><input type="checkbox" id="ef-digested"' + (meta.digested ? ' checked' : '') + '> 已消化</label>' +
+      '</div>' +
+      '<div class="form-row">' +
+        '<label>正文</label>' +
+        '<textarea id="ef-content">' + esc(b.content || '') + '</textarea>' +
+      '</div>' +
+      '<div class="form-row">' +
+        '<label>添加图片 (可选)</label>' +
+        '<input type="file" id="ef-image" accept="image/*" onchange="previewImage(event)">' +
+        '<div class="help-text">选中图片后保存时会上传到 R2 并插入正文顶部</div>' +
+        '<div class="image-preview" id="ef-image-preview"></div>' +
+      '</div>' +
+      '<div class="form-actions">' +
+        '<button class="primary" onclick="saveBucketEdit()">保存</button>' +
+        '<button onclick="cancelEdit()">取消</button>' +
+      '</div>' +
+    '</div>';
+}
+
+function toggleEditMode() {
+  if (!currentBucket) return;
+  editMode = !editMode;
+  document.getElementById('edit-toggle-btn').textContent = editMode ? '👁️' : '✏️';
+  if (editMode) {
+    renderEditForm(currentBucket);
+  } else {
+    renderDetailView(currentBucket);
+  }
+}
+
+function cancelEdit() {
+  editMode = false;
+  document.getElementById('edit-toggle-btn').textContent = '✏️';
+  renderDetailView(currentBucket);
+}
+
+var pendingImageBase64 = null;
+var pendingImageFilename = null;
+
+function previewImage(evt) {
+  var file = evt.target.files[0];
+  if (!file) {
+    pendingImageBase64 = null;
+    pendingImageFilename = null;
+    document.getElementById('ef-image-preview').innerHTML = '';
+    return;
+  }
+  pendingImageFilename = file.name;
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    var dataUrl = e.target.result;
+    var commaIdx = dataUrl.indexOf(',');
+    pendingImageBase64 = commaIdx >= 0 ? dataUrl.substring(commaIdx + 1) : dataUrl;
+    document.getElementById('ef-image-preview').innerHTML = '<img src="' + dataUrl + '">';
+  };
+  reader.readAsDataURL(file);
+}
+
+async function saveBucketEdit() {
+  if (!currentBucket) return;
+  var payload = {
+    name: document.getElementById('ef-name').value,
+    domain: document.getElementById('ef-domain').value,
+    tags: document.getElementById('ef-tags').value,
+    valence: parseFloat(document.getElementById('ef-valence').value),
+    arousal: parseFloat(document.getElementById('ef-arousal').value),
+    importance: parseInt(document.getElementById('ef-importance').value),
+    pinned: document.getElementById('ef-pinned').checked,
+    resolved: document.getElementById('ef-resolved').checked,
+    digested: document.getElementById('ef-digested').checked,
+    content: document.getElementById('ef-content').value
+  };
+  if (pendingImageBase64) {
+    payload.image_base64 = pendingImageBase64;
+    payload.image_filename = pendingImageFilename || 'image';
+  }
+
+  var saveBtn = document.querySelector('.edit-form button.primary');
+  if (saveBtn) { saveBtn.textContent = '保存中…'; saveBtn.disabled = true; }
+
+  try {
+    var res = await fetch(BASE + '/api/bucket/' + currentBucket.id, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    var data = await res.json();
+    if (data.error) {
+      alert('保存失败: ' + data.error);
+      if (saveBtn) { saveBtn.textContent = '保存'; saveBtn.disabled = false; }
+      return;
+    }
+    pendingImageBase64 = null;
+    pendingImageFilename = null;
+    var refresh = await fetch(BASE + '/api/bucket/' + currentBucket.id);
+    currentBucket = await refresh.json();
+    editMode = false;
+    document.getElementById('edit-toggle-btn').textContent = '✏️';
+    renderDetailView(currentBucket);
+    loadBuckets();
+  } catch (e) {
+    alert('保存出错: ' + e.message);
+    if (saveBtn) { saveBtn.textContent = '保存'; saveBtn.disabled = false; }
+  }
+}
+
 function closeDetail() {
   document.getElementById('detail-panel').classList.remove('open');
+  editMode = false;
+  currentBucket = null;
+  pendingImageBase64 = null;
+  pendingImageFilename = null;
 }
 
 var networkData = null;
