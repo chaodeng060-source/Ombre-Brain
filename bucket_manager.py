@@ -136,6 +136,10 @@ class BucketManager:
         if protected:
             metadata["protected"] = True
 
+        # Defensive: ensure no 'content' key sneaks into metadata kwargs
+        # 防御性：确保 metadata 里没有 content 键，否则会和 body 撞 Post() 参数
+        metadata.pop("content", None)
+
         post = frontmatter.Post(linked_content, **metadata)
 
         if bucket_type == "permanent" or pinned:
@@ -205,14 +209,19 @@ class BucketManager:
             return False
 
         try:
-            post = frontmatter.load(file_path)
+            post = self._safe_load_post(file_path)
             old_domain = post.get("domain", ["未分类"])
             old_type = post.get("type", "dynamic")
             old_pinned = post.get("pinned", False)
 
             for key, value in kwargs.items():
                 if value is not None:
-                    post[key] = value
+                    if key == "content":
+                        # 'content' is body, not metadata — avoid Post() collision
+                        # 'content' 是正文不是元数据 — 防止 Post() 撞键
+                        post.content = value
+                    else:
+                        post[key] = value
 
             post["last_active"] = now_iso()
 
@@ -268,7 +277,7 @@ class BucketManager:
             return False
 
         try:
-            post = frontmatter.load(file_path)
+            post = self._safe_load_post(file_path)
             if post.get("protected", False):
                 logger.warning(f"Cannot delete protected bucket / 受保护的桶不可删除: {bucket_id}")
                 return False
@@ -293,7 +302,7 @@ class BucketManager:
             return
 
         try:
-            post = frontmatter.load(file_path)
+            post = self._safe_load_post(file_path)
             post["last_active"] = now_iso()
             post["activation_count"] = post.get("activation_count", 0) + 1
 
@@ -334,7 +343,7 @@ class BucketManager:
                 if not file_path:
                     continue
                 try:
-                    post = frontmatter.load(file_path)
+                    post = self._safe_load_post(file_path)
                     current_count = post.get("activation_count", 1)
                     post["activation_count"] = round(current_count + 0.3, 1)
                     with open(file_path, "w", encoding="utf-8") as f:
@@ -587,7 +596,7 @@ class BucketManager:
             return False
 
         try:
-            post = frontmatter.load(file_path)
+            post = self._safe_load_post(file_path)
             domain = post.get("domain", ["未分类"])
             primary_domain = sanitize_name(domain[0]) if domain else "未分类"
             archive_subdir = os.path.join(self.archive_dir, primary_domain)
@@ -630,9 +639,57 @@ class BucketManager:
     # ---------------------------------------------------------
     # Internal: load bucket data
     # ---------------------------------------------------------
+    def _safe_load_post(self, file_path: str):
+        """
+        Wrap frontmatter.load to tolerate dirty YAML headers that contain
+        a 'content' key (would collide with the body positional arg).
+        Strategy: try native load first; on collision, manually strip the
+        offending key from YAML and rebuild the Post object.
+        包装 frontmatter.load 以容忍 YAML 头里混入 'content' 键的脏数据
+        （会和 body 位置参数撞键）。策略：先尝试原生 load；如果撞键，
+        手动从 YAML 里剥掉冲突字段后重建 Post 对象。
+        """
+        try:
+            return frontmatter.load(file_path)
+        except TypeError as e:
+            if "content" not in str(e):
+                raise
+            # Manual repair: split YAML header, drop 'content' key, rebuild
+            # 手动修复：拆开 YAML 头，丢掉 content 键，重组
+            with open(file_path, "r", encoding="utf-8") as f:
+                text = f.read()
+            if not text.startswith("---\n"):
+                raise
+            end = text.find("\n---\n", 4)
+            if end < 0:
+                raise
+            yaml_part = text[4:end]
+            body = text[end + 5:]
+            # Remove 'content:' line and any continuation lines until next top-level key
+            # 删 content: 行及其续行，直到下一个顶级 YAML 字段
+            cleaned_lines = []
+            skip = False
+            for line in yaml_part.splitlines(keepends=True):
+                if skip:
+                    # continuation if line starts with whitespace; otherwise stop skipping
+                    if line and line[0] in " \t":
+                        continue
+                    skip = False
+                if line.startswith("content:"):
+                    skip = True
+                    continue
+                cleaned_lines.append(line)
+            cleaned_yaml = "".join(cleaned_lines)
+            cleaned_text = "---\n" + cleaned_yaml + "---\n" + body
+            logger.warning(
+                f"Auto-cleaned 'content' from YAML header / "
+                f"自动清理YAML头里的content键: {file_path}"
+            )
+            return frontmatter.loads(cleaned_text)
+
     def _load_bucket(self, file_path: str) -> Optional[dict]:
         try:
-            post = frontmatter.load(file_path)
+            post = self._safe_load_post(file_path)
             return {
                 "id": post.get("id", Path(file_path).stem),
                 "metadata": dict(post.metadata),
@@ -643,4 +700,4 @@ class BucketManager:
             logger.warning(
                 f"Failed to load bucket file / 加载桶文件失败: {file_path}: {e}"
             )
-            return None
+            return None 
