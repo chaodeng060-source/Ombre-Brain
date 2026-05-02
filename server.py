@@ -1056,7 +1056,110 @@ async def api_bucket_detail(request):
         "score": decay_engine.calculate_score(meta),
     })
 
+@mcp.custom_route("/api/bucket/{bucket_id}", methods=["POST"])
+async def api_bucket_update(request):
+    """Update bucket via dashboard. Accepts JSON body with optional fields:
+    name, domain (list or csv), tags (list or csv), valence, arousal,
+    importance, resolved, pinned, digested, content, image_base64, image_filename.
+    Mirrors trace() tool but exposed as HTTP for dashboard editing.
+    """
+    from starlette.responses import JSONResponse
+    bucket_id = request.path_params["bucket_id"]
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return JSONResponse({"error": "not found"}, status_code=404)
 
+    try:
+        data = await request.json()
+    except Exception as e:
+        return JSONResponse({"error": f"invalid json: {e}"}, status_code=400)
+
+    updates = {}
+
+    if "name" in data and data["name"]:
+        updates["name"] = str(data["name"]).strip()
+
+    if "domain" in data and data["domain"]:
+        d = data["domain"]
+        if isinstance(d, list):
+            updates["domain"] = [str(x).strip() for x in d if str(x).strip()]
+        else:
+            updates["domain"] = [x.strip() for x in str(d).split(",") if x.strip()]
+
+    if "tags" in data and data["tags"]:
+        t = data["tags"]
+        if isinstance(t, list):
+            updates["tags"] = [str(x).strip() for x in t if str(x).strip()]
+        else:
+            updates["tags"] = [x.strip() for x in str(t).split(",") if x.strip()]
+
+    if "valence" in data:
+        try:
+            v = float(data["valence"])
+            if 0 <= v <= 1:
+                updates["valence"] = v
+        except (TypeError, ValueError):
+            pass
+
+    if "arousal" in data:
+        try:
+            a = float(data["arousal"])
+            if 0 <= a <= 1:
+                updates["arousal"] = a
+        except (TypeError, ValueError):
+            pass
+
+    if "importance" in data:
+        try:
+            imp = int(data["importance"])
+            if 1 <= imp <= 10:
+                updates["importance"] = imp
+        except (TypeError, ValueError):
+            pass
+
+    if "resolved" in data and data["resolved"] is not None:
+        updates["resolved"] = bool(data["resolved"])
+
+    if "pinned" in data and data["pinned"] is not None:
+        updates["pinned"] = bool(data["pinned"])
+        if updates["pinned"]:
+            updates["importance"] = 10
+
+    if "digested" in data and data["digested"] is not None:
+        updates["digested"] = bool(data["digested"])
+
+    # Content + optional image upload
+    new_content = data.get("content", "")
+    image_b64 = data.get("image_base64", "")
+    image_filename = data.get("image_filename", "image")
+
+    if image_b64 and image_b64.strip():
+        try:
+            image_url = r2_storage.upload_base64(image_b64, image_filename) or ""
+        except Exception as e:
+            logger.warning(f"R2 image upload raised in dashboard edit: {e}")
+            image_url = ""
+        if image_url:
+            prefix = f"![{image_filename}]({image_url})\n\n"
+            new_content = prefix + (new_content or bucket.get("content", ""))
+
+    if new_content:
+        updates["content"] = new_content
+
+    if not updates:
+        return JSONResponse({"error": "no fields to update"}, status_code=400)
+
+    success = await bucket_mgr.update(bucket_id, **updates)
+    if not success:
+        return JSONResponse({"error": "update failed"}, status_code=500)
+
+    if "content" in updates:
+        try:
+            await embedding_engine.generate_and_store(bucket_id, updates["content"])
+        except Exception:
+            pass
+
+    return JSONResponse({"ok": True, "updated": list(updates.keys())})
 @mcp.custom_route("/api/search", methods=["GET"])
 async def api_search(request):
     """Search buckets by query."""
