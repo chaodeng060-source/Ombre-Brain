@@ -1154,7 +1154,18 @@ function renderDetailView(b) {
       '<div class="field"><label>创建</label>' + formatBJTime(meta.created) + '</div>' +
       '<div class="field"><label>最后活跃</label>' + formatBJTime(meta.last_active) + '</div>' +
     '</div>' +
-    '<div class="detail-content">' + esc(b.content) + '</div>';
+    '<div class="detail-content">' + renderContent(b.content) + '</div>';
+}
+
+function renderContent(text) {
+  if (!text) return '';
+  // First escape all HTML
+  var escaped = esc(text);
+  // Then convert markdown image syntax ![alt](url) back to <img>
+  // Only allow http(s) URLs to prevent XSS
+  return escaped.replace(/!\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g, function(match, alt, url) {
+    return '<img src="' + url + '" alt="' + alt + '" style="max-width:100%;border-radius:10px;margin:8px 0;display:block;">';
+  });
 }
 
 function renderEditForm(b) {
