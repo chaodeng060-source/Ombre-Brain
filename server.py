@@ -210,12 +210,15 @@ async def _merge_or_create(
     返回 (桶ID或名称, 是否合并)。
     """
     try:
-        existing = await bucket_mgr.search(content, limit=1, domain_filter=domain or None)
+        existing = await bucket_mgr.search(content, limit=5, domain_filter=domain or None)
+            if domain and existing:
+                primary = domain[0]
+                existing = [b for b in existing if primary in b["metadata"].get("domain", [])]
     except Exception as e:
         logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
         existing = []
 
-    if existing and existing[0].get("score", 0) > config.get("merge_threshold", 75):
+    if existing and existing[0].get("score", 0) > config.get("merge_threshold", 85):
         bucket = existing[0]
         # --- Never merge into pinned/protected buckets ---
         # --- 不合并到钉选/保护桶 ---
