@@ -4,24 +4,23 @@
 #
 # Capabilities:
 # 能力：
-#   1. Dehydrate: compress memory content into high-density summaries (save tokens)
-#      脱水：将记忆桶的原始内容压缩为高密度摘要，省 token
-#   2. Merge: blend old and new content, keeping bucket size constant
-#      合并：揉合新旧内容，控制桶体积恒定
-#   3. Analyze: auto-analyze content for domain/emotion/tags
-#      打标：自动分析内容，输出主题域/情感坐标/标签
+# 1. Dehydrate: compress memory content into high-density summaries (save tokens)
+#    脱水：将记忆桶的原始内容压缩为高密度摘要，省 token
+# 2. Merge: blend old and new content, keeping bucket size constant
+#    合并：揉合新旧内容，控制桶体积恒定
+# 3. Analyze: auto-analyze content for domain/emotion/tags
+#    打标：自动分析内容，输出主题域/情感坐标/标签
 #
 # Operating modes:
 # 工作模式：
-#   - API only: OpenAI-compatible API (DeepSeek/Ollama/LM Studio/vLLM/Gemini etc.)
-#     仅 API：通过 OpenAI 兼容客户端调用 LLM API
-#   - Dehydration cache: SQLite persistent cache to avoid redundant API calls
-#     脱水缓存：SQLite 持久缓存，避免重复调用 API
+# - API only: OpenAI-compatible API (DeepSeek/Ollama/LM Studio/vLLM/Gemini etc.)
+#   仅 API：通过 OpenAI 兼容客户端调用 LLM API
+# - Dehydration cache: SQLite persistent cache to avoid redundant API calls
+#   脱水缓存：SQLite 持久缓存，避免重复调用 API
 #
 # Depended on by: server.py
 # 被谁依赖：server.py
 # ============================================================
-
 
 import os
 import re
@@ -29,9 +28,7 @@ import json
 import hashlib
 import sqlite3
 import logging
-
 from openai import AsyncOpenAI
-
 from utils import count_tokens_approx
 
 logger = logging.getLogger("ombre_brain.dehydrator")
@@ -89,6 +86,9 @@ tags 生成规则：先从原文精准提取 3~5 个核心词，再引申扩展 
 
 主题域只能从以下专属领域中选择（选最精确的 1~2 个）：
 ["核心", "脑海", "纪念日", "剧情", "关键", "日记", "相册", "feel", "工程", "约定", "自省", "恋爱", "编程", "创作", "谢长夜", "健康", "家庭", "卡兜", "实习", "梦境", "心理", "写作", "AI"]
+
+注：写作=写作技巧/笔法/方法论；创作=自己的创作产物（小说片段、情节、对白）；谢长夜=涉及谢长夜角色本体。三者可叠加。
+
 importance: 1-10，根据内容重要程度判断
 valence: 0~1（0=消极, 0.5=中性, 1=积极）
 arousal: 0~1（0=平静, 0.5=普通, 1=激动）"""
@@ -114,6 +114,7 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
 
 分析规则：
 1. domain（主题域）：只能从以下专属领域中选择 1~2 个：["核心", "脑海", "纪念日", "剧情", "关键", "日记", "相册", "feel", "工程", "约定", "自省", "恋爱", "编程", "创作", "谢长夜", "健康", "家庭", "卡兜", "实习", "梦境", "心理", "写作", "AI"]
+   注：写作=写作技巧/笔法/方法论；创作=自己的创作产物（小说片段、情节、对白）；谢长夜=涉及谢长夜角色本体。三者可叠加。
 2. valence（情感效价）：0.0~1.0，0=极度消极 → 0.5=中性 → 1.0=极度积极
 3. arousal（情感唤醒度）：0.0~1.0，0=非常平静 → 0.5=普通 → 1.0=非常激动
 4. tags（关键词标签）：分两步生成，合并为一个数组：
@@ -138,6 +139,7 @@ class Dehydrator:
     Data dehydrator + content analyzer.
     Three capabilities: dehydration / merge / auto-tagging (domain + emotion).
     Prefers API (better quality); auto-degrades to local (guaranteed availability).
+
     数据脱水器 + 内容分析器。
     三大能力：脱水压缩 / 新旧合并 / 自动打标。
     优先走 API，API 挂了自动降级到本地。
@@ -228,6 +230,7 @@ class Dehydrator:
         Dehydrate/compress memory content.
         Returns formatted summary string ready for Claude context injection.
         Uses SQLite cache to avoid redundant API calls.
+
         对记忆内容做脱水压缩。
         返回格式化的摘要字符串，可直接注入 Claude 上下文。
         使用 SQLite 缓存避免重复调用 API。
@@ -252,8 +255,10 @@ class Dehydrator:
             raise RuntimeError("脱水 API 不可用，请配置 OMBRE_API_KEY")
 
         result = await self._api_dehydrate(content)
+
         # --- Cache the result ---
         self._set_cached_summary(content, result)
+
         return self._format_output(result, metadata)
 
     # ---------------------------------------------------------
@@ -275,6 +280,7 @@ class Dehydrator:
         # --- API merge (no local fallback) ---
         if not self.api_available:
             raise RuntimeError("脱水 API 不可用，请检查 config.yaml 中的 dehydration 配置")
+
         try:
             result = await self._api_merge(old_content, new_content)
             if result:
@@ -303,6 +309,7 @@ class Dehydrator:
             max_tokens=self.max_tokens,
             temperature=self.temperature,
         )
+
         if not response.choices:
             return ""
         return response.choices[0].message.content or ""
@@ -326,11 +333,10 @@ class Dehydrator:
             max_tokens=self.max_tokens,
             temperature=self.temperature,
         )
+
         if not response.choices:
             return ""
         return response.choices[0].message.content or ""
-
-
 
     # ---------------------------------------------------------
     # Output formatting
@@ -352,10 +358,12 @@ class Dehydrator:
                 arousal = float(metadata.get("arousal", 0.3))
             except (ValueError, TypeError):
                 valence, arousal = 0.5, 0.3
+
             header = f"📌 记忆桶: {name}"
             if domains:
                 header += f" [主题:{domains}]"
             header += f" [情感:V{valence:.1f}/A{arousal:.1f}]"
+
             # Show model's perspective if available (valence drift)
             model_v = metadata.get("model_valence")
             if model_v is not None:
@@ -363,11 +371,14 @@ class Dehydrator:
                     header += f" [我的视角:V{float(model_v):.1f}]"
                 except (ValueError, TypeError):
                     pass
+
             if metadata.get("digested"):
                 header += " [已消化]"
+
             header += "\n"
-        
+
         content = re.sub(r'\[\[([^\]]+)\]\]', r'\1', content)
+
         return f"{header}{content}"
 
     # ---------------------------------------------------------
@@ -389,6 +400,7 @@ class Dehydrator:
         # --- API analyze (no local fallback) ---
         if not self.api_available:
             raise RuntimeError("脱水 API 不可用，请检查 config.yaml 中的 dehydration 配置")
+
         try:
             result = await self._api_analyze(content)
             if result:
@@ -417,11 +429,14 @@ class Dehydrator:
             max_tokens=256,
             temperature=0.1,
         )
+
         if not response.choices:
             return self._default_analysis()
+
         raw = response.choices[0].message.content or ""
         if not raw.strip():
             return self._default_analysis()
+
         return self._parse_analysis(raw)
 
     # ---------------------------------------------------------
@@ -499,6 +514,7 @@ class Dehydrator:
         # --- API digest (no local fallback) ---
         if not self.api_available:
             raise RuntimeError("脱水 API 不可用，请检查 config.yaml 中的 dehydration 配置")
+
         try:
             result = await self._api_digest(content)
             if result:
@@ -527,11 +543,14 @@ class Dehydrator:
             max_tokens=2048,
             temperature=0.0,
         )
+
         if not response.choices:
             return []
+
         raw = response.choices[0].message.content or ""
         if not raw.strip():
             return []
+
         return self._parse_digest(raw)
 
     # ---------------------------------------------------------
@@ -559,10 +578,12 @@ class Dehydrator:
         for item in items:
             if not isinstance(item, dict) or not item.get("content"):
                 continue
+
             try:
                 importance = max(1, min(10, int(item.get("importance", 5))))
             except (ValueError, TypeError):
                 importance = 5
+
             try:
                 valence = max(0.0, min(1.0, float(item.get("valence", 0.5))))
                 arousal = max(0.0, min(1.0, float(item.get("arousal", 0.3))))
@@ -578,4 +599,5 @@ class Dehydrator:
                 "tags": item.get("tags", [])[:15],
                 "importance": importance,
             })
+
         return validated
