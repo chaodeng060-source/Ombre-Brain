@@ -211,9 +211,10 @@ async def _merge_or_create(
     """
     try:
         existing = await bucket_mgr.search(content, limit=5, domain_filter=domain or None)
-            if domain and existing:
-                primary = domain[0]
-                existing = [b for b in existing if primary in b["metadata"].get("domain", [])]
+        # 主 domain 严格匹配护栏：新内容的 primary domain 必须出现在候选桶的 domain 列表里
+        if domain and existing:
+            primary = domain[0]
+            existing = [b for b in existing if primary in b["metadata"].get("domain", [])]
     except Exception as e:
         logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
         existing = []
