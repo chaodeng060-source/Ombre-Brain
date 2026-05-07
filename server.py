@@ -1007,6 +1007,138 @@ async def dream() -> str:
 
 
 # =============================================================
+# Tool 7: briefing — Open-window handoff briefing
+# 工具 7：briefing — 开窗交接简报
+#
+# Aggregates pinned + top-weighted unresolved + recently-active
+# buckets, compresses via LLM into a ≤1500-char briefing.
+# 聚合钉选 + 高权重未解决 + 最近活跃桶，LLM 压缩为 ≤1500 字简报。
+# Designed to replace the 18000-token full-breath open-window cost
+# with a 3000-token briefing (~80% savings).
+# 用于替代开窗时 18000 token 的完整 breath 浮现，压到约 3000 token。
+# =============================================================
+@mcp.tool()
+async def briefing(
+    max_chars: int = 1500,
+    domain: str = "",
+    pinned_only: bool = False,
+) -> str:
+    """开窗简报。聚合钉选+高权重未解决+最近活跃桶,LLM压缩为≤max_chars字简报,默认1500字。domain逗号分隔可过滤主题域。pinned_only=True只用钉选桶。开窗调一次,省80%token。"""
+    await decay_engine.ensure_started()
+    max_chars = max(300, min(max_chars, 4000))
+
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+    except Exception as e:
+        logger.error(f"Briefing failed to list buckets: {e}")
+        return "记忆系统暂时无法访问。"
+
+    # --- Domain filter ---
+    domain_filter = [d.strip() for d in domain.split(",") if d.strip()]
+    if domain_filter:
+        def _domain_hit(b):
+            doms = b["metadata"].get("domain", []) or []
+            return any(d in doms for d in domain_filter)
+        all_buckets = [b for b in all_buckets if _domain_hit(b)]
+
+    # --- Pinned/protected: always included as core principles ---
+    # --- 钉选/protected:必入,作为核心准则 ---
+    pinned = [
+        b for b in all_buckets
+        if b["metadata"].get("pinned") or b["metadata"].get("protected")
+    ]
+
+    # --- Unresolved by weight (top 10), excluding pinned/feel ---
+    # --- 未解决按权重 top 10,排除 pinned/feel ---
+    unresolved_pool = [
+        b for b in all_buckets
+        if not b["metadata"].get("resolved", False)
+        and b["metadata"].get("type") not in ("permanent", "feel")
+        and not b["metadata"].get("pinned", False)
+        and not b["metadata"].get("protected", False)
+    ]
+    unresolved_pool.sort(
+        key=lambda b: decay_engine.calculate_score(b["metadata"]),
+        reverse=True,
+    )
+    top_unresolved = unresolved_pool[:10] if not pinned_only else []
+
+    # --- Recently active (top 5 by last_active), de-duped against above ---
+    # --- 最近活跃 top 5(按 last_active),与上面去重 ---
+    seen_ids = {b["id"] for b in pinned} | {b["id"] for b in top_unresolved}
+    recent_pool = [
+        b for b in all_buckets
+        if b["id"] not in seen_ids
+        and b["metadata"].get("type") not in ("feel",)
+    ]
+    recent_pool.sort(
+        key=lambda b: b["metadata"].get("last_active", ""),
+        reverse=True,
+    )
+    recent_active = recent_pool[:5] if not pinned_only else []
+
+    if not pinned and not top_unresolved and not recent_active:
+        return "记忆库当前空闲，没有可简报的素材。"
+
+    # --- Build raw material: name + meta + truncated content per bucket ---
+    # --- 拼接原始素材:每桶 name + meta + 截断 content ---
+    def _format_bucket(b, section_tag: str) -> str:
+        meta = b["metadata"]
+        name = meta.get("name", b["id"])
+        doms = ",".join(meta.get("domain", []) or [])
+        tags = ",".join((meta.get("tags", []) or [])[:10])
+        val = meta.get("valence", 0.5)
+        aro = meta.get("arousal", 0.3)
+        imp = meta.get("importance", 5)
+        last_active = meta.get("last_active", "")
+        body = strip_wikilinks(b.get("content", ""))[:400]
+        return (
+            f"[{section_tag}] {name}\n"
+            f"  domain:{doms} | tags:{tags}\n"
+            f"  V{val:.2f}/A{aro:.2f} 重要:{imp} last_active:{last_active}\n"
+            f"  {body}"
+        )
+
+    sections = []
+    if pinned:
+        sections.append(
+            "=== 核心准则 (pinned) ===\n"
+            + "\n\n".join(_format_bucket(b, "pinned") for b in pinned)
+        )
+    if top_unresolved:
+        sections.append(
+            "=== 高权重未解决 ===\n"
+            + "\n\n".join(_format_bucket(b, "unresolved") for b in top_unresolved)
+        )
+    if recent_active:
+        sections.append(
+            "=== 最近活跃 ===\n"
+            + "\n\n".join(_format_bucket(b, "recent") for b in recent_active)
+        )
+
+    raw_material = "\n\n".join(sections)
+
+    # --- Compress via LLM ---
+    try:
+        result = await dehydrator.briefing(raw_material, max_chars=max_chars)
+    except Exception as e:
+        logger.error(f"Briefing compression failed: {e}")
+        return f"简报生成失败：{e}"
+
+    if not result:
+        return "简报生成为空，请稍后重试。"
+
+    # --- Stats footer for visibility ---
+    stats = (
+        f"\n\n---\n"
+        f"_素材:{len(pinned)}钉选 / {len(top_unresolved)}未解决 / {len(recent_active)}最近活跃 "
+        f"→ 简报{len(result)}字 (~{count_tokens_approx(result)}token)_"
+    )
+
+    return result + stats
+
+
+# =============================================================
 # Dashboard API endpoints (for lightweight Web UI)
 # 仪表板 API（轻量 Web UI 用）
 # =============================================================
