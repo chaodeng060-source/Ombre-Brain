@@ -1717,6 +1717,74 @@ async def api_import_review(request):
     return JSONResponse({"applied": applied, "errors": errors})
 
 
+# =============================================================
+# Twin REST endpoints — bridge for Telegram bot (and other thin frontends)
+# Twin REST 接口 —— 给 Telegram bot（及其他薄前端）用的桥接
+# =============================================================
+@mcp.custom_route("/api/hold", methods=["POST"])
+async def api_hold(request):
+    """HTTP bridge to hold tool. Body: {content, tags?, importance?, pinned?, source?}.
+    HTTP 桥接 hold 工具。source 会作为额外标签合入 tags。"""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    content = str(body.get("content") or "").strip()
+    if not content:
+        return JSONResponse({"error": "content required"}, status_code=400)
+
+    raw_tags = body.get("tags") or []
+    if isinstance(raw_tags, list):
+        tag_parts = [str(t).strip() for t in raw_tags if str(t).strip()]
+    else:
+        tag_parts = [t.strip() for t in str(raw_tags).split(",") if t.strip()]
+    source = str(body.get("source") or "").strip()
+    if source and source not in tag_parts:
+        tag_parts.append(source)
+    tags_csv = ",".join(tag_parts)
+
+    try:
+        importance = int(body.get("importance") or 5)
+    except (TypeError, ValueError):
+        importance = 5
+    pinned = bool(body.get("pinned"))
+
+    try:
+        result = await hold(
+            content=content,
+            tags=tags_csv,
+            importance=importance,
+            pinned=pinned,
+        )
+        return JSONResponse({"result": result})
+    except Exception as e:
+        logger.error(f"/api/hold failed / 失败: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/briefing", methods=["GET"])
+async def api_briefing(request):
+    """HTTP bridge to briefing tool. Query: ?max_chars=&domain=&pinned_only=
+    HTTP 桥接 briefing 工具，返回纯文本简报。"""
+    from starlette.responses import PlainTextResponse, JSONResponse
+    try:
+        try:
+            max_chars = int(request.query_params.get("max_chars", 1500))
+        except ValueError:
+            max_chars = 1500
+        domain = request.query_params.get("domain", "")
+        pinned_only = request.query_params.get("pinned_only", "").lower() in ("1", "true", "yes")
+        text = await briefing(
+            max_chars=max_chars, domain=domain, pinned_only=pinned_only
+        )
+        return PlainTextResponse(text)
+    except Exception as e:
+        logger.error(f"/api/briefing failed / 失败: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 # --- Entry point / 启动入口 ---
 if __name__ == "__main__":
     transport = config.get("transport", "stdio")

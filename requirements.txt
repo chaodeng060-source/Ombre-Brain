@@ -30,3 +30,6 @@ scikit-learn>=1.2.0
 
 # Cloudflare R2 对象存储 (S3 兼容 API)，用于图片上传
 boto3>=1.34.0
+
+# Telegram bot frontend（仅 telegram_bot.py 用，海马体本体不依赖）
+python-telegram-bot>=21.0
