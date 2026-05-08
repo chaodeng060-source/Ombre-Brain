@@ -110,9 +110,20 @@ class BucketManager:
         protected: bool = False,
     ) -> str:
         bucket_id = generate_bucket_id()
-        bucket_name = sanitize_name(name) if name else bucket_id
         domain = domain or ["未分类"]
-        tags = tags or []
+        tags = list(tags) if tags else []
+
+        # --- Stamp creation date into name and tags (skip feel buckets) ---
+        # --- 时间戳进桶名+标签（feel 桶铁律：不动）---
+        if bucket_type != "feel":
+            today = datetime.now().strftime("%Y-%m-%d")
+            date_re = re.compile(r"\d{4}-\d{2}-\d{2}")
+            if name and not date_re.search(name):
+                name = f"{name}_{today}"
+            if not any(date_re.fullmatch(str(t)) for t in tags):
+                tags.append(today)
+
+        bucket_name = sanitize_name(name) if name else bucket_id
         linked_content = content
 
         if pinned or protected:
