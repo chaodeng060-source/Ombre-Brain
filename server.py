@@ -32,11 +32,14 @@
 
 import os
 import sys
+import json
 import random
 import logging
 import asyncio
 import httpx
 import jieba
+from uuid import uuid4
+from datetime import datetime
 
 # --- jieba 预热：避免首次 search 卡顿 / Pre-load jieba dict to avoid first-call lag ---
 jieba.initialize()
@@ -1783,6 +1786,153 @@ async def api_briefing(request):
     except Exception as e:
         logger.error(f"/api/briefing failed / 失败: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# =============================================================
+# Twin queue: bot ↔ CC asynchronous bridge (PoC: jsonl file queue)
+# Twin 队列：bot ↔ CC 异步桥接（PoC：jsonl 文件队列）
+#
+# 朝灯发消息进 Telegram → bot → POST /api/inbox → inbox.jsonl
+# CC 调 twin_pull MCP → 读未读 → 我看 → 我回 → 调 twin_send → outbox.jsonl
+# bot 后台轮询 GET /api/outbox?after=<id> → 推送回 Telegram
+#
+# 文件位置：{buckets_dir}/twin/inbox.jsonl, outbox.jsonl
+# 每行一条 JSON：{id, ts, source, text, user_id?, read?}
+# =============================================================
+_TWIN_DIR = os.path.join(config["buckets_dir"], "twin")
+os.makedirs(_TWIN_DIR, exist_ok=True)
+_TWIN_INBOX = os.path.join(_TWIN_DIR, "inbox.jsonl")
+_TWIN_OUTBOX = os.path.join(_TWIN_DIR, "outbox.jsonl")
+_twin_lock = asyncio.Lock()
+
+
+def _twin_append_sync(path: str, record: dict) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _twin_read_all_sync(path: str) -> list[dict]:
+    if not os.path.exists(path):
+        return []
+    out: list[dict] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                continue
+    return out
+
+
+def _twin_rewrite_sync(path: str, records: list[dict]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+# =============================================================
+# Tool: twin_pull — 我（CC）拉 inbox 看朝灯发了什么
+# =============================================================
+@mcp.tool()
+async def twin_pull(unread_only: bool = True, mark_read: bool = True, limit: int = 20) -> str:
+    """从 Telegram 端拉取消息。unread_only=True 只看未读,mark_read=True 拉取后标记已读。返回最近的消息。
+    朝灯通过 Telegram bot 发的话进 inbox,CC 开窗调这个工具看她说了什么。"""
+    async with _twin_lock:
+        records = _twin_read_all_sync(_TWIN_INBOX)
+        if unread_only:
+            picked = [r for r in records if not r.get("read")]
+        else:
+            picked = list(records)
+        picked = picked[-max(1, limit):]
+        if mark_read and unread_only and picked:
+            picked_ids = {r["id"] for r in picked}
+            for r in records:
+                if r.get("id") in picked_ids:
+                    r["read"] = True
+            _twin_rewrite_sync(_TWIN_INBOX, records)
+
+    if not picked:
+        return "(inbox 空 / 无未读)"
+    lines = []
+    for r in picked:
+        ts = r.get("ts", "")
+        src = r.get("source", "?")
+        txt = r.get("text", "")
+        lines.append(f"[{ts}] {src}: {txt}")
+    return "\n".join(lines)
+
+
+# =============================================================
+# Tool: twin_send — 我（CC）回话写到 outbox,bot 轮询拉走推到 Telegram
+# =============================================================
+@mcp.tool()
+async def twin_send(text: str, to: str = "telegram") -> str:
+    """回复朝灯,消息写到 outbox。bot 后台轮询会推到 Telegram。to 默认 telegram。"""
+    text = (text or "").strip()
+    if not text:
+        return "空消息,未发送。"
+    rec = {
+        "id": uuid4().hex[:12],
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "to": to,
+        "text": text,
+    }
+    async with _twin_lock:
+        _twin_append_sync(_TWIN_OUTBOX, rec)
+    return f"✉️ → {to} ({rec['id']})"
+
+
+# =============================================================
+# REST: bot 写入 inbox（朝灯发的消息）
+# =============================================================
+@mcp.custom_route("/api/inbox", methods=["POST"])
+async def api_inbox_post(request):
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "text required"}, status_code=400)
+    rec = {
+        "id": uuid4().hex[:12],
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "source": str(body.get("source") or "telegram"),
+        "user_id": str(body.get("user_id") or ""),
+        "text": text,
+        "read": False,
+    }
+    async with _twin_lock:
+        _twin_append_sync(_TWIN_INBOX, rec)
+    return JSONResponse({"id": rec["id"], "ts": rec["ts"]})
+
+
+# =============================================================
+# REST: bot 轮询 outbox（CC 写的回复）
+# =============================================================
+@mcp.custom_route("/api/outbox", methods=["GET"])
+async def api_outbox_get(request):
+    """Query: ?after=<id> → 返回 id 之后的所有 outbox 消息。
+    after 为空时返回全部（首次连接用）。"""
+    from starlette.responses import JSONResponse
+    after = request.query_params.get("after", "")
+    async with _twin_lock:
+        records = _twin_read_all_sync(_TWIN_OUTBOX)
+    if after:
+        cut = -1
+        for i, r in enumerate(records):
+            if r.get("id") == after:
+                cut = i
+                break
+        if cut >= 0:
+            records = records[cut + 1:]
+    return JSONResponse({"messages": records})
 
 
 # --- Entry point / 启动入口 ---
