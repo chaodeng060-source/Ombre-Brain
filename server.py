@@ -1118,11 +1118,11 @@ async def dream() -> str:
 # =============================================================
 @mcp.tool()
 async def briefing(
-    max_chars: int = 1500,
+    max_chars: int = 1000,
     domain: str = "",
     pinned_only: bool = False,
 ) -> str:
-    """开窗简报。聚合钉选+高权重未解决+最近活跃桶,LLM压缩为≤max_chars字简报,默认1500字。domain逗号分隔可过滤主题域。pinned_only=True只用钉选桶。开窗调一次,省80%token。"""
+    """开窗简报。聚合钉选+高权重未解决+最近活跃桶,LLM压缩为≤max_chars字简报,默认1000字。输出顺序:朝灯当前氛围/走向→最近因果链故事→活着的欠账→工程线→铁律。domain逗号分隔可过滤主题域。pinned_only=True只用钉选桶。开窗调一次,省80%token。"""
     await decay_engine.ensure_started()
     max_chars = max(300, min(max_chars, 4000))
 
