@@ -57,6 +57,13 @@ def load_config(config_path: str = None) -> dict:
             "fuzzy_threshold": 50,
             "max_results": 5,
         },
+        # --- World axis / 世界轴 ---
+        # worlds: 可选值清单，trace/hold 接受的合法 world。空字符串 "" 表示日常聊天（不属于任何世界）。
+        # current_world: 全局指针。hold 不传 world 时走这个；breath 不传 world 时按这个过滤。
+        # 角色扮演时切到具体世界，breath 默认只出"该世界 + 通用"，日常桶不浮现。
+        # current_world="" 即日常模式：breath 默认出"日常桶 + 通用"，角色世界桶不浮现。
+        "worlds": ["当前世界", "旧世界", "通用"],
+        "current_world": "",
     }
 
     if config_path is None:
@@ -125,12 +132,59 @@ def load_config(config_path: str = None) -> dict:
     if env_buckets_dir:
         config["buckets_dir"] = env_buckets_dir
 
+    env_current_world = os.environ.get("OMBRE_CURRENT_WORLD", "")
+    if env_current_world:
+        config["current_world"] = env_current_world
+
     # --- Ensure bucket storage directories exist ---
     buckets_dir = config["buckets_dir"]
     for subdir in ["permanent", "dynamic", "archive"]:
         os.makedirs(os.path.join(buckets_dir, subdir), exist_ok=True)
 
+    # --- Runtime state sidecar overrides current_world ---
+    # runtime 状态文件在 buckets 目录下，switch_world MCP 工具会写它。
+    # 优先级：env > sidecar > config.yaml > defaults。env 覆盖在前面已应用。
+    if not env_current_world:
+        sidecar_world = _load_runtime_current_world(buckets_dir)
+        if sidecar_world is not None:
+            config["current_world"] = sidecar_world
+
     return config
+
+
+def _runtime_state_path(buckets_dir: str) -> str:
+    return os.path.join(buckets_dir, ".ombre_runtime.yaml")
+
+
+def _load_runtime_current_world(buckets_dir: str):
+    path = _runtime_state_path(buckets_dir)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if isinstance(data, dict) and "current_world" in data:
+            return str(data.get("current_world") or "")
+    except (yaml.YAMLError, OSError):
+        return None
+    return None
+
+
+def save_current_world(buckets_dir: str, value: str) -> None:
+    """Persist current_world to runtime sidecar. switch_world MCP tool calls this."""
+    path = _runtime_state_path(buckets_dir)
+    data = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            if not isinstance(data, dict):
+                data = {}
+        except (yaml.YAMLError, OSError):
+            data = {}
+    data["current_world"] = str(value or "")
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -193,3 +247,22 @@ def count_tokens_approx(text: str) -> int:
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+# --- World filter helpers / 世界轴过滤辅助 ---
+# 桶 world="通用" 永远跟着任何 world filter 一起出。
+UNIVERSAL_WORLD = "通用"
+
+
+def world_matches(bucket_world: str, world_filter_set: set) -> bool:
+    """判定一个桶的 world 是否通过 filter。
+    world_filter_set 约定：
+      - {""}                  日常模式：只让 world="" 桶 + world="通用" 通过
+      - {"当前世界"}          单世界：只让 world="当前世界" + world="通用" 通过
+      - {"当前世界","旧世界"} 多世界：两个 + 通用
+      - 调用方需自行处理 None（None=不过滤，不应进入此函数）
+    """
+    bw = (bucket_world or "").strip()
+    if bw == UNIVERSAL_WORLD:
+        return True
+    return bw in world_filter_set

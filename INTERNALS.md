@@ -1,7 +1,7 @@
 # Ombre Brain — 内部开发文档 / INTERNALS
 
 > 本文档面向开发者和维护者。记录功能总览、环境变量、模块依赖、硬编码值和核心设计决策。
-> 最后更新：2026-04-19
+> 最后更新：2026-05-09
 
 ---
 
@@ -21,6 +21,7 @@
 - `valence`（事件效价 0~1）、`arousal`（唤醒度 0~1）、`model_valence`（模型独立感受）
 - `importance`（1~10）、`activation_count`（被想起次数）
 - `resolved`（已解决/沉底）、`digested`（已消化/写过 feel）、`pinned`（钉选）
+- `world`（世界归属，可选；空=日常桶；"通用"=跨世界设定，永远跟着任何 world filter 出）
 - `created`、`last_active` 时间戳
 
 **四种检索模式**
@@ -72,16 +73,17 @@
 
 ### 技术能力
 
-**6 个 MCP 工具**
+**7 个 MCP 工具**
 
 | 工具 | 关键参数 | 功能 |
 |---|---|---|
-| `breath` | query, max_tokens, domain, valence, arousal, max_results | 检索/浮现记忆 |
-| `hold` | content, tags, importance, pinned, feel, source_bucket, valence, arousal | 存储记忆 |
-| `grow` | content | 日记拆分归档 |
-| `trace` | bucket_id, name, domain, valence, arousal, importance, tags, resolved, pinned, digested, content, delete | 修改元数据/内容/删除 |
-| `pulse` | include_archive | 系统状态 |
+| `breath` | query, max_tokens, domain, valence, arousal, max_results, world | 检索/浮现记忆 |
+| `hold` | content, tags, importance, pinned, feel, source_bucket, valence, arousal, world | 存储记忆 |
+| `grow` | content, world | 日记拆分归档 |
+| `trace` | bucket_id, name, domain, valence, arousal, importance, tags, resolved, pinned, digested, content, world, delete | 修改元数据/内容/删除 |
+| `pulse` | include_archive | 系统状态（含当前世界） |
 | `dream` | （无） | 做梦自省 |
+| `switch_world` | world | 切换全局当前世界指针 |
 
 **工具详细行为**
 
@@ -170,6 +172,7 @@
 | `OMBRE_BASE_URL` | API base URL，覆盖 `config.yaml` 的 `dehydration.base_url` | 否 | `""` |
 | `OMBRE_TRANSPORT` | 传输模式：`stdio` / `sse` / `streamable-http` | 否 | `""` → 回退到 config 或 `"stdio"` |
 | `OMBRE_BUCKETS_DIR` | 记忆桶存储目录路径 | 否 | `""` → 回退到 config 或 `./buckets` |
+| `OMBRE_CURRENT_WORLD` | 全局当前世界指针，覆盖 config + sidecar | 否 | `""` → 日常模式 |
 | `OMBRE_HOOK_URL` | SessionStart 钩子调用的服务器 URL | 否 | `"http://localhost:8000"` |
 | `OMBRE_HOOK_SKIP` | 设为 `"1"` 跳过 SessionStart 钩子 | 否 | 未设置（不跳过） |
 
@@ -333,6 +336,8 @@
 | `wikilink.auto_top_k` | `8` | wikilink 取 Top-K 关键词 |
 | `wikilink.min_keyword_len` | `2` | wikilink 最短关键词长度 |
 | `wikilink.exclude_keywords` | `[]` | wikilink 排除关键词表 |
+| `worlds` | `["当前世界", "旧世界", "通用"]` | 合法 world 值清单（switch_world 校验用） |
+| `current_world` | `""` | 全局当前世界指针；运行时由 `{buckets_dir}/.ombre_runtime.yaml` 覆盖 |
 
 ---
 
@@ -431,6 +436,24 @@
 - 值域 1.0~2.0 保证老记忆不被惩罚（×1.0），只是新记忆有额外加成（×2.0）
 
 **放弃方案**：分段线性（原实现）。跳变点不自然，参数多且不直观。
+
+### 5.11 World 轴：剧情世界隔离
+
+**决策**：在 frontmatter 加 `world` 字段（可选），配 `current_world` 全局指针。breath 默认按 current_world 过滤，"通用" 桶永远跟着出。
+
+**理由**：
+- 同一个角色的不同剧情线（"当前世界"、"旧世界"...）需要互不串场。原来只能按 tag/domain 过滤，tag 是 LLM 自由文本不可靠
+- 日常聊天和角色扮演是两种独立模式：日常时不该浮现角色记忆，角色扮演时不该浮现日常记忆
+- 跨世界通用元素（人设/规则/机制）需要一个特殊归属，"通用" 这个保留 world 名解决这个
+
+**关键约定**：
+- `world=""` 表示日常桶（不属于任何剧情世界）
+- `world="通用"` 表示跨世界设定，**保留字**，匹配任何 world filter
+- breath 不传 world 时根据 current_world 推断 filter，传 `world="all"` 跳过过滤
+- LLM 不识别 world，靠全局 `current_world` 指针 + hold/trace 显式覆盖。switch_world MCP 工具切换指针，持久化到 `.ombre_runtime.yaml`
+- 合并护栏：`_merge_or_create` 限定同一 world 内合并，避免角色记忆跨世界融合
+
+**放弃方案**：让 LLM 自动识别 world（识别精度低，同一个世界容易写成不同名）；多级 domain（破坏现有打标 prompt 兼容）。
 
 ### 5.10 情感记忆重构（±0.1 偏移）的设计动机
 

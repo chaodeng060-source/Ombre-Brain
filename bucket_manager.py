@@ -39,7 +39,7 @@ import frontmatter
 import jieba
 from rapidfuzz import fuzz
 
-from utils import generate_bucket_id, sanitize_name, safe_path, now_iso
+from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, world_matches
 
 logger = logging.getLogger("ombre_brain.bucket")
 
@@ -108,6 +108,7 @@ class BucketManager:
         name: str = None,
         pinned: bool = False,
         protected: bool = False,
+        world: str = "",
     ) -> str:
         bucket_id = generate_bucket_id()
         domain = domain or ["未分类"]
@@ -146,6 +147,9 @@ class BucketManager:
             metadata["pinned"] = True
         if protected:
             metadata["protected"] = True
+        # world 字段仅在非空时写入（保持日常桶 frontmatter 简洁）
+        if world and world.strip():
+            metadata["world"] = world.strip()
 
         # Defensive: ensure no 'content' key sneaks into metadata kwargs
         # 防御性：确保 metadata 里没有 content 键，否则会和 body 撞 Post() 参数
@@ -371,6 +375,7 @@ class BucketManager:
         query: str,
         limit: int = None,
         domain_filter: list[str] = None,
+        world_filter: list[str] = None,
         query_valence: float = None,
         query_arousal: float = None,
     ) -> list[dict]:
@@ -404,6 +409,16 @@ class BucketManager:
                 return []
         else:
             candidates = all_buckets
+
+        # --- World 过滤：world_filter=None 跳过；否则按 world 字段过滤 ---
+        # 桶 world="通用" 在任何 world_filter 下都通过；world_filter 为空列表
+        # 表示"日常模式"，只让 world 字段为空的桶 + world="通用" 通过。
+        if world_filter is not None:
+            wf_set = {str(w).strip() for w in world_filter}
+            candidates = [
+                b for b in candidates
+                if world_matches(b["metadata"].get("world", ""), wf_set)
+            ]
 
         scored = []
         for bucket in candidates:

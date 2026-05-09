@@ -56,7 +56,10 @@ from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from r2_storage import r2_storage
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
+from utils import (
+    load_config, setup_logging, strip_wikilinks, count_tokens_approx,
+    world_matches, save_current_world, UNIVERSAL_WORLD,
+)
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -192,6 +195,20 @@ async def dream_hook(request):
 
 
 # =============================================================
+# Internal helper: resolve world filter for breath
+# 内部辅助：根据 world 显式参数 + 全局 current_world 决定过滤集合
+# 返回 None 表示不过滤（"all" 模式），否则返回 filter list。
+# =============================================================
+def _resolve_world_filter(world_param: str, current_world: str):
+    wp = (world_param or "").strip()
+    if wp.lower() == "all":
+        return None
+    if wp:
+        return [x.strip() for x in wp.split(",") if x.strip()]
+    return [(current_world or "").strip()]
+
+
+# =============================================================
 # Internal helper: merge-or-create
 # 内部辅助：检查是否可合并，可以则合并，否则新建
 # Shared by hold and grow to avoid duplicate logic
@@ -205,6 +222,7 @@ async def _merge_or_create(
     valence: float,
     arousal: float,
     name: str = "",
+    world: str = "",
 ) -> tuple[str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -212,8 +230,15 @@ async def _merge_or_create(
     检查是否有相似桶可合并，有则合并，无则新建。
     返回 (桶ID或名称, 是否合并)。
     """
+    # 合并候选必须在同一个 world 内（避免日常桶被角色记忆合并污染或反过来）。
+    # world="" 即日常桶，只在日常桶之间合并；通用桶单独按通用合并。
+    world_filter = [(world or "").strip()]
     try:
-        existing = await bucket_mgr.search(content, limit=5, domain_filter=domain or None)
+        existing = await bucket_mgr.search(
+            content, limit=5,
+            domain_filter=domain or None,
+            world_filter=world_filter,
+        )
         # 主 domain 严格匹配护栏：新内容的 primary domain 必须出现在候选桶的 domain 列表里
         if domain and existing:
             primary = domain[0]
@@ -259,6 +284,7 @@ async def _merge_or_create(
         valence=valence,
         arousal=arousal,
         name=name or None,
+        world=world,
     )
     # --- Generate embedding for new bucket ---
     try:
@@ -285,11 +311,17 @@ async def breath(
     valence: float = -1,
     arousal: float = -1,
     max_results: int = 20,
+    world: str = "",
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
+
+    # --- Resolve world filter once (used by all modes) ---
+    # --- 解析 world filter：显式参数 > current_world ---
+    world_filter = _resolve_world_filter(world, config.get("current_world", ""))
+    wf_set = {str(w).strip() for w in world_filter} if world_filter is not None else None
 
     # --- No args or empty query: surfacing mode (weight pool active push) ---
     # --- 无参数或空query：浮现模式（权重池主动推送）---
@@ -301,7 +333,7 @@ async def breath(
             return "记忆系统暂时无法访问。"
 
         # --- Pinned/protected buckets: always surface as core principles ---
-        # --- 钉选桶：作为核心准则，始终浮现 ---
+        # --- 钉选桶：作为核心准则，始终浮现（不受 world 过滤影响）---
         pinned_buckets = [
             b for b in all_buckets
             if b["metadata"].get("pinned") or b["metadata"].get("protected")
@@ -326,9 +358,18 @@ async def breath(
             and not b["metadata"].get("protected", False)
         ]
 
+        # --- World filter on surfacing pool ---
+        # --- 浮现池按 world 过滤：日常/角色扮演时不串场 ---
+        if wf_set is not None:
+            unresolved = [
+                b for b in unresolved
+                if world_matches(b["metadata"].get("world", ""), wf_set)
+            ]
+
         logger.info(
             f"Breath surfacing: {len(all_buckets)} total, "
-            f"{len(pinned_buckets)} pinned, {len(unresolved)} unresolved"
+            f"{len(pinned_buckets)} pinned, {len(unresolved)} unresolved "
+            f"(world_filter={wf_set if wf_set is not None else 'all'})"
         )
 
         scored = sorted(
@@ -418,6 +459,7 @@ async def breath(
             query,
             limit=max(max_results, 20),
             domain_filter=domain_filter,
+            world_filter=world_filter,
             query_valence=q_valence,
             query_arousal=q_arousal,
         )
@@ -436,12 +478,20 @@ async def breath(
                 break
             if bucket_id not in matched_ids and sim_score > 0.65:  # 阈值 0.5 → 0.65，提高语义相关性门槛
                 bucket = await bucket_mgr.get(bucket_id)
-                if bucket and not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
-                    bucket["score"] = round(sim_score * 100, 2)
-                    bucket["vector_match"] = True
-                    matches.append(bucket)
-                    matched_ids.add(bucket_id)
-                    vector_added += 1
+                if not bucket:
+                    continue
+                if bucket["metadata"].get("pinned") or bucket["metadata"].get("protected"):
+                    continue
+                # 向量通道也走 world filter，避免跨世界语义召回污染
+                if wf_set is not None and not world_matches(
+                    bucket["metadata"].get("world", ""), wf_set
+                ):
+                    continue
+                bucket["score"] = round(sim_score * 100, 2)
+                bucket["vector_match"] = True
+                matches.append(bucket)
+                matched_ids.add(bucket_id)
+                vector_added += 1
     except Exception as e:
         logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
 
@@ -483,6 +533,7 @@ async def breath(
                 b for b in all_buckets
                 if b["id"] not in matched_ids
                 and decay_engine.calculate_score(b["metadata"]) < 2.0
+                and (wf_set is None or world_matches(b["metadata"].get("world", ""), wf_set))
             ]
             if low_weight:
                 drifted = random.sample(low_weight, min(random.randint(1, 3), len(low_weight)))
@@ -517,8 +568,9 @@ async def hold(
     arousal: float = -1,
     image_base64: str = "",
     image_filename: str = "image",
+    world: str = "",
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。image_base64=可选,base64编码的图片数据,会上传到R2并把URL插入正文(允许此条记忆带图)。image_filename=图片名称提示(默认image)。"""
+    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。image_base64=可选,base64编码的图片数据,会上传到R2并把URL插入正文(允许此条记忆带图)。image_filename=图片名称提示(默认image)。world=显式指定世界归属,留空时走全局current_world(日常聊天=空,角色扮演=具体世界名),"通用"表示跨世界设定。feel桶不归属世界。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -527,6 +579,10 @@ async def hold(
 
     importance = max(1, min(10, importance))
     extra_tags = [t.strip() for t in tags.split(",") if t.strip()]
+
+    # --- Resolve effective world / 解析当前桶的 world 归属 ---
+    # 显式传 world > 全局 current_world。feel 桶在下面单独处理（feel 跨世界）。
+    effective_world = (world or "").strip() or (config.get("current_world", "") or "").strip()
 
     # --- Optional image upload to R2 / 可选：上传图片到 R2 ---
     # If image_base64 provided and R2 configured, upload and prepend URL
@@ -616,6 +672,7 @@ async def hold(
             name=suggested_name or None,
             bucket_type="permanent",
             pinned=True,
+            world=effective_world,
         )
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
@@ -632,6 +689,7 @@ async def hold(
         valence=valence,
         arousal=arousal,
         name=suggested_name,
+        world=effective_world,
     )
 
     action = "合并→" if is_merged else "新建→"
@@ -643,12 +701,15 @@ async def hold(
 # 工具 3：grow — 生长，一天的碎片长成记忆
 # =============================================================
 @mcp.tool()
-async def grow(content: str) -> str:
-    """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。"""
+async def grow(content: str, world: str = "") -> str:
+    """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。world留空走全局current_world。"""
     await decay_engine.ensure_started()
 
     if not content or not content.strip():
         return "内容为空，无法整理。"
+
+    # --- Resolve effective world / 解析当前批次的 world 归属 ---
+    effective_world = (world or "").strip() or (config.get("current_world", "") or "").strip()
 
     # --- Short content fast path: skip digest, use hold logic directly ---
     # --- 短内容快速路径：跳过 digest 拆分，直接走 hold 逻辑省一次 API ---
@@ -673,6 +734,7 @@ async def grow(content: str) -> str:
             valence=analysis.get("valence", 0.5),
             arousal=analysis.get("arousal", 0.3),
             name=analysis.get("suggested_name", ""),
+            world=effective_world,
         )
         action = "合并" if is_merged else "新建"
         return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
@@ -703,6 +765,7 @@ async def grow(content: str) -> str:
                 valence=item.get("valence", 0.5),
                 arousal=item.get("arousal", 0.3),
                 name=item.get("name", ""),
+                world=effective_world,
             )
 
             if is_merged:
@@ -740,9 +803,10 @@ async def trace(
     pinned: int = -1,
     digested: int = -1,
     content: str = "",
+    world: str = "",
     delete: bool = False,
 ) -> str:
-    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。"""
+    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。world=改世界归属(传"(none)"清空回日常),只传需改的,-1或空=不改。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -780,6 +844,10 @@ async def trace(
             updates["importance"] = 10  # pinned → lock importance
     if digested in (0, 1):
         updates["digested"] = bool(digested)
+    if world:
+        w = world.strip()
+        # sentinel "(none)" → 清空 world 字段（挪回日常）
+        updates["world"] = "" if w == "(none)" else w
     if content:
         updates["content"] = content
 
@@ -816,6 +884,32 @@ async def trace(
 
 
 # =============================================================
+# Tool: switch_world — change global current_world pointer at runtime
+# 工具：switch_world — 切换全局当前世界指针
+# =============================================================
+@mcp.tool()
+async def switch_world(world: str = "") -> str:
+    """切换全局当前世界。空字符串=日常模式(只浮现日常+通用桶),具体世界名=角色扮演模式。
+    生效范围：之后所有 hold(不传 world 时)写到该世界,breath(不传 world 时)只浮该世界+通用。
+    持久化到 {buckets_dir}/.ombre_runtime.yaml,重启不丢。pulse 可看当前指针。"""
+    target = (world or "").strip()
+    valid_worlds = config.get("worlds", []) or []
+    if target and target not in valid_worlds:
+        return (
+            f"未知世界: {target!r}。已知 worlds: {valid_worlds}\n"
+            f"如要新增世界,先在 config.yaml 的 worlds: 列表里加上,再切换。"
+        )
+    try:
+        save_current_world(config["buckets_dir"], target)
+    except OSError as e:
+        return f"持久化失败: {e}"
+    config["current_world"] = target
+    label = target if target else "日常模式 (空)"
+    logger.info(f"current_world switched → {label}")
+    return f"已切换到 → {label}"
+
+
+# =============================================================
 # Tool 5: pulse — Heartbeat, system status + memory listing
 # 工具 5：pulse — 脉搏，系统状态 + 记忆列表
 # =============================================================
@@ -827,8 +921,10 @@ async def pulse(include_archive: bool = False) -> str:
     except Exception as e:
         return f"获取系统状态失败: {e}"
 
+    cw = (config.get("current_world") or "").strip() or "日常模式 (空)"
     status = (
         f"=== Ombre Brain 记忆系统 ===\n"
+        f"当前世界: {cw}\n"
         f"固化记忆桶: {stats['permanent_count']} 个\n"
         f"动态记忆桶: {stats['dynamic_count']} 个\n"
         f"归档记忆桶: {stats['archive_count']} 个\n"

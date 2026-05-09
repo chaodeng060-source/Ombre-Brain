@@ -80,6 +80,21 @@ matching:
   fuzzy_threshold: 50             # Minimum match score (0-100) / 最低匹配分数
   max_results: 5                  # Max results per search / 单次搜索最多返回条数
 
+# --- World axis / 世界轴 ---
+# 用来隔离不同剧情世界的记忆。日常聊天的桶 world 留空（不属于任何世界）；
+# 角色扮演场景的桶必须标具体 world；跨世界通用设定标 world="通用"，搜哪个世界都跟着出。
+#
+# breath 默认行为：根据 current_world 过滤。current_world="" 时只出"日常桶 + 通用"，
+# 设了具体世界时只出"该世界 + 通用"，日常桶不浮现。breath(world="all") 跳过过滤。
+#
+# current_world 由 switch_world MCP 工具在运行时改动，写入 {buckets_dir}/.ombre_runtime.yaml。
+# 也可用环境变量 OMBRE_CURRENT_WORLD 覆盖。
+worlds:
+  - 当前世界
+  - 旧世界
+  - 通用
+current_world: ""
+
 # --- Obsidian wikilinks / Obsidian 双链自动注入 ---
 wikilink:
   enabled: true
