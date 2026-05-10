@@ -80,6 +80,16 @@ matching:
   fuzzy_threshold: 50             # Minimum match score (0-100) / 最低匹配分数
   max_results: 5                  # Max results per search / 单次搜索最多返回条数
 
+# --- RRF fusion / RRF 融合检索 ---
+# breath 双通道融合参数：keyword (jieba+rapidfuzz) + vector (embedding)
+# score(d) = keyword_weight/(k + rank_keyword(d)) + vector_weight/(k + rank_vector(d))
+# k 越大相邻 rank 间分差越平缓；权重默认对称（1:1）
+# 向量通道有 sim>0.5 硬阈值底线，挡掉高 cosine 噪音
+rrf:
+  k: 60                           # rank smoothing constant / 排名平滑常数
+  keyword_weight: 1.0             # keyword channel weight / 关键词通道权重
+  vector_weight: 1.0              # vector channel weight / 向量通道权重
+
 # --- World axis / 世界轴 ---
 # 用来隔离不同剧情世界的记忆。日常聊天的桶 world 留空（不属于任何世界）；
 # 角色扮演场景的桶必须标具体 world；跨世界通用设定标 world="通用"，搜哪个世界都跟着出。

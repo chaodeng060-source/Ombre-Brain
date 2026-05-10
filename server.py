@@ -71,6 +71,7 @@ from r2_storage import r2_storage
 from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
     world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
+    rrf_fuse,
 )
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -643,14 +644,15 @@ async def breath(
             logger.error(f"Feel retrieval failed: {e}")
             return "读取 feel 失败。"
 
-    # --- With args: search mode (keyword + vector dual channel) ---
-    # --- 有参数：检索模式（关键词 + 向量双通道）---
+    # --- With args: search mode (RRF fusion of keyword + vector) ---
+    # --- 有参数：检索模式（关键词 + 向量 RRF 融合）---
     domain_filter = [d.strip() for d in domain.split(",") if d.strip()] or None
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
 
+    # Keyword channel (already filtered by world/domain/threshold inside)
     try:
-        matches = await bucket_mgr.search(
+        keyword_matches = await bucket_mgr.search(
             query,
             limit=max(max_results, 20),
             domain_filter=domain_filter,
@@ -659,36 +661,59 @@ async def breath(
             query_arousal=q_arousal,
         )
     except Exception as e:
-        logger.error(f"Search failed / 检索失败: {e}")
+        logger.error(f"Keyword search failed / 关键词检索失败: {e}")
         return "检索过程出错，请稍后重试。"
 
-    # --- Vector similarity channel: find semantically related buckets ---
-    # --- 向量相似度通道：找到语义相关的桶 ---
-    matched_ids = {b["id"] for b in matches}
+    # Vector channel — sim>0.5 floor blocks high-cosine noise
     try:
-        vector_results = await embedding_engine.search_similar(query, top_k=max(max_results, 20))
-        vector_added = 0  # 限流计数器：向量通道最多补 3 条，防止污染精准检索
-        for bucket_id, sim_score in vector_results:
-            if vector_added >= 3:
-                break
-            if bucket_id not in matched_ids and sim_score > 0.65:  # 阈值 0.5 → 0.65，提高语义相关性门槛
-                bucket = await bucket_mgr.get(bucket_id)
-                if not bucket:
-                    continue
-                if bucket["metadata"].get("pinned") or bucket["metadata"].get("protected"):
-                    continue
-                # 向量通道也走 world filter，避免跨世界语义召回污染
-                if wf_set is not None and not world_matches(
-                    bucket["metadata"].get("world", ""), wf_set
-                ):
-                    continue
-                bucket["score"] = round(sim_score * 100, 2)
-                bucket["vector_match"] = True
-                matches.append(bucket)
-                matched_ids.add(bucket_id)
-                vector_added += 1
+        vector_raw = await embedding_engine.search_similar(query, top_k=max(max_results, 20))
+        vector_ranked = [(bid, sim) for bid, sim in vector_raw if sim > 0.5]
     except Exception as e:
         logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
+        vector_ranked = []
+
+    # RRF fusion of two ranked channels
+    rrf_cfg = config.get("rrf", {})
+    keyword_ranked = [(b["id"], b.get("score", 0)) for b in keyword_matches]
+    fused_pairs = rrf_fuse(
+        keyword_ranked,
+        vector_ranked,
+        k=rrf_cfg.get("k", 60),
+        keyword_weight=rrf_cfg.get("keyword_weight", 1.0),
+        vector_weight=rrf_cfg.get("vector_weight", 1.0),
+    )
+
+    # Materialize fused list: reuse keyword-channel buckets, fetch vector-only ones
+    bucket_cache = {b["id"]: b for b in keyword_matches}
+    matches = []
+    for bid, fused_score in fused_pairs:
+        if len(matches) >= max(max_results, 20):
+            break
+        if bid in bucket_cache:
+            b = bucket_cache[bid]
+            b["score"] = round(fused_score * 1000, 2)
+        else:
+            # Vector-only bucket — fetch and re-apply filters that bucket_mgr.search applied
+            b = await bucket_mgr.get(bid)
+            if not b:
+                continue
+            meta = b["metadata"]
+            if meta.get("pinned") or meta.get("protected"):
+                continue
+            if wf_set is not None and not world_matches(meta.get("world", ""), wf_set):
+                continue
+            if domain_filter:
+                b_domain = meta.get("domain", [])
+                if isinstance(b_domain, str):
+                    b_domain = [b_domain]
+                elif not isinstance(b_domain, list):
+                    b_domain = []
+                domain_lower = {str(d).lower() for d in domain_filter}
+                if not ({str(d).lower() for d in b_domain} & domain_lower):
+                    continue
+            b["score"] = round(fused_score * 1000, 2)
+            b["vector_match"] = True
+        matches.append(b)
 
     results = []
     token_used = 0

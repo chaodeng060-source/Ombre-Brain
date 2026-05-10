@@ -291,3 +291,45 @@ def world_matches(bucket_world: str, world_filter_set: set) -> bool:
     if bw == UNIVERSAL_WORLD:
         return True
     return bw in world_filter_set
+
+
+# --- Reciprocal Rank Fusion / 倒数排名融合 ---
+# Combines two ranked channels (keyword + vector) into a single fused ranking.
+# 将两个 ranked 通道（关键词 + 向量）融合成一个统一排序。
+#
+# Formula: score(d) = w_k/(k + rank_k(d)) + w_v/(k + rank_v(d))
+# 公式：桶 d 的融合分 = 关键词权重/(k + 关键词通道排名) + 向量权重/(k + 向量通道排名)
+#
+# Buckets present in only one channel only contribute that channel's term.
+# 只在单通道出现的桶，只贡献该通道的项。
+#
+# k 默认 60（标准 RRF 取值）。k 越大，相邻 rank 间分差越平缓。
+
+def rrf_fuse(
+    keyword_ranked: list,
+    vector_ranked: list,
+    k: int = 60,
+    keyword_weight: float = 1.0,
+    vector_weight: float = 1.0,
+) -> list:
+    """
+    Reciprocal Rank Fusion of two ranked channels.
+
+    Args:
+        keyword_ranked: list of (bucket_id, _score_unused), top-down ordered
+        vector_ranked:  list of (bucket_id, _score_unused), top-down ordered
+        k:              rank smoothing constant (default 60)
+        keyword_weight: weight for keyword channel (default 1.0)
+        vector_weight:  weight for vector channel (default 1.0)
+
+    Returns:
+        list of (bucket_id, fused_score), sorted by fused_score descending
+    """
+    scores: dict = {}
+    for rank, item in enumerate(keyword_ranked, start=1):
+        bid = item[0]
+        scores[bid] = scores.get(bid, 0.0) + keyword_weight / (k + rank)
+    for rank, item in enumerate(vector_ranked, start=1):
+        bid = item[0]
+        scores[bid] = scores.get(bid, 0.0) + vector_weight / (k + rank)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
