@@ -391,10 +391,10 @@ def _maybe_start_backfill() -> None:
 # =============================================================
 async def _auto_infer_edges(
     source_id: str, content: str, world: str = ""
-) -> int:
-    """Returns count of edges actually added."""
+) -> list[dict]:
+    """Returns list of edge dicts actually added: [{type, target, target_name, note}]."""
     if not content or not content.strip():
-        return 0
+        return []
 
     # --- Gather candidates: vector neighbors + keyword search, dedup, exclude self ---
     candidate_ids: list[str] = []
@@ -420,7 +420,7 @@ async def _auto_infer_edges(
         logger.warning(f"Keyword candidate fetch failed / 关键词候选失败: {e}")
 
     if not candidate_ids:
-        return 0
+        return []
 
     # --- Build candidate list with dehydrated summaries (cap 8 to bound LLM cost) ---
     candidates: list[dict] = []
@@ -448,22 +448,28 @@ async def _auto_infer_edges(
         })
 
     if not candidates:
-        return 0
+        return []
 
     edges = await dehydrator.infer_relations(content, candidates)
     if not edges:
-        return 0
+        return []
 
-    added = 0
+    cand_name_by_id = {c["id"]: c["name"] for c in candidates}
+    added: list[dict] = []
     for edge in edges:
         ok = await bucket_mgr.add_relation(
             source_id, edge["target"], edge["type"], edge.get("note", "")
         )
         if ok:
-            added += 1
+            added.append({
+                "type": edge["type"],
+                "target": edge["target"],
+                "target_name": cand_name_by_id.get(edge["target"], edge["target"]),
+                "note": edge.get("note", ""),
+            })
     if added:
         logger.info(
-            f"Auto-edge inference added {added} edge(s) / 自动建边 {added} 条 "
+            f"Auto-edge inference added {len(added)} edge(s) / 自动建边 {len(added)} 条 "
             f"from {source_id}"
         )
     return added
@@ -921,18 +927,26 @@ async def hold(
 
     # --- Step 3: auto-edge inference (only on new buckets, never on merges) ---
     # --- 自动建边：仅对新建桶，合并桶已经融进了相关性，不再加边避免冗余 ---
-    edge_count = 0
+    added_edges: list[dict] = []
     if not is_merged:
         try:
-            edge_count = await _auto_infer_edges(
+            added_edges = await _auto_infer_edges(
                 source_id=bucket_id, content=content, world=effective_world
             )
         except Exception as e:
             logger.warning(f"Auto-edge inference failed / 自动建边失败: {e}")
 
     action = "合并→" if is_merged else "新建→"
-    edge_suffix = f" +{edge_count}边" if edge_count else ""
-    return f"{action}{result_name} {','.join(domain)}{edge_suffix}"
+    base = f"{action}{result_name} {','.join(domain)}"
+    if not added_edges:
+        return base
+    # 写=读：hold 同时返回相关桶（让用户感知这条记忆和什么连着）
+    related_lines = [
+        f"  • [{e['type']}] {e['target_name']} ({e['target']})"
+        + (f" — {e['note']}" if e.get("note") else "")
+        for e in added_edges
+    ]
+    return f"{base} +{len(added_edges)}边\n关联：\n" + "\n".join(related_lines)
 
 
 # =============================================================
@@ -1170,11 +1184,12 @@ async def backfill_relations(
         if not bucket:
             return f"未找到桶: {bucket_id}"
         try:
-            n = await _auto_infer_edges(
+            edges = await _auto_infer_edges(
                 source_id=bucket["id"],
                 content=bucket["content"],
                 world=bucket["metadata"].get("world", ""),
             )
+            n = len(edges)
             return f"{bucket['id']}: +{n}边"
         except Exception as e:
             logger.warning(f"backfill single failed {bucket_id}: {e}")
@@ -1206,11 +1221,12 @@ async def backfill_relations(
     total = 0
     for b in batch:
         try:
-            n = await _auto_infer_edges(
+            edges = await _auto_infer_edges(
                 source_id=b["id"],
                 content=b["content"],
                 world=b["metadata"].get("world", ""),
             )
+            n = len(edges)
             results.append(f"{b['id'][:6]}+{n}")
             total += n
         except Exception as e:
