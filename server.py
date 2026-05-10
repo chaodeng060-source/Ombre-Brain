@@ -1064,6 +1064,84 @@ async def trace(
 
 
 # =============================================================
+# Tool: backfill_relations — run auto-edge inference on existing buckets
+# 工具：backfill_relations — 给老桶批量自动建边
+# Hold-time auto-edge only fires on new buckets; this tool fills in the
+# graph for memories that existed before the feature shipped. Batched to
+# avoid MCP timeout and to let the caller resume between calls.
+# =============================================================
+@mcp.tool()
+async def backfill_relations(
+    bucket_id: str = "",
+    limit: int = 5,
+    offset: int = 0,
+) -> str:
+    """对已有桶批量跑自动建边。
+    bucket_id=指定单桶处理（最快验证用）。
+    bucket_id 为空时按 limit/offset 批量遍历 dynamic 桶（跳过 pinned/permanent/feel/resolved），每次最多 10 个，多次调用滚动跑完。
+    返回每桶加了几条边和下一批 offset。"""
+    if bucket_id and bucket_id.strip():
+        bucket = await bucket_mgr.get(bucket_id.strip())
+        if not bucket:
+            return f"未找到桶: {bucket_id}"
+        try:
+            n = await _auto_infer_edges(
+                source_id=bucket["id"],
+                content=bucket["content"],
+                world=bucket["metadata"].get("world", ""),
+            )
+            return f"{bucket['id']}: +{n}边"
+        except Exception as e:
+            logger.warning(f"backfill single failed {bucket_id}: {e}")
+            return f"{bucket_id}: 失败 {e}"
+
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+    except Exception as e:
+        return f"列桶失败: {e}"
+
+    # 跳过钉选/保护/permanent/feel/resolved——这些桶要么不需要长边、要么是潜意识素材库
+    eligible = [
+        b for b in all_buckets
+        if not b["metadata"].get("pinned")
+        and not b["metadata"].get("protected")
+        and b["metadata"].get("type") not in ("feel", "permanent")
+        and not b["metadata"].get("resolved", False)
+    ]
+    eligible.sort(key=lambda b: b["id"])
+
+    limit = max(1, min(int(limit), 10))
+    offset = max(0, int(offset))
+    batch = eligible[offset:offset + limit]
+
+    if not batch:
+        return f"无桶可处理 (eligible={len(eligible)}, offset={offset})"
+
+    results = []
+    total = 0
+    for b in batch:
+        try:
+            n = await _auto_infer_edges(
+                source_id=b["id"],
+                content=b["content"],
+                world=b["metadata"].get("world", ""),
+            )
+            results.append(f"{b['id'][:6]}+{n}")
+            total += n
+        except Exception as e:
+            logger.warning(f"backfill bucket {b['id']} failed: {e}")
+            results.append(f"{b['id'][:6]}!err")
+
+    next_offset = offset + len(batch)
+    remaining = len(eligible) - next_offset
+    return (
+        f"批 {offset}-{next_offset - 1}/{len(eligible)} | "
+        f"+{total}边 | {' '.join(results)} | "
+        f"剩 {remaining}, next offset={next_offset}"
+    )
+
+
+# =============================================================
 # Tool: switch_world — change global current_world pointer at runtime
 # 工具：switch_world — 切换全局当前世界指针
 # =============================================================
