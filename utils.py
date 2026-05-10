@@ -28,6 +28,20 @@ RELATION_TYPES = frozenset({
     "kin",          # 同类
 })
 
+# Domains where a bucket must never be marked resolved=True.
+# Not "problem-and-solution" structures — persistent states (relationships,
+# commitments, feelings, family, self-reflection). Resolving = forgetting.
+# 5.10 incident: a CC self over-zealously resolved 13 buckets in this set;
+# code-level guard supersedes "trust the bot to read the iron rule".
+PROTECTED_RESOLVE_DOMAINS = frozenset({
+    "恋爱", "纪念日", "约定", "家庭", "自省", "feel",
+})
+
+
+class ResolvedGuardError(Exception):
+    """Refused setting resolved=True on a protected-domain bucket."""
+    pass
+
 
 def load_config(config_path: str = None) -> dict:
     """

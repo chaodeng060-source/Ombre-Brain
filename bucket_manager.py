@@ -39,7 +39,10 @@ import frontmatter
 import jieba
 from rapidfuzz import fuzz
 
-from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, world_matches, RELATION_TYPES
+from utils import (
+    generate_bucket_id, sanitize_name, safe_path, now_iso, world_matches,
+    RELATION_TYPES, PROTECTED_RESOLVE_DOMAINS, ResolvedGuardError,
+)
 
 logger = logging.getLogger("ombre_brain.bucket")
 
@@ -229,6 +232,20 @@ class BucketManager:
             old_type = post.get("type", "dynamic")
             old_pinned = post.get("pinned", False)
 
+            # Guard: protected-domain (or feel-type) buckets can never be resolved.
+            # 守卫：保护域桶（或 feel 类型）禁止 resolved=1（5.10 黑洞事件根治）
+            if kwargs.get("resolved") is True:
+                cur_domain = old_domain if isinstance(old_domain, list) else [old_domain]
+                hit = [d for d in cur_domain if d in PROTECTED_RESOLVE_DOMAINS]
+                if hit or old_type == "feel":
+                    label = ",".join(hit) if hit else f"type={old_type}"
+                    logger.warning(
+                        f"[ResolvedGuard] refused resolved=True on {bucket_id} (protected: {label})"
+                    )
+                    raise ResolvedGuardError(
+                        f"桶 {bucket_id} 属于保护域 [{label}]，禁止 resolved=1"
+                    )
+
             for key, value in kwargs.items():
                 if value is not None:
                     if key == "content":
@@ -276,6 +293,8 @@ class BucketManager:
             if need_move and target_type_dir:
                 self._move_bucket(file_path, target_type_dir, new_domain)
 
+        except ResolvedGuardError:
+            raise
         except Exception as e:
             logger.error(f"Failed to update bucket / 更新桶失败: {bucket_id}: {e}")
             return False

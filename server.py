@@ -58,7 +58,7 @@ from import_memory import ImportEngine
 from r2_storage import r2_storage
 from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
-    world_matches, save_current_world, UNIVERSAL_WORLD,
+    world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
 )
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -1129,7 +1129,10 @@ async def trace(
         return "没有任何字段需要修改。"
 
     if updates:
-        success = await bucket_mgr.update(bucket_id, **updates)
+        try:
+            success = await bucket_mgr.update(bucket_id, **updates)
+        except ResolvedGuardError as e:
+            return f"❌ 守卫拦截: {e}。这条铁律是 5.10 黑洞修复后落代码的兜底——保护域桶=持续状态，不该有'完结'。"
         if not success:
             return f"修改失败: {bucket_id}"
     else:
