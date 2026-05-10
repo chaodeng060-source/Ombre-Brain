@@ -39,7 +39,7 @@ import frontmatter
 import jieba
 from rapidfuzz import fuzz
 
-from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, world_matches
+from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, world_matches, RELATION_TYPES
 
 logger = logging.getLogger("ombre_brain.bucket")
 
@@ -282,6 +282,82 @@ class BucketManager:
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
         return True
+
+    # ---------------------------------------------------------
+    # Relation edges (6 类关系边：只在 source 桶记出边，反向遍历得入边)
+    # ---------------------------------------------------------
+    async def add_relation(
+        self, source_id: str, target_id: str, rel_type: str, note: str = ""
+    ) -> bool:
+        if rel_type not in RELATION_TYPES:
+            logger.warning(f"Unknown relation type / 未知关系类型: {rel_type}")
+            return False
+        if source_id == target_id:
+            return False
+        if not await self.get(target_id):
+            logger.warning(f"Relation target not found / 关系目标桶不存在: {target_id}")
+            return False
+        file_path = self._find_bucket_file(source_id)
+        if not file_path:
+            return False
+        try:
+            post = self._safe_load_post(file_path)
+            relations = list(post.get("relations") or [])
+            for r in relations:
+                if isinstance(r, dict) and r.get("type") == rel_type and r.get("target") == target_id:
+                    return True  # 幂等：已有同 type+target 的边就不重复
+            edge = {"type": rel_type, "target": target_id}
+            if note and note.strip():
+                edge["note"] = note.strip()
+            relations.append(edge)
+            post["relations"] = relations
+            post["last_active"] = now_iso()
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(frontmatter.dumps(post))
+            logger.info(f"Added relation / 加边: {source_id} -[{rel_type}]-> {target_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to add relation / 加边失败 {source_id}->{target_id}: {e}")
+            return False
+
+    async def remove_relation(
+        self, source_id: str, target_id: str, rel_type: str = ""
+    ) -> int:
+        file_path = self._find_bucket_file(source_id)
+        if not file_path:
+            return 0
+        try:
+            post = self._safe_load_post(file_path)
+            relations = list(post.get("relations") or [])
+            if not relations:
+                return 0
+            kept = []
+            removed = 0
+            for r in relations:
+                if not isinstance(r, dict):
+                    kept.append(r)
+                    continue
+                if r.get("target") != target_id:
+                    kept.append(r)
+                    continue
+                if rel_type and r.get("type") != rel_type:
+                    kept.append(r)
+                    continue
+                removed += 1
+            if removed == 0:
+                return 0
+            if kept:
+                post["relations"] = kept
+            else:
+                post.metadata.pop("relations", None)
+            post["last_active"] = now_iso()
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(frontmatter.dumps(post))
+            logger.info(f"Removed {removed} relation(s) / 删边: {source_id}->{target_id}")
+            return removed
+        except Exception as e:
+            logger.error(f"Failed to remove relation / 删边失败 {source_id}->{target_id}: {e}")
+            return 0
 
     # ---------------------------------------------------------
     # Delete bucket

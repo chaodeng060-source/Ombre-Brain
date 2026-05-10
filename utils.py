@@ -18,6 +18,17 @@ from pathlib import Path
 from datetime import datetime
 
 
+# 6 类关系边：causes/contributes/improves/explains/updates 有向，kin 无向（仍单边记一次）
+RELATION_TYPES = frozenset({
+    "causes",       # 触发/导致
+    "contributes",  # 贡献
+    "improves",     # 改善
+    "explains",     # 解释
+    "updates",      # 更新（A 取代/补正 B）
+    "kin",          # 同类
+})
+
+
 def load_config(config_path: str = None) -> dict:
     """
     Load configuration file.

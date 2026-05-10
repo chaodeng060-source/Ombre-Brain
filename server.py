@@ -314,8 +314,9 @@ async def breath(
     arousal: float = -1,
     max_results: int = 20,
     world: str = "",
+    relation_depth: int = 1,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿关系边召回邻居的跳数(默认1,0=不走关系边),目前 MVP 只走 1 跳出边,最多附加 5 条。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
@@ -524,6 +525,55 @@ async def breath(
         except Exception as e:
             logger.warning(f"Failed to dehydrate search result / 检索结果脱水失败: {e}")
             continue
+
+    # --- Relation expansion: 1-hop out-edges of matched buckets ---
+    # --- 关系网召回：沿主结果桶的出边带 1 跳邻居（不进主排序，单独列在末尾）---
+    if relation_depth >= 1 and matches and token_used < max_tokens:
+        seen_neighbors = set()
+        neighbor_msgs = []
+        for bucket in matches:
+            if len(neighbor_msgs) >= 5 or token_used >= max_tokens:
+                break
+            relations = bucket["metadata"].get("relations") or []
+            if not isinstance(relations, list):
+                continue
+            for r in relations:
+                if len(neighbor_msgs) >= 5 or token_used >= max_tokens:
+                    break
+                if not isinstance(r, dict):
+                    continue
+                t_id = r.get("target")
+                if not t_id or t_id in matched_ids or t_id in seen_neighbors:
+                    continue
+                try:
+                    neighbor = await bucket_mgr.get(t_id)
+                except Exception:
+                    continue
+                if not neighbor:
+                    continue
+                if wf_set is not None and not world_matches(
+                    neighbor["metadata"].get("world", ""), wf_set
+                ):
+                    continue
+                try:
+                    clean_meta = {k: v for k, v in neighbor["metadata"].items() if k != "tags"}
+                    summary = await dehydrator.dehydrate(
+                        strip_wikilinks(neighbor["content"]), clean_meta
+                    )
+                    summary_tokens = count_tokens_approx(summary)
+                    if token_used + summary_tokens > max_tokens:
+                        break
+                    rel_type = r.get("type", "?")
+                    neighbor_msgs.append(
+                        f"[关系:{rel_type}←{bucket['id']}] [bucket_id:{t_id}] {summary}"
+                    )
+                    token_used += summary_tokens
+                    seen_neighbors.add(t_id)
+                except Exception as e:
+                    logger.warning(f"Failed to dehydrate neighbor / 邻居脱水失败: {e}")
+                    continue
+        if neighbor_msgs:
+            results.append("--- 关系网邻居 ---\n" + "\n---\n".join(neighbor_msgs))
 
     # --- Random surfacing: when search returns < 3, 40% chance to float old memories ---
     # --- 随机浮现：检索结果不足 3 条时，40% 概率从低权重旧桶里漂上来 ---
@@ -807,8 +857,10 @@ async def trace(
     content: str = "",
     world: str = "",
     delete: bool = False,
+    add_relation: str = "",
+    remove_relation: str = "",
 ) -> str:
-    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。world=改世界归属(传"(none)"清空回日常),只传需改的,-1或空=不改。"""
+    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。world=改世界归属(传"(none)"清空回日常),只传需改的,-1或空=不改。add_relation格式"type:target_id"或"type:target_id:note",6类:causes/contributes/improves/explains/updates/kin。remove_relation格式"target_id"或"type:target_id"。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -853,12 +905,34 @@ async def trace(
     if content:
         updates["content"] = content
 
-    if not updates:
+    # --- Relation edits / 关系边操作（独立于 metadata update，避免和 update 字段竞争）---
+    relation_msgs = []
+    if add_relation and add_relation.strip():
+        parts = [p.strip() for p in add_relation.split(":", 2)]
+        if len(parts) < 2:
+            return "add_relation 格式错误，需 'type:target_id' 或 'type:target_id:note'。"
+        rel_type, target_id = parts[0], parts[1]
+        note = parts[2] if len(parts) >= 3 else ""
+        ok = await bucket_mgr.add_relation(bucket_id, target_id, rel_type, note)
+        relation_msgs.append(f"+边 [{rel_type}→{target_id}]" if ok else f"加边失败 [{rel_type}→{target_id}]")
+    if remove_relation and remove_relation.strip():
+        parts = [p.strip() for p in remove_relation.split(":", 1)]
+        if len(parts) == 1:
+            rel_type, target_id = "", parts[0]
+        else:
+            rel_type, target_id = parts[0], parts[1]
+        n = await bucket_mgr.remove_relation(bucket_id, target_id, rel_type)
+        relation_msgs.append(f"-边 ×{n} [{target_id}]" if n else f"删边未命中 [{target_id}]")
+
+    if not updates and not relation_msgs:
         return "没有任何字段需要修改。"
 
-    success = await bucket_mgr.update(bucket_id, **updates)
-    if not success:
-        return f"修改失败: {bucket_id}"
+    if updates:
+        success = await bucket_mgr.update(bucket_id, **updates)
+        if not success:
+            return f"修改失败: {bucket_id}"
+    else:
+        success = True
 
     # Re-generate embedding if content changed
     if "content" in updates:
@@ -882,6 +956,8 @@ async def trace(
             changed += " → 已隐藏，保留但不再浮现"
         else:
             changed += " → 已取消隐藏，重新参与浮现"
+    if relation_msgs:
+        changed = (changed + "; " if changed else "") + "; ".join(relation_msgs)
     return f"已修改记忆桶 {bucket_id}: {changed}"
 
 
