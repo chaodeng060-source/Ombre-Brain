@@ -739,6 +739,40 @@
     .config-row label { width: 100%; }
     .breath-flow { display: none; }
   }
+
+  .drawer-intro {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    padding: 20px 24px;
+    margin-bottom: 22px;
+    background: linear-gradient(135deg, rgba(139, 106, 106, 0.10), rgba(47, 79, 79, 0.04));
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    box-shadow: inset 1px 1px 3px var(--shadow-light), 2px 2px 6px var(--shadow-dark-subtle);
+  }
+  .drawer-icon { font-size: 30px; opacity: 0.65; }
+  .drawer-title {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 19px;
+    color: var(--accent);
+    letter-spacing: 0.5px;
+    font-style: italic;
+  }
+  .drawer-sub {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-top: 4px;
+    letter-spacing: 0.3px;
+    line-height: 1.55;
+  }
+  .drawer-meta {
+    margin-bottom: 12px;
+    padding: 0 6px;
+    font-size: 11px;
+    color: var(--text-light);
+    letter-spacing: 0.4px;
+  }
 </style>
 </head>
 <body>
@@ -757,6 +791,7 @@
   <div class="tab" data-tab="network">记忆网络</div>
   <div class="tab" data-tab="config">配置</div>
   <div class="tab" data-tab="import">导入</div>
+  <div class="tab" data-tab="drawer">🫧 抽屉</div>
 </div>
 
 <div class="content" id="list-view">
@@ -924,6 +959,20 @@
   </div>
 </div>
 
+<div class="content" id="drawer-view" style="display:none">
+  <div class="drawer-intro">
+    <div class="drawer-icon">🫧</div>
+    <div class="drawer-text">
+      <div class="drawer-title">潜意识素材库</div>
+      <div class="drawer-sub">空标签的桶——还没被语言抓住的 feel。做梦时浮上来用。不删、不合并、不动。</div>
+    </div>
+  </div>
+  <div class="drawer-meta" id="drawer-meta"></div>
+  <div class="bucket-list" id="drawer-list">
+    <div class="loading">加载中…</div>
+  </div>
+</div>
+
 <div class="detail-panel" id="detail-panel">
   <button class="close-btn" onclick="closeDetail()">✕</button>
   <button class="edit-btn" id="edit-toggle-btn" onclick="toggleEditMode()" title="编辑">✏️</button>
@@ -947,9 +996,11 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('network-view').style.display = target === 'network' ? '' : 'none';
     document.getElementById('config-view').style.display = target === 'config' ? '' : 'none';
     document.getElementById('import-view').style.display = target === 'import' ? '' : 'none';
+    document.getElementById('drawer-view').style.display = target === 'drawer' ? '' : 'none';
     if (target === 'network') loadNetwork();
     if (target === 'config') loadConfig();
     if (target === 'import') { pollImportStatus(); loadImportResults(); }
+    if (target === 'drawer') renderDrawer();
   });
 });
 
@@ -1109,6 +1160,41 @@ async function searchBuckets(query) {
   } catch (e) {
     console.error('Search failed:', e);
   }
+}
+
+function renderDrawer() {
+  var feels = allBuckets.filter(function(b) { return b.type === 'feel'; });
+  feels.sort(function(a, b) {
+    var ta = a.last_active || a.created || '';
+    var tb = b.last_active || b.created || '';
+    if (ta < tb) return 1;
+    if (ta > tb) return -1;
+    return 0;
+  });
+  var meta = document.getElementById('drawer-meta');
+  if (meta) {
+    var avgV = feels.length ? (feels.reduce(function(s, b) { return s + (b.valence || 0); }, 0) / feels.length) : 0;
+    var avgA = feels.length ? (feels.reduce(function(s, b) { return s + (b.arousal || 0); }, 0) / feels.length) : 0;
+    meta.textContent = feels.length + ' 个 feel · 平均 V' + avgV.toFixed(2) + ' / A' + avgA.toFixed(2) + ' · 按最后活跃排';
+  }
+  var list = document.getElementById('drawer-list');
+  if (!feels.length) {
+    list.innerHTML = '<div class="loading">还没有 feel 桶</div>';
+    return;
+  }
+  list.innerHTML = feels.map(function(b) {
+    var vPos = Math.round((b.valence || 0) * 100);
+    var timeAgo = formatTimeAgo(b.last_active || b.created);
+    return '<div class="bucket-row" onclick="showDetail(\'' + b.id + '\')">' +
+      '<span class="icon">🫧</span>' +
+      '<span class="name" title="' + esc(b.name) + '">' + esc(b.name) + '</span>' +
+      '<span class="domain"></span>' +
+      '<span class="emotion"><span class="v-bar"><span class="v-dot" style="left:' + vPos + '%"></span></span></span>' +
+      '<span class="score">' + (b.score != null ? b.score.toFixed(2) : '—') + '</span>' +
+      '<span class="time">' + timeAgo + '</span>' +
+      '<span class="preview">' + esc(b.content_preview || '') + '</span>' +
+    '</div>';
+  }).join('');
 }
 
 var currentBucket = null;
