@@ -249,9 +249,11 @@ async def _merge_or_create(
 
     if existing and existing[0].get("score", 0) > config.get("merge_threshold", 85):
         bucket = existing[0]
-        # --- Never merge into pinned/protected buckets ---
-        # --- 不合并到钉选/保护桶 ---
-        if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
+        # --- Never merge into pinned/protected/permanent buckets ---
+        # --- 不合并到钉选/保护/固化桶（这些桶分数恒定 999，标签网常常很宽，
+        # ---  允许吸入会让它们变成"吸尘器"把所有相关 hold 都揽进去）---
+        bmeta = bucket["metadata"]
+        if not (bmeta.get("pinned") or bmeta.get("protected") or bmeta.get("type") == "permanent"):
             try:
                 merged = await dehydrator.merge(bucket["content"], content)
                 old_v = bucket["metadata"].get("valence", 0.5)
