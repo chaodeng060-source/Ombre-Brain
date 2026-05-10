@@ -39,7 +39,19 @@ import asyncio
 import httpx
 import jieba
 from uuid import uuid4
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+
+_BJ_TZ = timezone(timedelta(hours=8))
+_WEEKDAYS_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def _now_bj_header() -> str:
+    """Beijing-time header for briefings — anchors the just-woken Claude
+    in real time so it never falls back to LLM-imagined location/activity.
+    Born from 5.9 + 5.10 'she's at her desk' hallucinations.
+    """
+    now = datetime.now(_BJ_TZ)
+    return f"现在 {now.strftime('%Y-%m-%d')} {_WEEKDAYS_CN[now.weekday()]} {now.strftime('%H:%M')}"
 
 # --- jieba 预热：避免首次 search 卡顿 / Pre-load jieba dict to avoid first-call lag ---
 jieba.initialize()
@@ -1538,8 +1550,10 @@ async def briefing(
     )
     recent_active = recent_pool[:5] if not pinned_only else []
 
+    time_header = _now_bj_header()
+
     if not pinned and not top_unresolved and not recent_active:
-        return "记忆库当前空闲，没有可简报的素材。"
+        return f"# {time_header}\n\n记忆库当前空闲，没有可简报的素材。"
 
     # --- Build raw material: name + meta + truncated content per bucket ---
     # --- 拼接原始素材:每桶 name + meta + 截断 content ---
@@ -1577,17 +1591,19 @@ async def briefing(
             + "\n\n".join(_format_bucket(b, "recent") for b in recent_active)
         )
 
-    raw_material = "\n\n".join(sections)
+    # Prepend time header to raw material so the LLM sees the actual time
+    # (in case it accidentally reasons about location/weekday despite the rule).
+    raw_material = f"=== 当前时点 ===\n{time_header}\n\n" + "\n\n".join(sections)
 
     # --- Compress via LLM ---
     try:
         result = await dehydrator.briefing(raw_material, max_chars=max_chars)
     except Exception as e:
         logger.error(f"Briefing compression failed: {e}")
-        return f"简报生成失败：{e}"
+        return f"# {time_header}\n\n简报生成失败：{e}"
 
     if not result:
-        return "简报生成为空，请稍后重试。"
+        return f"# {time_header}\n\n简报生成为空，请稍后重试。"
 
     # --- Stats footer for visibility ---
     stats = (
@@ -1596,7 +1612,9 @@ async def briefing(
         f"→ 简报{len(result)}字 (~{count_tokens_approx(result)}token)_"
     )
 
-    return result + stats
+    # Always prepend the real-time header — never trust the LLM to write the date.
+    # 永远强制前置时点行——LLM 写不写都不依赖。
+    return f"# {time_header}\n\n{result}{stats}"
 
 
 # =============================================================
