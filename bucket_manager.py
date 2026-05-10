@@ -481,11 +481,12 @@ class BucketManager:
         name_lower = str(name).lower()
         tags_lower = [str(t).lower() for t in tags]
 
-        # --- 0. 最强绝对命中机制（全句包含） ---
-        if query_lower in name_lower or name_lower in query_lower:
+        # query 整体嵌在 name/tag 里才算绝对命中；反向（tag/name 嵌在 query 里）走比例打分，
+        # 否则长 query 下任一短 tag 都会硬撞 1.0 把不相干桶推上满分。
+        if query_lower in name_lower:
             return 1.0
         for t in tags_lower:
-            if query_lower in t or t in query_lower:
+            if query_lower in t:
                 return 1.0
 
         # --- 1. 核心词短路机制（Jieba 分词检测） ---
@@ -501,21 +502,27 @@ class BucketManager:
         if not query_parts:
             query_parts = [query_lower]
 
+        # 单 part 命中按比例打分，避免任一词命中就硬返 1.0 导致桶被合并吸入黑洞
+        hit_count = 0
         for part in query_parts:
             if name_lower and part in name_lower:
-                return 1.0
-            for t in tags_lower:
-                if t and part in t:
-                    return 1.0
+                hit_count += 1
+                continue
+            if any(t and part in t for t in tags_lower):
+                hit_count += 1
 
-        # --- 2. 模糊匹配得分独立计算（强制转换为字符串，杜绝 Exception 静默拦截） ---
-        name_score = fuzz.partial_ratio(query, str(name)) / 100.0 if name else 0.0
-        domain_score = max([fuzz.partial_ratio(query, str(d)) for d in domain] + [0]) / 100.0 if domain else 0.0
-        tag_score = max([fuzz.partial_ratio(query, str(t)) for t in tags] + [0]) / 100.0 if tags else 0.0
+        partial_hit_score = hit_count / len(query_parts) if query_parts else 0.0
+
+        # name/tag/domain 用对称 ratio：短 tag 在长 query 里 partial_ratio 会硬给 100，
+        # 是黑洞的另一面。只有 content 本来就长才适合 partial_ratio。
+        name_score = fuzz.ratio(query, str(name)) / 100.0 if name else 0.0
+        domain_score = max([fuzz.ratio(query, str(d)) for d in domain] + [0]) / 100.0 if domain else 0.0
+        tag_score = max([fuzz.ratio(query, str(t)) for t in tags] + [0]) / 100.0 if tags else 0.0
         content_score = fuzz.partial_ratio(query, content) / 100.0 if content else 0.0
 
         # --- 3. 最高亮机制（Max-Win）替代加权平均 ---
         final_score = max(
+            partial_hit_score,
             name_score,
             tag_score,
             domain_score * 0.9,     # 域的匹配权重略微打折
