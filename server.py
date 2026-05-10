@@ -1782,17 +1782,23 @@ async def api_search(request):
 
 @mcp.custom_route("/api/network", methods=["GET"])
 async def api_network(request):
-    """Get embedding similarity network for visualization."""
+    """Get memory network for visualization.
+    Edges have two flavors:
+      - kind=relation: explicit 6-type semantic edges from frontmatter `relations`
+      - kind=similarity: embedding cosine similarity > 0.5 (background layer)
+    """
     from starlette.responses import JSONResponse
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         nodes = []
         edges = []
         embeddings = {}
+        bucket_ids = set()
 
         for b in all_buckets:
             meta = b.get("metadata", {})
             bid = b["id"]
+            bucket_ids.add(bid)
             nodes.append({
                 "id": bid,
                 "name": meta.get("name", bid),
@@ -1810,13 +1816,36 @@ async def api_network(request):
                 if emb is not None:
                     embeddings[bid] = emb
 
-        # Build edges from embeddings (similarity > 0.5)
+        # Explicit semantic relations (6 types: causes/contributes/improves/explains/updates/kin)
+        for b in all_buckets:
+            src = b["id"]
+            for r in (b.get("metadata", {}).get("relations") or []):
+                if not isinstance(r, dict):
+                    continue
+                tgt = r.get("target")
+                rtype = r.get("type")
+                if not tgt or not rtype or tgt not in bucket_ids:
+                    continue
+                edges.append({
+                    "source": src,
+                    "target": tgt,
+                    "kind": "relation",
+                    "type": rtype,
+                    "note": r.get("note", ""),
+                })
+
+        # Embedding similarity edges (background layer, undirected)
         ids = list(embeddings.keys())
         for i, id_a in enumerate(ids):
             for id_b in ids[i+1:]:
                 sim = embedding_engine._cosine_similarity(embeddings[id_a], embeddings[id_b])
                 if sim > 0.5:
-                    edges.append({"source": id_a, "target": id_b, "similarity": round(sim, 3)})
+                    edges.append({
+                        "source": id_a,
+                        "target": id_b,
+                        "kind": "similarity",
+                        "similarity": round(sim, 3),
+                    })
 
         return JSONResponse({"nodes": nodes, "edges": edges})
     except Exception as e:

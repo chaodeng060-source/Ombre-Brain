@@ -553,7 +553,9 @@
   }
   .network-legend {
     display: flex;
-    gap: 20px;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 14px;
     margin-bottom: 16px;
     font-size: 12px;
     color: var(--text-dim);
@@ -566,6 +568,25 @@
     display: inline-block;
     box-shadow: 0 1px 3px var(--shadow-dark-subtle);
   }
+  .legend-line {
+    width: 18px;
+    height: 2px;
+    display: inline-block;
+    border-radius: 1px;
+  }
+  .legend-group-label {
+    font-size: 11px;
+    color: var(--text-light);
+    letter-spacing: 0.5px;
+    margin-right: -4px;
+  }
+  .legend-divider {
+    width: 1px;
+    height: 14px;
+    background: var(--border-strong);
+    margin: 0 4px;
+  }
+  .legend-soft { opacity: 0.7; font-style: italic; }
 
   .loading {
     text-align: center;
@@ -841,10 +862,20 @@
 
 <div class="content" id="network-view" style="display:none">
   <div class="network-legend">
+    <div class="legend-group-label">节点</div>
     <div class="legend-item"><span class="legend-dot" style="background:#2F4F4F"></span> dynamic</div>
     <div class="legend-item"><span class="legend-dot" style="background:#9A7B4F"></span> permanent</div>
     <div class="legend-item"><span class="legend-dot" style="background:#8B6A6A"></span> feel</div>
     <div class="legend-item"><span class="legend-dot" style="background:#B0A590"></span> archived</div>
+    <div class="legend-divider"></div>
+    <div class="legend-group-label">关系边</div>
+    <div class="legend-item"><span class="legend-line" style="background:#8B4A4A"></span> causes 因</div>
+    <div class="legend-item"><span class="legend-line" style="background:#4A7C59"></span> contributes 助</div>
+    <div class="legend-item"><span class="legend-line" style="background:#3D6363"></span> improves 进</div>
+    <div class="legend-item"><span class="legend-line" style="background:#9A7B4F"></span> explains 释</div>
+    <div class="legend-item"><span class="legend-line" style="background:#6B5B8B"></span> updates 更</div>
+    <div class="legend-item"><span class="legend-line" style="background:#A89580"></span> kin 同</div>
+    <div class="legend-item legend-soft"><span class="legend-line" style="background:#8A8070;opacity:0.4"></span> 相似度</div>
   </div>
   <canvas id="network-canvas"></canvas>
 </div>
@@ -1467,7 +1498,8 @@ function drawNetwork(ctx, W, H, data) {
       if (!a || !b) return;
       var dx = b.x - a.x, dy = b.y - a.y;
       var dist = Math.sqrt(dx*dx + dy*dy);
-      var force = (dist - 100) * 0.01 * (e.similarity || 0.5);
+      var weight = e.kind === 'relation' ? 0.85 : (e.similarity || 0.5);
+      var force = (dist - 100) * 0.01 * weight;
       dx = (dx / Math.max(1,dist)) * force;
       dy = (dy / Math.max(1,dist)) * force;
       a.x += dx; a.y += dy;
@@ -1483,15 +1515,57 @@ function drawNetwork(ctx, W, H, data) {
   ctx.fillStyle = '#FDFCF0';
   ctx.fillRect(0, 0, W, H);
 
+  // Layer 1: similarity edges (background, soft gray)
   edges.forEach(function(e) {
+    if (e.kind === 'relation') return;
     var a = positions[e.source], b = positions[e.target];
     if (!a || !b) return;
     ctx.beginPath();
     ctx.moveTo(a.x, a.y);
     ctx.lineTo(b.x, b.y);
-    ctx.strokeStyle = 'rgba(47, 79, 79, ' + (e.similarity * 0.35) + ')';
-    ctx.lineWidth = Math.max(0.5, e.similarity * 2);
+    ctx.strokeStyle = 'rgba(138, 128, 112, ' + ((e.similarity || 0.5) * 0.22) + ')';
+    ctx.lineWidth = Math.max(0.4, (e.similarity || 0.5) * 1.5);
     ctx.stroke();
+  });
+
+  // Layer 2: explicit relation edges (colored + arrowed, drawn on top)
+  var relColors = {
+    causes:      '#8B4A4A',
+    contributes: '#4A7C59',
+    improves:    '#3D6363',
+    explains:    '#9A7B4F',
+    updates:     '#6B5B8B',
+    kin:         '#A89580'
+  };
+  edges.forEach(function(e) {
+    if (e.kind !== 'relation') return;
+    var a = positions[e.source], b = positions[e.target];
+    if (!a || !b) return;
+    var color = relColors[e.type] || '#3A3530';
+    var dx = b.x - a.x, dy = b.y - a.y;
+    var dist = Math.max(1, Math.sqrt(dx*dx + dy*dy));
+    var ux = dx / dist, uy = dy / dist;
+    // Stop the line short of the target node so the arrowhead lands cleanly
+    var pad = 12;
+    var ex = b.x - ux * pad, ey = b.y - uy * pad;
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(ex, ey);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.4;
+    ctx.globalAlpha = 0.78;
+    ctx.stroke();
+    // Arrowhead
+    var ah = 7;
+    var perpX = -uy, perpY = ux;
+    ctx.beginPath();
+    ctx.moveTo(ex, ey);
+    ctx.lineTo(ex - ux * ah + perpX * (ah * 0.45), ey - uy * ah + perpY * (ah * 0.45));
+    ctx.lineTo(ex - ux * ah - perpX * (ah * 0.45), ey - uy * ah - perpY * (ah * 0.45));
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.globalAlpha = 1.0;
   });
 
   var colors = { dynamic: '#2F4F4F', permanent: '#9A7B4F', feel: '#8B6A6A', archived: '#B0A590' };
