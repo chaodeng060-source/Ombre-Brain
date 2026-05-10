@@ -298,6 +298,89 @@ async def _merge_or_create(
 
 
 # =============================================================
+# Background backfill: hydrate relations for legacy buckets without edges
+# 后台 backfill：给老桶补建关系网
+# Lazy-started on first hold/breath call. Idempotent — only touches buckets
+# whose `relations` field is empty/missing, so it can run safely on every
+# server restart without redoing work.
+# =============================================================
+_backfill_started = False
+
+
+async def _startup_backfill_loop() -> None:
+    """Walk eligible buckets without relations and run _auto_infer_edges on each.
+    Rate-limited to ~1 bucket per 2s so the LLM API isn't hammered."""
+    global _backfill_started
+    try:
+        await asyncio.sleep(30)  # let the server fully come up first
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+        except Exception as e:
+            logger.warning(f"Backfill list_all failed / 列桶失败: {e}")
+            return
+
+        candidates = [
+            b for b in all_buckets
+            if not b["metadata"].get("pinned")
+            and not b["metadata"].get("protected")
+            and b["metadata"].get("type") not in ("feel", "permanent")
+            and not b["metadata"].get("resolved", False)
+            and not b["metadata"].get("relations")
+        ]
+        candidates.sort(key=lambda b: b["id"])
+
+        if not candidates:
+            logger.info("Backfill: no eligible buckets / 没有需 backfill 的桶")
+            return
+
+        logger.info(
+            f"Backfill starting: {len(candidates)} eligible buckets / "
+            f"开始 backfill {len(candidates)} 个桶"
+        )
+
+        for i, b in enumerate(candidates):
+            try:
+                n = await _auto_infer_edges(
+                    source_id=b["id"],
+                    content=b["content"],
+                    world=b["metadata"].get("world", ""),
+                )
+                if i % 5 == 0:
+                    logger.info(
+                        f"Backfill {i + 1}/{len(candidates)} | "
+                        f"{b['id'][:6]} +{n}边"
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"Backfill bucket {b['id']} failed: {e}")
+            await asyncio.sleep(2)  # rate-limit LLM calls
+
+        logger.info(
+            f"Backfill complete: {len(candidates)} buckets / "
+            f"backfill 完成 {len(candidates)} 桶"
+        )
+    finally:
+        # Don't reset flag on success — we don't want repeat passes within same
+        # process. A server restart will re-trigger via _maybe_start_backfill.
+        pass
+
+
+def _maybe_start_backfill() -> None:
+    """Lazy start of the backfill loop on first MCP tool call."""
+    global _backfill_started
+    if _backfill_started:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return  # no event loop yet, will retry on next call
+    _backfill_started = True
+    loop.create_task(_startup_backfill_loop())
+    logger.info("Backfill task scheduled (T-30s) / backfill 已排程")
+
+
+# =============================================================
 # Helper: auto-edge inference for newly created bucket
 # 工具：新桶自动建边
 # Wraps embedding-similar + keyword-search candidate gathering, LLM relation
@@ -408,6 +491,7 @@ async def breath(
 ) -> str:
     """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿关系边召回邻居的跳数(默认1,0=不走关系边),目前 MVP 只走 1 跳出边,最多附加 5 条。"""
     await decay_engine.ensure_started()
+    _maybe_start_backfill()
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
 
@@ -714,6 +798,7 @@ async def hold(
 ) -> str:
     """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。image_base64=可选,base64编码的图片数据,会上传到R2并把URL插入正文(允许此条记忆带图)。image_filename=图片名称提示(默认image)。world=显式指定世界归属,留空时走全局current_world(日常聊天=空,角色扮演=具体世界名),"通用"表示跨世界设定。feel桶不归属世界。"""
     await decay_engine.ensure_started()
+    _maybe_start_backfill()
 
     # --- Input validation / 输入校验 ---
     if not content or not content.strip():
