@@ -223,12 +223,12 @@ async def _merge_or_create(
     arousal: float,
     name: str = "",
     world: str = "",
-) -> tuple[str, bool]:
+) -> tuple[str, str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
-    Returns (bucket_id_or_name, is_merged).
+    Returns (bucket_id, display_name, is_merged).
     检查是否有相似桶可合并，有则合并，无则新建。
-    返回 (桶ID或名称, 是否合并)。
+    返回 (桶ID, 显示名, 是否合并)。
     """
     # 合并候选必须在同一个 world 内（避免日常桶被角色记忆合并污染或反过来）。
     # world="" 即日常桶，只在日常桶之间合并；通用桶单独按通用合并。
@@ -274,7 +274,7 @@ async def _merge_or_create(
                     await embedding_engine.generate_and_store(bucket["id"], merged)
                 except Exception:
                     pass
-                return bucket["metadata"].get("name", bucket["id"]), True
+                return bucket["id"], bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
 
@@ -293,7 +293,97 @@ async def _merge_or_create(
         await embedding_engine.generate_and_store(bucket_id, content)
     except Exception:
         pass
-    return bucket_id, False
+    display = name if name else bucket_id
+    return bucket_id, display, False
+
+
+# =============================================================
+# Helper: auto-edge inference for newly created bucket
+# 工具：新桶自动建边
+# Wraps embedding-similar + keyword-search candidate gathering, LLM relation
+# inference via dehydrator, and add_relation calls. All failures swallowed —
+# never blocks hold.
+# 包装 embedding 邻居 + 关键词搜索拿候选，dehydrator LLM 判边，bucket_mgr 加边。
+# 所有失败吞掉——绝不阻塞 hold 主流程。
+# =============================================================
+async def _auto_infer_edges(
+    source_id: str, content: str, world: str = ""
+) -> int:
+    """Returns count of edges actually added."""
+    if not content or not content.strip():
+        return 0
+
+    # --- Gather candidates: vector neighbors + keyword search, dedup, exclude self ---
+    candidate_ids: list[str] = []
+    seen = {source_id}
+
+    try:
+        vec_hits = await embedding_engine.search_similar(content, top_k=8)
+        for bid, _score in vec_hits:
+            if bid not in seen:
+                candidate_ids.append(bid)
+                seen.add(bid)
+    except Exception as e:
+        logger.warning(f"Vector candidate fetch failed / 向量候选失败: {e}")
+
+    try:
+        kw_hits = await bucket_mgr.search(content, limit=5)
+        for b in kw_hits:
+            bid = b.get("id")
+            if bid and bid not in seen:
+                candidate_ids.append(bid)
+                seen.add(bid)
+    except Exception as e:
+        logger.warning(f"Keyword candidate fetch failed / 关键词候选失败: {e}")
+
+    if not candidate_ids:
+        return 0
+
+    # --- Build candidate list with dehydrated summaries (cap 8 to bound LLM cost) ---
+    candidates: list[dict] = []
+    wf_set = {(world or "").strip()}
+    for bid in candidate_ids[:8]:
+        b = await bucket_mgr.get(bid)
+        if not b:
+            continue
+        # Skip cross-world candidates: don't link daily↔roleplay buckets
+        # 跨世界候选跳过：避免日常↔角色扮演桶被自动连边
+        b_world = b["metadata"].get("world", "")
+        if not world_matches(b_world, wf_set):
+            continue
+        try:
+            summary = await dehydrator.dehydrate(
+                strip_wikilinks(b["content"]),
+                {k: v for k, v in b["metadata"].items() if k != "tags"},
+            )
+        except Exception:
+            summary = (b["content"] or "")[:200]
+        candidates.append({
+            "id": bid,
+            "name": b["metadata"].get("name", bid),
+            "summary": summary,
+        })
+
+    if not candidates:
+        return 0
+
+    edges = await dehydrator.infer_relations(content, candidates)
+    if not edges:
+        return 0
+
+    added = 0
+    for edge in edges:
+        ok = await bucket_mgr.add_relation(
+            source_id, edge["target"], edge["type"], edge.get("note", "")
+        )
+        if ok:
+            added += 1
+    if added:
+        logger.info(
+            f"Auto-edge inference added {added} edge(s) / 自动建边 {added} 条 "
+            f"from {source_id}"
+        )
+    return added
 
 
 # =============================================================
@@ -733,7 +823,7 @@ async def hold(
         return f"📌钉选→{bucket_id} {','.join(domain)}"
 
     # --- Step 2: merge or create / 合并或新建 ---
-    result_name, is_merged = await _merge_or_create(
+    bucket_id, result_name, is_merged = await _merge_or_create(
         content=content,
         tags=all_tags,
         importance=importance,
@@ -744,8 +834,20 @@ async def hold(
         world=effective_world,
     )
 
+    # --- Step 3: auto-edge inference (only on new buckets, never on merges) ---
+    # --- 自动建边：仅对新建桶，合并桶已经融进了相关性，不再加边避免冗余 ---
+    edge_count = 0
+    if not is_merged:
+        try:
+            edge_count = await _auto_infer_edges(
+                source_id=bucket_id, content=content, world=effective_world
+            )
+        except Exception as e:
+            logger.warning(f"Auto-edge inference failed / 自动建边失败: {e}")
+
     action = "合并→" if is_merged else "新建→"
-    return f"{action}{result_name} {','.join(domain)}"
+    edge_suffix = f" +{edge_count}边" if edge_count else ""
+    return f"{action}{result_name} {','.join(domain)}{edge_suffix}"
 
 
 # =============================================================
@@ -778,7 +880,7 @@ async def grow(content: str, world: str = "") -> str:
                 "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
                 "tags": [], "suggested_name": "",
             }
-        result_name, is_merged = await _merge_or_create(
+        _bid, result_name, is_merged = await _merge_or_create(
             content=content.strip(),
             tags=analysis.get("tags", []),
             importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
@@ -809,7 +911,7 @@ async def grow(content: str, world: str = "") -> str:
     # --- 逐条合并或新建（单条失败不影响其他）---
     for item in items:
         try:
-            result_name, is_merged = await _merge_or_create(
+            _bid, result_name, is_merged = await _merge_or_create(
                 content=item["content"],
                 tags=item.get("tags", []),
                 importance=item.get("importance", 5),

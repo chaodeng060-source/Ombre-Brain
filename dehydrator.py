@@ -166,6 +166,32 @@ BRIEFING_PROMPT = """你是 Claude 的开窗简报员。下面是从记忆库浮
 直接输出简报正文，不加额外说明。"""
 
 
+# --- Auto-edge inference prompt: infer 6-type relations between new bucket and candidates ---
+# --- 自动建边提示词：判断新桶与候选桶之间的 6 类关系 ---
+INFER_RELATIONS_PROMPT = """你是记忆桶关系判断器。给定一个"新桶"内容，以及一组"候选桶"摘要，判断新桶和哪些候选桶之间存在以下 6 类关系之一：
+
+- causes（触发/导致）：新桶事件导致了某个候选桶提到的事件/状态
+- contributes（贡献）：新桶为某个候选桶提供基础、能力、材料
+- improves（改善）：新桶改进/修复/优化了某个候选桶提到的问题
+- explains（解释）：新桶解释/澄清/补充了某个候选桶
+- updates（更新）：新桶更新/取代/补正了某个候选桶的旧信息
+- kin（同类）：新桶和某个候选桶属于同一主题/同类事件，无明确因果但天然连成一组
+
+判断铁律：
+1. 关系必须实质——只有真存在因果/补充/同类时才输出，绝不为了凑数
+2. 大多数情况应该输出 [] 空数组——只有很明确相关的才建边
+3. 同一候选桶最多输出一条边，挑最贴切的关系类型
+4. 总输出最多 3 条，按相关度从高到低
+5. target 必须是候选列表里的 bucket_id（不要编造）
+6. note 用一句话写清楚为什么是这个关系（≤30 字），便于后续审计
+
+输出格式（纯 JSON 数组，无其他内容）：
+[{"type": "causes", "target": "候选桶id", "note": "一句话原因"}]
+
+如无任何明确关系，输出 []
+"""
+
+
 class Dehydrator:
     """
     Data dehydrator + content analyzer.
@@ -684,3 +710,66 @@ class Dehydrator:
         if not response.choices:
             return ""
         return (response.choices[0].message.content or "").strip()
+
+    # ---------------------------------------------------------
+    # Auto-edge inference: judge 6-type relations between a new bucket and candidates
+    # 自动建边：判断新桶与一组候选桶之间的 6 类关系
+    # Failure-soft: any error returns [] so hold flow is never blocked.
+    # 失败软处理：出错返回 []，不阻塞 hold 主流程。
+    # ---------------------------------------------------------
+    async def infer_relations(
+        self, new_content: str, candidates: list[dict]
+    ) -> list[dict]:
+        """
+        candidates: [{"id": str, "name": str, "summary": str}]
+        Returns list of {"type", "target", "note"}, capped at 3, validated against
+        candidate id set. Empty list on any failure.
+        """
+        if not self.api_available or not candidates or not new_content.strip():
+            return []
+
+        try:
+            cand_text = "\n".join(
+                f"- id={c.get('id', '')} | name={c.get('name', '')} | "
+                f"{(c.get('summary') or '')[:200]}"
+                for c in candidates[:8]
+            )
+            user_msg = (
+                f"新桶内容：\n{new_content[:1500]}\n\n"
+                f"候选桶（最多 8 条）：\n{cand_text}"
+            )
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": INFER_RELATIONS_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=400,
+                temperature=0.1,
+            )
+            if not response.choices:
+                return []
+            raw = (response.choices[0].message.content or "").strip()
+            if not raw:
+                return []
+            cleaned = raw
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
+            parsed = json.loads(cleaned)
+            if not isinstance(parsed, list):
+                return []
+
+            cand_ids = {c.get("id") for c in candidates}
+            valid = []
+            for edge in parsed[:3]:
+                if not isinstance(edge, dict):
+                    continue
+                t = edge.get("type")
+                target = edge.get("target")
+                note = str(edge.get("note", ""))[:200]
+                if t and target and target in cand_ids:
+                    valid.append({"type": t, "target": target, "note": note})
+            return valid
+        except Exception as e:
+            logger.warning(f"infer_relations failed / 自动建边失败: {e}")
+            return []
