@@ -47,6 +47,25 @@ from utils import (
 logger = logging.getLogger("ombre_brain.bucket")
 
 
+def _bucket_in_time_range(bucket: dict, after: datetime = None, before: datetime = None) -> bool:
+    """
+    Check if a bucket's `created` timestamp falls within [after, before].
+    Buckets with unparseable timestamps are kept (conservative).
+    Either bound may be None (open-ended).
+    """
+    meta = bucket.get("metadata", {}) or {}
+    raw = meta.get("created") or meta.get("last_active") or ""
+    try:
+        created = datetime.fromisoformat(str(raw))
+    except (ValueError, TypeError):
+        return True
+    if after is not None and created < after:
+        return False
+    if before is not None and created > before:
+        return False
+    return True
+
+
 class BucketManager:
     """
     Memory bucket manager — entry point for all bucket CRUD operations.
@@ -473,6 +492,8 @@ class BucketManager:
         world_filter: list[str] = None,
         query_valence: float = None,
         query_arousal: float = None,
+        created_after: datetime = None,
+        created_before: datetime = None,
     ) -> list[dict]:
         if not query or not query.strip():
             return []
@@ -513,6 +534,14 @@ class BucketManager:
             candidates = [
                 b for b in candidates
                 if world_matches(b["metadata"].get("world", ""), wf_set)
+            ]
+
+        # --- Created time range filter ---
+        # --- 创建时间范围过滤：用 frontmatter 的 created 字段，无法解析的桶不过滤掉 ---
+        if created_after is not None or created_before is not None:
+            candidates = [
+                b for b in candidates
+                if _bucket_in_time_range(b, created_after, created_before)
             ]
 
         scored = []

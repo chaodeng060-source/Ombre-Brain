@@ -71,7 +71,7 @@ from r2_storage import r2_storage
 from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
     world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
-    rrf_fuse,
+    rrf_fuse, parse_relative_time,
 )
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -507,8 +507,10 @@ async def breath(
     max_results: int = 20,
     world: str = "",
     relation_depth: int = 1,
+    since: str = "",
+    until: str = "",
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿关系边召回邻居的跳数(默认1,0=不走关系边),目前 MVP 只走 1 跳出边,最多附加 5 条。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿关系边召回邻居的跳数(默认1,0=不走关系边),目前 MVP 只走 1 跳出边,最多附加 5 条。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。"""
     await decay_engine.ensure_started()
     _maybe_start_backfill()
     max_results = min(max_results, 50)
@@ -518,6 +520,11 @@ async def breath(
     # --- 解析 world filter：显式参数 > current_world ---
     world_filter = _resolve_world_filter(world, config.get("current_world", ""))
     wf_set = {str(w).strip() for w in world_filter} if world_filter is not None else None
+
+    # --- Resolve since/until once (shared by surfacing/feel/search modes) ---
+    # --- 解析时间范围：无法解析的参数静默忽略，不报错 ---
+    created_after = parse_relative_time(since) if since else None
+    created_before = parse_relative_time(until) if until else None
 
     # --- No args or empty query: surfacing mode (weight pool active push) ---
     # --- 无参数或空query：浮现模式（权重池主动推送）---
@@ -560,6 +567,15 @@ async def breath(
             unresolved = [
                 b for b in unresolved
                 if world_matches(b["metadata"].get("world", ""), wf_set)
+            ]
+
+        # --- Time range filter on surfacing pool ---
+        # --- 时间范围过滤：pinned/protected 不受影响（始终浮现），只过滤 unresolved 池 ---
+        if created_after is not None or created_before is not None:
+            from bucket_manager import _bucket_in_time_range
+            unresolved = [
+                b for b in unresolved
+                if _bucket_in_time_range(b, created_after, created_before)
             ]
 
         logger.info(
@@ -629,6 +645,9 @@ async def breath(
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
             feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
+            if created_after is not None or created_before is not None:
+                from bucket_manager import _bucket_in_time_range
+                feels = [f for f in feels if _bucket_in_time_range(f, created_after, created_before)]
             feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
             if not feels:
                 return "没有留下过 feel。"
@@ -659,6 +678,8 @@ async def breath(
             world_filter=world_filter,
             query_valence=q_valence,
             query_arousal=q_arousal,
+            created_after=created_after,
+            created_before=created_before,
         )
     except Exception as e:
         logger.error(f"Keyword search failed / 关键词检索失败: {e}")
@@ -702,6 +723,10 @@ async def breath(
                 continue
             if wf_set is not None and not world_matches(meta.get("world", ""), wf_set):
                 continue
+            if created_after is not None or created_before is not None:
+                from bucket_manager import _bucket_in_time_range
+                if not _bucket_in_time_range(b, created_after, created_before):
+                    continue
             if domain_filter:
                 b_domain = meta.get("domain", [])
                 if isinstance(b_domain, str):

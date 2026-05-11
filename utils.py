@@ -15,7 +15,7 @@ import uuid
 import yaml
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 # 6 类关系边：causes/contributes/improves/explains/updates 有向，kin 无向（仍单边记一次）
@@ -272,6 +272,66 @@ def count_tokens_approx(text: str) -> int:
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+# --- Time string parsing / 时间字符串解析 ---
+# Used by breath() since/until params and bucket_manager.search created range.
+# 给 breath since/until 和 bucket_manager.search created 范围过滤用。
+#
+# Supports three forms / 支持三种格式：
+#   - ISO 8601: "2026-05-01" / "2026-05-01T12:00:00"
+#   - Keywords: "now" / "today" (today 00:00) / "yesterday" (yesterday 00:00)
+#   - Relative offsets: "-7d" / "-3h" / "-30m" / "+1d" / "7d" (positive default)
+#
+# Natural language like "上周/三天前" intentionally NOT supported here.
+# Caller (LLM/Claude) translates natural language to one of the above forms.
+# 不做"上周/三天前"类中文 NLU，调用方（LLM）负责把人话翻成上面三种确定格式。
+
+_RELATIVE_TIME_RE = re.compile(r"([+-]?)(\d+)([dhm])")
+
+
+def parse_relative_time(s: str, reference: datetime = None):
+    """
+    Parse a time string into a datetime. Returns None on failure.
+    """
+    if not s or not isinstance(s, str):
+        return None
+    s = s.strip()
+    if not s:
+        return None
+
+    ref = reference if reference is not None else datetime.now()
+
+    low = s.lower()
+    if low == "now":
+        return ref
+    if low == "today":
+        return ref.replace(hour=0, minute=0, second=0, microsecond=0)
+    if low == "yesterday":
+        return (ref - timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+
+    m = _RELATIVE_TIME_RE.fullmatch(low)
+    if m:
+        sign, num, unit = m.groups()
+        try:
+            n = int(num)
+        except ValueError:
+            return None
+        if sign == "-":
+            n = -n
+        if unit == "d":
+            return ref + timedelta(days=n)
+        if unit == "h":
+            return ref + timedelta(hours=n)
+        if unit == "m":
+            return ref + timedelta(minutes=n)
+
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
 
 
 # --- World filter helpers / 世界轴过滤辅助 ---
