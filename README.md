@@ -233,8 +233,8 @@ Ombre Brain gives it persistent memory — not cold key-value storage, but a sys
 - **情感坐标打标 / Emotional tagging**: 每条记忆用 Russell 环形情感模型的 valence（效价）和 arousal（唤醒度）两个连续维度标记。不是"开心/难过"这种离散标签。
   Each memory is tagged with two continuous dimensions from Russell's circumplex model: valence and arousal. Not discrete labels like "happy/sad".
 
-- **双通道检索 / Dual-channel search**: 关键词模糊匹配 + 向量语义相似度并联检索。关键词通道用 rapidfuzz 做模糊匹配；语义通道用 embedding（默认 `gemini-embedding-001`，3072 维）计算 cosine similarity，能在"今天很累"这种没有精确关键词的查询里找到"身体不适"、"睡眠问题"等语义相关记忆。两个通道去重合并，token 预算截断。
-  Keyword fuzzy matching + vector semantic similarity in parallel. Keyword channel uses rapidfuzz; semantic channel uses embeddings (default `gemini-embedding-001`, 3072 dims) with cosine similarity — finds semantically related memories even without exact keyword matches (e.g. "feeling tired" → "health issues", "sleep problems"). Results are deduplicated and truncated by token budget.
+- **双通道检索 / Dual-channel search**: 关键词模糊匹配 + 向量语义相似度并联检索。关键词通道用 rapidfuzz 做模糊匹配；语义通道用 embedding（默认 `gemini-embedding-001`，3072 维）计算 cosine similarity，能在"今天很累"这种没有精确关键词的查询里找到"身体不适"、"睡眠问题"等语义相关记忆。两个通道用 RRF（Reciprocal Rank Fusion, k=60）融合排序，向量通道 sim>0.5 兜底挡高 cosine 噪音，token 预算截断。
+  Keyword fuzzy matching + vector semantic similarity in parallel. Keyword channel uses rapidfuzz; semantic channel uses embeddings (default `gemini-embedding-001`, 3072 dims) with cosine similarity — finds semantically related memories even without exact keyword matches (e.g. "feeling tired" → "health issues", "sleep problems"). The two ranked channels are fused via RRF (Reciprocal Rank Fusion, k=60), with a sim>0.5 floor on the vector side to filter high-cosine noise. Token budget truncated.
 
 - **自然遗忘 / Natural forgetting**: 改进版艾宾浩斯遗忘曲线。不活跃的记忆自动衰减归档，高情绪强度的记忆衰减更慢。
   Modified Ebbinghaus forgetting curve. Inactive memories naturally decay and archive. High-arousal memories decay slower.
@@ -300,10 +300,11 @@ breath(query="今天很累")
     │         │
     └────┬────┘
          │
-    去重 + 合并
+    RRF 融合排序 (k=60)
+    sim>0.5 兜底
     token 预算截断
          │
-    [语义关联] 标注 vector 来源
+    [语义关联] 标注 vector-only 来源
          │
     返回 ≤20 条结果
 ```
