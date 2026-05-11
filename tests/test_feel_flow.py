@@ -13,12 +13,13 @@
 
 import os
 import pytest
+import pytest_asyncio
 import asyncio
 
 # Feel flow tests use direct BucketManager calls, no LLM needed.
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def isolated_tools(test_config, tmp_path, monkeypatch):
     """
     Import server tools with config pointing to temp dir.
@@ -39,12 +40,6 @@ async def isolated_tools(test_config, tmp_path, monkeypatch):
     with open(config_path, "w") as f:
         yaml.dump(test_config, f)
     monkeypatch.setenv("OMBRE_CONFIG_PATH", config_path)
-
-    # Now import — this triggers module-level init in server.py
-    # We need to re-import with our patched env
-    import importlib
-    import utils
-    importlib.reload(utils)
 
     from bucket_manager import BucketManager
     from decay_engine import DecayEngine

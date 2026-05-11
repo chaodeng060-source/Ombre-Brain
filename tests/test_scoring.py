@@ -14,6 +14,7 @@
 
 import math
 import pytest
+import pytest_asyncio
 from datetime import datetime, timedelta
 
 from tests.dataset import DATASET
@@ -22,7 +23,7 @@ from tests.dataset import DATASET
 # ============================================================
 # Fixtures: populate temp buckets from dataset
 # ============================================================
-@pytest.fixture
+@pytest_asyncio.fixture
 async def populated_env(test_config, bucket_mgr, decay_eng):
     """Create all dataset buckets in temp dir, return (bucket_mgr, decay_eng, bucket_ids)."""
     import frontmatter as fm
