@@ -1204,6 +1204,67 @@ async def trace(
 
 
 # =============================================================
+# Tool: inspect — view full bucket content by ID
+# 工具：inspect — 按 ID 查看记忆桶完整内容（不脱水）
+# Bypasses surfacing/search; for engineering ops (merge, edit, audit)
+# where the caller already knows the ID and needs to see the raw content.
+# 绕过浮现/检索；用于已知 ID、需要看原文的工程操作（整合、编辑、审查）。
+# =============================================================
+@mcp.tool()
+async def inspect(bucket_id: str) -> str:
+    """按 ID 查看记忆桶完整内容（不脱水）。用于整合/编辑/审查时需看原文的工程操作。"""
+    if not bucket_id or not bucket_id.strip():
+        return "请提供有效的 bucket_id。"
+
+    bucket = await bucket_mgr.get(bucket_id.strip())
+    if not bucket:
+        return f"未找到记忆桶: {bucket_id}"
+
+    meta = bucket.get("metadata", {})
+    content = strip_wikilinks(bucket.get("content", ""))
+
+    try:
+        score = decay_engine.calculate_score(meta)
+    except Exception:
+        score = 0.0
+
+    name = meta.get("name") or "(未命名)"
+    domains = ",".join(meta.get("domain", []) if isinstance(meta.get("domain"), list) else [str(meta.get("domain", ""))])
+    tags = ",".join(meta.get("tags", []) if isinstance(meta.get("tags"), list) else [str(meta.get("tags", ""))])
+    val = meta.get("valence", 0.5)
+    aro = meta.get("arousal", 0.5)
+    imp = meta.get("importance", "?")
+    world = meta.get("world", "") or "(日常)"
+    flags = []
+    if meta.get("pinned"): flags.append("pinned")
+    if meta.get("protected"): flags.append("protected")
+    if meta.get("resolved"): flags.append("resolved")
+    if meta.get("digested"): flags.append("digested")
+    if meta.get("type"): flags.append(f"type={meta['type']}")
+    flag_str = ", ".join(flags) if flags else "无"
+
+    header = (
+        f"[bucket_id:{bucket['id']}] {name}\n"
+        f"主题: {domains}  标签: {tags}\n"
+        f"情感: V{val:.1f}/A{aro:.1f}  重要性: {imp}  当前分: {score:.2f}\n"
+        f"world: {world}  标志: {flag_str}\n"
+        f"创建: {meta.get('created_at', '?')}  更新: {meta.get('updated_at', '?')}"
+    )
+
+    relations = meta.get("relations") or []
+    rel_lines = []
+    if isinstance(relations, list):
+        for r in relations:
+            if isinstance(r, dict):
+                note = r.get("note", "")
+                note_str = f" ({note})" if note else ""
+                rel_lines.append(f"  - {r.get('type', '?')} → {r.get('target', '?')}{note_str}")
+    rel_block = ("\n\n关系边:\n" + "\n".join(rel_lines)) if rel_lines else ""
+
+    return f"{header}\n\n--- 正文 ---\n{content}{rel_block}"
+
+
+# =============================================================
 # Tool: backfill_relations — run auto-edge inference on existing buckets
 # 工具：backfill_relations — 给老桶批量自动建边
 # Hold-time auto-edge only fires on new buckets; this tool fills in the
