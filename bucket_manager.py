@@ -535,10 +535,14 @@ class BucketManager:
                 weight_sum = self.w_topic + self.w_emotion + self.w_time + self.w_importance
                 normalized = (total / weight_sum) * 100 if weight_sum > 0 else 0
 
-                if meta.get("resolved", False):
-                    normalized *= 0.3
-
+                # Threshold check uses raw (pre-penalty) score so resolved buckets
+                # remain reachable by keyword (penalty applied only to ranking).
+                # 阈值用原始分数判定，确保 resolved 桶在关键词命中时仍可被搜出
                 if normalized >= self.fuzzy_threshold:
+                    # Resolved buckets get ranking penalty (but still reachable by keyword)
+                    # 已解决的桶仅在排序时降权
+                    if meta.get("resolved", False):
+                        normalized *= 0.3
                     bucket["score"] = round(normalized, 2)
                     scored.append(bucket)
             except Exception as e:
