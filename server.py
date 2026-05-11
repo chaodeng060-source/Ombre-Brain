@@ -745,6 +745,7 @@ async def breath(
 
     # --- Relation expansion: 1-hop out-edges of matched buckets ---
     # --- 关系网召回：沿主结果桶的出边带 1 跳邻居（不进主排序，单独列在末尾）---
+    matched_ids = {b["id"] for b in matches}
     if relation_depth >= 1 and matches and token_used < max_tokens:
         seen_neighbors = set()
         neighbor_msgs = []
