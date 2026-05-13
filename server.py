@@ -236,6 +236,7 @@ async def _merge_or_create(
     arousal: float,
     name: str = "",
     world: str = "",
+    chord_tag: str = "",
 ) -> tuple[str, str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -273,8 +274,7 @@ async def _merge_or_create(
                 old_a = bucket["metadata"].get("arousal", 0.3)
                 merged_valence = round((old_v + valence) / 2, 2)
                 merged_arousal = round((old_a + arousal) / 2, 2)
-                await bucket_mgr.update(
-                    bucket["id"],
+                update_kwargs = dict(
                     content=merged,
                     tags=list(set(bucket["metadata"].get("tags", []) + tags)),
                     importance=max(bucket["metadata"].get("importance", 5), importance),
@@ -282,6 +282,11 @@ async def _merge_or_create(
                     valence=merged_valence,
                     arousal=merged_arousal,
                 )
+                # 合并时若新 hold 带了 chord_tag,以"最近一次为准"覆盖旧桶的色调
+                # Merge: if incoming hold carries a chord_tag, the newer takes precedence
+                if chord_tag and chord_tag.strip():
+                    update_kwargs["chord_tag"] = chord_tag.strip()
+                await bucket_mgr.update(bucket["id"], **update_kwargs)
                 # --- Update embedding after merge ---
                 try:
                     await embedding_engine.generate_and_store(bucket["id"], merged)
@@ -300,6 +305,7 @@ async def _merge_or_create(
         arousal=arousal,
         name=name or None,
         world=world,
+        chord_tag=chord_tag,
     )
     # --- Generate embedding for new bucket ---
     try:
@@ -864,8 +870,9 @@ async def hold(
     image_base64: str = "",
     image_filename: str = "image",
     world: str = "",
+    chord_tag: str = "",
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。image_base64=可选,base64编码的图片数据,会上传到R2并把URL插入正文(允许此条记忆带图)。image_filename=图片名称提示(默认image)。world=显式指定世界归属,留空时走全局current_world(日常聊天=空,角色扮演=具体世界名),"通用"表示跨世界设定。feel桶不归属世界。"""
+    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。image_base64=可选,base64编码的图片数据,会上传到R2并把URL插入正文(允许此条记忆带图)。image_filename=图片名称提示(默认image)。world=显式指定世界归属,留空时走全局current_world(日常聊天=空,角色扮演=具体世界名),"通用"表示跨世界设定。feel桶不归属世界。chord_tag=可选和弦记号串(如"Em(maj7) → A13#11 · 92bpm · f"),作为情绪色调索引,只用于跨窗口标记,不参与表达。feel桶不打chord_tag。merge时若新带chord_tag会覆盖旧桶。"""
     await decay_engine.ensure_started()
     _maybe_start_backfill()
 
@@ -969,6 +976,7 @@ async def hold(
             bucket_type="permanent",
             pinned=True,
             world=effective_world,
+            chord_tag=chord_tag,
         )
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
@@ -986,6 +994,7 @@ async def hold(
         arousal=arousal,
         name=suggested_name,
         world=effective_world,
+        chord_tag=chord_tag,
     )
 
     # --- Step 3: auto-edge inference (only on new buckets, never on merges) ---
@@ -1017,8 +1026,8 @@ async def hold(
 # 工具 3：grow — 生长，一天的碎片长成记忆
 # =============================================================
 @mcp.tool()
-async def grow(content: str, world: str = "") -> str:
-    """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。world留空走全局current_world。"""
+async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
+    """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。world留空走全局current_world。chord_tag=可选和弦记号串作为整段日记的色调,会打到所有子桶上(子桶共用同一色调)。"""
     await decay_engine.ensure_started()
 
     if not content or not content.strip():
@@ -1051,6 +1060,7 @@ async def grow(content: str, world: str = "") -> str:
             arousal=analysis.get("arousal", 0.3),
             name=analysis.get("suggested_name", ""),
             world=effective_world,
+            chord_tag=chord_tag,
         )
         action = "合并" if is_merged else "新建"
         return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
@@ -1082,6 +1092,7 @@ async def grow(content: str, world: str = "") -> str:
                 arousal=item.get("arousal", 0.3),
                 name=item.get("name", ""),
                 world=effective_world,
+                chord_tag=chord_tag,
             )
 
             if is_merged:
@@ -1120,11 +1131,12 @@ async def trace(
     digested: int = -1,
     content: str = "",
     world: str = "",
+    chord_tag: str = "",
     delete: bool = False,
     add_relation: str = "",
     remove_relation: str = "",
 ) -> str:
-    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。world=改世界归属(传"(none)"清空回日常),只传需改的,-1或空=不改。add_relation格式"type:target_id"或"type:target_id:note",6类:causes/contributes/improves/explains/updates/kin。remove_relation格式"target_id"或"type:target_id"。"""
+    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。world=改世界归属(传"(none)"清空回日常),只传需改的,-1或空=不改。chord_tag=改情绪色调和弦串(传"(none)"清空),空=不改。add_relation格式"type:target_id"或"type:target_id:note",6类:causes/contributes/improves/explains/updates/kin。remove_relation格式"target_id"或"type:target_id"。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -1166,6 +1178,10 @@ async def trace(
         w = world.strip()
         # sentinel "(none)" → 清空 world 字段（挪回日常）
         updates["world"] = "" if w == "(none)" else w
+    if chord_tag:
+        ct = chord_tag.strip()
+        # sentinel "(none)" → 清空 chord_tag 字段
+        updates["chord_tag"] = "" if ct == "(none)" else ct
     if content:
         updates["content"] = content
 
@@ -1260,6 +1276,7 @@ async def inspect(bucket_id: str) -> str:
     aro = meta.get("arousal", 0.5)
     imp = meta.get("importance", "?")
     world = meta.get("world", "") or "(日常)"
+    chord = meta.get("chord_tag", "") or ""
     flags = []
     if meta.get("pinned"): flags.append("pinned")
     if meta.get("protected"): flags.append("protected")
@@ -1273,7 +1290,8 @@ async def inspect(bucket_id: str) -> str:
         f"主题: {domains}  标签: {tags}\n"
         f"情感: V{val:.1f}/A{aro:.1f}  重要性: {imp}  当前分: {score:.2f}\n"
         f"world: {world}  标志: {flag_str}\n"
-        f"创建: {meta.get('created_at', '?')}  更新: {meta.get('updated_at', '?')}"
+        + (f"chord_tag: {chord}\n" if chord else "")
+        + f"创建: {meta.get('created_at', '?')}  更新: {meta.get('updated_at', '?')}"
     )
 
     relations = meta.get("relations") or []

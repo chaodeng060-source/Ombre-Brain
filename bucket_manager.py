@@ -131,6 +131,7 @@ class BucketManager:
         pinned: bool = False,
         protected: bool = False,
         world: str = "",
+        chord_tag: str = None,
     ) -> str:
         bucket_id = generate_bucket_id()
         domain = domain or ["未分类"]
@@ -172,6 +173,11 @@ class BucketManager:
         # world 字段仅在非空时写入（保持日常桶 frontmatter 简洁）
         if world and world.strip():
             metadata["world"] = world.strip()
+        # chord_tag 字段：和弦记号串作为情绪坐标索引,仅在非空时写入
+        # chord_tag: chord-notation string as emotion-coordinate index; written only if non-empty
+        # 不参与表达,仅作跨窗口标记。格式示例: "Em(maj7) → A13#11 · 92bpm · f"
+        if chord_tag and chord_tag.strip():
+            metadata["chord_tag"] = chord_tag.strip()
 
         # Defensive: ensure no 'content' key sneaks into metadata kwargs
         # 防御性：确保 metadata 里没有 content 键，否则会和 body 撞 Post() 参数
