@@ -1610,6 +1610,67 @@ async def dream() -> str:
 
 
 # =============================================================
+# Helper: split recent buckets into "current window" vs "prior windows"
+# 辅助函数:把最近活跃桶按时间 gap 拆成「上一窗口」+「再之前」两组
+#
+# Pure function (no side effects, no async); easy to unit-test.
+# 纯函数,易测试。
+# =============================================================
+def _split_recent_by_time_gap(
+    buckets: list,
+    gap_threshold_seconds: int = 3600,
+    window_cap: int = 5,
+    prior_cap: int = 3,
+) -> tuple[list, list]:
+    """
+    Split a list of buckets (already sorted by last_active desc) into:
+      - recent_window: buckets from the most recent contiguous time cluster
+      - prior_windows: buckets from earlier clusters
+
+    Detection: find the largest gap between consecutive last_active timestamps.
+    If max_gap >= gap_threshold_seconds, that gap is the window boundary.
+    Otherwise treat the whole list as one continuous window.
+
+    把按 last_active 降序排好的桶拆成两组:
+      - recent_window: 上一窗口(最新一段连续时间团)
+      - prior_windows: 再之前(更早的时间团)
+    用最大时间 gap 检测窗口边界,gap 不够阈值就全归 recent_window。
+    """
+    def _parse_ts(s: str):
+        if not s:
+            return None
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    ts_pairs = [
+        (_parse_ts(b["metadata"].get("last_active", "")), b) for b in buckets
+    ]
+    ts_pairs = [(t, b) for t, b in ts_pairs if t is not None]
+
+    if not ts_pairs:
+        return ([], [])
+    if len(ts_pairs) == 1:
+        return ([ts_pairs[0][1]], [])
+
+    gaps = [
+        ((ts_pairs[i][0] - ts_pairs[i + 1][0]).total_seconds(), i)
+        for i in range(len(ts_pairs) - 1)
+    ]
+    max_gap, split_idx = max(gaps, key=lambda x: x[0])
+
+    if max_gap >= gap_threshold_seconds:
+        recent_window = [b for _, b in ts_pairs[: split_idx + 1]][:window_cap]
+        prior_windows = [b for _, b in ts_pairs[split_idx + 1 :]][:prior_cap]
+    else:
+        recent_window = [b for _, b in ts_pairs][:window_cap]
+        prior_windows = []
+
+    return (recent_window, prior_windows)
+
+
+# =============================================================
 # Tool 7: briefing — Open-window handoff briefing
 # 工具 7：briefing — 开窗交接简报
 #
@@ -1666,8 +1727,10 @@ async def briefing(
     )
     top_unresolved = unresolved_pool[:10] if not pinned_only else []
 
-    # --- Recently active (top 5 by last_active), de-duped against above ---
-    # --- 最近活跃 top 5(按 last_active),与上面去重 ---
+    # --- Recently active: split by largest time-gap into current vs prior windows ---
+    # --- 最近活跃:按最大时间 gap 拆成「上一窗口」(主体情绪源)+「再之前」(过渡背景) ---
+    # 解决"今早吵架桶和昨晚和弦桶一起进、权重相同"的问题：让 LLM 看到时间梯度，
+    # 末尾「现在的体感」取自上一窗口而非更早窗口的紧绷。
     seen_ids = {b["id"] for b in pinned} | {b["id"] for b in top_unresolved}
     recent_pool = [
         b for b in all_buckets
@@ -1678,11 +1741,14 @@ async def briefing(
         key=lambda b: b["metadata"].get("last_active", ""),
         reverse=True,
     )
-    recent_active = recent_pool[:5] if not pinned_only else []
+    recent_window: list = []
+    prior_windows: list = []
+    if not pinned_only:
+        recent_window, prior_windows = _split_recent_by_time_gap(recent_pool[:10])
 
     time_header = _now_bj_header()
 
-    if not pinned and not top_unresolved and not recent_active:
+    if not pinned and not top_unresolved and not recent_window and not prior_windows:
         return f"# {time_header}\n\n记忆库当前空闲，没有可简报的素材。"
 
     # --- Build raw material: name + meta + truncated content per bucket ---
@@ -1715,10 +1781,15 @@ async def briefing(
             "=== 高权重未解决 ===\n"
             + "\n\n".join(_format_bucket(b, "unresolved") for b in top_unresolved)
         )
-    if recent_active:
+    if recent_window:
         sections.append(
-            "=== 最近活跃 ===\n"
-            + "\n\n".join(_format_bucket(b, "recent") for b in recent_active)
+            "=== 上一窗口 (主体情绪源) ===\n"
+            + "\n\n".join(_format_bucket(b, "recent_window") for b in recent_window)
+        )
+    if prior_windows:
+        sections.append(
+            "=== 再之前 (过渡背景) ===\n"
+            + "\n\n".join(_format_bucket(b, "prior_window") for b in prior_windows)
         )
 
     # Prepend time header to raw material so the LLM sees the actual time
@@ -1738,7 +1809,8 @@ async def briefing(
     # --- Stats footer for visibility ---
     stats = (
         f"\n\n---\n"
-        f"_素材:{len(pinned)}钉选 / {len(top_unresolved)}未解决 / {len(recent_active)}最近活跃 "
+        f"_素材:{len(pinned)}钉选 / {len(top_unresolved)}未解决 / "
+        f"{len(recent_window)}上一窗口 / {len(prior_windows)}再之前 "
         f"→ 简报{len(result)}字 (~{count_tokens_approx(result)}token)_"
     )
 
