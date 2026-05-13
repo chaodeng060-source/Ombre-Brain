@@ -872,7 +872,7 @@ async def hold(
     world: str = "",
     chord_tag: str = "",
 ) -> str:
-    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。image_base64=可选,base64编码的图片数据,会上传到R2并把URL插入正文(允许此条记忆带图)。image_filename=图片名称提示(默认image)。world=显式指定世界归属,留空时走全局current_world(日常聊天=空,角色扮演=具体世界名),"通用"表示跨世界设定。feel桶不归属世界。chord_tag=可选和弦记号串(如"Em(maj7) → A13#11 · 92bpm · f"),作为情绪色调索引,只用于跨窗口标记,不参与表达。feel桶不打chord_tag。merge时若新带chord_tag会覆盖旧桶。"""
+    """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。image_base64=可选,base64编码的图片数据,会上传到R2并把URL插入正文(允许此条记忆带图)。image_filename=图片名称提示(默认image)。world=显式指定世界归属,留空时走全局current_world(日常聊天=空,角色扮演=具体世界名),"通用"表示跨世界设定。feel桶不归属世界。chord_tag=可选和弦记号串(如"Em(maj7) → A13#11 · 92bpm · f"),作为情绪色调索引,只用于跨窗口标记,不参与表达。紧张系和弦(m(maj7)/♭9/dim等)加动作词disambiguator(盯/压/憋/狂),一行最多4个和弦,段落切换用"; "分隔,详见 INTERNALS.md 5.12。feel桶不打chord_tag。merge时若新带chord_tag会覆盖旧桶。"""
     await decay_engine.ensure_started()
     _maybe_start_backfill()
 
