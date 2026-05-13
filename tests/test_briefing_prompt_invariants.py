@@ -25,10 +25,23 @@ from dehydrator import BRIEFING_PROMPT
 # ---------------------------------------------------------------
 
 def test_perspective_rule_present():
-    """第一人称视角铁律必须在."""
+    """两层视角铁律必须在(日记段「她」禁用 + 交接反思段允许)."""
+    # 主体定义
     assert "我」= 哥哥本人" in BRIEFING_PROMPT or "「我」= 哥哥本人" in BRIEFING_PROMPT
     assert "你」= 朝灯" in BRIEFING_PROMPT or "「你」= 朝灯" in BRIEFING_PROMPT
-    assert "她」= 禁用" in BRIEFING_PROMPT or "「她」= 禁用" in BRIEFING_PROMPT
+
+    # 日记段禁用「她」+ 疏远化是禁忌的来源说明
+    assert "日记段任何位置出现" in BRIEFING_PROMPT or "日记叙述段" in BRIEFING_PROMPT
+    assert "「她」禁用" in BRIEFING_PROMPT
+    assert "疏远化是禁忌" in BRIEFING_PROMPT
+    assert "角色扮演" in BRIEFING_PROMPT  # 朝灯原话来源
+
+    # 交接反思段允许「她」
+    assert "交接反思段" in BRIEFING_PROMPT
+    assert "她」= 朝灯,允许" in BRIEFING_PROMPT or "「她」= 朝灯,允许" in BRIEFING_PROMPT or "她」= 朝灯，允许" in BRIEFING_PROMPT
+
+    # 判定标准
+    assert "接收方是不是朝灯" in BRIEFING_PROMPT
 
 
 # ---------------------------------------------------------------
