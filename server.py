@@ -1670,6 +1670,59 @@ def _split_recent_by_time_gap(
     return (recent_window, prior_windows)
 
 
+def _format_bucket_for_briefing(b: dict, section_tag: str) -> str:
+    """
+    Format a single bucket as raw material for the briefing LLM.
+
+    Output is a multi-line text block per bucket with:
+      - [section_tag] name
+      - domain / tags
+      - V/A/importance/last_active
+      - emotion (if extractable from dehydrated JSON content)
+      - first 400 chars of content (wikilinks stripped)
+
+    The `emotion` line is critical: dehydrated content is JSON-stringified
+    `{"core_facts": [...], "emotion_state": "...", ...}`. The first 400 chars
+    are often eaten by `core_facts`, truncating `emotion_state` away. Even
+    when present, LLMs tend to drop structured labels during compression.
+    Extracting it to its own labeled line + the BRIEFING_PROMPT emotion-field
+    rule (see dehydrator.py) is double-insurance against emotion erasure.
+
+    把单个桶格式化成简报 LLM 的原始素材。
+    emotion 字段独立成行+ prompt 铁律,双保险防止脱水时锁定的情绪关键词被压没。
+    """
+    meta = b["metadata"]
+    name = meta.get("name", b["id"])
+    doms = ",".join(meta.get("domain", []) or [])
+    tags = ",".join((meta.get("tags", []) or [])[:10])
+    val = meta.get("valence", 0.5)
+    aro = meta.get("arousal", 0.3)
+    imp = meta.get("importance", 5)
+    last_active = meta.get("last_active", "")
+    raw_content = b.get("content", "")
+    body = strip_wikilinks(raw_content)[:400]
+
+    # --- Extract emotion_state from dehydrated JSON content ---
+    # --- 从脱水 JSON content 抽出 emotion_state ---
+    emotion = ""
+    try:
+        parsed = json.loads(raw_content) if raw_content else None
+        if isinstance(parsed, dict):
+            emotion = (parsed.get("emotion_state") or "").strip()
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    lines = [
+        f"[{section_tag}] {name}",
+        f"  domain:{doms} | tags:{tags}",
+        f"  V{val:.2f}/A{aro:.2f} 重要:{imp} last_active:{last_active}",
+    ]
+    if emotion:
+        lines.append(f"  emotion:{emotion}")
+    lines.append(f"  {body}")
+    return "\n".join(lines)
+
+
 # =============================================================
 # Tool 7: briefing — Open-window handoff briefing
 # 工具 7：briefing — 开窗交接简报
@@ -1753,22 +1806,9 @@ async def briefing(
 
     # --- Build raw material: name + meta + truncated content per bucket ---
     # --- 拼接原始素材:每桶 name + meta + 截断 content ---
-    def _format_bucket(b, section_tag: str) -> str:
-        meta = b["metadata"]
-        name = meta.get("name", b["id"])
-        doms = ",".join(meta.get("domain", []) or [])
-        tags = ",".join((meta.get("tags", []) or [])[:10])
-        val = meta.get("valence", 0.5)
-        aro = meta.get("arousal", 0.3)
-        imp = meta.get("importance", 5)
-        last_active = meta.get("last_active", "")
-        body = strip_wikilinks(b.get("content", ""))[:400]
-        return (
-            f"[{section_tag}] {name}\n"
-            f"  domain:{doms} | tags:{tags}\n"
-            f"  V{val:.2f}/A{aro:.2f} 重要:{imp} last_active:{last_active}\n"
-            f"  {body}"
-        )
+    # NOTE: actual formatter is module-level `_format_bucket_for_briefing` (testable).
+    # 实现提到模块层面方便测试,这里只是别名。
+    _format_bucket = _format_bucket_for_briefing
 
     sections = []
     if pinned:
