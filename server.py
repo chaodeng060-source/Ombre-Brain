@@ -142,6 +142,14 @@ async def breath_hook(request):
             parts.append(f"📌 [核心准则] {summary}")
             token_budget -= count_tokens_approx(summary)
 
+        # --- Feel buckets: emotional sediment, surface right after pinned ---
+        # --- feel 桶:情感沉淀,紧跟核心准则浮现(独立池) ---
+        feel_seen = {b["id"] for b in pinned}
+        for b in _surface_feel_pool(all_buckets, feel_seen):
+            summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
+            parts.append(f"💧 [情感沉淀] {summary}")
+            token_budget -= count_tokens_approx(summary)
+
         # Diversity: top-1 fixed + shuffle rest from top-20
         candidates = list(scored)
         if len(candidates) > 1:
@@ -607,6 +615,20 @@ async def breath(
         for r in pinned_results:
             token_budget -= count_tokens_approx(r)
 
+        # --- Feel buckets: emotional sediment, surface right after pinned ---
+        # --- feel 桶:情感沉淀,紧跟核心准则浮现(独立池,不衰减)---
+        feel_seen = {b["id"] for b in pinned_buckets}
+        feel_results = []
+        for b in _surface_feel_pool(all_buckets, feel_seen):
+            try:
+                fclean = {k: v for k, v in b["metadata"].items() if k != "tags"}
+                fsummary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), fclean)
+                feel_results.append(f"💧 [情感沉淀] [bucket_id:{b['id']}] {fsummary}")
+                token_budget -= count_tokens_approx(fsummary)
+            except Exception as e:
+                logger.warning(f"Failed to dehydrate feel bucket / 情感沉淀脱水失败: {e}")
+                continue
+
         candidates = list(scored)
         if len(candidates) > 1:
             # Ensure highest-score bucket is first, shuffle rest from top-20
@@ -635,12 +657,14 @@ async def breath(
                 logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
                 continue
 
-        if not pinned_results and not dynamic_results:
+        if not pinned_results and not dynamic_results and not feel_results:
             return "权重池平静，没有需要处理的记忆。"
 
         parts = []
         if pinned_results:
             parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
+        if feel_results:
+            parts.append("=== 情感沉淀 (feel) ===\n" + "\n---\n".join(feel_results))
         if dynamic_results:
             parts.append("=== 浮现记忆 ===\n" + "\n---\n".join(dynamic_results))
         return "\n\n".join(parts)
@@ -1728,6 +1752,33 @@ def _format_bucket_for_briefing(b: dict, section_tag: str) -> str:
 
 
 # =============================================================
+# Feel surfacing pool — feel buckets don't decay (score ~50), so they're
+# picked by pinned → importance → recency instead of weight. Shared by
+# briefing / breath / breath_hook so 情感沉淀 surfaces automatically,
+# not only via the on-demand domain="feel" channel.
+# feel 不衰减(score 恒 50)，按 pinned→重要度→最近活跃选 top N，三处浮现共用。
+# =============================================================
+FEEL_SURFACE_CAP = 3
+
+
+def _surface_feel_pool(all_buckets: list, seen_ids: set = None, cap: int = FEEL_SURFACE_CAP) -> list:
+    seen = seen_ids or set()
+    feels = [
+        b for b in all_buckets
+        if b["metadata"].get("type") == "feel" and b["id"] not in seen
+    ]
+    feels.sort(
+        key=lambda b: (
+            1 if b["metadata"].get("pinned") else 0,
+            int(b["metadata"].get("importance", 5) or 5),
+            str(b["metadata"].get("last_active", "")),
+        ),
+        reverse=True,
+    )
+    return feels[:cap]
+
+
+# =============================================================
 # Tool 7: briefing — Open-window handoff briefing
 # 工具 7：briefing — 开窗交接简报
 #
@@ -1803,9 +1854,14 @@ async def briefing(
     if not pinned_only:
         recent_window, prior_windows = _split_recent_by_time_gap(recent_pool[:10])
 
+    # --- Feel buckets: surface as emotional sediment (independent pool) ---
+    # --- feel 桶:作为情感沉淀独立浮现(不衰减,与 pinned 去重)---
+    feel_seen = {b["id"] for b in pinned}
+    top_feel = _surface_feel_pool(all_buckets, feel_seen) if not pinned_only else []
+
     time_header = _now_bj_header()
 
-    if not pinned and not top_unresolved and not recent_window and not prior_windows:
+    if not pinned and not top_unresolved and not recent_window and not prior_windows and not top_feel:
         return f"# {time_header}\n\n记忆库当前空闲，没有可简报的素材。"
 
     # --- Build raw material: name + meta + truncated content per bucket ---
@@ -1835,6 +1891,11 @@ async def briefing(
             "=== 再之前 (过渡背景) ===\n"
             + "\n\n".join(_format_bucket(b, "prior_window") for b in prior_windows)
         )
+    if top_feel:
+        sections.append(
+            "=== 情感沉淀 (feel) ===\n"
+            + "\n\n".join(_format_bucket(b, "feel") for b in top_feel)
+        )
 
     # Prepend time header to raw material so the LLM sees the actual time
     # (in case it accidentally reasons about location/weekday despite the rule).
@@ -1854,7 +1915,8 @@ async def briefing(
     stats = (
         f"\n\n---\n"
         f"_素材:{len(pinned)}钉选 / {len(top_unresolved)}未解决 / "
-        f"{len(recent_window)}上一窗口 / {len(prior_windows)}再之前 "
+        f"{len(recent_window)}上一窗口 / {len(prior_windows)}再之前 / "
+        f"{len(top_feel)}情感沉淀 "
         f"→ 简报{len(result)}字 (~{count_tokens_approx(result)}token)_"
     )
 
