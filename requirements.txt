@@ -24,9 +24,10 @@ jieba>=0.42.1
 # 异步 HTTP 客户端（应用层保活 ping）
 httpx>=0.27.0
 
-# 向量相似度计算 (导入模式/聚类)
+# 数值计算（仅 import_memory.py 旧数据导入用）
+# 注：embedding 的 cosine 相似度在 embedding_engine.py 用纯 math 手算，
+# 不依赖 sklearn/scipy；删掉 scikit-learn 省构建内存（Zeabur 2C4GB 装 scipy 35MB 会 OOM）。
 numpy>=1.24.0
-scikit-learn>=1.2.0
 
 # Cloudflare R2 对象存储 (S3 兼容 API)，用于图片上传
 boto3>=1.34.0
