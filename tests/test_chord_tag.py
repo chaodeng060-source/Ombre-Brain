@@ -94,7 +94,7 @@ async def test_chord_tag_persists_in_frontmatter(mgr, tmp_path):
     bid = await mgr.create(content="持久化测试", chord_tag=chord)
     file_path = mgr._find_bucket_file(bid)
     assert file_path is not None
-    with open(file_path) as f:
+    with open(file_path, encoding="utf-8") as f:
         post = frontmatter.load(f)
     assert post.get("chord_tag") == chord
 
