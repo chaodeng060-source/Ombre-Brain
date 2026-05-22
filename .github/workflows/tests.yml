@@ -28,7 +28,7 @@ jobs:
           pip install pytest pytest-asyncio
 
       - name: Run local tests (no API key needed)
-        run: python -m pytest tests/test_scoring.py tests/test_feel_flow.py -v --asyncio-mode=auto
+        run: python -m pytest tests/test_scoring.py tests/test_feel_flow.py tests/test_pr1_noise_tools.py -v --asyncio-mode=auto
 
       - name: Run LLM quality tests
         if: env.OMBRE_API_KEY != ''

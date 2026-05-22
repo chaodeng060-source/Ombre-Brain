@@ -1111,17 +1111,18 @@ async def breath(
     # --- Relation expansion: 1-hop out-edges of matched buckets ---
     # --- 关系网召回：沿主结果桶的出边带 1 跳邻居（不进主排序，单独列在末尾）---
     matched_ids = {b["id"] for b in matches}
-    if relation_depth >= 1 and matches and token_used < max_tokens:
+    remaining_relation_slots = max(0, max_results - len(result_ids))
+    if relation_depth >= 1 and matches and token_used < max_tokens and remaining_relation_slots:
         seen_neighbors = set()
         neighbor_msgs = []
         for bucket in matches:
-            if len(neighbor_msgs) >= 5 or token_used >= max_tokens:
+            if len(neighbor_msgs) >= min(5, remaining_relation_slots) or token_used >= max_tokens:
                 break
             relations = bucket["metadata"].get("relations") or []
             if not isinstance(relations, list):
                 continue
             for r in relations:
-                if len(neighbor_msgs) >= 5 or token_used >= max_tokens:
+                if len(neighbor_msgs) >= min(5, remaining_relation_slots) or token_used >= max_tokens:
                     break
                 if not isinstance(r, dict):
                     continue
@@ -1180,7 +1181,7 @@ async def breath(
                 and (wf_set is None or world_matches(b["metadata"].get("world", ""), wf_set))
             ]
             if low_weight:
-                remaining_slots = max(0, max_results - len(results))
+                remaining_slots = max(0, max_results - len(result_ids))
                 drifted = random.sample(low_weight, min(random.randint(1, 3), len(low_weight), remaining_slots))
                 drift_results = []
                 for b in drifted:

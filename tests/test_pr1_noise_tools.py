@@ -161,6 +161,35 @@ async def test_breath_uses_recall_pool_caps_output_and_dedups_session(tmp_path, 
 
 
 @pytest.mark.asyncio
+async def test_breath_relation_neighbors_do_not_exceed_max_results(tmp_path, monkeypatch):
+    buckets = [
+        _bucket("a", "alpha"),
+        _bucket("b", "beta"),
+        _bucket("c", "gamma"),
+    ]
+    buckets[0]["metadata"]["relations"] = [{"type": "kin", "target": "c"}]
+    fake_mgr = FakeBucketMgr(buckets)
+    monkeypatch.setitem(server.config, "buckets_dir", str(tmp_path))
+    monkeypatch.setitem(server.config, "random_surfacing", {})
+    monkeypatch.setattr(server, "bucket_mgr", fake_mgr)
+    monkeypatch.setattr(server, "decay_engine", FakeDecay())
+    monkeypatch.setattr(server, "dehydrator", FakeDehydrator())
+    monkeypatch.setattr(server, "embedding_engine", FakeEmbedding())
+    monkeypatch.setattr(server, "_backfill_started", True)
+
+    result = await server.breath(
+        query="工程",
+        max_results=2,
+        relation_depth=1,
+        include_images=False,
+    )
+
+    assert "[bucket_id:a]" in result
+    assert "[bucket_id:b]" in result
+    assert "[bucket_id:c]" not in result
+
+
+@pytest.mark.asyncio
 async def test_ds_filter_stub_preserves_order_and_caps():
     buckets = [_bucket("a", "A"), _bucket("b", "B"), _bucket("c", "C")]
     selected = await server._ds_filter_candidates(
