@@ -36,8 +36,12 @@ import json
 import random
 import logging
 import asyncio
+import base64
+import mimetypes
+import re
 import httpx
 import jieba
+from urllib.parse import urlparse
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
 
@@ -61,6 +65,7 @@ jieba.initialize()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ImageContent, TextContent
 
 from bucket_manager import BucketManager
 from dehydrator import Dehydrator
@@ -94,6 +99,282 @@ mcp = FastMCP(
     host="0.0.0.0",
     port=8000,
 )
+
+
+BREATH_RECALL_POOL_SIZE = 20
+BREATH_DEFAULT_MAX_RESULTS = 8
+BREATH_DEFAULT_MAX_TOKENS = 6000
+PULSE_NAV_SUMMARY_CHARS = 110
+MCP_IMAGE_MAX_ITEMS = 3
+MCP_IMAGE_MAX_BYTES = 900_000
+SESSION_SURFACE_DIRNAME = ".session_surface"
+IMAGE_MARKDOWN_RE = re.compile(r"!\[([^\]]*)\]\((https?://[^\s)]+)\)")
+
+
+def _bucket_icon(meta: dict) -> str:
+    if meta.get("pinned") or meta.get("protected"):
+        return "📌"
+    if meta.get("type") == "permanent":
+        return "📦"
+    if meta.get("type") == "feel":
+        return "🫧"
+    if meta.get("type") == "archived":
+        return "🗄️"
+    if meta.get("resolved", False):
+        return "✅"
+    return "💭"
+
+
+def _collapse_ws(text: str) -> str:
+    return " ".join(str(text or "").split())
+
+
+def _clip_text(text: str, max_chars: int) -> str:
+    text = _collapse_ws(text)
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
+
+
+def _strip_markdown_images(text: str) -> str:
+    return IMAGE_MARKDOWN_RE.sub("", text or "")
+
+
+def _bucket_navigator_summary(bucket: dict, max_chars: int = PULSE_NAV_SUMMARY_CHARS) -> str:
+    raw = bucket.get("content", "") or ""
+    summary = ""
+
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            summary = str(parsed.get("summary") or "").strip()
+            if not summary:
+                facts = parsed.get("core_facts") or []
+                if isinstance(facts, list) and facts:
+                    summary = str(facts[0] or "").strip()
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    if not summary:
+        plain = strip_wikilinks(_strip_markdown_images(raw))
+        for line in plain.splitlines():
+            if line.strip():
+                summary = line.strip()
+                break
+
+    return _clip_text(summary or "无摘要，inspect 查看原文", max_chars)
+
+
+def _format_pulse_line(bucket: dict, score: float, full: bool = False) -> str:
+    meta = bucket.get("metadata", {})
+    icon = _bucket_icon(meta)
+    domains = ",".join(meta.get("domain", []) or [])
+    val = meta.get("valence", 0.5)
+    aro = meta.get("arousal", 0.3)
+    resolved_tag = " [已解决]" if meta.get("resolved", False) else ""
+
+    if full:
+        return (
+            f"{icon} [{meta.get('name', bucket['id'])}]{resolved_tag} "
+            f"bucket_id:{bucket['id']} "
+            f"主题:{domains} "
+            f"情感:V{val:.1f}/A{aro:.1f} "
+            f"重要:{meta.get('importance', '?')} "
+            f"权重:{score:.2f} "
+            f"标签:{','.join(meta.get('tags', []) or [])}"
+        )
+
+    summary = _bucket_navigator_summary(bucket)
+    return (
+        f"{icon} [{meta.get('name', bucket['id'])}]{resolved_tag} "
+        f"bucket_id:{bucket['id']} "
+        f"主题:{domains or '未分类'} "
+        f"重要:{meta.get('importance', '?')} "
+        f"权重:{score:.2f} "
+        f"摘要:{summary} "
+        f"inspect:{bucket['id']}"
+    )
+
+
+def _session_seen_path(session_id: str) -> str:
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", session_id.strip())[:80]
+    safe_id = safe_id.strip("._-") or "default"
+    base = os.path.join(config["buckets_dir"], SESSION_SURFACE_DIRNAME)
+    return os.path.join(base, f"{safe_id}.json")
+
+
+def _load_session_seen_ids(session_id: str) -> set[str]:
+    if not session_id or not session_id.strip():
+        return set()
+    path = _session_seen_path(session_id)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return {str(x) for x in data if x}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return set()
+
+
+def _remember_session_seen_ids(session_id: str, bucket_ids: list[str]) -> None:
+    if not session_id or not session_id.strip() or not bucket_ids:
+        return
+    seen = _load_session_seen_ids(session_id)
+    seen.update(str(x) for x in bucket_ids if x)
+    path = _session_seen_path(session_id)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(sorted(seen), f, ensure_ascii=False)
+    except OSError as e:
+        logger.warning(f"Session surface dedup write failed / 会话去重写入失败: {e}")
+
+
+def _filter_session_seen(buckets: list[dict], session_id: str) -> list[dict]:
+    seen = _load_session_seen_ids(session_id)
+    if not seen:
+        return buckets
+    return [b for b in buckets if b.get("id") not in seen]
+
+
+async def _ds_filter_candidates(
+    query: str,
+    candidates: list[dict],
+    *,
+    mode: str,
+    max_results: int,
+    force_keep_ids: set[str] = None,
+) -> list[dict]:
+    """
+    DS filter interface placeholder.
+
+    PR-1 intentionally does not call an LLM or drop candidates by semantics yet.
+    It preserves order, keeps forced IDs, and applies the injection cap so later
+    DeepSeek filtering can replace this body without changing breath's shape.
+    """
+    if max_results <= 0:
+        return []
+    keep = force_keep_ids or set()
+    selected: list[dict] = []
+    for b in candidates:
+        is_forced = b.get("id") in keep
+        if len(selected) < max_results or is_forced:
+            selected.append(b)
+    logger.debug(
+        "DS filter stub mode=%s query=%r input=%d output=%d",
+        mode,
+        query[:80] if query else "",
+        len(candidates),
+        len(selected),
+    )
+    return selected
+
+
+def _extract_markdown_images(text: str) -> list[tuple[str, str]]:
+    return [(alt.strip(), url.strip()) for alt, url in IMAGE_MARKDOWN_RE.findall(text or "")]
+
+
+def _bucket_allows_mcp_image(bucket: dict) -> bool:
+    meta = bucket.get("metadata", {}) or {}
+    if meta.get("pinned") or meta.get("protected"):
+        return True
+    try:
+        if int(meta.get("importance", 0)) >= 8:
+            return True
+    except (TypeError, ValueError):
+        pass
+    tags = [str(t).lower() for t in (meta.get("tags", []) or [])]
+    return any("anchor" in t or "锚" in t or "mcp-image" in t for t in tags)
+
+
+def _is_r2_image_url(url: str) -> bool:
+    if not url:
+        return False
+    public_url = getattr(r2_storage, "public_url", "") or ""
+    if public_url and url.startswith(public_url.rstrip("/") + "/"):
+        return True
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return False
+    return host.endswith(".r2.dev") or host.endswith(".r2.cloudflarestorage.com")
+
+
+def _mime_from_url_or_header(url: str, content_type: str = "") -> str:
+    mime = (content_type or "").split(";", 1)[0].strip().lower()
+    if mime.startswith("image/"):
+        return mime
+    guessed, _ = mimetypes.guess_type(url)
+    if guessed and guessed.startswith("image/"):
+        return guessed
+    return "application/octet-stream"
+
+
+async def _fetch_mcp_image_content(bucket: dict, url: str) -> ImageContent | None:
+    if not _is_r2_image_url(url):
+        return None
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=8.0) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+    except Exception as e:
+        logger.warning(f"MCP image fetch failed / MCP 图片拉取失败: {url}: {e}")
+        return None
+
+    blob = resp.content or b""
+    if not blob or len(blob) > MCP_IMAGE_MAX_BYTES:
+        logger.info(
+            "MCP image skipped size=%d max=%d url=%s",
+            len(blob),
+            MCP_IMAGE_MAX_BYTES,
+            url,
+        )
+        return None
+
+    mime = _mime_from_url_or_header(url, resp.headers.get("content-type", ""))
+    if not mime.startswith("image/"):
+        return None
+    data = base64.b64encode(blob).decode("ascii")
+    return ImageContent(
+        type="image",
+        data=data,
+        mimeType=mime,
+        _meta={"bucket_id": bucket.get("id"), "source_url": url},
+    )
+
+
+async def _collect_mcp_images(buckets: list[dict]) -> list[ImageContent]:
+    images: list[ImageContent] = []
+    seen_urls: set[str] = set()
+    for bucket in buckets:
+        if len(images) >= MCP_IMAGE_MAX_ITEMS:
+            break
+        if not _bucket_allows_mcp_image(bucket):
+            continue
+        for _alt, url in _extract_markdown_images(bucket.get("content", "")):
+            if len(images) >= MCP_IMAGE_MAX_ITEMS:
+                break
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            image = await _fetch_mcp_image_content(bucket, url)
+            if image:
+                images.append(image)
+    return images
+
+
+async def _tool_result_with_optional_images(
+    text: str,
+    buckets: list[dict],
+    include_images: bool,
+) -> str | list[TextContent | ImageContent]:
+    if not include_images:
+        return text
+    images = await _collect_mcp_images(buckets)
+    if not images:
+        return text
+    return [TextContent(type="text", text=text), *images]
 
 
 # =============================================================
@@ -514,21 +795,24 @@ async def _auto_infer_edges(
 @mcp.tool()
 async def breath(
     query: str = "",
-    max_tokens: int = 10000,
+    max_tokens: int = BREATH_DEFAULT_MAX_TOKENS,
     domain: str = "",
     valence: float = -1,
     arousal: float = -1,
-    max_results: int = 20,
+    max_results: int = BREATH_DEFAULT_MAX_RESULTS,
     world: str = "",
     relation_depth: int = 1,
     since: str = "",
     until: str = "",
-) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿关系边召回邻居的跳数(默认1,0=不走关系边),目前 MVP 只走 1 跳出边,最多附加 5 条。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。"""
+    session_id: str = "",
+    include_images: bool = True,
+) -> str | list[TextContent | ImageContent]:
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认6000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制注入数量上限(默认8,最大50; 内部仍先召回20条给过滤器)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿关系边召回邻居的跳数(默认1,0=不走关系边),目前 MVP 只走 1 跳出边,最多附加 5 条。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。session_id=同一会话内对已浮现动态桶去重。include_images=True时,白名单图桶会随文本返回 MCP image content。"""
     await decay_engine.ensure_started()
     _maybe_start_backfill()
-    max_results = min(max_results, 50)
-    max_tokens = min(max_tokens, 20000)
+    max_results = max(1, min(max_results, 50))
+    max_tokens = max(1000, min(max_tokens, 20000))
+    recall_limit = max(BREATH_RECALL_POOL_SIZE, max_results)
 
     # --- Resolve world filter once (used by all modes) ---
     # --- 解析 world filter：显式参数 > current_world ---
@@ -603,6 +887,13 @@ async def breath(
             key=lambda b: decay_engine.calculate_score(b["metadata"]),
             reverse=True,
         )
+        scored = _filter_session_seen(scored, session_id)[:recall_limit]
+        scored = await _ds_filter_candidates(
+            "",
+            scored,
+            mode="surfacing",
+            max_results=max_results,
+        )
 
         if scored:
             top_scores = [(b["metadata"].get("name", b["id"]), decay_engine.calculate_score(b["metadata"])) for b in scored[:5]]
@@ -640,6 +931,8 @@ async def breath(
         candidates = candidates[:max_results]
 
         dynamic_results = []
+        dynamic_buckets = []
+        dynamic_ids = []
         for b in candidates:
             if token_budget <= 0:
                 break
@@ -652,6 +945,8 @@ async def breath(
                 # NOTE: no touch() here — surfacing should NOT reset decay timer
                 score = decay_engine.calculate_score(b["metadata"])
                 dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
+                dynamic_buckets.append(b)
+                dynamic_ids.append(b["id"])
                 token_budget -= summary_tokens
             except Exception as e:
                 logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
@@ -667,7 +962,10 @@ async def breath(
             parts.append("=== 情感沉淀 (feel) ===\n" + "\n---\n".join(feel_results))
         if dynamic_results:
             parts.append("=== 浮现记忆 ===\n" + "\n---\n".join(dynamic_results))
-        return "\n\n".join(parts)
+        text = "\n\n".join(parts)
+        _remember_session_seen_ids(session_id, dynamic_ids)
+        image_buckets = pinned_buckets + dynamic_buckets
+        return await _tool_result_with_optional_images(text, image_buckets, include_images)
 
     # --- Feel retrieval: domain="feel" is a special channel ---
     # --- Feel 检索：domain="feel" 是独立入口 ---
@@ -703,7 +1001,7 @@ async def breath(
     try:
         keyword_matches = await bucket_mgr.search(
             query,
-            limit=max(max_results, 20),
+            limit=recall_limit,
             domain_filter=domain_filter,
             world_filter=world_filter,
             query_valence=q_valence,
@@ -717,7 +1015,7 @@ async def breath(
 
     # Vector channel — sim>0.5 floor blocks high-cosine noise
     try:
-        vector_raw = await embedding_engine.search_similar(query, top_k=max(max_results, 20))
+        vector_raw = await embedding_engine.search_similar(query, top_k=recall_limit)
         vector_ranked = [(bid, sim) for bid, sim in vector_raw if sim > 0.5]
     except Exception as e:
         logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
@@ -738,7 +1036,7 @@ async def breath(
     bucket_cache = {b["id"]: b for b in keyword_matches}
     matches = []
     for bid, fused_score in fused_pairs:
-        if len(matches) >= max(max_results, 20):
+        if len(matches) >= recall_limit:
             break
         if bid in bucket_cache:
             b = bucket_cache[bid]
@@ -770,8 +1068,18 @@ async def breath(
             b["vector_match"] = True
         matches.append(b)
 
+    matches = _filter_session_seen(matches, session_id)
+    matches = await _ds_filter_candidates(
+        query,
+        matches,
+        mode="search",
+        max_results=max_results,
+    )
+
     results = []
     token_used = 0
+    result_buckets = []
+    result_ids = []
     for bucket in matches:
         if token_used >= max_tokens:
             break
@@ -793,6 +1101,8 @@ async def breath(
             else:
                 summary = f"[bucket_id:{bucket['id']}] {summary}"
             results.append(summary)
+            result_buckets.append(bucket)
+            result_ids.append(bucket["id"])
             token_used += summary_tokens
         except Exception as e:
             logger.warning(f"Failed to dehydrate search result / 检索结果脱水失败: {e}")
@@ -842,39 +1152,54 @@ async def breath(
                     )
                     token_used += summary_tokens
                     seen_neighbors.add(t_id)
+                    result_buckets.append(neighbor)
+                    result_ids.append(t_id)
                 except Exception as e:
                     logger.warning(f"Failed to dehydrate neighbor / 邻居脱水失败: {e}")
                     continue
         if neighbor_msgs:
             results.append("--- 关系网邻居 ---\n" + "\n---\n".join(neighbor_msgs))
 
-    # --- Random surfacing: when search returns < 3, 40% chance to float old memories ---
-    # --- 随机浮现：检索结果不足 3 条时，40% 概率从低权重旧桶里漂上来 ---
-    if len(matches) < 3 and random.random() < 0.4:
+    # --- Random surfacing is opt-in after PR-1 noise reduction.
+    # --- 减噪后随机漂浮改为显式配置，默认关闭，避免检索不足时硬塞旧噪音。
+    random_cfg = config.get("random_surfacing", {}) or {}
+    try:
+        random_chance = float(random_cfg.get("search_underflow_chance", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        random_chance = 0.0
+    if len(matches) < 3 and random_chance > 0 and random.random() < random_chance:
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
             matched_ids = {b["id"] for b in matches}
+            seen_ids = _load_session_seen_ids(session_id)
             low_weight = [
                 b for b in all_buckets
                 if b["id"] not in matched_ids
+                and b["id"] not in seen_ids
                 and decay_engine.calculate_score(b["metadata"]) < 2.0
                 and (wf_set is None or world_matches(b["metadata"].get("world", ""), wf_set))
             ]
             if low_weight:
-                drifted = random.sample(low_weight, min(random.randint(1, 3), len(low_weight)))
+                remaining_slots = max(0, max_results - len(results))
+                drifted = random.sample(low_weight, min(random.randint(1, 3), len(low_weight), remaining_slots))
                 drift_results = []
                 for b in drifted:
                     clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                     summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
                     drift_results.append(f"[surface_type: random]\n{summary}")
-                results.append("--- 忽然想起来 ---\n" + "\n---\n".join(drift_results))
+                    result_buckets.append(b)
+                    result_ids.append(b["id"])
+                if drift_results:
+                    results.append("--- 忽然想起来 ---\n" + "\n---\n".join(drift_results))
         except Exception as e:
             logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")
 
     if not results:
         return "未找到相关记忆。"
 
-    return "\n---\n".join(results)
+    text = "\n---\n".join(results)
+    _remember_session_seen_ids(session_id, result_ids)
+    return await _tool_result_with_optional_images(text, result_buckets, include_images)
 
 
 # =============================================================
@@ -1446,8 +1771,8 @@ async def switch_world(world: str = "") -> str:
 # 工具 5：pulse — 脉搏，系统状态 + 记忆列表
 # =============================================================
 @mcp.tool()
-async def pulse(include_archive: bool = False) -> str:
-    """系统状态+记忆桶列表。include_archive=True含归档。"""
+async def pulse(include_archive: bool = False, full: bool = False) -> str:
+    """系统状态+记忆桶导航。默认显示目录化摘要; full=True 返回旧版完整列表。include_archive=True含归档。"""
     try:
         stats = await bucket_mgr.get_stats()
     except Exception as e:
@@ -1476,37 +1801,20 @@ async def pulse(include_archive: bool = False) -> str:
     lines = []
     for b in buckets:
         meta = b.get("metadata", {})
-        if meta.get("pinned") or meta.get("protected"):
-            icon = "📌"
-        elif meta.get("type") == "permanent":
-            icon = "📦"
-        elif meta.get("type") == "feel":
-            icon = "🫧"
-        elif meta.get("type") == "archived":
-            icon = "🗄️"
-        elif meta.get("resolved", False):
-            icon = "✅"
-        else:
-            icon = "💭"
         try:
             score = decay_engine.calculate_score(meta)
         except Exception:
             score = 0.0
-        domains = ",".join(meta.get("domain", []))
-        val = meta.get("valence", 0.5)
-        aro = meta.get("arousal", 0.3)
-        resolved_tag = " [已解决]" if meta.get("resolved", False) else ""
-        lines.append(
-            f"{icon} [{meta.get('name', b['id'])}]{resolved_tag} "
-            f"bucket_id:{b['id']} "
-            f"主题:{domains} "
-            f"情感:V{val:.1f}/A{aro:.1f} "
-            f"重要:{meta.get('importance', '?')} "
-            f"权重:{score:.2f} "
-            f"标签:{','.join(meta.get('tags', []))}"
-        )
+        lines.append(_format_pulse_line(b, score, full=full))
 
-    return status + "\n=== 记忆列表 ===\n" + "\n".join(lines)
+    if full:
+        return status + "\n=== 记忆列表 ===\n" + "\n".join(lines)
+    return (
+        status
+        + "\n=== 记忆导航 ===\n"
+        + "默认摘要模式；需要完整原文用 inspect(bucket_id)，需要旧版列表用 pulse(full=True)。\n"
+        + "\n".join(lines)
+    )
 
 
 # =============================================================
