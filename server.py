@@ -238,6 +238,90 @@ def _filter_session_seen(buckets: list[dict], session_id: str) -> list[dict]:
     return [b for b in buckets if b.get("id") not in seen]
 
 
+def _ds_gate_enabled(mode: str) -> bool:
+    """DeepSeek 语义门控开关。默认关；仅对 OMBRE_DS_FILTER_MODES 列出的 mode 生效（默认只 search）。"""
+    flag = os.getenv("OMBRE_DS_FILTER_ENABLED", "0").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return False
+    modes = os.getenv("OMBRE_DS_FILTER_MODES", "search")
+    allowed = {m.strip() for m in modes.split(",") if m.strip()}
+    return mode in allowed
+
+
+def _ds_gate_timeout() -> float:
+    try:
+        return float(os.getenv("OMBRE_DS_FILTER_TIMEOUT", "8"))
+    except ValueError:
+        return 8.0
+
+
+def _parse_ds_keep_indices(raw: str, n: int) -> list[int]:
+    """解析 DeepSeek 返回的 {"keep":[...]}；失败返回 []（调用方据此保守保留全部）。"""
+    cleaned = (raw or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
+    try:
+        data = json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError, IndexError):
+        return []
+    arr = data.get("keep") if isinstance(data, dict) else data
+    if not isinstance(arr, list):
+        return []
+    out: list[int] = []
+    for x in arr:
+        try:
+            i = int(x)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= i < n:
+            out.append(i)
+    return out
+
+
+async def _ds_semantic_select(
+    query: str,
+    buckets: list[dict],
+    keep: set[str],
+    max_results: int,
+) -> list[dict]:
+    """用 DeepSeek 判断每条候选是否与 query 语义相关；纯减法（只剔噪、不重排不外拉），forced 恒留。"""
+    client = getattr(dehydrator, "client", None)
+    if client is None:
+        raise RuntimeError("no DeepSeek client configured")
+    lines = []
+    for i, b in enumerate(buckets):
+        name = (b.get("metadata", {}) or {}).get("name") or b.get("id", "")
+        snippet = (b.get("content") or "").strip().replace("\n", " ")[:200]
+        lines.append(f"[{i}] {name}: {snippet}")
+    sys_prompt = (
+        "你是记忆召回的相关性过滤器。给定用户查询和一组候选记忆条目，"
+        "判断每条是否与查询语义相关、值得进入上下文。"
+        '只返回 JSON：{"keep": [相关条目的序号整数数组]}，不要解释。'
+        "宁可多留也别漏掉明显相关的；只剔除与查询确实无关的。"
+    )
+    user_prompt = f"查询：{query}\n\n候选：\n" + "\n".join(lines)
+    resp = await client.chat.completions.create(
+        model=getattr(dehydrator, "model", "deepseek-chat"),
+        messages=[
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        max_tokens=200,
+        temperature=0.0,
+    )
+    raw = resp.choices[0].message.content if resp.choices else ""
+    idxs = _parse_ds_keep_indices(raw, len(buckets))
+    if not idxs:
+        # 解析不到可信结果 → 保守保留全部（绝不因模型抽风清空召回）
+        return buckets
+    keep_idx = set(idxs)
+    selected = [
+        b for i, b in enumerate(buckets)
+        if i in keep_idx or b.get("id") in keep
+    ]
+    return selected[:max_results]
+
+
 async def _ds_filter_candidates(
     query: str,
     candidates: list[dict],
@@ -247,28 +331,49 @@ async def _ds_filter_candidates(
     force_keep_ids: set[str] = None,
 ) -> list[dict]:
     """
-    DS filter interface placeholder.
+    召回候选的注入裁剪 + 可选 DeepSeek 语义门控。
 
-    PR-1 intentionally does not call an LLM or drop candidates by semantics yet.
-    It preserves order, keeps forced IDs, and applies the injection cap so later
-    DeepSeek filtering can replace this body without changing breath's shape.
+    默认行为（门控关，PR-1 语义）：保序 + 保留 forced IDs + 限到 max_results，不调 LLM。
+    门控开（OMBRE_DS_FILTER_ENABLED 且 mode 命中且 query 非空）：在已裁剪集合上跑 DeepSeek
+    相关性过滤，纯减法剔噪；超时/出错/解析失败一律回退裁剪集合，绝不清空召回。
     """
     if max_results <= 0:
         return []
     keep = force_keep_ids or set()
-    selected: list[dict] = []
+    capped: list[dict] = []
     for b in candidates:
         is_forced = b.get("id") in keep
-        if len(selected) < max_results or is_forced:
-            selected.append(b)
-    logger.debug(
-        "DS filter stub mode=%s query=%r input=%d output=%d",
-        mode,
-        query[:80] if query else "",
-        len(candidates),
-        len(selected),
+        if len(capped) < max_results or is_forced:
+            capped.append(b)
+
+    if not _ds_gate_enabled(mode) or not query or not capped:
+        logger.debug(
+            "DS filter stub mode=%s query=%r input=%d output=%d",
+            mode,
+            query[:80] if query else "",
+            len(candidates),
+            len(capped),
+        )
+        return capped
+
+    try:
+        kept = await asyncio.wait_for(
+            _ds_semantic_select(query, capped, keep, max_results),
+            timeout=_ds_gate_timeout(),
+        )
+    except Exception as e:
+        logger.warning(
+            "DS filter fell back to stub / 门控回退裁剪集合 (%s): %s",
+            type(e).__name__, e,
+        )
+        return capped
+
+    result = kept if kept else capped
+    logger.info(
+        "DS filter mode=%s query=%r input=%d capped=%d kept=%d",
+        mode, query[:80], len(candidates), len(capped), len(result),
     )
-    return selected
+    return result
 
 
 def _extract_markdown_images(text: str) -> list[tuple[str, str]]:

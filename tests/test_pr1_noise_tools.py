@@ -1,4 +1,5 @@
 import json
+import types
 
 import pytest
 from mcp.types import ImageContent, TextContent
@@ -234,3 +235,74 @@ def test_dehydrate_prompt_locks_concrete_noise_reduction_rules():
     assert "时间 + 主体 + 事件/动作 + 对象 + 影响" in DEHYDRATE_PROMPT
     assert "不要编日期" in DEHYDRATE_PROMPT
     assert "优于“讨论记忆库优化”" in DEHYDRATE_PROMPT
+
+
+def _fake_dehydrator_with_response(create_fn):
+    return types.SimpleNamespace(
+        model="deepseek-chat",
+        client=types.SimpleNamespace(
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(create=create_fn)
+            )
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_ds_gate_off_by_default_is_pure_stub(monkeypatch):
+    monkeypatch.delenv("OMBRE_DS_FILTER_ENABLED", raising=False)
+    buckets = [_bucket("a", "A"), _bucket("b", "B"), _bucket("c", "C")]
+    selected = await server._ds_filter_candidates(
+        "query", buckets, mode="search", max_results=2
+    )
+    assert [b["id"] for b in selected] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_ds_gate_subtractive_when_enabled(monkeypatch):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+
+    async def _create(**_kw):
+        msg = types.SimpleNamespace(content='{"keep": [0, 2]}')
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+
+    monkeypatch.setattr(server, "dehydrator", _fake_dehydrator_with_response(_create))
+    buckets = [_bucket("a", "A"), _bucket("b", "B"), _bucket("c", "C")]
+    selected = await server._ds_filter_candidates(
+        "工程", buckets, mode="search", max_results=3
+    )
+    # capped=[a,b,c]; DeepSeek keeps idx 0,2 -> subtractive -> a,c
+    assert [b["id"] for b in selected] == ["a", "c"]
+
+
+@pytest.mark.asyncio
+async def test_ds_gate_falls_back_to_capped_on_error(monkeypatch):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+
+    async def _create(**_kw):
+        raise RuntimeError("api boom")
+
+    monkeypatch.setattr(server, "dehydrator", _fake_dehydrator_with_response(_create))
+    buckets = [_bucket("a", "A"), _bucket("b", "B"), _bucket("c", "C")]
+    selected = await server._ds_filter_candidates(
+        "工程", buckets, mode="search", max_results=2
+    )
+    assert [b["id"] for b in selected] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_ds_gate_skips_surfacing_without_query(monkeypatch):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search,surfacing")
+
+    async def _create(**_kw):
+        raise AssertionError("LLM must not be called for empty-query surfacing")
+
+    monkeypatch.setattr(server, "dehydrator", _fake_dehydrator_with_response(_create))
+    buckets = [_bucket("a", "A"), _bucket("b", "B")]
+    selected = await server._ds_filter_candidates(
+        "", buckets, mode="surfacing", max_results=2
+    )
+    assert [b["id"] for b in selected] == ["a", "b"]
