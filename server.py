@@ -2121,6 +2121,7 @@ def _format_bucket_for_briefing(b: dict, section_tag: str) -> str:
       - domain / tags
       - V/A/importance/last_active
       - emotion (if extractable from dehydrated JSON content)
+      - optional emotion scaffold lines for non-feel buckets
       - first 400 chars of content (wikilinks stripped)
 
     The `emotion` line is critical: dehydrated content is JSON-stringified
@@ -2132,6 +2133,7 @@ def _format_bucket_for_briefing(b: dict, section_tag: str) -> str:
 
     把单个桶格式化成简报 LLM 的原始素材。
     emotion 字段独立成行+ prompt 铁律,双保险防止脱水时锁定的情绪关键词被压没。
+    非 feel 桶额外暴露情绪脚手架 wire 行,供 prompt 决定靠近方式。
     """
     meta = b["metadata"]
     name = meta.get("name", b["id"])
@@ -2142,17 +2144,42 @@ def _format_bucket_for_briefing(b: dict, section_tag: str) -> str:
     imp = meta.get("importance", 5)
     last_active = meta.get("last_active", "")
     raw_content = b.get("content", "")
-    body = strip_wikilinks(raw_content)[:400]
 
-    # --- Extract emotion_state from dehydrated JSON content ---
-    # --- 从脱水 JSON content 抽出 emotion_state ---
+    def _clean_string(value) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    def _clean_string_list(value) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+    # --- Extract structured emotion fields from dehydrated JSON content ---
+    # --- 从脱水 JSON content 抽出结构化情绪字段 ---
+    parsed = None
     emotion = ""
     try:
-        parsed = json.loads(raw_content) if raw_content else None
-        if isinstance(parsed, dict):
-            emotion = (parsed.get("emotion_state") or "").strip()
+        loaded = json.loads(raw_content) if raw_content else None
+        if isinstance(loaded, dict):
+            parsed = loaded
+            emotion = _clean_string(parsed.get("emotion_state"))
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
+
+    scaffold_keys = {
+        "body_signal",
+        "unspoken_need",
+        "sore_point",
+        "response_rule",
+        "do_not",
+        "sample_voice",
+    }
+    body_source = raw_content
+    if parsed is not None:
+        body_source = json.dumps(
+            {k: v for k, v in parsed.items() if k not in scaffold_keys},
+            ensure_ascii=False,
+        )
+    body = strip_wikilinks(body_source)[:400]
 
     lines = [
         f"[{section_tag}] {name}",
@@ -2161,6 +2188,18 @@ def _format_bucket_for_briefing(b: dict, section_tag: str) -> str:
     ]
     if emotion:
         lines.append(f"  emotion:{emotion}")
+    if parsed is not None and meta.get("type") != "feel":
+        scaffold = [
+            ("body", _clean_string(parsed.get("body_signal"))),
+            ("need", _clean_string(parsed.get("unspoken_need"))),
+            ("sore", _clean_string(parsed.get("sore_point"))),
+            ("approach", _clean_string(parsed.get("response_rule"))),
+            ("avoid", " / ".join(_clean_string_list(parsed.get("do_not")))),
+            ("voice", " | ".join(_clean_string_list(parsed.get("sample_voice")))),
+        ]
+        for label, value in scaffold:
+            if value:
+                lines.append(f"  {label}:{value}")
     lines.append(f"  {body}")
     return "\n".join(lines)
 

@@ -17,7 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from dehydrator import BRIEFING_PROMPT
+from dehydrator import BRIEFING_PROMPT, DEHYDRATE_PROMPT
 
 
 # ---------------------------------------------------------------
@@ -89,6 +89,37 @@ def test_emotion_field_rule_present():
     # 关键示例: 上一窗 emotion 是「现在的体感」直接来源
     assert "现在的体感" in BRIEFING_PROMPT
     assert "修复后饱满" in BRIEFING_PROMPT
+
+
+def test_emotion_scaffold_prompt_contract_present():
+    """PR-0 情绪脚手架 wire 语义必须在 briefing prompt 里。"""
+    for label in ("body:", "need:", "sore:", "approach:", "avoid:", "voice:"):
+        assert label in BRIEFING_PROMPT
+    assert "不是要复述的事实" in BRIEFING_PROMPT
+    assert "字段名或标签" in BRIEFING_PROMPT
+    assert "唯一可逐字引用" in BRIEFING_PROMPT
+    assert "只能从 voice 逐字取" in BRIEFING_PROMPT
+    assert "没有 voice 就不要新增引号引用" in BRIEFING_PROMPT
+    assert "当前回应策略" in BRIEFING_PROMPT
+
+
+def test_dehydrate_prompt_emotion_scaffold_contract_present():
+    """PR-0 六字段和 optional/feel 边界必须在脱水 prompt 里。"""
+    for field in (
+        "body_signal",
+        "unspoken_need",
+        "sore_point",
+        "response_rule",
+        "do_not",
+        "sample_voice",
+    ):
+        assert field in DEHYDRATE_PROMPT
+    assert "整个 key 省略" in DEHYDRATE_PROMPT
+    assert "不要输出 null/空串/空数组" in DEHYDRATE_PROMPT
+    assert "纯工程笔记类内容不要产出" in DEHYDRATE_PROMPT
+    assert "feel/底色/哥哥第一人称感受沉淀" in DEHYDRATE_PROMPT
+    assert "sample_voice 是唯一逐字引用字段" in DEHYDRATE_PROMPT
+    assert "朝灯的原话" in DEHYDRATE_PROMPT
 
 
 def test_residual_pain_only_from_undigested_rule_present():

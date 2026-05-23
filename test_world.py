@@ -12,6 +12,8 @@ import shutil
 import sys
 import tempfile
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils import (
@@ -19,6 +21,19 @@ from utils import (
     save_current_world, _load_runtime_current_world,
 )
 from bucket_manager import BucketManager
+
+
+@pytest.fixture
+def buckets_dir(tmp_path):
+    root = tmp_path / "buckets"
+    for sub in ["permanent", "dynamic", "archive", "feel"]:
+        (root / sub).mkdir(parents=True, exist_ok=True)
+    return str(root)
+
+
+@pytest.fixture
+def tmp_dir(tmp_path):
+    return str(tmp_path)
 
 
 def test_world_matches():
@@ -56,6 +71,7 @@ def test_resolve_world_filter():
     print("  [OK]")
 
 
+@pytest.mark.asyncio
 async def test_search_world_filter(buckets_dir):
     print("=== 3. bucket_manager.search world_filter ===")
     config = {
