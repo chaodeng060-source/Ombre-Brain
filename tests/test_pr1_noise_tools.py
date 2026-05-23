@@ -306,3 +306,64 @@ async def test_ds_gate_skips_surfacing_without_query(monkeypatch):
         "", buckets, mode="surfacing", max_results=2
     )
     assert [b["id"] for b in selected] == ["a", "b"]
+
+
+# --- 多模态 anchor 补全：anchor 优先级 / feel 出图 / breath e2e ---
+
+def test_feel_bucket_is_mcp_image_eligible():
+    md = "![绿月夜](https://pub-test.r2.dev/feel.png)"
+    # feel 桶带图 = 私密锚点，应可出图
+    assert server._bucket_allows_mcp_image(_bucket("f", md, bucket_type="feel"))
+    # 回归：普通低权重非 feel 非 anchor 仍不出图
+    assert not server._bucket_allows_mcp_image(_bucket("low", md, importance=7))
+    assert server._is_anchor_bucket(_bucket("a", md, tags=["多模态anchor"]))
+    assert not server._is_anchor_bucket(_bucket("p", md, importance=9))
+
+
+@pytest.mark.asyncio
+async def test_collect_mcp_images_prioritizes_anchor_buckets(monkeypatch):
+    # MAX_ITEMS 截断时，anchor 桶应优先占满，非 anchor（即便 eligible）被挤掉
+    monkeypatch.setattr(server, "MCP_IMAGE_MAX_ITEMS", 2)
+    fetched = []
+
+    async def fake_fetch(bucket, url):
+        fetched.append(bucket["id"])
+        return ImageContent(type="image", data="YWJj", mimeType="image/png")
+
+    monkeypatch.setattr(server, "_fetch_mcp_image_content", fake_fetch)
+    md = lambda n: f"![x](https://pub-test.r2.dev/{n}.png)"
+    plain = _bucket("plain", md("p"), importance=9)            # eligible 但非 anchor
+    anchor1 = _bucket("anchor1", md("a1"), tags=["多模态anchor"])
+    anchor2 = _bucket("anchor2", md("a2"), tags=["锚"])
+
+    images = await server._collect_mcp_images([plain, anchor1, anchor2])
+    assert len(images) == 2
+    assert fetched == ["anchor1", "anchor2"]  # anchor 优先，plain 在 cap 处被挤掉
+
+
+@pytest.mark.asyncio
+async def test_breath_search_emits_image_content_end_to_end(tmp_path, monkeypatch):
+    md = "锚点\n![胸口](https://pub-test.r2.dev/anchor.png)\n尾巴"
+    buckets = [_bucket("img", md, importance=9, tags=["多模态anchor"])]
+    fake_mgr = FakeBucketMgr(buckets)
+    monkeypatch.setitem(server.config, "buckets_dir", str(tmp_path))
+    monkeypatch.setitem(server.config, "random_surfacing", {})
+    monkeypatch.setattr(server, "bucket_mgr", fake_mgr)
+    monkeypatch.setattr(server, "decay_engine", FakeDecay())
+    monkeypatch.setattr(server, "dehydrator", FakeDehydrator())
+    monkeypatch.setattr(server, "embedding_engine", FakeEmbedding())
+    monkeypatch.setattr(server, "_backfill_started", True)
+
+    captured = []
+
+    async def fake_fetch(bucket, url):
+        captured.append(url)
+        return ImageContent(type="image", data="YWJj", mimeType="image/png")
+
+    monkeypatch.setattr(server, "_fetch_mcp_image_content", fake_fetch)
+
+    result = await server.breath(query="工程", relation_depth=0, include_images=True)
+    assert isinstance(result, list)
+    assert any(isinstance(c, ImageContent) for c in result)
+    assert isinstance(result[0], TextContent)
+    assert "https://pub-test.r2.dev/anchor.png" in captured

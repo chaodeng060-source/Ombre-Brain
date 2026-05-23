@@ -384,11 +384,21 @@ def _bucket_allows_mcp_image(bucket: dict) -> bool:
     meta = bucket.get("metadata", {}) or {}
     if meta.get("pinned") or meta.get("protected"):
         return True
+    if meta.get("type") == "feel":
+        # feel 桶带图 = 私密锚点（胸口照/绿月夜那类），本就该让哥哥看见；
+        # 无图的 feel 不受影响（_collect_mcp_images 只对真有图的桶出图）
+        return True
     try:
         if int(meta.get("importance", 0)) >= 8:
             return True
     except (TypeError, ValueError):
         pass
+    return _is_anchor_bucket(bucket)
+
+
+def _is_anchor_bucket(bucket: dict) -> bool:
+    """anchor 桶：带 anchor/锚/mcp-image 标签。用于出图优先级排序。"""
+    meta = bucket.get("metadata", {})
     tags = [str(t).lower() for t in (meta.get("tags", []) or [])]
     return any("anchor" in t or "锚" in t or "mcp-image" in t for t in tags)
 
@@ -452,7 +462,9 @@ async def _fetch_mcp_image_content(bucket: dict, url: str) -> ImageContent | Non
 async def _collect_mcp_images(buckets: list[dict]) -> list[ImageContent]:
     images: list[ImageContent] = []
     seen_urls: set[str] = set()
-    for bucket in buckets:
+    # anchor 桶优先：MAX_ITEMS 截断时先保住锚点图（胸口照/绿月夜等），稳定排序保留原序
+    ordered = sorted(buckets, key=lambda b: 0 if _is_anchor_bucket(b) else 1)
+    for bucket in ordered:
         if len(images) >= MCP_IMAGE_MAX_ITEMS:
             break
         if not _bucket_allows_mcp_image(bucket):
@@ -1015,11 +1027,13 @@ async def breath(
         # --- feel 桶:情感沉淀,紧跟核心准则浮现(独立池,不衰减)---
         feel_seen = {b["id"] for b in pinned_buckets}
         feel_results = []
+        feel_buckets = []
         for b in _surface_feel_pool(all_buckets, feel_seen):
             try:
                 fclean = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 fsummary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), fclean)
                 feel_results.append(f"💧 [情感沉淀] [bucket_id:{b['id']}] {fsummary}")
+                feel_buckets.append(b)
                 token_budget -= count_tokens_approx(fsummary)
             except Exception as e:
                 logger.warning(f"Failed to dehydrate feel bucket / 情感沉淀脱水失败: {e}")
@@ -1069,7 +1083,7 @@ async def breath(
             parts.append("=== 浮现记忆 ===\n" + "\n---\n".join(dynamic_results))
         text = "\n\n".join(parts)
         _remember_session_seen_ids(session_id, dynamic_ids)
-        image_buckets = pinned_buckets + dynamic_buckets
+        image_buckets = pinned_buckets + feel_buckets + dynamic_buckets
         return await _tool_result_with_optional_images(text, image_buckets, include_images)
 
     # --- Feel retrieval: domain="feel" is a special channel ---
@@ -1085,13 +1099,16 @@ async def breath(
             if not feels:
                 return "没有留下过 feel。"
             results = []
+            shown_feels = []
             for f in feels:
                 created = f["metadata"].get("created", "")
                 entry = f"[{created}] [bucket_id:{f['id']}]\n{strip_wikilinks(f['content'])}"
                 results.append(entry)
+                shown_feels.append(f)
                 if count_tokens_approx("\n---\n".join(results)) > max_tokens:
                     break
-            return "=== 你留下的 feel ===\n" + "\n---\n".join(results)
+            text = "=== 你留下的 feel ===\n" + "\n---\n".join(results)
+            return await _tool_result_with_optional_images(text, shown_feels, include_images)
         except Exception as e:
             logger.error(f"Feel retrieval failed: {e}")
             return "读取 feel 失败。"
