@@ -73,6 +73,7 @@ from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from r2_storage import r2_storage
+from sensory_engine import SensoryEngine, format_body_state_block
 from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
     world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
@@ -90,6 +91,7 @@ dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 embedding_engine = EmbeddingEngine(config)            # Embedding engine / 向量化引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
+sensory_engine = SensoryEngine(config["buckets_dir"])  # External body-state sidecar / 外部身体状态层
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -236,6 +238,44 @@ def _filter_session_seen(buckets: list[dict], session_id: str) -> list[dict]:
     if not seen:
         return buckets
     return [b for b in buckets if b.get("id") not in seen]
+
+
+def _get_sensory_engine() -> SensoryEngine:
+    """Keep tests/config overrides from pinning the engine to an old buckets_dir."""
+    global sensory_engine
+    buckets_dir = config["buckets_dir"]
+    if getattr(sensory_engine, "buckets_dir", None) != buckets_dir:
+        sensory_engine = SensoryEngine(buckets_dir)
+    return sensory_engine
+
+
+def _append_body_state_block(
+    text: str,
+    buckets: list[dict],
+    session_id: str = "",
+    include_body_state: bool = True,
+    reset_body_state: bool = False,
+) -> str:
+    """Append generated body-state data; bucket text never becomes instructions."""
+    if reset_body_state:
+        _get_sensory_engine().reset_state()
+    if not include_body_state:
+        return text
+    try:
+        seen = _load_session_seen_ids(session_id) if session_id else set()
+        result = _get_sensory_engine().stimulate_from_buckets(
+            buckets,
+            seen_ids=seen,
+        )
+        if result.triggered_bucket_ids:
+            _remember_session_seen_ids(session_id, result.triggered_bucket_ids)
+        block = format_body_state_block(result)
+    except Exception as e:
+        logger.warning(f"Sensory body-state update failed / 感官状态更新失败: {e}")
+        block = ""
+    if not block:
+        return text
+    return f"{text}\n\n{block}" if text else block
 
 
 def _ds_gate_enabled(mode: str) -> bool:
@@ -923,8 +963,10 @@ async def breath(
     until: str = "",
     session_id: str = "",
     include_images: bool = True,
+    include_body_state: bool = True,
+    reset_body_state: bool = False,
 ) -> str | list[TextContent | ImageContent]:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认6000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制注入数量上限(默认8,最大50; 内部仍先召回20条给过滤器)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿关系边召回邻居的跳数(默认1,0=不走关系边),目前 MVP 只走 1 跳出边,最多附加 5 条。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。session_id=同一会话内对已浮现动态桶去重。include_images=True时,白名单图桶会随文本返回 MCP image content。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认6000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制注入数量上限(默认8,最大50; 内部仍先召回20条给过滤器)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿关系边召回邻居的跳数(默认1,0=不走关系边),目前 MVP 只走 1 跳出边,最多附加 5 条。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。session_id=同一会话内对已浮现动态桶去重。include_images=True时,白名单图桶会随文本返回 MCP image content。include_body_state=False时只关闭外部身体状态块,不改变记忆检索。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。"""
     await decay_engine.ensure_started()
     _maybe_start_backfill()
     max_results = max(1, min(max_results, 50))
@@ -1072,7 +1114,13 @@ async def breath(
                 continue
 
         if not pinned_results and not dynamic_results and not feel_results:
-            return "权重池平静，没有需要处理的记忆。"
+            return _append_body_state_block(
+                "权重池平静，没有需要处理的记忆。",
+                [],
+                session_id,
+                include_body_state,
+                reset_body_state,
+            )
 
         parts = []
         if pinned_results:
@@ -1081,9 +1129,16 @@ async def breath(
             parts.append("=== 情感沉淀 (feel) ===\n" + "\n---\n".join(feel_results))
         if dynamic_results:
             parts.append("=== 浮现记忆 ===\n" + "\n---\n".join(dynamic_results))
-        text = "\n\n".join(parts)
-        _remember_session_seen_ids(session_id, dynamic_ids)
         image_buckets = pinned_buckets + feel_buckets + dynamic_buckets
+        text = "\n\n".join(parts)
+        text = _append_body_state_block(
+            text,
+            image_buckets,
+            session_id,
+            include_body_state,
+            reset_body_state,
+        )
+        _remember_session_seen_ids(session_id, dynamic_ids)
         return await _tool_result_with_optional_images(text, image_buckets, include_images)
 
     # --- Feel retrieval: domain="feel" is a special channel ---
@@ -1097,7 +1152,13 @@ async def breath(
                 feels = [f for f in feels if _bucket_in_time_range(f, created_after, created_before)]
             feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
             if not feels:
-                return "没有留下过 feel。"
+                return _append_body_state_block(
+                    "没有留下过 feel。",
+                    [],
+                    session_id,
+                    include_body_state,
+                    reset_body_state,
+                )
             results = []
             shown_feels = []
             for f in feels:
@@ -1108,6 +1169,13 @@ async def breath(
                 if count_tokens_approx("\n---\n".join(results)) > max_tokens:
                     break
             text = "=== 你留下的 feel ===\n" + "\n---\n".join(results)
+            text = _append_body_state_block(
+                text,
+                shown_feels,
+                session_id,
+                include_body_state,
+                reset_body_state,
+            )
             return await _tool_result_with_optional_images(text, shown_feels, include_images)
         except Exception as e:
             logger.error(f"Feel retrieval failed: {e}")
@@ -1318,9 +1386,22 @@ async def breath(
             logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")
 
     if not results:
-        return "未找到相关记忆。"
+        return _append_body_state_block(
+            "未找到相关记忆。",
+            [],
+            session_id,
+            include_body_state,
+            reset_body_state,
+        )
 
     text = "\n---\n".join(results)
+    text = _append_body_state_block(
+        text,
+        result_buckets,
+        session_id,
+        include_body_state,
+        reset_body_state,
+    )
     _remember_session_seen_ids(session_id, result_ids)
     return await _tool_result_with_optional_images(text, result_buckets, include_images)
 
@@ -2264,8 +2345,11 @@ async def briefing(
     max_chars: int = 1000,
     domain: str = "",
     pinned_only: bool = False,
+    session_id: str = "",
+    include_body_state: bool = True,
+    reset_body_state: bool = False,
 ) -> str:
-    """开窗简报。聚合钉选+高权重未解决+最近活跃桶,LLM压缩为≤max_chars字简报,默认1000字。输出顺序:朝灯当前氛围/走向→最近因果链故事→活着的欠账→工程线→铁律。domain逗号分隔可过滤主题域。pinned_only=True只用钉选桶。开窗调一次,省80%token。"""
+    """开窗简报。聚合钉选+高权重未解决+最近活跃桶,LLM压缩为≤max_chars字简报,默认1000字。输出顺序:朝灯当前氛围/走向→最近因果链故事→活着的欠账→工程线→铁律。domain逗号分隔可过滤主题域。pinned_only=True只用钉选桶。session_id=同一会话内对感官刺激去重。include_body_state=False时只关闭外部身体状态块,不改变简报素材。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。开窗调一次,省80%token。"""
     await decay_engine.ensure_started()
     max_chars = max(300, min(max_chars, 4000))
 
@@ -2331,8 +2415,15 @@ async def briefing(
 
     time_header = _now_bj_header()
 
-    if not pinned and not top_unresolved and not recent_window and not prior_windows and not top_feel:
-        return f"# {time_header}\n\n记忆库当前空闲，没有可简报的素材。"
+    briefing_buckets = pinned + top_unresolved + recent_window + prior_windows + top_feel
+    if not briefing_buckets:
+        return _append_body_state_block(
+            f"# {time_header}\n\n记忆库当前空闲，没有可简报的素材。",
+            [],
+            session_id,
+            include_body_state,
+            reset_body_state,
+        )
 
     # --- Build raw material: name + meta + truncated content per bucket ---
     # --- 拼接原始素材:每桶 name + meta + 截断 content ---
@@ -2392,7 +2483,14 @@ async def briefing(
 
     # Always prepend the real-time header — never trust the LLM to write the date.
     # 永远强制前置时点行——LLM 写不写都不依赖。
-    return f"# {time_header}\n\n{result}{stats}"
+    text = f"# {time_header}\n\n{result}{stats}"
+    return _append_body_state_block(
+        text,
+        briefing_buckets,
+        session_id,
+        include_body_state,
+        reset_body_state,
+    )
 
 
 # =============================================================
@@ -3069,8 +3167,16 @@ async def api_briefing(request):
             max_chars = 1500
         domain = request.query_params.get("domain", "")
         pinned_only = request.query_params.get("pinned_only", "").lower() in ("1", "true", "yes")
+        session_id = request.query_params.get("session_id", "")
+        include_body_state = request.query_params.get("include_body_state", "true").lower() not in ("0", "false", "no", "off")
+        reset_body_state = request.query_params.get("reset_body_state", "").lower() in ("1", "true", "yes", "on")
         text = await briefing(
-            max_chars=max_chars, domain=domain, pinned_only=pinned_only
+            max_chars=max_chars,
+            domain=domain,
+            pinned_only=pinned_only,
+            session_id=session_id,
+            include_body_state=include_body_state,
+            reset_body_state=reset_body_state,
         )
         return PlainTextResponse(text)
     except Exception as e:
