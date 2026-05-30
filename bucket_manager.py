@@ -83,6 +83,9 @@ class BucketManager:
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
         self.archive_dir = os.path.join(self.base_dir, "archive")
         self.feel_dir = os.path.join(self.base_dir, "feel")
+        self.nsfw_dir = os.path.join(self.base_dir, "涩涩")  # 色色单独文件夹：日常默认不扫
+        # 当前是否处于涩涩 world（switch_world 维护）；list_all 默认跟随它决定是否加载涩涩目录
+        self.nsfw_active = (config.get("current_world", "") or "").strip() == "涩涩"
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
 
@@ -706,11 +709,17 @@ class BucketManager:
     # ---------------------------------------------------------
     # List all buckets
     # ---------------------------------------------------------
-    async def list_all(self, include_archive: bool = False) -> list[dict]:
+    async def list_all(self, include_archive: bool = False, include_nsfw: bool | None = None) -> list[dict]:
+        # include_nsfw=None → 跟随当前世界状态 self.nsfw_active（switch_world 维护）；
+        # 显式 True/False 可覆盖（如 dashboard 管理界面传 True 看全部）。
+        if include_nsfw is None:
+            include_nsfw = getattr(self, "nsfw_active", False)
         buckets = []
         dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir]
         if include_archive:
             dirs.append(self.archive_dir)
+        if include_nsfw:
+            dirs.append(self.nsfw_dir)  # 涩涩独立目录：日常默认不扫，涩涩 world 或显式 True 才加载
 
         for dir_path in dirs:
             if not os.path.exists(dir_path):
@@ -799,7 +808,8 @@ class BucketManager:
     def _find_bucket_file(self, bucket_id: str) -> Optional[str]:
         if not bucket_id:
             return None
-        for dir_path in [self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir]:
+        # 含 nsfw_dir：按 id 精确取/改/建边永远找得到（隔离只在 list_all 召回层，不在精确取层）
+        for dir_path in [self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir, self.nsfw_dir]:
             if not os.path.exists(dir_path):
                 continue
             for root, _, files in os.walk(dir_path):

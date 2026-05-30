@@ -11,11 +11,13 @@
 import os
 import json
 import math
+import time
 import sqlite3
 import logging
 import asyncio
 from pathlib import Path
 
+import httpx
 from openai import AsyncOpenAI
 
 logger = logging.getLogger("ombre_brain.embedding")
@@ -45,16 +47,49 @@ class EmbeddingEngine:
         self.model = embed_cfg.get("model", "gemini-embedding-001")
         self.enabled = bool(self.api_key) and embed_cfg.get("enabled", True)
 
+        # --- Fail-fast timeout (was a hard 30s; unreachable endpoint stalled grow/hold) ---
+        # --- 快速失败超时（原来死写 30s，端点不可达时把 grow/hold 卡到几分钟）---
+        self.timeout = float(os.environ.get(
+            "OMBRE_EMBED_TIMEOUT", embed_cfg.get("timeout", 5)))
+
+        # --- Circuit breaker: after N consecutive failures, skip the API for a cooldown ---
+        # --- 熔断器：连续失败 N 次后，冷却期内直接跳过 API 调用，瞬返不阻塞 ---
+        # When the embedding endpoint is unreachable (e.g. Google endpoint from a
+        # China-hosted NAS without proxy), every call would otherwise burn `timeout`
+        # seconds. The breaker trips and lets grow/hold run at digest-only speed;
+        # it auto-closes after the cooldown so embeddings resume once reachable.
+        self._circuit_threshold = int(os.environ.get("OMBRE_EMBED_CIRCUIT_FAILS", 3))
+        self._circuit_cooldown = float(os.environ.get("OMBRE_EMBED_CIRCUIT_COOLDOWN", 300))
+        self._consec_fail = 0
+        self._circuit_until = 0.0
+
         # SQLite path
         db_path = os.path.join(config["buckets_dir"], "embeddings.db")
         self.db_path = db_path
 
+        # --- Optional dedicated proxy ONLY for embedding traffic ---
+        # --- 仅给 embedding 流量挂的专用代理（不碰 DeepSeek/R2 直连）---
+        # The Google embedding endpoint is GFW-blocked from a China-hosted NAS;
+        # route just this client through a LAN proxy (e.g. the PC's Clash with
+        # "Allow LAN" on). DeepSeek/R2 stay direct, so they never depend on the proxy.
+        # Google embedding 端点在国内被墙，只把这个 client 走局域网代理（如 PC 的 Clash 开
+        # Allow LAN）；DeepSeek/R2 仍直连，PC 关机也不影响它们。
+        self.embed_proxy = os.environ.get("OMBRE_EMBED_PROXY", "").strip()
+
         if self.enabled:
-            self.client = AsyncOpenAI(
+            client_kwargs = dict(
                 api_key=self.api_key,
                 base_url=self.base_url,
-                timeout=30.0,
+                timeout=self.timeout,
+                # No SDK retries: a single unreachable call already retried 2x with
+                # exponential backoff stacks to ~6min (measured 362s). Fail in one shot.
+                # 关掉 SDK 重试：不可达时默认 2 次重试+退避会堆到 ~6 分钟（实测 362s）。
+                max_retries=0,
             )
+            if self.embed_proxy:
+                client_kwargs["http_client"] = httpx.AsyncClient(
+                    proxy=self.embed_proxy, timeout=self.timeout)
+            self.client = AsyncOpenAI(**client_kwargs)
         else:
             self.client = None
 
@@ -88,16 +123,29 @@ class EmbeddingEngine:
             return False
 
     async def _generate_embedding(self, text: str) -> list[float]:
+        # --- Circuit open: endpoint deemed unreachable, skip API entirely (instant) ---
+        # --- 熔断打开：端点已判定不可达，直接跳过 API（瞬返），不再空转等超时 ---
+        if self._circuit_until > time.time():
+            return []
+
         truncated = text[:2000]
         try:
             response = await self.client.embeddings.create(
                 model=self.model,
                 input=truncated,
             )
+            self._consec_fail = 0  # success resets the breaker
             if response.data and len(response.data) > 0:
                 return response.data[0].embedding
             return []
         except Exception as e:
+            self._consec_fail += 1
+            if self._consec_fail >= self._circuit_threshold and self._circuit_until <= time.time():
+                self._circuit_until = time.time() + self._circuit_cooldown
+                logger.warning(
+                    f"Embedding circuit OPEN for {self._circuit_cooldown:.0f}s after "
+                    f"{self._consec_fail} consecutive failures / 向量化熔断打开，冷却期内跳过"
+                )
             logger.warning(f"Embedding API call failed: {e}")
             return []
 

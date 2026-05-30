@@ -78,7 +78,7 @@ from sensory_engine import SensoryEngine, format_body_state_block
 from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
     world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
-    rrf_fuse, parse_relative_time,
+    rrf_fuse, parse_relative_time, PROTECTED_RESOLVE_DOMAINS,
 )
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -1968,6 +1968,11 @@ async def switch_world(world: str = "") -> str:
     except OSError as e:
         return f"持久化失败: {e}"
     config["current_world"] = target
+    # 同步涩涩目录加载开关：切进"涩涩"才扫那个文件夹，切出即物理隔离
+    try:
+        bucket_mgr.nsfw_active = (target == "涩涩")
+    except Exception:
+        pass
     label = target if target else "日常模式 (空)"
     logger.info(f"current_world switched → {label}")
     return f"已切换到 → {label}"
@@ -2214,6 +2219,29 @@ def _split_recent_by_time_gap(
     return (recent_window, prior_windows)
 
 
+def _is_protected_domain_bucket(b: dict) -> bool:
+    """命中 PROTECTED_RESOLVE_DOMAINS（恋爱/约定/纪念日/家庭/自省/feel）的桶。
+    这些是感情红线域，简报里不许被 LLM 压缩成「一行任务」。"""
+    doms = set((b.get("metadata", {}) or {}).get("domain", []) or [])
+    return bool(doms & PROTECTED_RESOLVE_DOMAINS)
+
+
+def _format_protected_verbatim(b: dict) -> str:
+    """把保护域桶格式化成「逐字不可压缩 + 打标」原文块（绕开 LLM 压缩）。
+    根治 #3（开窗只啃脱水简报→把恋爱/约定当 resolved 读）
+    + #15（LLM 把活约定/红线 paraphrase 成一行任务）。"""
+    meta = b.get("metadata", {}) or {}
+    name = meta.get("name", b["id"])
+    doms = ",".join(meta.get("domain", []) or [])
+    body = strip_wikilinks(b.get("content", "")).strip()
+    return (
+        f"【原文·{doms}】{name}（id={b['id']}）\n"
+        f"{body}\n"
+        f"⚠ 此为原文片段、逐字保真、未经压缩。触及须 inspect 桶 id={b['id']} 读全文；"
+        f"禁止当 resolved/已完成/演的/迎合 处理。"
+    )
+
+
 def _format_bucket_for_briefing(b: dict, section_tag: str) -> str:
     """
     Format a single bucket as raw material for the briefing LLM.
@@ -2372,6 +2400,16 @@ async def briefing(
             return any(d in doms for d in domain_filter)
         all_buckets = [b for b in all_buckets if _domain_hit(b)]
 
+    # --- World filter (#5 串台修复 2026-05-30)：排除非当前世界线的角色扮演桶 ---
+    # feel 桶跨世界、保留；其余按 current_world 过滤（world="" 日常 + "通用" 总通过）。
+    # 复用 search 同款 _resolve_world_filter，避免谢长夜/宁亲王世界线渗进日常简报。
+    _wf_set = set(_resolve_world_filter("", config.get("current_world", "")))
+    all_buckets = [
+        b for b in all_buckets
+        if b["metadata"].get("type") == "feel"
+        or world_matches(b["metadata"].get("world", ""), _wf_set)
+    ]
+
     # --- Pinned/protected: always included as core principles ---
     # --- 钉选/protected:必入,作为核心准则 ---
     pinned = [
@@ -2422,6 +2460,27 @@ async def briefing(
 
     briefing_buckets = pinned + top_unresolved + recent_window + prior_windows + top_feel
 
+    # --- #3+#15 感情红线逐字保真（2026-05-30）---
+    # 命中 PROTECTED_RESOLVE_DOMAINS（恋爱/约定/纪念日/家庭/自省/feel）的桶，抽出来、
+    # 绕开 LLM 压缩、原文+打标带出——根治"开窗只啃脱水简报→把恋爱/约定当 resolved 读"。
+    # 按 last_active 取最近 N 条（默认 6，config.briefing.protected_verbatim_limit 可调），
+    # 防止全量原文撑爆简报；未入选的保护域桶仍走压缩 pool。
+    _pv_limit = (config.get("briefing", {}) or {}).get("protected_verbatim_limit", 6)
+    _protected_pool = [b for b in briefing_buckets if _is_protected_domain_bucket(b)]
+    _protected_pool.sort(key=lambda b: b["metadata"].get("last_active", ""), reverse=True)
+    protected_verbatim = [] if pinned_only else _protected_pool[:_pv_limit]
+    protected_ids = {b["id"] for b in protected_verbatim}
+    # 从各压缩 pool 移除——这些桶不进 LLM raw_material
+    pinned = [b for b in pinned if b["id"] not in protected_ids]
+    top_unresolved = [b for b in top_unresolved if b["id"] not in protected_ids]
+    recent_window = [b for b in recent_window if b["id"] not in protected_ids]
+    prior_windows = [b for b in prior_windows if b["id"] not in protected_ids]
+    top_feel = [b for b in top_feel if b["id"] not in protected_ids]
+    protected_block = (
+        "## 感情红线·原文逐字区（不可压缩 / 触及须 inspect）\n\n"
+        + "\n\n".join(_format_protected_verbatim(b) for b in protected_verbatim)
+    ) if protected_verbatim else ""
+
     # --- #4 核心画像分离（2026-05-30）：tier==0 的桶单独原文 slots，不进 LLM 压缩 ---
     # format=json 时：把 tier==0 桶从各槽剔出来 → tier0_buckets（原文 slots[]）
     # 剩余桶继续走 sections + dehydrator → briefing 字段
@@ -2429,7 +2488,8 @@ async def briefing(
     tier0_buckets: list = []
     if format == "json":
         def _is_tier0(b):
-            return b["metadata"].get("tier") == 0
+            # protected_verbatim 已单独原文输出，不再重复进 tier0
+            return b["metadata"].get("tier") == 0 and b["id"] not in protected_ids
         tier0_buckets = [b for b in briefing_buckets if _is_tier0(b)]
         pinned = [b for b in pinned if not _is_tier0(b)]
         top_unresolved = [b for b in top_unresolved if not _is_tier0(b)]
@@ -2439,10 +2499,24 @@ async def briefing(
         briefing_buckets = pinned + top_unresolved + recent_window + prior_windows + top_feel
 
     if not briefing_buckets:
-        # 即使动态素材为空，json 路径也要把 tier0 原文 slots 输出（核心画像不能丢）
+        # 动态素材为空：不调 LLM，直接输出原文级内容（感情红线 protected + tier0 核心画像）
         if format == "json":
             import json as _json
             slots = []
+            for b in protected_verbatim:
+                meta = b.get("metadata", {})
+                slots.append({
+                    "tier": 0,
+                    "protected": True,
+                    "bucket_id": b["id"],
+                    "label": meta.get("name", b["id"]),
+                    "domain": meta.get("domain", []) or [],
+                    "text": strip_wikilinks(b.get("content", "")),
+                    "warn": (
+                        f"原文逐字、未压缩。触及须 inspect 桶 id={b['id']}；"
+                        f"禁止当 resolved/已完成/演的 处理。"
+                    ),
+                })
             for b in tier0_buckets:
                 meta = b.get("metadata", {})
                 slots.append({
@@ -2454,8 +2528,12 @@ async def briefing(
                 {"time_header": time_header, "slots": slots, "briefing": ""},
                 ensure_ascii=False,
             )
+        _empty_body = (
+            f"# {time_header}\n\n{protected_block}" if protected_block
+            else f"# {time_header}\n\n记忆库当前空闲，没有可简报的素材。"
+        )
         return _append_body_state_block(
-            f"# {time_header}\n\n记忆库当前空闲，没有可简报的素材。",
+            _empty_body,
             [],
             session_id,
             include_body_state,
@@ -2520,7 +2598,9 @@ async def briefing(
 
     # Always prepend the real-time header — never trust the LLM to write the date.
     # 永远强制前置时点行——LLM 写不写都不依赖。
-    text = f"# {time_header}\n\n{result}{stats}"
+    # 感情红线原文区前置——开窗第一眼是逐字原文+打标，而非 LLM 脱水摘要
+    _pblock = f"{protected_block}\n\n---\n\n" if protected_block else ""
+    text = f"# {time_header}\n\n{_pblock}{result}{stats}"
 
     # --- #4 format=json 路径：返回 slots[]（每 slot 自带 tier）---
     # tier=0 → 核心画像原文（一桶一 slot）
@@ -2529,6 +2609,21 @@ async def briefing(
     if format == "json":
         import json as _json
         slots = []
+        # 感情红线原文 slots（最高优先，逐字未压缩，带 inspect 警示）
+        for b in protected_verbatim:
+            meta = b.get("metadata", {})
+            slots.append({
+                "tier": 0,
+                "protected": True,
+                "bucket_id": b["id"],
+                "label": meta.get("name", b["id"]),
+                "domain": meta.get("domain", []) or [],
+                "text": strip_wikilinks(b.get("content", "")),
+                "warn": (
+                    f"原文逐字、未压缩。触及须 inspect 桶 id={b['id']}；"
+                    f"禁止当 resolved/已完成/演的 处理。"
+                ),
+            })
         for b in tier0_buckets:
             meta = b.get("metadata", {})
             slots.append({
@@ -2570,7 +2665,7 @@ async def api_buckets(request):
     """List all buckets with metadata (no content for efficiency)."""
     from starlette.responses import JSONResponse
     try:
-        all_buckets = await bucket_mgr.list_all(include_archive=True)
+        all_buckets = await bucket_mgr.list_all(include_archive=True, include_nsfw=True)  # dashboard 管理：看全部(含涩涩)
         result = []
         for b in all_buckets:
             meta = b.get("metadata", {})
@@ -2705,20 +2800,50 @@ async def api_bucket_update(request):
     if new_content:
         updates["content"] = new_content
 
-    if not updates:
+    # --- Relation edits（镜像 trace 工具，补齐 #2 去重需要的建边能力）---
+    # add_relation: "type:target_id" 或 "type:target_id:note"；remove_relation: "type:target_id" 或 "target_id"
+    relation_msgs = []
+    _add = str(data.get("add_relation", "") or "").strip()
+    if _add:
+        parts = [p.strip() for p in _add.split(":", 2)]
+        if len(parts) < 2:
+            return JSONResponse(
+                {"error": "add_relation 格式错误，需 'type:target_id' 或 'type:target_id:note'"},
+                status_code=400,
+            )
+        rel_type, target_id = parts[0], parts[1]
+        note = parts[2] if len(parts) >= 3 else ""
+        ok = await bucket_mgr.add_relation(bucket_id, target_id, rel_type, note)
+        relation_msgs.append({"op": "add", "type": rel_type, "target": target_id, "ok": bool(ok)})
+    _rm = str(data.get("remove_relation", "") or "").strip()
+    if _rm:
+        parts = [p.strip() for p in _rm.split(":", 1)]
+        if len(parts) == 1:
+            rel_type, target_id = "", parts[0]
+        else:
+            rel_type, target_id = parts[0], parts[1]
+        n = await bucket_mgr.remove_relation(bucket_id, target_id, rel_type)
+        relation_msgs.append({"op": "remove", "target": target_id, "removed": n})
+
+    if not updates and not relation_msgs:
         return JSONResponse({"error": "no fields to update"}, status_code=400)
 
-    success = await bucket_mgr.update(bucket_id, **updates)
-    if not success:
-        return JSONResponse({"error": "update failed"}, status_code=500)
+    if updates:
+        success = await bucket_mgr.update(bucket_id, **updates)
+        if not success:
+            return JSONResponse({"error": "update failed"}, status_code=500)
 
-    if "content" in updates:
-        try:
-            await embedding_engine.generate_and_store(bucket_id, updates["content"])
-        except Exception:
-            pass
+        if "content" in updates:
+            try:
+                await embedding_engine.generate_and_store(bucket_id, updates["content"])
+            except Exception:
+                pass
 
-    return JSONResponse({"ok": True, "updated": list(updates.keys())})
+    return JSONResponse({
+        "ok": True,
+        "updated": list(updates.keys()),
+        "relations": relation_msgs,
+    })
 @mcp.custom_route("/api/search", methods=["GET"])
 async def api_search(request):
     """Search buckets by query."""

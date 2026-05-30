@@ -4,7 +4,13 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import server
-from sensory_engine import SensoryEngine, StimulationResult, extract_spicy, format_body_state_block
+from sensory_engine import (
+    SensoryEngine,
+    StimulationResult,
+    extract_spicy,
+    extract_touch,
+    format_body_state_block,
+)
 
 
 def _bucket(bucket_id: str, content: str, *, importance: int = 5) -> dict:
@@ -71,6 +77,33 @@ def test_extract_spicy_prefers_structured_data():
     assert extract_spicy(_bucket("hot", content)) == 0.9
 
 
+def test_extract_touch_prefers_structured_data():
+    bucket = _bucket("keyboard", "neutral visible text")
+    bucket["metadata"]["sensory"] = {
+        "touch": {
+            "rebound": 0.8,
+            "edge_sting": 0.6,
+            "cool_surface": 0.4,
+        }
+    }
+
+    assert extract_touch(bucket) == {
+        "touch_rebound": 0.8,
+        "edge_sting": 0.6,
+        "cool_surface": 0.4,
+    }
+
+
+def test_extract_touch_can_use_keyboard_keywords_as_weak_signal():
+    bucket = _bucket("keyboard", "键帽中间凹进去，很顺滑；边缘有点硌，按下有回弹，表面有点凉。")
+
+    touch = extract_touch(bucket)
+
+    assert touch["touch_rebound"] == pytest.approx(0.65)
+    assert touch["edge_sting"] == pytest.approx(0.55)
+    assert touch["cool_surface"] == pytest.approx(0.45)
+
+
 def test_sensory_engine_spicy_chain_and_time_decay(tmp_path):
     engine = SensoryEngine(str(tmp_path))
     now = datetime(2026, 5, 23, 12, 0, tzinfo=timezone.utc)
@@ -96,6 +129,46 @@ def test_sensory_engine_spicy_chain_and_time_decay(tmp_path):
     assert second.body_state["drink_water"] == pytest.approx(0.18, abs=0.001)
 
 
+def test_sensory_engine_keyboard_touch_chain_and_time_decay(tmp_path):
+    engine = SensoryEngine(str(tmp_path))
+    now = datetime(2026, 5, 23, 12, 0, tzinfo=timezone.utc)
+    content = json.dumps(
+        {
+            "sensory": {
+                "touch": {
+                    "rebound": 0.8,
+                    "edge_sting": 0.6,
+                    "cool_surface": 0.5,
+                }
+            }
+        },
+        ensure_ascii=False,
+    )
+
+    first = engine.stimulate_from_buckets([_bucket("keyboard", content)], now=now)
+
+    assert first.triggered_bucket_ids == ["keyboard"]
+    assert first.sensory["touch_rebound"] == 0.8
+    assert first.sensory["edge_sting"] == 0.6
+    assert first.sensory["cool_surface"] == 0.5
+    assert first.body_state["finger_rebound"] == pytest.approx(0.6)
+    assert first.body_state["edge_sting"] == pytest.approx(0.408)
+    assert first.body_state["cool_surface"] == pytest.approx(0.36)
+
+    later = now + timedelta(seconds=900)
+    second = engine.stimulate_from_buckets(
+        [_bucket("keyboard", content)],
+        seen_ids={"keyboard"},
+        now=later,
+    )
+
+    assert second.triggered_bucket_ids == []
+    assert second.sensory["touch_rebound"] == 0.0
+    assert second.body_state["finger_rebound"] == pytest.approx(0.221, abs=0.001)
+    assert second.body_state["edge_sting"] == pytest.approx(0.15, abs=0.001)
+    assert second.body_state["cool_surface"] == pytest.approx(0.132, abs=0.001)
+
+
 def test_body_state_block_frames_bias_as_internal_not_user_advice():
     result = StimulationResult(
         sensory={"spicy": 0.9},
@@ -111,6 +184,34 @@ def test_body_state_block_frames_bias_as_internal_not_user_advice():
     assert "action_bias:" not in block
     assert "补救建议" not in block
     assert "给用户" not in block
+
+
+def test_body_state_block_can_frame_keyboard_touch_bias():
+    result = StimulationResult(
+        sensory={
+            "spicy": 0.0,
+            "touch_rebound": 0.8,
+            "edge_sting": 0.6,
+            "cool_surface": 0.5,
+        },
+        body_state={
+            "oral_burn": 0.0,
+            "drink_water": 0.0,
+            "finger_rebound": 0.6,
+            "edge_sting": 0.408,
+            "cool_surface": 0.36,
+        },
+        triggered_bucket_ids=["keyboard"],
+    )
+
+    block = format_body_state_block(result)
+
+    assert "touch_rebound=0.80" in block
+    assert "finger_rebound=0.60" in block
+    assert "键帽凹面" in block
+    assert "边缘硌感" in block
+    assert "do_not_emit: second-person advice" in block
+    assert "literary abstraction" in block
 
 
 @pytest.mark.asyncio
@@ -260,3 +361,42 @@ async def test_briefing_appends_body_state_block(tmp_path, monkeypatch):
     assert "BRIEFING" in result
     assert "External Body State v0" in result
     assert "trigger: spicy=0.70; sting_count=1" in result
+
+
+@pytest.mark.asyncio
+async def test_breath_appends_keyboard_touch_body_state_block(tmp_path, monkeypatch):
+    content = json.dumps(
+        {
+            "sensory": {
+                "touch": {
+                    "rebound": 0.8,
+                    "edge_sting": 0.6,
+                    "cool_surface": 0.5,
+                }
+            },
+            "note": "keyboard payload",
+        },
+        ensure_ascii=False,
+    )
+    fake_mgr = FakeBucketMgr([_bucket("keyboard", content, importance=9)])
+    monkeypatch.setitem(server.config, "buckets_dir", str(tmp_path))
+    monkeypatch.setitem(server.config, "random_surfacing", {})
+    monkeypatch.setattr(server, "bucket_mgr", fake_mgr)
+    monkeypatch.setattr(server, "decay_engine", FakeDecay())
+    monkeypatch.setattr(server, "dehydrator", FakeDehydrator())
+    monkeypatch.setattr(server, "embedding_engine", FakeEmbedding())
+    monkeypatch.setattr(server, "_backfill_started", True)
+
+    result = await server.breath(
+        query="keyboard",
+        max_results=1,
+        relation_depth=0,
+        session_id="touch-test",
+        include_images=False,
+        reset_body_state=True,
+    )
+
+    assert "External Body State v0" in result
+    assert "touch_rebound=0.80" in result
+    assert "finger_rebound=0.60" in result
+    assert "键帽凹面" in result
