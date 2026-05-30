@@ -2522,7 +2522,10 @@ async def briefing(
     # 永远强制前置时点行——LLM 写不写都不依赖。
     text = f"# {time_header}\n\n{result}{stats}"
 
-    # --- #4 format=json 路径：返回 slots[]（tier=0 原文）+ briefing（LLM 压缩文）---
+    # --- #4 format=json 路径：返回 slots[]（每 slot 自带 tier）---
+    # tier=0 → 核心画像原文（一桶一 slot）
+    # tier=1 → 动态记忆简报（LLM 压缩后整段一个 slot，匹配 claude-twin 消费侧约定）
+    # 保留 briefing 字段方便诊断/直接读，消费侧实际按 slots[].tier 分流。
     if format == "json":
         import json as _json
         slots = []
@@ -2532,6 +2535,12 @@ async def briefing(
                 "tier": 0,
                 "label": meta.get("name", b["id"]),
                 "text": strip_wikilinks(b.get("content", "")),
+            })
+        if result:
+            slots.append({
+                "tier": 1,
+                "label": "动态记忆简报",
+                "text": result,
             })
         return _json.dumps(
             {
