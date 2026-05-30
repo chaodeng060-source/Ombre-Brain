@@ -132,6 +132,7 @@ class BucketManager:
         protected: bool = False,
         world: str = "",
         chord_tag: str = None,
+        tier: int = None,
     ) -> str:
         bucket_id = generate_bucket_id()
         domain = domain or ["未分类"]
@@ -178,6 +179,13 @@ class BucketManager:
         # 不参与表达,仅作跨窗口标记。格式示例: "Em(maj7) → A13#11 · 92bpm · f"
         if chord_tag and chord_tag.strip():
             metadata["chord_tag"] = chord_tag.strip()
+
+        # tier 字段（2026-05-30 #4 核心画像分离）：
+        # 仿生五层记忆分层 0=核心画像/铁律 / 1=档案 / 2=日记 / 3=趋势 / 4=时段摘要
+        # 仅在显式传入时写入；旧桶 tier 缺失，briefing 按 None 处理（不进 tier0 原文 slots）。
+        # tier=0 的桶在 briefing(format=json) 时单独原文输出、不进 LLM 压缩链路。
+        if tier is not None:
+            metadata["tier"] = int(tier)
 
         # Defensive: ensure no 'content' key sneaks into metadata kwargs
         # 防御性：确保 metadata 里没有 content 键，否则会和 body 撞 Post() 参数

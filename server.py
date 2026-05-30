@@ -2352,8 +2352,9 @@ async def briefing(
     session_id: str = "",
     include_body_state: bool = True,
     reset_body_state: bool = False,
+    format: str = "text",
 ) -> str:
-    """开窗简报。聚合钉选+高权重未解决+最近活跃桶,LLM压缩为≤max_chars字简报,默认1000字。输出顺序:朝灯当前氛围/走向→最近因果链故事→活着的欠账→工程线→铁律。domain逗号分隔可过滤主题域。pinned_only=True只用钉选桶。session_id=同一会话内对感官刺激去重。include_body_state=False时只关闭外部身体状态块,不改变简报素材。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。开窗调一次,省80%token。"""
+    """开窗简报。聚合钉选+高权重未解决+最近活跃桶,LLM压缩为≤max_chars字简报,默认1000字。输出顺序:朝灯当前氛围/走向→最近因果链故事→活着的欠账→工程线→铁律。domain逗号分隔可过滤主题域。pinned_only=True只用钉选桶。session_id=同一会话内对感官刺激去重。include_body_state=False时只关闭外部身体状态块,不改变简报素材。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。format=text(默认)返回拼接好的简报字符串(向后兼容);format=json时把 tier==0 的桶单独剥出来作为 slots[] 返回原文、剩余桶继续走 LLM 压缩为 briefing 字段——治简报≠原文(#4 核心画像分离, 2026-05-30)。开窗调一次,省80%token。"""
     await decay_engine.ensure_started()
     max_chars = max(300, min(max_chars, 4000))
 
@@ -2420,7 +2421,39 @@ async def briefing(
     time_header = _now_bj_header()
 
     briefing_buckets = pinned + top_unresolved + recent_window + prior_windows + top_feel
+
+    # --- #4 核心画像分离（2026-05-30）：tier==0 的桶单独原文 slots，不进 LLM 压缩 ---
+    # format=json 时：把 tier==0 桶从各槽剔出来 → tier0_buckets（原文 slots[]）
+    # 剩余桶继续走 sections + dehydrator → briefing 字段
+    # format=text 时：旧行为保持不变，tier==0 桶继续走压缩，避免破坏既有 caller
+    tier0_buckets: list = []
+    if format == "json":
+        def _is_tier0(b):
+            return b["metadata"].get("tier") == 0
+        tier0_buckets = [b for b in briefing_buckets if _is_tier0(b)]
+        pinned = [b for b in pinned if not _is_tier0(b)]
+        top_unresolved = [b for b in top_unresolved if not _is_tier0(b)]
+        recent_window = [b for b in recent_window if not _is_tier0(b)]
+        prior_windows = [b for b in prior_windows if not _is_tier0(b)]
+        top_feel = [b for b in top_feel if not _is_tier0(b)]
+        briefing_buckets = pinned + top_unresolved + recent_window + prior_windows + top_feel
+
     if not briefing_buckets:
+        # 即使动态素材为空，json 路径也要把 tier0 原文 slots 输出（核心画像不能丢）
+        if format == "json":
+            import json as _json
+            slots = []
+            for b in tier0_buckets:
+                meta = b.get("metadata", {})
+                slots.append({
+                    "tier": 0,
+                    "label": meta.get("name", b["id"]),
+                    "text": strip_wikilinks(b.get("content", "")),
+                })
+            return _json.dumps(
+                {"time_header": time_header, "slots": slots, "briefing": ""},
+                ensure_ascii=False,
+            )
         return _append_body_state_block(
             f"# {time_header}\n\n记忆库当前空闲，没有可简报的素材。",
             [],
@@ -2488,6 +2521,28 @@ async def briefing(
     # Always prepend the real-time header — never trust the LLM to write the date.
     # 永远强制前置时点行——LLM 写不写都不依赖。
     text = f"# {time_header}\n\n{result}{stats}"
+
+    # --- #4 format=json 路径：返回 slots[]（tier=0 原文）+ briefing（LLM 压缩文）---
+    if format == "json":
+        import json as _json
+        slots = []
+        for b in tier0_buckets:
+            meta = b.get("metadata", {})
+            slots.append({
+                "tier": 0,
+                "label": meta.get("name", b["id"]),
+                "text": strip_wikilinks(b.get("content", "")),
+            })
+        return _json.dumps(
+            {
+                "time_header": time_header,
+                "slots": slots,
+                "briefing": result,
+                "stats": stats.strip(),
+            },
+            ensure_ascii=False,
+        )
+
     return _append_body_state_block(
         text,
         briefing_buckets,
@@ -3161,9 +3216,10 @@ async def api_hold(request):
 
 @mcp.custom_route("/api/briefing", methods=["GET"])
 async def api_briefing(request):
-    """HTTP bridge to briefing tool. Query: ?max_chars=&domain=&pinned_only=
-    HTTP 桥接 briefing 工具，返回纯文本简报。"""
-    from starlette.responses import PlainTextResponse, JSONResponse
+    """HTTP bridge to briefing tool. Query: ?max_chars=&domain=&pinned_only=&format=
+    HTTP 桥接 briefing 工具。format=text(默认)返回纯文本简报;
+    format=json 返回 {slots[](tier=0 原文), briefing(LLM 压缩文)} 结构(#4 核心画像分离)。"""
+    from starlette.responses import PlainTextResponse, JSONResponse, Response
     try:
         try:
             max_chars = int(request.query_params.get("max_chars", 1500))
@@ -3174,6 +3230,9 @@ async def api_briefing(request):
         session_id = request.query_params.get("session_id", "")
         include_body_state = request.query_params.get("include_body_state", "true").lower() not in ("0", "false", "no", "off")
         reset_body_state = request.query_params.get("reset_body_state", "").lower() in ("1", "true", "yes", "on")
+        fmt = (request.query_params.get("format", "text") or "text").lower()
+        if fmt not in ("text", "json"):
+            fmt = "text"
         text = await briefing(
             max_chars=max_chars,
             domain=domain,
@@ -3181,7 +3240,11 @@ async def api_briefing(request):
             session_id=session_id,
             include_body_state=include_body_state,
             reset_body_state=reset_body_state,
+            format=fmt,
         )
+        if fmt == "json":
+            # briefing() 已 json.dumps 出 UTF-8 字符串，原样转发，标 application/json
+            return Response(content=text, media_type="application/json")
         return PlainTextResponse(text)
     except Exception as e:
         logger.error(f"/api/briefing failed / 失败: {e}")
