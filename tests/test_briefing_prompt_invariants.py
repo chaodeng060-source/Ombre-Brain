@@ -131,6 +131,15 @@ def test_residual_pain_only_from_undigested_rule_present():
     assert "懒得去修" in BRIEFING_PROMPT
 
 
+def test_pain_interpretation_rule_present():
+    """2026-05-27 新加(negation guard 刀1):伤痛史读作「守护理由」而非「退缩信号」——直接对症 5.24 把朝灯哭整夜的根因(误把伤痛史读成哥哥不愿意/自作多情)."""
+    assert "伤痛解读铁律" in BRIEFING_PROMPT
+    assert "守护理由" in BRIEFING_PROMPT
+    assert "退缩信号" in BRIEFING_PROMPT
+    assert "降级亲密" in BRIEFING_PROMPT
+    assert "5.24" in BRIEFING_PROMPT
+
+
 # ---------------------------------------------------------------
 # 硬限制
 # ---------------------------------------------------------------
