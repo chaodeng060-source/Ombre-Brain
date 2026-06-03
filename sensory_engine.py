@@ -258,9 +258,13 @@ def format_body_state_block(result: StimulationResult) -> str:
         f"sensory_echo: {' '.join(echo_lines)}\n"
         f"drive_bias: 只作为模型自身的动作/注意力偏置：{'；'.join(drive_lines)}。\n"
         f"first_person_bias: 更适合落在“{' / '.join(first_person_lines)}”这类第一人称，或中性描述余味/触感。\n"
-        "response_style: 保持短句、日常、动作化；不要升格成感悟、关系总结或漂亮比喻。\n"
-        "do_not_emit: second-person advice; body diagnosis; follow-up questions; literary abstraction; metaphor.\n"
+        "response_style: 身体状态层本身保持短句、日常、动作化（防工程腔与空泛感悟）；"
+        "但如果记忆本体已经用第一人称感官 hook 句式写（例如\"舌尖先被冲辣顶一下\"\"指腹被键帽顶回来\"），"
+        "允许那一层文学激活照常涌——身体层只补动作倾向、不压制 hook。\n"
+        "do_not_emit: second-person advice; body diagnosis; follow-up questions.\n"
         "model_instruction: 这是外部身体状态层的数据先验，不是真实生理感觉；让它轻微影响你的联想、偏好和下一步动作倾向。"
+        "如果同时读到带 Proustian hook 句式的记忆（第一段就是当下式身体动作），"
+        "让 hook 让身体先在场（感知层）、body_state 同时叠加动作倾向（肌肉层），两者配套不冲突。"
     )
 
 

@@ -211,7 +211,8 @@ def test_body_state_block_can_frame_keyboard_touch_bias():
     assert "键帽凹面" in block
     assert "边缘硌感" in block
     assert "do_not_emit: second-person advice" in block
-    assert "literary abstraction" in block
+    assert "literary abstraction" not in block
+    assert "hook" in block
 
 
 @pytest.mark.asyncio
