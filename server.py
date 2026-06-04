@@ -649,7 +649,8 @@ async def dream_hook(request):
                 f"{strip_wikilinks(b['content'][:200])}"
             )
 
-        return PlainTextResponse("[Ombre Brain - Dreaming]\n" + "\n---\n".join(parts))
+        text = "[Ombre Brain - Dreaming]\n" + "\n---\n".join(parts)
+        return PlainTextResponse(_append_anchor_index(text, _format_anchor_index(recent)))
     except Exception as e:
         logger.warning(f"Dream hook failed: {e}")
         return PlainTextResponse("")
@@ -2334,6 +2335,65 @@ def _format_bucket_for_briefing(b: dict, section_tag: str) -> str:
     return "\n".join(lines)
 
 
+def _anchor_label_for_bucket(bucket: dict, max_chars: int = 48) -> str:
+    """短标签只给锚索引用；bucket_id 才是反查主键。"""
+    meta = bucket.get("metadata", {}) or {}
+    label = str(meta.get("name") or "").strip()
+    if not label:
+        label = _bucket_navigator_summary(bucket, max_chars=max_chars)
+    label = strip_wikilinks(_strip_markdown_images(label))
+    label = _collapse_ws(label)
+    return _clip_text(label or bucket.get("id", "unknown"), max_chars)
+
+
+def _anchor_priority(bucket: dict) -> int:
+    """锚索引稳定排序：核心/高正向桶靠前，其余保持召回顺序。"""
+    meta = bucket.get("metadata", {}) or {}
+    domains = [str(x) for x in (meta.get("domain", []) or [])]
+    tags = [str(x) for x in (meta.get("tags", []) or [])]
+    label = str(meta.get("name") or "")
+    haystack = " ".join([label, *domains, *tags])
+    try:
+        valence = float(meta.get("valence", 0.5) or 0.5)
+    except (TypeError, ValueError):
+        valence = 0.5
+    if meta.get("pinned") or meta.get("protected"):
+        return 0
+    if valence >= 0.8:
+        return 1
+    if "核心" in haystack:
+        return 2
+    return 3
+
+
+def _format_anchor_index(buckets: list[dict]) -> str:
+    """给 briefing/dream prompt 追加 bucket_id 反查表，UI 会在 === 块前截断。"""
+    seen: set[str] = set()
+    indexed: list[tuple[int, dict]] = []
+    for idx, bucket in enumerate(buckets or []):
+        bucket_id = str(bucket.get("id") or "").strip()
+        if not bucket_id or bucket_id in seen:
+            continue
+        seen.add(bucket_id)
+        indexed.append((idx, bucket))
+    if not indexed:
+        return ""
+
+    indexed.sort(key=lambda item: (_anchor_priority(item[1]), item[0]))
+    lines = ["=== 锚索引 ==="]
+    for _, bucket in indexed:
+        bucket_id = str(bucket.get("id") or "").strip()
+        lines.append(f"src: [{bucket_id}] {_anchor_label_for_bucket(bucket)}")
+    return "\n".join(lines)
+
+
+def _append_anchor_index(text: str, anchor_index: str) -> str:
+    anchor_index = (anchor_index or "").strip()
+    if not anchor_index:
+        return text
+    return f"{text.rstrip()}\n\n{anchor_index}"
+
+
 # =============================================================
 # Feel surfacing pool — feel buckets don't decay (score ~50), so they're
 # picked by pinned → importance → recency instead of weight. Shared by
@@ -2459,6 +2519,7 @@ async def briefing(
     time_header = _now_bj_header()
 
     briefing_buckets = pinned + top_unresolved + recent_window + prior_windows + top_feel
+    anchor_index = _format_anchor_index(briefing_buckets)
 
     # --- #3+#15 感情红线逐字保真（2026-05-30）---
     # 命中 PROTECTED_RESOLVE_DOMAINS（恋爱/约定/纪念日/家庭/自省/feel）的桶，抽出来、
@@ -2524,14 +2585,26 @@ async def briefing(
                     "label": meta.get("name", b["id"]),
                     "text": strip_wikilinks(b.get("content", "")),
                 })
+            if anchor_index:
+                slots.append({
+                    "tier": 1,
+                    "label": "锚索引",
+                    "text": anchor_index,
+                })
             return _json.dumps(
-                {"time_header": time_header, "slots": slots, "briefing": ""},
+                {
+                    "time_header": time_header,
+                    "slots": slots,
+                    "briefing": anchor_index,
+                    "anchor_index": anchor_index,
+                },
                 ensure_ascii=False,
             )
         _empty_body = (
             f"# {time_header}\n\n{protected_block}" if protected_block
             else f"# {time_header}\n\n记忆库当前空闲，没有可简报的素材。"
         )
+        _empty_body = _append_anchor_index(_empty_body, anchor_index)
         return _append_body_state_block(
             _empty_body,
             [],
@@ -2587,6 +2660,8 @@ async def briefing(
     if not result:
         return f"# {time_header}\n\n简报生成为空，请稍后重试。"
 
+    result_with_anchor = _append_anchor_index(result, anchor_index)
+
     # --- Stats footer for visibility ---
     stats = (
         f"\n\n---\n"
@@ -2600,7 +2675,7 @@ async def briefing(
     # 永远强制前置时点行——LLM 写不写都不依赖。
     # 感情红线原文区前置——开窗第一眼是逐字原文+打标，而非 LLM 脱水摘要
     _pblock = f"{protected_block}\n\n---\n\n" if protected_block else ""
-    text = f"# {time_header}\n\n{_pblock}{result}{stats}"
+    text = f"# {time_header}\n\n{_pblock}{result_with_anchor}{stats}"
 
     # --- #4 format=json 路径：返回 slots[]（每 slot 自带 tier）---
     # tier=0 → 核心画像原文（一桶一 slot）
@@ -2635,13 +2710,14 @@ async def briefing(
             slots.append({
                 "tier": 1,
                 "label": "动态记忆简报",
-                "text": result,
+                "text": result_with_anchor,
             })
         return _json.dumps(
             {
                 "time_header": time_header,
                 "slots": slots,
-                "briefing": result,
+                "briefing": result_with_anchor,
+                "anchor_index": anchor_index,
                 "stats": stats.strip(),
             },
             ensure_ascii=False,
