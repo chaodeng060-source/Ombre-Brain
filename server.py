@@ -622,10 +622,73 @@ async def breath_hook(request):
 # /dream-hook endpoint: Dedicated hook for Dreaming
 # Dreaming 专用挂载点
 # =============================================================
+def _sample_dream_material(candidates: list[dict], n: int = 0) -> list[dict]:
+    """梦的「材料混合器」。
+
+    旧版只取最近 10 条 → 梦永远像「昨日日报改写」。这里把材料混起来：
+      最近记忆(40%) / 未解决残渣·偏老(25%) / 感官锚点(15%) / 随机小碎片(余量补满)，
+    最后**打乱顺序**——梦会跳跃、不按时间线走。n<=0 时随机 8~14 条（梦有长有短）。
+
+    纯函数、只读、不写库。配额各至少 1 条；候选不足时尽力填、不报错。
+    TODO(#4 落库后): 掺入「上一两个梦的残影」(dream_events.jsonl 的 source/正文)，
+    让梦能接住前一晚的影子，而不是每晚从零。
+    """
+    if not candidates:
+        return []
+    if n <= 0:
+        n = random.randint(8, 14)
+
+    def _created(b):
+        return b["metadata"].get("created", "")
+
+    by_recent = sorted(candidates, key=_created, reverse=True)
+    unresolved_old = sorted(
+        [b for b in candidates if not b["metadata"].get("resolved", False)],
+        key=_created,
+    )
+    anchors = [b for b in candidates if _is_anchor_bucket(b)]
+    fragments = list(candidates)
+    random.shuffle(fragments)
+
+    q_recent = max(1, round(n * 0.40))
+    q_unresolved = max(1, round(n * 0.25))
+    q_anchor = max(1, round(n * 0.15)) if anchors else 0
+
+    picks: list[dict] = []
+    seen: set = set()
+
+    def _take(pool, k):
+        for b in pool:
+            if len(picks) >= n or k <= 0:
+                break
+            bid = b["id"]
+            if bid in seen:
+                continue
+            seen.add(bid)
+            picks.append(b)
+            k -= 1
+
+    _take(by_recent, q_recent)
+    _take(unresolved_old, q_unresolved)
+    _take(anchors, q_anchor)
+    _take(fragments, n - len(picks))   # 余量用随机碎片补满（含很老的普通桶 → 无厘头接点）
+    random.shuffle(picks)              # 关键：打乱时间线，梦不是日报
+    return picks
+
+
 @mcp.custom_route("/dream-hook", methods=["GET"])
 async def dream_hook(request):
     from starlette.responses import PlainTextResponse
     try:
+        # 可选 ?n=：让 claude-twin 的 DreamProfile 调长短梦（长梦多取、短梦少取）。
+        # request 可能为 None（单测直调），兜底成默认随机条数。
+        n = 0
+        if request is not None:
+            try:
+                n = int(request.query_params.get("n", "0"))
+            except (ValueError, TypeError):
+                n = 0
+
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         candidates = [
             b for b in all_buckets
@@ -633,14 +696,15 @@ async def dream_hook(request):
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
         ]
-        candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
-        recent = candidates[:10]
+        if not candidates:
+            return PlainTextResponse("")
 
-        if not recent:
+        picks = _sample_dream_material(candidates, n)
+        if not picks:
             return PlainTextResponse("")
 
         parts = []
-        for b in recent:
+        for b in picks:
             meta = b["metadata"]
             resolved_tag = "[已解决]" if meta.get("resolved", False) else "[未解决]"
             parts.append(
@@ -650,7 +714,7 @@ async def dream_hook(request):
             )
 
         text = "[Ombre Brain - Dreaming]\n" + "\n---\n".join(parts)
-        return PlainTextResponse(_append_anchor_index(text, _format_anchor_index(recent)))
+        return PlainTextResponse(_append_anchor_index(text, _format_anchor_index(picks)))
     except Exception as e:
         logger.warning(f"Dream hook failed: {e}")
         return PlainTextResponse("")
@@ -3392,8 +3456,11 @@ async def api_import_review(request):
 # =============================================================
 @mcp.custom_route("/api/hold", methods=["POST"])
 async def api_hold(request):
-    """HTTP bridge to hold tool. Body: {content, tags?, importance?, pinned?, source?}.
-    HTTP 桥接 hold 工具。source 会作为额外标签合入 tags。"""
+    """HTTP bridge to hold tool. Body: {content, tags?, importance?, pinned?, source?,
+    domain?, feel?, chord_tag?, valence?, arousal?, source_bucket?}.
+    HTTP 桥接 hold 工具。source 会作为额外标签合入 tags。
+    feel/chord_tag/valence/arousal/source_bucket 透传给 hold——让 server 侧能替哥哥落第一人称
+    feel 桶（如逛 X 的体验沉进海马体，2026-06-04 接 C）。"""
     from starlette.responses import JSONResponse
     try:
         body = await request.json()
@@ -3426,6 +3493,19 @@ async def api_hold(request):
     else:
         domain_csv = ",".join(d.strip() for d in str(raw_domain).split(",") if d.strip())
 
+    feel = bool(body.get("feel"))
+    chord_tag = str(body.get("chord_tag") or "").strip()
+    source_bucket = str(body.get("source_bucket") or "").strip()
+
+    def _num(key, default=-1.0):
+        try:
+            return float(body.get(key))
+        except (TypeError, ValueError):
+            return default
+
+    valence = _num("valence")
+    arousal = _num("arousal")
+
     try:
         result = await hold(
             content=content,
@@ -3433,6 +3513,11 @@ async def api_hold(request):
             importance=importance,
             pinned=pinned,
             domain=domain_csv,
+            feel=feel,
+            chord_tag=chord_tag,
+            valence=valence,
+            arousal=arousal,
+            source_bucket=source_bucket,
         )
         return JSONResponse({"result": result})
     except Exception as e:
