@@ -15,7 +15,7 @@ services:
     container_name: ombre-brain
     restart: unless-stopped
     ports:
-      - "18001:8000"                        # Local debug port (optional) / 本地调试端口
+      - "8000:8000"                        # Local debug port (optional) / 本地调试端口
     environment:
       - OMBRE_API_KEY=${OMBRE_API_KEY}      # From .env file / 从 .env 文件读取
       - OMBRE_TRANSPORT=streamable-http     # Claude.ai requires streamable-http
@@ -25,13 +25,13 @@ services:
       # 挂载你的 Obsidian 仓库（或任意宿主机目录）做持久化存储
       # Example / 示例:
       #   - /path/to/your/Obsidian Vault/Ombre Brain:/data
-      - /Users/p0lar1s/Library/Mobile Documents/iCloud~md~obsidian/Documents/Obsidian Vault/Ombre Brain:/data
+      - /vol1/ombre-data:/data
       - ./config.yaml:/app/config.yaml
 
   # Cloudflare Tunnel (optional) — expose to public internet
   # Cloudflare Tunnel（可选）— 暴露到公网
-  # Configure your own credentials under ~/.cloudflared/
-  # 在 ~/.cloudflared/ 下放你自己的凭证
+  # Configure your own credentials under /home/zhaodeng/.cloudflared/
+  # 在 /home/zhaodeng/.cloudflared/ 下放你自己的凭证
   tunnel:
     image: cloudflare/cloudflared:latest
     container_name: ombre-tunnel
@@ -43,6 +43,6 @@ services:
       --proxy-connection-timeout 300s
       run
     volumes:
-      - ~/.cloudflared:/etc/cloudflared
+      - /home/zhaodeng/.cloudflared:/etc/cloudflared
     depends_on:
       - ombre-brain
