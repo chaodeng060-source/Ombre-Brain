@@ -1984,8 +1984,10 @@ async def switch_world(world: str = "") -> str:
 # 工具 5：pulse — 脉搏，系统状态 + 记忆列表
 # =============================================================
 @mcp.tool()
-async def pulse(include_archive: bool = False, full: bool = False) -> str:
-    """系统状态+记忆桶导航。默认显示目录化摘要; full=True 返回旧版完整列表。include_archive=True含归档。"""
+async def pulse(include_archive: bool = False, full: bool = False, limit: int = 40) -> str:
+    """系统状态+记忆桶导航。默认按权重只显示 Top-`limit` 个桶的目录化摘要(防止记忆增长撑爆工具返回上限);
+    full=True 返回旧版完整列表(全量,记忆多时可能很大,慎用)。include_archive=True含归档。
+    要看某桶原文用 inspect(bucket_id),要精确找用 search(关键词)。"""
     try:
         stats = await bucket_mgr.get_stats()
     except Exception as e:
@@ -2012,22 +2014,36 @@ async def pulse(include_archive: bool = False, full: bool = False) -> str:
     if not buckets:
         return status + "\n记忆库为空。"
 
-    lines = []
+    # 先算分排序：默认只列权重最高的 limit 个，封顶工具返回大小，记忆再涨也不撑爆。
+    scored = []
     for b in buckets:
         meta = b.get("metadata", {})
         try:
             score = decay_engine.calculate_score(meta)
         except Exception:
             score = 0.0
-        lines.append(_format_pulse_line(b, score, full=full))
+        scored.append((b, score))
+    scored.sort(key=lambda x: x[1], reverse=True)
 
     if full:
-        return status + "\n=== 记忆列表 ===\n" + "\n".join(lines)
+        lines = [_format_pulse_line(b, score, full=True) for b, score in scored]
+        return status + "\n=== 记忆列表 (全量 {0} 个) ===\n".format(len(scored)) + "\n".join(lines)
+
+    shown = scored if limit <= 0 else scored[:limit]
+    lines = [_format_pulse_line(b, score, full=False) for b, score in shown]
+    omitted = len(scored) - len(shown)
+    footer = ""
+    if omitted > 0:
+        footer = (
+            f"\n…还有 {omitted} 个权重较低的桶未列出。"
+            "用 inspect(bucket_id) 看原文、search(关键词) 精确找、pulse(full=True) 拉全量。"
+        )
     return (
         status
-        + "\n=== 记忆导航 ===\n"
-        + "默认摘要模式；需要完整原文用 inspect(bucket_id)，需要旧版列表用 pulse(full=True)。\n"
+        + f"\n=== 记忆导航 (Top {len(shown)} / 共 {len(scored)}) ===\n"
+        + "默认按权重摘要；完整原文用 inspect(bucket_id)，精确找用 search(关键词)，全量用 pulse(full=True)。\n"
         + "\n".join(lines)
+        + footer
     )
 
 
