@@ -28,21 +28,22 @@ services:
       - /vol1/ombre-data:/data
       - ./config.yaml:/app/config.yaml
 
-  # Cloudflare Tunnel (optional) — expose to public internet
-  # Cloudflare Tunnel（可选）— 暴露到公网
-  # Configure your own credentials under /home/zhaodeng/.cloudflared/
-  # 在 /home/zhaodeng/.cloudflared/ 下放你自己的凭证
-  tunnel:
-    image: cloudflare/cloudflared:latest
-    container_name: ombre-tunnel
-    restart: unless-stopped
-    command: >
-      tunnel --no-autoupdate --protocol http2
-      --config /etc/cloudflared/config.yml
-      --proxy-keepalive-timeout 300s
-      --proxy-connection-timeout 300s
-      run
-    volumes:
-      - /home/zhaodeng/.cloudflared:/etc/cloudflared
-    depends_on:
-      - ombre-brain
+  # Cloudflare Tunnel — 在朝灯 NAS 上已由 host 上的 cloudflared systemd/手起进程承担
+  #（zhaodeng 用户跑 `cloudflared tunnel --config ~/.cloudflared/config.yml run ombre`）
+  # 故此处 service 段长期禁用；若 host 进程没了再启此段做兜底。下次 `docker compose up`
+  # 不会再勾起空 ombre-tunnel 容器 fail。
+  #
+  # tunnel:
+  #   image: cloudflare/cloudflared:latest
+  #   container_name: ombre-tunnel
+  #   restart: unless-stopped
+  #   command: >
+  #     tunnel --no-autoupdate --protocol http2
+  #     --config /etc/cloudflared/config.yml
+  #     --proxy-keepalive-timeout 300s
+  #     --proxy-connection-timeout 300s
+  #     run
+  #   volumes:
+  #     - /home/zhaodeng/.cloudflared:/etc/cloudflared
+  #   depends_on:
+  #     - ombre-brain
