@@ -78,6 +78,15 @@ def load_config(config_path: str = None) -> dict:
                 "arousal_boost": 0.8,
             },
         },
+        "briefing": {
+            # 简报「最近活跃」叙事段的绝对年龄闸（按 created 计，单位天）。
+            # last_active 会被 inspect/backfill_relations/touch 等维护操作 bump，
+            # 旧桶会冒充「最近活跃」被 LLM 写成「前两天」。created 早于此窗的桶
+            # 只许走 pinned/protected/未解决权重池，不许进「上一窗口/再之前」叙事。
+            # (2026-06-08 修：朝灯戳穿一个月前的卡兜事被当成前两天)
+            "recent_max_age_days": 7,
+            "protected_verbatim_limit": 6,
+        },
         "matching": {
             "fuzzy_threshold": 50,
             "max_results": 5,

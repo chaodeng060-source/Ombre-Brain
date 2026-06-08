@@ -2300,6 +2300,32 @@ def _split_recent_by_time_gap(
     return (recent_window, prior_windows)
 
 
+def _created_within_days(b: dict, max_age_days: float, now: datetime = None) -> bool:
+    """桶的 created（事件真正发生时间）是否落在最近 max_age_days 天内。
+
+    用于简报「最近活跃」叙事段的绝对年龄闸：last_active 会被 inspect/
+    backfill_relations/touch/update 等维护操作 bump，旧桶会冒充「最近活跃」
+    被 LLM 写成「前两天」。改用 created 判事件年龄，旧桶踢出叙事段
+    （仍可走 pinned/protected/未解决权重池）。
+
+    created 缺失或不可解析 → False（保守踢出，宁缺毋滥防旧桶漏网）。
+    (2026-06-08 修：朝灯戳穿一个月前的卡兜事被当成前两天)
+    """
+    raw = (b.get("metadata", {}) or {}).get("created") or ""
+    if not raw:
+        return False
+    try:
+        ev = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except Exception:
+        return False
+    try:
+        # naive/aware 各取对应 now，避免 offset-naive 减 offset-aware 报错。
+        ref = (now or (datetime.now(ev.tzinfo) if ev.tzinfo is not None else datetime.now()))
+        return (ref - ev).total_seconds() <= max_age_days * 86400
+    except Exception:
+        return False
+
+
 def _is_protected_domain_bucket(b: dict) -> bool:
     """命中 PROTECTED_RESOLVE_DOMAINS（恋爱/约定/纪念日/家庭/自省/feel）的桶。
     这些是感情红线域，简报里不许被 LLM 压缩成「一行任务」。"""
@@ -2581,6 +2607,16 @@ async def briefing(
         b for b in all_buckets
         if b["id"] not in seen_ids
         and b["metadata"].get("type") not in ("feel",)
+    ]
+    # --- 绝对年龄闸（2026-06-08 修）---
+    # last_active 会被 inspect/backfill_relations/touch/update 等维护操作 bump，
+    # 导致一个月前的桶冒充「最近活跃」、被 LLM 写成「前两天 XXX」。
+    # 改用 created（事件真正发生时间）做硬性上限：created 早于窗口的桶踢出最近活跃叙事，
+    # 它们若仍重要，自会走 pinned/protected/未解决权重池——不许混进「上一窗口/再之前」。
+    _recent_max_age_days = (config.get("briefing", {}) or {}).get("recent_max_age_days", 7)
+    recent_pool = [
+        b for b in recent_pool
+        if _created_within_days(b, _recent_max_age_days)
     ]
     recent_pool.sort(
         key=lambda b: b["metadata"].get("last_active", ""),
@@ -3174,6 +3210,13 @@ async def api_breath_debug(request):
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/", methods=["GET"])
+async def root_redirect(request):
+    """根路径跳转到 /dashboard，避免存根书签打不开(404)。"""
+    from starlette.responses import RedirectResponse
+    return RedirectResponse(url="/dashboard")
 
 
 @mcp.custom_route("/dashboard", methods=["GET"])
