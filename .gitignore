@@ -15,3 +15,8 @@ scarp_paper
 backup_*/
 *.db
 import_state.json
+
+# Local one-off / copied deployment artifacts. Do not commit: these can lag
+# behind server.py and accidentally roll back production behavior.
+patch_briefing_cache.py
+server_container.py
