@@ -1753,6 +1753,7 @@ async def trace(
     tags: str = "",
     resolved: int = -1,
     pinned: int = -1,
+    protected: int = -1,
     digested: int = -1,
     content: str = "",
     world: str = "",
@@ -1761,7 +1762,7 @@ async def trace(
     add_relation: str = "",
     remove_relation: str = "",
 ) -> str:
-    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。world=改世界归属(传"(none)"清空回日常),只传需改的,-1或空=不改。chord_tag=改情绪色调和弦串(传"(none)"清空),空=不改。add_relation格式"type:target_id"或"type:target_id:note",6类:causes/contributes/improves/explains/updates/kin。remove_relation格式"target_id"或"type:target_id"。"""
+    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,protected=1永不遗忘(无条件入简报)/0摘保护回归衰减池(仅清过时工程桶,感情桶绝不摘),digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。world=改世界归属(传"(none)"清空回日常),只传需改的,-1或空=不改。chord_tag=改情绪色调和弦串(传"(none)"清空),空=不改。add_relation格式"type:target_id"或"type:target_id:note",6类:causes/contributes/improves/explains/updates/kin。remove_relation格式"target_id"或"type:target_id"。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -1797,6 +1798,10 @@ async def trace(
         updates["pinned"] = bool(pinned)
         if pinned == 1:
             updates["importance"] = 10  # pinned → lock importance
+    if protected in (0, 1):
+        # protected=1 永不自动遗忘（无条件入简报核心区）；=0 摘掉保护、回归正常衰减池。
+        # 仅用于清理过时工程态桶——感情/约定/纪念日域桶绝不摘（摘了违 5.14 不回避感情约定）。
+        updates["protected"] = bool(protected)
     if digested in (0, 1):
         updates["digested"] = bool(digested)
     if world:

@@ -357,6 +357,18 @@ class Dehydrator:
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+        # --- Generic JSON result cache: analyze / infer_relations ---
+        # --- 通用 JSON 结果缓存：打标 / 推关系 ---
+        # 键 = sha256(kind \x00 model \x00 实际发给 API 的输入)；
+        # 桶内容没变 → 同样的 API 请求直接命中本地、不调 DeepSeek。
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS json_cache (
+                cache_key TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                model TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
         conn.commit()
         conn.close()
 
@@ -389,6 +401,45 @@ class Dehydrator:
         conn.execute("DELETE FROM dehydration_cache WHERE content_hash = ?", (content_hash,))
         conn.commit()
         conn.close()
+
+    # ---------------------------------------------------------
+    # Generic JSON result cache (analyze / infer_relations)
+    # 通用 JSON 结果缓存（打标 / 推关系）
+    # 失败软处理：任何缓存层异常都不得阻塞主流程，直接当未命中。
+    # ---------------------------------------------------------
+    def _json_cache_key(self, kind: str, key_text: str) -> str:
+        return hashlib.sha256(
+            f"{kind}\x00{self.model}\x00{key_text}".encode()
+        ).hexdigest()
+
+    def _get_cached_json(self, kind: str, key_text: str):
+        """Look up a cached JSON result by (kind, model, exact-API-input)."""
+        try:
+            ck = self._json_cache_key(kind, key_text)
+            conn = sqlite3.connect(self.cache_db_path)
+            row = conn.execute(
+                "SELECT payload FROM json_cache WHERE cache_key = ?", (ck,)
+            ).fetchone()
+            conn.close()
+            return json.loads(row[0]) if row else None
+        except Exception:
+            return None
+
+    def _set_cached_json(self, kind: str, key_text: str, obj) -> None:
+        """Store a JSON result. Soft-fail: never raise into the main flow."""
+        try:
+            payload = json.dumps(obj, ensure_ascii=False)
+            ck = self._json_cache_key(kind, key_text)
+            conn = sqlite3.connect(self.cache_db_path)
+            conn.execute(
+                "INSERT OR REPLACE INTO json_cache (cache_key, payload, model) "
+                "VALUES (?, ?, ?)",
+                (ck, payload, self.model),
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            return
 
     # ---------------------------------------------------------
     # Dehydrate: compress raw content into concise summary
@@ -568,6 +619,13 @@ class Dehydrator:
         if not content or not content.strip():
             return self._default_analysis()
 
+        # --- Cache check: same content → same tags, skip API ---
+        # --- 先查缓存：内容没变就不重新打标（键 = 实际发给 API 的 content[:2000]）---
+        cache_key = content[:2000]
+        cached = self._get_cached_json("analyze", cache_key)
+        if cached is not None:
+            return cached
+
         # --- API analyze (no local fallback) ---
         if not self.api_available:
             raise RuntimeError("脱水 API 不可用，请检查 config.yaml 中的 dehydration 配置")
@@ -575,6 +633,7 @@ class Dehydrator:
         try:
             result = await self._api_analyze(content)
             if result:
+                self._set_cached_json("analyze", cache_key, result)
                 return result
             raise RuntimeError("API 打标返回空结果")
         except RuntimeError:
@@ -885,6 +944,11 @@ class Dehydrator:
                 f"新桶内容：\n{new_content[:1500]}\n\n"
                 f"候选桶（最多 8 条）：\n{cand_text}"
             )
+            # --- Cache check: same (new bucket + candidate set) → same edges ---
+            # --- 先查缓存：新桶+候选集没变就不重新推关系（键 = 完整 user_msg）---
+            cached = self._get_cached_json("infer_relations", user_msg)
+            if cached is not None:
+                return cached
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
@@ -916,6 +980,7 @@ class Dehydrator:
                 note = str(edge.get("note", ""))[:200]
                 if t and target and target in cand_ids:
                     valid.append({"type": t, "target": target, "note": note})
+            self._set_cached_json("infer_relations", user_msg, valid)
             return valid
         except Exception as e:
             logger.warning(f"infer_relations failed / 自动建边失败: {e}")
