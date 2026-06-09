@@ -2767,8 +2767,19 @@ async def briefing(
     raw_material = f"=== 当前时点 ===\n{time_header}\n\n" + "\n\n".join(sections)
 
     # --- Compress via LLM ---
+    # 2026-06-08 并入源码（原为 docker cp 热补丁、重建会丢）：briefing 的 LLM 压缩加
+    # 180s 内存缓存，按 sections 内容 + max_chars 为键。重复开窗 3.6s→0.19s（容器实测）。
+    # 缓存挂在已 import 的 dehydrator 模块对象上，只改这一处局部、不注入模块级变量。
     try:
-        result = await dehydrator.briefing(raw_material, max_chars=max_chars)
+        import hashlib as _hl, time as _t
+        _bc = dehydrator.__dict__.setdefault('_briefing_llm_cache', {})
+        _ck = _hl.md5((chr(10).join(sections) + str(max_chars)).encode('utf-8')).hexdigest()
+        _ce = _bc.get(_ck)
+        if _ce and (_t.time() - _ce[1]) < 180:
+            result = _ce[0]
+        else:
+            result = await dehydrator.briefing(raw_material, max_chars=max_chars)
+            _bc[_ck] = (result, _t.time())
     except Exception as e:
         logger.error(f"Briefing compression failed: {e}")
         return f"# {time_header}\n\n简报生成失败：{e}"
