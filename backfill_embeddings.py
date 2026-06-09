@@ -21,7 +21,7 @@ from bucket_manager import BucketManager
 from embedding_engine import EmbeddingEngine
 
 
-async def backfill(batch_size: int = 20, dry_run: bool = False):
+async def backfill(batch_size: int = 20, dry_run: bool = False, force: bool = False):
     config = load_config()
     bucket_mgr = BucketManager(config)
     engine = EmbeddingEngine(config)
@@ -33,14 +33,19 @@ async def backfill(batch_size: int = 20, dry_run: bool = False):
     all_buckets = await bucket_mgr.list_all(include_archive=True)
     print(f"Total buckets: {len(all_buckets)}")
 
-    # Find buckets without embeddings
-    missing = []
-    for b in all_buckets:
-        emb = await engine.get_embedding(b["id"])
-        if emb is None:
-            missing.append(b)
-
-    print(f"Missing embeddings: {len(missing)}")
+    # --force: re-embed ALL buckets (use after switching to chunked multi-vector,
+    # to refresh existing single-vector rows). Otherwise only fill buckets w/o embedding.
+    # --force：重算全部（切到分段多向量后刷新存量单向量桶用）；否则只补缺向量的桶。
+    if force:
+        missing = list(all_buckets)
+        print(f"FORCE re-embed ALL: {len(missing)} buckets")
+    else:
+        missing = []
+        for b in all_buckets:
+            emb = await engine.get_embedding(b["id"])
+            if emb is None:
+                missing.append(b)
+        print(f"Missing embeddings: {len(missing)}")
 
     if dry_run:
         for b in missing[:10]:
@@ -89,5 +94,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", type=int, default=20)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--force", action="store_true",
+                        help="re-embed ALL buckets (use after switching to chunked multi-vector)")
     args = parser.parse_args()
-    asyncio.run(backfill(batch_size=args.batch_size, dry_run=args.dry_run))
+    asyncio.run(backfill(batch_size=args.batch_size, dry_run=args.dry_run, force=args.force))

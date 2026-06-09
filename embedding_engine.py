@@ -108,15 +108,60 @@ class EmbeddingEngine:
         conn.commit()
         conn.close()
 
+    # --- Multi-vector chunking (2026-06-09) ---
+    # 旧版：整桶取前 2000 字、生成单一向量。大杂烩桶（多条 core_facts）里的子主题
+    # 会被整桶平均稀释，且 2000 字之后的内容根本没进向量 → 子主题召不回（benchmark
+    # 实测 R@5 在「大桶埋小主题」类 query 上掉到 0）。
+    # 新版：长桶按行/段拆成多段，每段各生成一个向量，整桶存「多向量数组」；检索时对
+    # 一个桶的多段取 max 相似度（哪段对得上就召回整桶）。表结构不变，向后兼容旧的单向量。
+    _CHUNK_SIZE = int(os.environ.get("OMBRE_EMBED_CHUNK_SIZE", 1200))
+    _MAX_CHUNKS = int(os.environ.get("OMBRE_EMBED_MAX_CHUNKS", 10))
+
+    def _split_into_chunks(self, text: str) -> list[str]:
+        """长文本按行贪心合并成 ≤_CHUNK_SIZE 的段；短文本单段；单行超长则硬切。"""
+        text = text.strip()
+        if not text:
+            return []
+        if len(text) <= self._CHUNK_SIZE:
+            return [text]
+        chunks: list[str] = []
+        cur = ""
+        for ln in (l.strip() for l in text.split("\n")):
+            if not ln:
+                continue
+            if len(ln) > self._CHUNK_SIZE:           # 单行超长：flush + 硬切
+                if cur:
+                    chunks.append(cur)
+                    cur = ""
+                for i in range(0, len(ln), self._CHUNK_SIZE):
+                    chunks.append(ln[i:i + self._CHUNK_SIZE])
+                continue
+            if cur and len(cur) + len(ln) + 1 > self._CHUNK_SIZE:
+                chunks.append(cur)
+                cur = ln
+            else:
+                cur = (cur + "\n" + ln) if cur else ln
+        if cur:
+            chunks.append(cur)
+        return chunks[:self._MAX_CHUNKS]             # 限段数防超大桶爆 API 调用
+
     async def generate_and_store(self, bucket_id: str, content: str) -> bool:
         if not self.enabled or not content or not content.strip():
             return False
 
         try:
-            embedding = await self._generate_embedding(content)
-            if not embedding:
+            chunks = self._split_into_chunks(content)
+            if not chunks:
                 return False
-            self._store_embedding(bucket_id, embedding)
+            embeddings = []
+            for ch in chunks:
+                emb = await self._generate_embedding(ch)
+                if emb:
+                    embeddings.append(emb)
+                # circuit open / 全失败时 embeddings 为空，下面会返回 False，不写脏数据
+            if not embeddings:
+                return False
+            self._store_embedding(bucket_id, embeddings)   # 存「多向量数组」
             return True
         except Exception as e:
             logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
@@ -200,14 +245,29 @@ class EmbeddingEngine:
         results = []
         for bucket_id, emb_json in rows:
             try:
-                stored_embedding = json.loads(emb_json)
-                sim = self._cosine_similarity(query_embedding, stored_embedding)
+                stored = json.loads(emb_json)
+                sim = self._max_similarity(query_embedding, stored)
                 results.append((bucket_id, sim))
             except (json.JSONDecodeError, Exception):
                 continue
 
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
+
+    def _max_similarity(self, query_emb: list[float], stored) -> float:
+        """对一个桶的 stored 向量取与 query 的最高余弦相似度。
+        兼容两种格式：旧=单向量 list[float]；新=多向量 list[list[float]]（分段）。
+        迁移期 DB 里两种并存，这里统一处理，无需先刷全库即可上线读路径。"""
+        if not stored:
+            return 0.0
+        if isinstance(stored[0], (int, float)):          # 旧格式：单向量
+            return self._cosine_similarity(query_emb, stored)
+        best = 0.0                                        # 新格式：多段取 max
+        for emb in stored:
+            s = self._cosine_similarity(query_emb, emb)
+            if s > best:
+                best = s
+        return best
 
     @staticmethod
     def _cosine_similarity(a: list[float], b: list[float]) -> float:
