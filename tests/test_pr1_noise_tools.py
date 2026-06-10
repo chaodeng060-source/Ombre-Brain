@@ -101,13 +101,13 @@ async def test_pulse_defaults_to_navigator_and_full_preserves_old_listing(monkey
     monkeypatch.setattr(server, "decay_engine", FakeDecay())
 
     nav = await server.pulse()
-    assert "=== 记忆导航 ===" in nav
+    assert "=== 记忆导航 (Top 1 / 共 1) ===" in nav
     assert "摘要:5.21朝灯定下海马体减噪三层方案" in nav
     assert "inspect:b1" in nav
     assert "标签:" not in nav
 
     full = await server.pulse(full=True)
-    assert "=== 记忆列表 ===" in full
+    assert "=== 记忆列表 (全量 1 个) ===" in full
     assert "标签:" in full
     assert "情感:V0.5/A0.3" in full
 
