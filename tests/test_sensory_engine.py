@@ -39,6 +39,8 @@ class FakeDecay:
 
     def calculate_score(self, meta):
         return float(meta.get("importance", 5))
+    def apply_retrieval_decay(self, score, meta):
+        return score
 
 
 class FakeDehydrator:

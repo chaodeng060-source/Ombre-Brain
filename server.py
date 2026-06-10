@@ -1326,6 +1326,12 @@ async def breath(
             b["vector_match"] = True
         matches.append(b)
 
+    # --- Forgetting curve on fused ranking (ebbingflow 偷师) ---
+    # --- 检索排序权重掺遗忘曲线：老桶/resolved 桶自然下沉，pinned/feel 豁免 ---
+    for b in matches:
+        b["score"] = round(decay_engine.apply_retrieval_decay(b["score"], b["metadata"]), 2)
+    matches.sort(key=lambda b: b["score"], reverse=True)
+
     matches = _filter_session_seen(matches, session_id)
     matches = await _ds_filter_candidates(
         query,

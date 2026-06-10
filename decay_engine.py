@@ -49,6 +49,14 @@ class DecayEngine:
         self.emotion_base = emotion_cfg.get("base", 1.0)
         self.arousal_boost = emotion_cfg.get("arousal_boost", 0.8)
 
+        # --- Retrieval-time forgetting curve (Ebbinghaus, borrowed from ebbingflow) ---
+        # --- 检索期遗忘曲线参数（艾宾浩斯，偷师 ebbingflow）---
+        retrieval_cfg = decay_cfg.get("retrieval", {})
+        self.retrieval_half_life_days = retrieval_cfg.get("half_life_days", 14.0)
+        self.retrieval_min_decay = retrieval_cfg.get("min_decay", 0.25)
+        self.retrieval_weight = max(0.0, min(1.0, retrieval_cfg.get("weight", 0.4)))
+        self.retrieval_rehearsal_boost = retrieval_cfg.get("rehearsal_boost", 0.5)
+
         self.bucket_mgr = bucket_mgr
 
         # --- Background task control / 后台任务控制 ---
@@ -166,6 +174,63 @@ class DecayEngine:
         urgency_boost = 1.5 if (arousal > 0.7 and not resolved) else 1.0
 
         return round(base_score * resolved_factor * urgency_boost, 4)
+
+    # ---------------------------------------------------------
+    # Retrieval-time forgetting curve factor (search mode ranking)
+    # 检索期遗忘曲线因子（breath 检索模式排序用）
+    #
+    # Ebbinghaus: decay = exp(-ln2 × age_days / half_life_eff)
+    # - Age uses `created`, NOT last_active — search hits call touch(),
+    #   so last_active would self-reinforce ("retrieved → forever fresh").
+    #   年龄用 created 而非 last_active——检索命中会 touch 刷新 last_active，
+    #   用它会自强化成「被检索到的永远新」死循环。
+    # - Rehearsal: activation_count stretches the half-life
+    #   (ebbingflow "Episode half-life ×2 = oft-retold memories live longer",
+    #   made continuous): half_life_eff = half_life × (1 + boost × log2(1+n))
+    # - Floor min_decay keeps old-but-relevant memories alive,
+    #   EXCEPT resolved buckets — stale self-locks should truly sink.
+    #   保底让「老但相关」不归零；resolved 桶不吃保底——过期自锁就该真衰下去。
+    # - pinned / protected / permanent / feel are exempt (factor 1.0).
+    # ---------------------------------------------------------
+    def retrieval_decay_factor(self, metadata: dict) -> float:
+        if not isinstance(metadata, dict):
+            return 1.0
+        if metadata.get("pinned") or metadata.get("protected"):
+            return 1.0
+        if metadata.get("type") in ("permanent", "feel"):
+            return 1.0
+
+        created_str = metadata.get("created", "")
+        try:
+            created = datetime.fromisoformat(str(created_str))
+            age_days = max(0.0, (datetime.now() - created).total_seconds() / 86400)
+        except (ValueError, TypeError):
+            return 1.0  # 无时间戳给中性因子，不惩罚脏数据
+
+        try:
+            activation_count = max(0, int(metadata.get("activation_count", 0)))
+        except (ValueError, TypeError):
+            activation_count = 0
+        half_life_eff = self.retrieval_half_life_days * (
+            1.0 + self.retrieval_rehearsal_boost * math.log2(1 + activation_count)
+        )
+
+        raw_decay = math.exp(-0.693 * age_days / max(0.001, half_life_eff))
+        if metadata.get("resolved", False):
+            decay = raw_decay
+        else:
+            decay = max(self.retrieval_min_decay, raw_decay)
+        return max(0.0, min(1.0, decay))
+
+    def apply_retrieval_decay(self, score: float, metadata: dict) -> float:
+        """
+        Blend the forgetting-curve factor into a retrieval score.
+        把遗忘曲线因子温和混入检索分：factor = (1-w) + w×decay。
+        w=0.4 时最老的非 resolved 桶 ×0.7、resolved 老桶最低 ×0.6、新桶 ×1.0——
+        够让同分老桶下沉，但不至于把高相关老记忆直接挤出局。
+        """
+        factor = (1.0 - self.retrieval_weight) + self.retrieval_weight * self.retrieval_decay_factor(metadata)
+        return score * factor
 
     # ---------------------------------------------------------
     # Execute one decay cycle

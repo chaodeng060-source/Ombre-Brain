@@ -57,6 +57,11 @@ decay:
   emotion_weights:
     base: 1.0                     # Base weight / 基础权重
     arousal_boost: 0.8            # Arousal boost coefficient / 唤醒度加成系数
+  retrieval:                      # Retrieval-time forgetting curve / 检索期遗忘曲线（breath 检索模式排序）
+    half_life_days: 14.0          # Half-life / 半衰期（天），14 天前的记忆衰到 50%
+    min_decay: 0.25               # Floor for unresolved / 非 resolved 桶的衰减保底（老记忆不归零）
+    weight: 0.4                   # Blend weight / 混入强度 0~1（0=关闭，1=纯乘衰减）
+    rehearsal_boost: 0.5          # Rehearsal stretch / 复述拉长半衰系数：half_life×(1+boost×log2(1+激活次数))
 
 # --- Embedding / 向量化配置 ---
 # Uses embedding API for semantic similarity search
