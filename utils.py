@@ -91,6 +91,13 @@ def load_config(config_path: str = None) -> dict:
             "fuzzy_threshold": 50,
             "max_results": 5,
         },
+        "merge": {
+            "keyword_limit": 5,
+            "vector_limit": 8,
+            "vector_floor": 0.50,
+            "vector_threshold": 0.78,
+            "candidate_limit": 8,
+        },
         # --- World axis / 世界轴 ---
         # worlds: 可选值清单，trace/hold 接受的合法 world。空字符串 "" 表示日常聊天（不属于任何世界）。
         # current_world: 全局指针。hold 不传 world 时走这个；breath 不传 world 时按这个过滤。

@@ -27,6 +27,18 @@ log_level: "INFO"
 # 存新记忆时，如果与已有桶的相似度超过此值（0-100），则合并而非新建
 merge_threshold: 75
 
+# --- Merge candidate fusion / 合并候选融合 ---
+# hold/grow write path uses keyword + vector channels to find duplicate buckets.
+# A candidate can merge if keyword score exceeds merge_threshold or vector
+# similarity exceeds vector_threshold; protected/feel/chord-tagged domains still
+# bypass automatic merge.
+merge:
+  keyword_limit: 5                # Keyword candidates considered for merge
+  vector_limit: 8                 # Vector candidates considered for merge
+  vector_floor: 0.50              # Ignore vector noise below this similarity
+  vector_threshold: 0.78          # Vector-only merge threshold
+  candidate_limit: 8              # Max fused candidates checked after RRF ranking
+
 # --- Dehydration API / 脱水压缩 API 配置 ---
 # Uses a cheap LLM for intelligent compression; auto-degrades to local
 # keyword extraction if API is unavailable

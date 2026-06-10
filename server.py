@@ -734,6 +734,241 @@ def _resolve_world_filter(world_param: str, current_world: str):
     return [(current_world or "").strip()]
 
 
+def _metadata_list(value) -> list:
+    if isinstance(value, list):
+        return [str(v) for v in value if str(v).strip()]
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if value is None:
+        return []
+    return [str(value)]
+
+
+def _bucket_primary_domain_matches(meta: dict, domain: list) -> bool:
+    if not domain:
+        return True
+    primary = str(domain[0])
+    return primary in _metadata_list(meta.get("domain", []))
+
+
+def _is_merge_protected_bucket(bucket: dict, incoming_domain: list = None, incoming_chord_tag: str = "") -> bool:
+    meta = bucket.get("metadata", {}) or {}
+    if meta.get("pinned") or meta.get("protected"):
+        return True
+    if meta.get("type") in ("permanent", "feel"):
+        return True
+
+    bucket_domains = set(_metadata_list(meta.get("domain", [])))
+    incoming_domains = set(_metadata_list(incoming_domain or []))
+    if (bucket_domains | incoming_domains) & PROTECTED_RESOLVE_DOMAINS:
+        return True
+
+    # Chord-tagged memories carry affective color. Do not auto-rewrite them via dedupe merge.
+    if meta.get("chord_tag") or (incoming_chord_tag and incoming_chord_tag.strip()):
+        return True
+    return False
+
+
+def _passes_merge_candidate_filters(
+    bucket: dict,
+    domain: list,
+    world_filter: list,
+    incoming_chord_tag: str = "",
+) -> bool:
+    meta = bucket.get("metadata", {}) or {}
+    if _is_merge_protected_bucket(bucket, domain, incoming_chord_tag):
+        return False
+    if world_filter is not None:
+        wf_set = {str(w).strip() for w in world_filter}
+        if not world_matches(meta.get("world", ""), wf_set):
+            return False
+    return _bucket_primary_domain_matches(meta, domain)
+
+
+def _merge_candidate_passes_threshold(bucket: dict) -> bool:
+    merge_cfg = config.get("merge", {}) or {}
+    keyword_threshold = float(merge_cfg.get("keyword_threshold", config.get("merge_threshold", 85)))
+    vector_threshold = float(merge_cfg.get("vector_threshold", 0.78))
+    kw_score = float(bucket.get("merge_keyword_score", bucket.get("score", 0)) or 0)
+    vec_sim = float(bucket.get("merge_vector_similarity", 0) or 0)
+    return kw_score > keyword_threshold or vec_sim >= vector_threshold
+
+
+async def _find_merge_candidates(
+    content: str,
+    domain: list,
+    world_filter: list,
+    incoming_chord_tag: str = "",
+) -> list[dict]:
+    merge_cfg = config.get("merge", {}) or {}
+    keyword_limit = int(merge_cfg.get("keyword_limit", 5))
+    vector_limit = int(merge_cfg.get("vector_limit", 8))
+    candidate_limit = int(merge_cfg.get("candidate_limit", max(keyword_limit, vector_limit)))
+    vector_floor = float(merge_cfg.get("vector_floor", 0.50))
+
+    try:
+        keyword_matches = await bucket_mgr.search(
+            content,
+            limit=keyword_limit,
+            domain_filter=domain or None,
+            world_filter=world_filter,
+        )
+    except Exception as e:
+        logger.warning(f"Keyword merge search failed / 关键词合并搜索失败: {e}")
+        keyword_matches = []
+
+    keyword_matches = [
+        b for b in keyword_matches
+        if _passes_merge_candidate_filters(b, domain, world_filter, incoming_chord_tag)
+    ]
+
+    try:
+        vector_raw = await embedding_engine.search_similar(content, top_k=vector_limit)
+        vector_ranked = [(bid, sim) for bid, sim in vector_raw if sim >= vector_floor]
+    except Exception as e:
+        logger.warning(f"Vector merge search failed, using keyword only / 向量合并搜索失败: {e}")
+        vector_ranked = []
+
+    keyword_by_id = {b["id"]: b for b in keyword_matches}
+    keyword_scores = {b["id"]: float(b.get("score", 0) or 0) for b in keyword_matches}
+    vector_scores = {bid: float(sim) for bid, sim in vector_ranked}
+    keyword_ranked = [(bid, score) for bid, score in keyword_scores.items()]
+
+    rrf_cfg = config.get("rrf", {}) or {}
+    fused_pairs = rrf_fuse(
+        keyword_ranked,
+        vector_ranked,
+        k=rrf_cfg.get("k", 60),
+        keyword_weight=rrf_cfg.get("keyword_weight", 1.0),
+        vector_weight=rrf_cfg.get("vector_weight", 1.0),
+    )
+
+    candidates = []
+    for bid, fused_score in fused_pairs:
+        if len(candidates) >= candidate_limit:
+            break
+        if bid in keyword_by_id:
+            bucket = keyword_by_id[bid]
+        else:
+            bucket = await bucket_mgr.get(bid)
+            if not bucket:
+                continue
+        if not _passes_merge_candidate_filters(bucket, domain, world_filter, incoming_chord_tag):
+            continue
+
+        kw_score = keyword_scores.get(bid, 0.0)
+        vec_sim = vector_scores.get(bid, 0.0)
+        bucket["merge_keyword_score"] = round(kw_score, 2)
+        bucket["merge_vector_similarity"] = round(vec_sim, 4)
+        bucket["merge_fused_score"] = round(fused_score, 6)
+        bucket["score"] = round(max(kw_score, vec_sim * 100.0, fused_score * 1000.0), 2)
+        if bid not in keyword_by_id:
+            bucket["vector_match"] = True
+        candidates.append(bucket)
+    return candidates
+
+
+_KV_CONFLICT_RE = re.compile(r"(?im)^\s*([A-Za-z0-9_\-\u4e00-\u9fff]{2,40})\s*[:：=]\s*([^\n#;；]+?)\s*$")
+_DATE_CONFLICT_RE = re.compile(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b|\b\d{1,2}月\d{1,2}[日号]?\b")
+_NUMBER_CONFLICT_RE = re.compile(
+    r"(?<![\w.])\d+(?:\.\d+)?\s*(?:kg|g|mg|ml|cm|mm|km|斤|克|毫克|毫升|天|次|小时|分钟|分|度|℃|%|元|块|h|m)\b",
+    re.IGNORECASE,
+)
+_NEGATION_CONFLICT_RE = re.compile(r"\b(no|not|never|none|without|cancelled|canceled)\b|不再|不是|没有|没|无|取消|别|不要")
+_ARBITRATION_CONTEXT_BLOCK_RE = re.compile(r"\n?\[ARBITRATION_CONTEXT\].*?\[/ARBITRATION_CONTEXT\]\n?", re.DOTALL)
+
+
+def _extract_key_values_for_conflict(text: str) -> dict:
+    pairs = {}
+    for match in _KV_CONFLICT_RE.finditer(text or ""):
+        key = match.group(1).strip().lower()
+        value = match.group(2).strip()
+        if key and value:
+            pairs[key] = value[:180]
+    return pairs
+
+
+def _detect_merge_conflicts(old_content: str, new_content: str) -> list[dict]:
+    old_text = strip_wikilinks(old_content or "")
+    new_text = strip_wikilinks(new_content or "")
+    conflicts: list[dict] = []
+    seen_fields: set[str] = set()
+
+    old_kv = _extract_key_values_for_conflict(old_text)
+    new_kv = _extract_key_values_for_conflict(new_text)
+    for field, old_value in old_kv.items():
+        new_value = new_kv.get(field)
+        if new_value is not None and old_value != new_value:
+            conflicts.append({"field": field, "old": old_value, "new": new_value})
+            seen_fields.add(field)
+
+    old_dates = sorted({m.group(0) for m in _DATE_CONFLICT_RE.finditer(old_text)})
+    new_dates = sorted({m.group(0) for m in _DATE_CONFLICT_RE.finditer(new_text)})
+    if old_dates and new_dates and old_dates != new_dates and "date" not in seen_fields:
+        conflicts.append({
+            "field": "date",
+            "old": ", ".join(old_dates)[:180],
+            "new": ", ".join(new_dates)[:180],
+        })
+
+    old_without_dates = _DATE_CONFLICT_RE.sub(" ", old_text)
+    new_without_dates = _DATE_CONFLICT_RE.sub(" ", new_text)
+    old_numbers = sorted({m.group(0).strip() for m in _NUMBER_CONFLICT_RE.finditer(old_without_dates)})
+    new_numbers = sorted({m.group(0).strip() for m in _NUMBER_CONFLICT_RE.finditer(new_without_dates)})
+    if old_numbers and new_numbers and old_numbers != new_numbers and "number" not in seen_fields:
+        conflicts.append({
+            "field": "number",
+            "old": ", ".join(old_numbers)[:180],
+            "new": ", ".join(new_numbers)[:180],
+        })
+
+    old_negated = bool(_NEGATION_CONFLICT_RE.search(old_text))
+    new_negated = bool(_NEGATION_CONFLICT_RE.search(new_text))
+    if old_negated != new_negated:
+        conflicts.append({
+            "field": "negation",
+            "old": "negated" if old_negated else "affirmed",
+            "new": "negated" if new_negated else "affirmed",
+        })
+    return conflicts
+
+
+def _build_supersedes_audit(bucket: dict, new_content: str) -> list[dict]:
+    conflicts = _detect_merge_conflicts(bucket.get("content", ""), new_content)
+    if not conflicts:
+        return []
+    at = datetime.now(_BJ_TZ).isoformat(timespec="seconds")
+    return [
+        {
+            "field": c["field"],
+            "old": c["old"],
+            "new": c["new"],
+            "at": at,
+            "bucket_id": bucket.get("id", ""),
+        }
+        for c in conflicts
+    ]
+
+
+def _with_arbitration_context(content: str, audit_entries: list[dict]) -> str:
+    if not audit_entries:
+        return content
+    lines = [
+        "[ARBITRATION_CONTEXT]",
+        "Use these newer values as authoritative for this merge. Keep the old values only in historical/audit wording if needed. Do not copy this block into the final memory.",
+    ]
+    for entry in audit_entries:
+        lines.append(f"- {entry['field']}: old={entry['old']} -> new={entry['new']}")
+    lines.append("[/ARBITRATION_CONTEXT]")
+    return f"{content}\n\n" + "\n".join(lines)
+
+
+def _strip_arbitration_context(content: str) -> str:
+    if not content:
+        return content
+    return _ARBITRATION_CONTEXT_BLOCK_RE.sub("\n", content).strip()
+
+
 # =============================================================
 # Internal helper: merge-or-create
 # 内部辅助：检查是否可合并，可以则合并，否则新建
@@ -761,28 +996,28 @@ async def _merge_or_create(
     # world="" 即日常桶，只在日常桶之间合并；通用桶单独按通用合并。
     world_filter = [(world or "").strip()]
     try:
-        existing = await bucket_mgr.search(
-            content, limit=5,
-            domain_filter=domain or None,
+        existing = await _find_merge_candidates(
+            content=content,
+            domain=domain,
             world_filter=world_filter,
+            incoming_chord_tag=chord_tag,
         )
-        # 主 domain 严格匹配护栏：新内容的 primary domain 必须出现在候选桶的 domain 列表里
-        if domain and existing:
-            primary = domain[0]
-            existing = [b for b in existing if primary in b["metadata"].get("domain", [])]
     except Exception as e:
         logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
         existing = []
 
-    if existing and existing[0].get("score", 0) > config.get("merge_threshold", 85):
-        bucket = existing[0]
+    bucket = next((b for b in existing if _merge_candidate_passes_threshold(b)), None)
+    if bucket:
         # --- Never merge into pinned/protected/permanent buckets ---
         # --- 不合并到钉选/保护/固化桶（这些桶分数恒定 999，标签网常常很宽，
         # ---  允许吸入会让它们变成"吸尘器"把所有相关 hold 都揽进去）---
         bmeta = bucket["metadata"]
-        if not (bmeta.get("pinned") or bmeta.get("protected") or bmeta.get("type") == "permanent"):
+        if not _is_merge_protected_bucket(bucket, domain, chord_tag):
             try:
-                merged = await dehydrator.merge(bucket["content"], content)
+                audit_entries = _build_supersedes_audit(bucket, content)
+                merge_content = _with_arbitration_context(content, audit_entries)
+                merged = await dehydrator.merge(bucket["content"], merge_content)
+                merged = _strip_arbitration_context(merged) or merged
                 old_v = bucket["metadata"].get("valence", 0.5)
                 old_a = bucket["metadata"].get("arousal", 0.3)
                 merged_valence = round((old_v + valence) / 2, 2)
@@ -795,10 +1030,11 @@ async def _merge_or_create(
                     valence=merged_valence,
                     arousal=merged_arousal,
                 )
-                # 合并时若新 hold 带了 chord_tag,以"最近一次为准"覆盖旧桶的色调
-                # Merge: if incoming hold carries a chord_tag, the newer takes precedence
-                if chord_tag and chord_tag.strip():
-                    update_kwargs["chord_tag"] = chord_tag.strip()
+                if audit_entries:
+                    prior = bmeta.get("supersedes", [])
+                    if not isinstance(prior, list):
+                        prior = []
+                    update_kwargs["supersedes"] = prior + audit_entries
                 await bucket_mgr.update(bucket["id"], **update_kwargs)
                 # --- Update embedding after merge ---
                 try:
