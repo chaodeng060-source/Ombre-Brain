@@ -4046,14 +4046,40 @@ if __name__ == "__main__":
             _app = mcp.streamable_http_app()
         else:
             _app = mcp.sse_app()
+
+        # --- /api/* Bearer 鉴权（扫盘 #1）：dashboard 端点（读 + 改 bucket / 换 key / 导记忆）
+        #     裸暴露在隧道上，拿到 URL 即可读全部记忆原文。要求 Authorization: Bearer <OMBRE_API_TOKEN>。
+        #     前端不直连 Ombre（走 claude-twin 代理服务端注入 token），所以加锁不影响面板。
+        #     OMBRE_API_TOKEN 未配 → fail-open（只告警），两边都配才真正生效，避免半配置锁死。
+        #     MCP 传输路径（/mcp、/sse、/messages）和 /health 放行：Claude 经 MCP 客户端访问、另算。
+        from starlette.middleware.base import BaseHTTPMiddleware as _BaseHTTPMiddleware
+        from starlette.responses import JSONResponse  # 本库 JSONResponse 在各端点内 import，模块级无
+
+        _OMBRE_API_TOKEN = os.environ.get("OMBRE_API_TOKEN", "").strip()
+        if not _OMBRE_API_TOKEN:
+            logger.warning("OMBRE_API_TOKEN 未配置 → /api/* 鉴权 fail-open（暂不拦截）；配上后即强制")
+
+        async def _api_auth_dispatch(request, call_next):
+            path = request.url.path or ""
+            if path.startswith("/api/") and _OMBRE_API_TOKEN:
+                auth = request.headers.get("authorization") or ""
+                if auth.strip() != f"Bearer {_OMBRE_API_TOKEN}":
+                    logger.warning(f"/api 鉴权拒绝：{request.method} {path}")
+                    return JSONResponse({"error": "unauthorized"}, status_code=401)
+            return await call_next(request)
+
+        _app.add_middleware(_BaseHTTPMiddleware, dispatch=_api_auth_dispatch)
+
+        # CORS：前端不直连 Ombre（经 claude-twin 代理），故收紧到本机回环 —— 杀掉
+        # 「任意网站用浏览器跨域读你记忆」的攻击面。MCP 是服务端到服务端、不吃浏览器 CORS。
         _app.add_middleware(
             CORSMiddleware,
-            allow_origins=["*"],
+            allow_origins=["http://localhost", "http://127.0.0.1", "http://localhost:8000"],
             allow_methods=["*"],
             allow_headers=["*"],
             expose_headers=["*"],
         )
-        logger.info("CORS middleware enabled for remote transport / 已启用 CORS 中间件")
+        logger.info("CORS + /api Bearer 鉴权中间件已启用 / auth middleware enabled")
         uvicorn.run(_app, host="0.0.0.0", port=8000)
     else:
         mcp.run(transport=transport)
