@@ -28,6 +28,7 @@ import json
 import hashlib
 import sqlite3
 import logging
+import asyncio
 from contextlib import closing
 from openai import AsyncOpenAI
 from utils import count_tokens_approx
@@ -771,16 +772,24 @@ class Dehydrator:
         """
         last_raw = ""
         for attempt in range(3):
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": DIGEST_PROMPT},
-                    {"role": "user", "content": content[:5000]},
-                ],
-                max_tokens=4096,
-                temperature=0.0,
-                response_format={"type": "json_object"},
-            )
+            # 扫盘 #12：重试加指数退避（0/2/4s）；API 网络异常也算一次重试而不是
+            # 直接炸穿整个 digest 流程（原来一次网络抖动就 3 次机会全没）。
+            if attempt > 0:
+                await asyncio.sleep(2 ** attempt)
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": DIGEST_PROMPT},
+                        {"role": "user", "content": content[:5000]},
+                    ],
+                    max_tokens=4096,
+                    temperature=0.0,
+                    response_format={"type": "json_object"},
+                )
+            except Exception as e:
+                logger.warning(f"Diary digest API error, retrying / API 异常重试 (attempt {attempt + 1}/3): {e}")
+                continue
 
             if not response.choices:
                 continue

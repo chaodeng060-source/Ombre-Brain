@@ -36,6 +36,7 @@ import json
 import random
 import logging
 import asyncio
+import threading
 import base64
 import mimetypes
 import re
@@ -1037,10 +1038,11 @@ async def _merge_or_create(
                     update_kwargs["supersedes"] = prior + audit_entries
                 await bucket_mgr.update(bucket["id"], **update_kwargs)
                 # --- Update embedding after merge ---
+                # 扫盘 #10：embedding 失败不再静默——语义检索会悄悄陈旧，至少留 warning
                 try:
                     await embedding_engine.generate_and_store(bucket["id"], merged)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Embedding update after merge failed / 合并后向量更新失败: {bucket['id']}: {e}")
                 return bucket["id"], bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
@@ -1057,10 +1059,11 @@ async def _merge_or_create(
         chord_tag=chord_tag,
     )
     # --- Generate embedding for new bucket ---
+    # 扫盘 #10：失败留痕，否则新桶语义检索召不回且无任何日志线索
     try:
         await embedding_engine.generate_and_store(bucket_id, content)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Embedding for new bucket failed / 新桶向量生成失败: {bucket_id}: {e}")
     display = name if name else bucket_id
     return bucket_id, display, False
 
@@ -1073,6 +1076,9 @@ async def _merge_or_create(
 # server restart without redoing work.
 # =============================================================
 _backfill_started = False
+# 扫盘 #11：check-and-set 加锁。asyncio 单线程本不会交错，但 MCP 工具可能被
+# 线程池/多 loop 调起，无锁时并发首调会起多个 backfill 重复烧 LLM。
+_backfill_start_lock = threading.Lock()
 
 
 async def _startup_backfill_loop() -> None:
@@ -1143,7 +1149,10 @@ def _maybe_start_backfill() -> None:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return  # no event loop yet, will retry on next call
-    _backfill_started = True
+    with _backfill_start_lock:
+        if _backfill_started:
+            return
+        _backfill_started = True
     loop.create_task(_startup_backfill_loop())
     logger.info("Backfill task scheduled (T-30s) / backfill 已排程")
 
@@ -2090,11 +2099,12 @@ async def trace(
         success = True
 
     # Re-generate embedding if content changed
+    # 扫盘 #10：失败留痕（改内容后旧向量还指着旧文本，检索结果会对不上）
     if "content" in updates:
         try:
             await embedding_engine.generate_and_store(bucket_id, updates["content"])
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Embedding refresh after update failed / 改内容后向量刷新失败: {bucket_id}: {e}")
 
     changed = ", ".join(f"{k}={v}" for k, v in updates.items() if k != "content")
     if "content" in updates:
@@ -2276,7 +2286,8 @@ async def switch_world(world: str = "") -> str:
             f"如要新增世界,先在 config.yaml 的 worlds: 列表里加上,再切换。"
         )
     try:
-        save_current_world(config["buckets_dir"], target)
+        # 扫盘 #12：同步文件 I/O 挪 to_thread，NAS 磁盘慢时不卡 event loop
+        await asyncio.to_thread(save_current_world, config["buckets_dir"], target)
     except OSError as e:
         return f"持久化失败: {e}"
     config["current_world"] = target
