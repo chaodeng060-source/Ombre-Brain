@@ -89,6 +89,11 @@ class BucketManager:
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
 
+        # id→文件路径缓存（扫盘 #3）：_find_bucket_file 原来每次 os.walk 全 5 目录，
+        # get/update/delete 高频路径 O(目录树)。命中先 isfile 校验，归档/删除移动文件后
+        # 自动失效回退全扫，外部手动建的新文件走 miss 全扫也能找到——不需要主动失效钩子。
+        self._bucket_path_cache: dict[str, str] = {}
+
         # --- Wikilink config / 双链配置 ---
         wikilink_cfg = config.get("wikilink", {})
         self.wikilink_enabled = wikilink_cfg.get("enabled", True)
@@ -808,6 +813,11 @@ class BucketManager:
     def _find_bucket_file(self, bucket_id: str) -> Optional[str]:
         if not bucket_id:
             return None
+        cached = self._bucket_path_cache.get(bucket_id)
+        if cached is not None:
+            if os.path.isfile(cached):
+                return cached
+            self._bucket_path_cache.pop(bucket_id, None)
         # 含 nsfw_dir：按 id 精确取/改/建边永远找得到（隔离只在 list_all 召回层，不在精确取层）
         for dir_path in [self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir, self.nsfw_dir]:
             if not os.path.exists(dir_path):
@@ -818,7 +828,9 @@ class BucketManager:
                         continue
                     name_part = fname[:-3]
                     if name_part == bucket_id or name_part.endswith(f"_{bucket_id}"):
-                        return os.path.join(root, fname)
+                        path = os.path.join(root, fname)
+                        self._bucket_path_cache[bucket_id] = path
+                        return path
         return None
 
     # ---------------------------------------------------------

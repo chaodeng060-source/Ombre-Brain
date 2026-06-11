@@ -15,6 +15,7 @@ import time
 import sqlite3
 import logging
 import asyncio
+from contextlib import closing
 from pathlib import Path
 
 import httpx
@@ -97,16 +98,16 @@ class EmbeddingEngine:
 
     def _init_db(self):
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS embeddings (
-                bucket_id TEXT PRIMARY KEY,
-                embedding TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
-        conn.commit()
-        conn.close()
+        # 扫盘 #4：全文件 SQLite 一律 closing() 包住——中途抛异常也不漏连接（长跑进程会累积）
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS embeddings (
+                    bucket_id TEXT PRIMARY KEY,
+                    embedding TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.commit()
 
     # --- Multi-vector chunking (2026-06-09) ---
     # 旧版：整桶取前 2000 字、生成单一向量。大杂烩桶（多条 core_facts）里的子主题
@@ -196,26 +197,23 @@ class EmbeddingEngine:
 
     def _store_embedding(self, bucket_id: str, embedding: list[float]):
         from utils import now_iso
-        conn = sqlite3.connect(self.db_path)
-        conn.execute(
-            "INSERT OR REPLACE INTO embeddings (bucket_id, embedding, updated_at) VALUES (?, ?, ?)",
-            (bucket_id, json.dumps(embedding), now_iso()),
-        )
-        conn.commit()
-        conn.close()
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO embeddings (bucket_id, embedding, updated_at) VALUES (?, ?, ?)",
+                (bucket_id, json.dumps(embedding), now_iso()),
+            )
+            conn.commit()
 
     def delete_embedding(self, bucket_id: str):
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("DELETE FROM embeddings WHERE bucket_id = ?", (bucket_id,))
-        conn.commit()
-        conn.close()
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("DELETE FROM embeddings WHERE bucket_id = ?", (bucket_id,))
+            conn.commit()
 
     async def get_embedding(self, bucket_id: str) -> list[float] | None:
-        conn = sqlite3.connect(self.db_path)
-        row = conn.execute(
-            "SELECT embedding FROM embeddings WHERE bucket_id = ?", (bucket_id,)
-        ).fetchone()
-        conn.close()
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            row = conn.execute(
+                "SELECT embedding FROM embeddings WHERE bucket_id = ?", (bucket_id,)
+            ).fetchone()
         if row:
             try:
                 return json.loads(row[0])
@@ -235,9 +233,8 @@ class EmbeddingEngine:
             logger.warning(f"Query embedding failed: {e}")
             return []
 
-        conn = sqlite3.connect(self.db_path)
-        rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
-        conn.close()
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
 
         if not rows:
             return []

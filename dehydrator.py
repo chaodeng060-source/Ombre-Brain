@@ -28,6 +28,7 @@ import json
 import hashlib
 import sqlite3
 import logging
+from contextlib import closing
 from openai import AsyncOpenAI
 from utils import count_tokens_approx
 
@@ -350,59 +351,56 @@ class Dehydrator:
     def _init_cache_db(self):
         """Create dehydration cache table if not exists."""
         os.makedirs(os.path.dirname(self.cache_db_path), exist_ok=True)
-        conn = sqlite3.connect(self.cache_db_path)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS dehydration_cache (
-                content_hash TEXT PRIMARY KEY,
-                summary TEXT NOT NULL,
-                model TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
-        # --- Generic JSON result cache: analyze / infer_relations ---
-        # --- 通用 JSON 结果缓存：打标 / 推关系 ---
-        # 键 = sha256(kind \x00 model \x00 实际发给 API 的输入)；
-        # 桶内容没变 → 同样的 API 请求直接命中本地、不调 DeepSeek。
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS json_cache (
-                cache_key TEXT PRIMARY KEY,
-                payload TEXT NOT NULL,
-                model TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
-        conn.commit()
-        conn.close()
+        # 扫盘 #4：全文件 SQLite 一律 closing() 包住——中途抛异常也不漏连接（长跑进程会累积）
+        with closing(sqlite3.connect(self.cache_db_path)) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS dehydration_cache (
+                    content_hash TEXT PRIMARY KEY,
+                    summary TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            # --- Generic JSON result cache: analyze / infer_relations ---
+            # --- 通用 JSON 结果缓存：打标 / 推关系 ---
+            # 键 = sha256(kind \x00 model \x00 实际发给 API 的输入)；
+            # 桶内容没变 → 同样的 API 请求直接命中本地、不调 DeepSeek。
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS json_cache (
+                    cache_key TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            conn.commit()
 
     def _get_cached_summary(self, content: str) -> str | None:
         """Look up cached dehydration result by content hash."""
         content_hash = hashlib.sha256(content.encode()).hexdigest()
-        conn = sqlite3.connect(self.cache_db_path)
-        row = conn.execute(
-            "SELECT summary FROM dehydration_cache WHERE content_hash = ?",
-            (content_hash,)
-        ).fetchone()
-        conn.close()
+        with closing(sqlite3.connect(self.cache_db_path)) as conn:
+            row = conn.execute(
+                "SELECT summary FROM dehydration_cache WHERE content_hash = ?",
+                (content_hash,)
+            ).fetchone()
         return row[0] if row else None
 
     def _set_cached_summary(self, content: str, summary: str):
         """Store dehydration result in cache."""
         content_hash = hashlib.sha256(content.encode()).hexdigest()
-        conn = sqlite3.connect(self.cache_db_path)
-        conn.execute(
-            "INSERT OR REPLACE INTO dehydration_cache (content_hash, summary, model) VALUES (?, ?, ?)",
-            (content_hash, summary, self.model)
-        )
-        conn.commit()
-        conn.close()
+        with closing(sqlite3.connect(self.cache_db_path)) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO dehydration_cache (content_hash, summary, model) VALUES (?, ?, ?)",
+                (content_hash, summary, self.model)
+            )
+            conn.commit()
 
     def invalidate_cache(self, content: str):
         """Remove cached summary for specific content (call when bucket content changes)."""
         content_hash = hashlib.sha256(content.encode()).hexdigest()
-        conn = sqlite3.connect(self.cache_db_path)
-        conn.execute("DELETE FROM dehydration_cache WHERE content_hash = ?", (content_hash,))
-        conn.commit()
-        conn.close()
+        with closing(sqlite3.connect(self.cache_db_path)) as conn:
+            conn.execute("DELETE FROM dehydration_cache WHERE content_hash = ?", (content_hash,))
+            conn.commit()
 
     # ---------------------------------------------------------
     # Generic JSON result cache (analyze / infer_relations)
@@ -418,11 +416,10 @@ class Dehydrator:
         """Look up a cached JSON result by (kind, model, exact-API-input)."""
         try:
             ck = self._json_cache_key(kind, key_text)
-            conn = sqlite3.connect(self.cache_db_path)
-            row = conn.execute(
-                "SELECT payload FROM json_cache WHERE cache_key = ?", (ck,)
-            ).fetchone()
-            conn.close()
+            with closing(sqlite3.connect(self.cache_db_path)) as conn:
+                row = conn.execute(
+                    "SELECT payload FROM json_cache WHERE cache_key = ?", (ck,)
+                ).fetchone()
             return json.loads(row[0]) if row else None
         except Exception:
             return None
@@ -432,14 +429,13 @@ class Dehydrator:
         try:
             payload = json.dumps(obj, ensure_ascii=False)
             ck = self._json_cache_key(kind, key_text)
-            conn = sqlite3.connect(self.cache_db_path)
-            conn.execute(
-                "INSERT OR REPLACE INTO json_cache (cache_key, payload, model) "
-                "VALUES (?, ?, ?)",
-                (ck, payload, self.model),
-            )
-            conn.commit()
-            conn.close()
+            with closing(sqlite3.connect(self.cache_db_path)) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO json_cache (cache_key, payload, model) "
+                    "VALUES (?, ?, ?)",
+                    (ck, payload, self.model),
+                )
+                conn.commit()
         except Exception:
             return
 
