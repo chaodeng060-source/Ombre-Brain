@@ -74,6 +74,7 @@ from decay_engine import DecayEngine
 from consolidation_engine import ConsolidationEngine
 from episode_engine import EpisodeEngine
 from saga_engine import SagaEngine
+from sense_tagger import detect_senses, union_senses
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from r2_storage import r2_storage
@@ -1000,6 +1001,9 @@ async def _merge_or_create(
     检查是否有相似桶可合并，有则合并，无则新建。
     返回 (桶ID, 显示名, 是否合并)。
     """
+    # 五感入口层 v1：从内容识别感官标签（嗅/味/触/听），合并与新建两路都带上。
+    detected_senses = detect_senses(content)
+
     # 合并候选必须在同一个 world 内（避免日常桶被角色记忆合并污染或反过来）。
     # world="" 即日常桶，只在日常桶之间合并；通用桶单独按通用合并。
     world_filter = [(world or "").strip()]
@@ -1043,6 +1047,10 @@ async def _merge_or_create(
                     if not isinstance(prior, list):
                         prior = []
                     update_kwargs["supersedes"] = prior + audit_entries
+                # 感官标签并入（合并不丢已有 sense、补上新内容触到的感官）
+                merged_senses = union_senses(bmeta.get("sense"), detected_senses)
+                if merged_senses:
+                    update_kwargs["sense"] = merged_senses
                 await bucket_mgr.update(bucket["id"], **update_kwargs)
                 # --- Update embedding after merge ---
                 # 扫盘 #10：embedding 失败不再静默——语义检索会悄悄陈旧，至少留 warning
@@ -1064,6 +1072,7 @@ async def _merge_or_create(
         name=name or None,
         world=world,
         chord_tag=chord_tag,
+        sense=detected_senses or None,
     )
     # --- Generate embedding for new bucket ---
     # 扫盘 #10：失败留痕，否则新桶语义检索召不回且无任何日志线索
@@ -1581,8 +1590,21 @@ async def breath(
 
     # --- Forgetting curve on fused ranking (ebbingflow 偷师) ---
     # --- 检索排序权重掺遗忘曲线：老桶/resolved 桶自然下沉，pinned/feel 豁免 ---
+    # --- 五感入口层 v1：query 带感官线索时，同感官的 sense 桶轻微上浮（普鲁斯特钩子）---
+    sense_cfg = config.get("sense", {})
+    sense_boost = (
+        float(sense_cfg.get("recall_boost", 1.25))
+        if sense_cfg.get("enabled", True) else 1.0
+    )
+    query_senses = set(detect_senses(query)) if sense_boost != 1.0 else set()
     for b in matches:
         b["score"] = round(decay_engine.apply_retrieval_decay(b["score"], b["metadata"]), 2)
+        if query_senses:
+            b_sense = b["metadata"].get("sense")
+            if isinstance(b_sense, str):
+                b_sense = [b_sense]
+            if b_sense and set(b_sense) & query_senses:
+                b["score"] = round(b["score"] * sense_boost, 2)
     matches.sort(key=lambda b: b["score"], reverse=True)
 
     matches = _filter_session_seen(matches, session_id)

@@ -141,6 +141,7 @@ class BucketManager:
         world: str = "",
         chord_tag: str = None,
         tier: int = None,
+        sense: list[str] = None,
     ) -> str:
         bucket_id = generate_bucket_id()
         domain = domain or ["未分类"]
@@ -194,6 +195,13 @@ class BucketManager:
         # tier=0 的桶在 briefing(format=json) 时单独原文输出、不进 LLM 压缩链路。
         if tier is not None:
             metadata["tier"] = int(tier)
+
+        # sense 字段（五感入口层 v1）：嗅觉/味觉/触觉/听觉 标签，仅在非空时写入。
+        # 让 breath 能按感官线索把"带味道/触感的记忆"连情绪一起浮回（普鲁斯特钩子）。
+        if sense:
+            clean_sense = [s for s in sense if isinstance(s, str) and s.strip()]
+            if clean_sense:
+                metadata["sense"] = clean_sense
 
         # Defensive: ensure no 'content' key sneaks into metadata kwargs
         # 防御性：确保 metadata 里没有 content 键，否则会和 body 撞 Post() 参数

@@ -92,6 +92,15 @@ narrative:
   max_episodes_per_cycle: 5       # Cap episodes built per cycle / 每轮最多卷几个 episode
   max_episodes_into_saga_per_cycle: 8  # Cap episodes routed to sagas per cycle / 每轮最多归并几个 episode 进 saga
 
+# --- Sense entry layer / 五感入口层（嗅/味/触/听）---
+# On write, content describing a smell/taste/touch/sound auto-gets a `sense:` tag.
+# On breath, a sensory query lifts same-sense buckets (the Proust hook).
+# 写入时带感官描述的内容自动打 sense 标签；breath 时感官 query 让同感官桶上浮（普鲁斯特钩子）。
+# All values have safe code defaults; this block is optional.
+sense:
+  enabled: true                   # Enable sense tagging + recall boost / 启用感官打标+召回上浮
+  recall_boost: 1.25              # Score multiplier for same-sense buckets on a sensory query / 同感官桶召回分乘子
+
 # --- Embedding / 向量化配置 ---
 # Uses embedding API for semantic similarity search
 # 通过 embedding API 实现语义相似度搜索
