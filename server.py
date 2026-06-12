@@ -72,6 +72,8 @@ from bucket_manager import BucketManager
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from consolidation_engine import ConsolidationEngine
+from episode_engine import EpisodeEngine
+from saga_engine import SagaEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from r2_storage import r2_storage
@@ -93,6 +95,11 @@ dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 embedding_engine = EmbeddingEngine(config)            # Embedding engine / 向量化引擎
 consolidation_engine = ConsolidationEngine(config, bucket_mgr, embedding_engine)  # Consolidation engine / 整理引擎（夜班）
+# Narrative layer (kernel 3): Event -> Episode -> Saga. Episode owns the loop,
+# runs saga consolidation after building episodes each cycle.
+# 叙事层（内核 3）：Event -> Episode -> Saga。episode 引擎持有后台循环，每轮卷完 episode 后接 saga 归并。
+saga_engine = SagaEngine(config, bucket_mgr, dehydrator)
+episode_engine = EpisodeEngine(config, bucket_mgr, embedding_engine, dehydrator, saga_engine=saga_engine)
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 sensory_engine = SensoryEngine(config["buckets_dir"])  # External body-state sidecar / 外部身体状态层
 
@@ -1281,6 +1288,7 @@ async def breath(
     """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认6000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制注入数量上限(默认8,最大50; 内部仍先召回20条给过滤器)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿关系边召回邻居的跳数(默认1,0=不走关系边),目前 MVP 只走 1 跳出边,最多附加 5 条。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。session_id=同一会话内对已浮现动态桶去重。include_images=True时,白名单图桶会随文本返回 MCP image content。include_body_state=False时只关闭外部身体状态块,不改变记忆检索。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。"""
     await decay_engine.ensure_started()
     await consolidation_engine.ensure_started()
+    await episode_engine.ensure_started()
     _maybe_start_backfill()
     max_results = max(1, min(max_results, 50))
     max_tokens = max(1000, min(max_tokens, 20000))
@@ -2325,6 +2333,7 @@ async def pulse(include_archive: bool = False, full: bool = False, limit: int = 
         f"总存储大小: {stats['total_size_kb']:.1f} KB\n"
         f"衰减引擎: {'运行中' if decay_engine.is_running else '已停止'}\n"
         f"整理引擎: {'运行中' if consolidation_engine.is_running else '已停止'}\n"
+        f"情节引擎: {'运行中' if episode_engine.is_running else '已停止'}\n"
     )
 
     # --- List all bucket summaries / 列出所有桶摘要 ---

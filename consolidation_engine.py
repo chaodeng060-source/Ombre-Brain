@@ -32,7 +32,10 @@ logger = logging.getLogger("ombre_brain.consolidation")
 
 # Bucket types that are never touched by consolidation.
 # 整理永不触碰的桶类型。
-_EXEMPT_TYPES = ("permanent", "feel", "archived")
+# episode/saga are derived narrative layers (kernel 3) — consolidation must
+# leave them alone (they legitimately summarize many buckets, not duplicates).
+# episode/saga 是内核 3 的派生叙事层，整理引擎不碰（它们本就是多桶摘要、非重复）。
+_EXEMPT_TYPES = ("permanent", "feel", "archived", "episode", "saga")
 
 
 class ConsolidationEngine:

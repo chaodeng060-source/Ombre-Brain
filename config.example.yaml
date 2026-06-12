@@ -75,6 +75,23 @@ decay:
     weight: 0.4                   # Blend weight / 混入强度 0~1（0=关闭，1=纯乘衰减）
     rehearsal_boost: 0.5          # Rehearsal stretch / 复述拉长半衰系数：half_life×(1+boost×log2(1+激活次数))
 
+# --- Narrative layer / 叙事层（内核 3：Event -> Episode -> Saga）---
+# Additive consolidation: clusters recent related buckets into episode summaries,
+# then folds episodes into long-running sagas. Never mutates source buckets.
+# 只增不改：把最近相关的桶卷成 episode 摘要，再把 episode 归并进长线 saga。绝不碰源桶。
+# All values have safe code defaults; this block is optional.
+# 所有值代码里都有安全默认，本节点可省。
+narrative:
+  enabled: true                   # Enable narrative engine / 启用叙事层
+  interval_hours: 24              # Cycle interval (hours) / 归并周期间隔（小时）
+  min_cluster_size: 3             # Min events to form an episode / 成一个 episode 的最小 event 数
+  max_cluster_size: 12            # Max events per episode / 单 episode 最多 event 数
+  episode_sim_threshold: 0.78     # Semantic continuity cosine / 语义连续性 cosine 阈值
+  episode_span_days: 3.0          # Max time span of one episode / 单 episode 时间跨度上限（天）
+  episode_lookback_days: 30.0     # Only narrate events newer than this / 只卷这么多天内的新 event
+  max_episodes_per_cycle: 5       # Cap episodes built per cycle / 每轮最多卷几个 episode
+  max_episodes_into_saga_per_cycle: 8  # Cap episodes routed to sagas per cycle / 每轮最多归并几个 episode 进 saga
+
 # --- Embedding / 向量化配置 ---
 # Uses embedding API for semantic similarity search
 # 通过 embedding API 实现语义相似度搜索
