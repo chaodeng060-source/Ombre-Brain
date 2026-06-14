@@ -78,7 +78,7 @@ from sense_tagger import detect_senses, union_senses
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from r2_storage import r2_storage
-from sensory_engine import SensoryEngine, format_body_state_block
+from sensory_engine import SensoryEngine, format_body_state_block, senses_from_sensory
 from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
     world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
@@ -1048,7 +1048,10 @@ async def _merge_or_create(
                         prior = []
                     update_kwargs["supersedes"] = prior + audit_entries
                 # 感官标签并入（合并不丢已有 sense、补上新内容触到的感官）
-                merged_senses = union_senses(bmeta.get("sense"), detected_senses)
+                # 结构化 sensory.spicy/touch 也映射成 sense 通道：闭环另一半——带 sensory.* 的桶
+                # 既能被读到点燃身体，也能被「味觉/触觉」类 query 上浮（普鲁斯特钩子，小卷 #1）。
+                structured_senses = senses_from_sensory({"metadata": bmeta})
+                merged_senses = union_senses(bmeta.get("sense"), detected_senses, structured_senses)
                 if merged_senses:
                     update_kwargs["sense"] = merged_senses
                 await bucket_mgr.update(bucket["id"], **update_kwargs)

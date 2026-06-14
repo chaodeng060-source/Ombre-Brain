@@ -87,6 +87,13 @@ def load_config(config_path: str = None) -> dict:
             "recent_max_age_days": 7,
             "protected_verbatim_limit": 6,
         },
+        # --- 五感入口层 / Sense entry layer ---
+        # 写入时给带感官描述的内容打 sense 标签，breath 时同感官 query 让相关桶上浮（普鲁斯特钩子）。
+        # 代码各处已有同值 fallback，这里补进 defaults：让配置可见、可热改、可被 env 覆盖（小卷 #5）。
+        "sense": {
+            "enabled": True,
+            "recall_boost": 1.25,
+        },
         "matching": {
             "fuzzy_threshold": 50,
             "max_results": 5,
@@ -161,6 +168,20 @@ def load_config(config_path: str = None) -> dict:
     if env_fuzzy:
         try:
             config.setdefault("matching", {})["fuzzy_threshold"] = int(env_fuzzy)
+        except ValueError:
+            pass
+
+    # --- Sense env overrides ---
+    env_sense_enabled = os.environ.get("OMBRE_SENSE_ENABLED", "")
+    if env_sense_enabled:
+        config.setdefault("sense", {})["enabled"] = (
+            env_sense_enabled.lower() not in ("0", "false", "no", "off")
+        )
+
+    env_sense_boost = os.environ.get("OMBRE_SENSE_RECALL_BOOST", "")
+    if env_sense_boost:
+        try:
+            config.setdefault("sense", {})["recall_boost"] = float(env_sense_boost)
         except ValueError:
             pass
 

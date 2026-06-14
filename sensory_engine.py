@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from sense_tagger import SENSES
+
 
 BODY_STATE_FILENAME = "body_state.json"
 DECAY_TAU_SECONDS = 900.0
@@ -201,6 +203,26 @@ def extract_touch(bucket: dict) -> dict[str, float]:
     touch = _merge_touch(touch, _extract_structured_touch_from_text(content))
     touch = _merge_touch(touch, _extract_keyword_touch(content, meta))
     return touch
+
+
+def senses_from_sensory(bucket: dict) -> list[str]:
+    """Derive sense channels (味觉/触觉) from a bucket's structured sensory intensities.
+    把桶的结构化感官强度映射回 sense 通道，按 SENSES 固定顺序去重；无则 []。
+
+    闭环的另一半：sensory_engine 让带 sensory.* 的桶「被读到点燃身体状态」；这里让同一批
+    桶也能被「味觉/辣/入口」「触觉/凉/回弹」这类 query 上浮——否则辣椒酱桶有 sensory.spicy
+    却没 sense:[味觉]，detect_senses 只看关键词时会召不出它（小卷 #1）。
+    阈值复用本模块触发阈（单一真相源）；通道名取自 sense_tagger.SENSES（词表一致）。
+    注：嗅觉/听觉/视觉暂无结构化强度字段，故目前只产出 味觉/触觉 两路。"""
+    if not isinstance(bucket, dict):
+        return []
+    hit: set[str] = set()
+    if extract_spicy(bucket) >= SPICY_TRIGGER_THRESHOLD:
+        hit.add("味觉")
+    touch = extract_touch(bucket)
+    if any(value >= TOUCH_TRIGGER_THRESHOLD for value in touch.values()):
+        hit.add("触觉")
+    return [s for s in SENSES if s in hit]
 
 
 def format_body_state_block(result: StimulationResult) -> str:

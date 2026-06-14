@@ -10,6 +10,7 @@ from sensory_engine import (
     extract_spicy,
     extract_touch,
     format_body_state_block,
+    senses_from_sensory,
 )
 
 
@@ -104,6 +105,44 @@ def test_extract_touch_can_use_keyboard_keywords_as_weak_signal():
     assert touch["touch_rebound"] == pytest.approx(0.65)
     assert touch["edge_sting"] == pytest.approx(0.55)
     assert touch["cool_surface"] == pytest.approx(0.45)
+
+
+def test_senses_from_sensory_maps_spicy_to_taste():
+    # 辣椒酱桶的真实形状：sensory.spicy 在 metadata(frontmatter)，正文无味觉关键词。
+    bucket = _bucket("hot", "那口家里的酱入口")
+    bucket["metadata"]["sensory"] = {"spicy": 0.9}
+    assert senses_from_sensory(bucket) == ["味觉"]
+
+
+def test_senses_from_sensory_maps_touch():
+    bucket = _bucket("keyboard", "neutral visible text")
+    bucket["metadata"]["sensory"] = {"touch": {"rebound": 0.8}}
+    assert senses_from_sensory(bucket) == ["触觉"]
+
+
+def test_senses_from_sensory_below_threshold_is_empty():
+    bucket = _bucket("mild", "neutral visible text")
+    bucket["metadata"]["sensory"] = {"spicy": 0.1}
+    assert senses_from_sensory(bucket) == []
+
+
+def test_senses_from_sensory_neutral_and_bad_input_are_empty():
+    assert senses_from_sensory(_bucket("plain", "把向量通道补上 RRF 融合")) == []
+    assert senses_from_sensory({}) == []
+    assert senses_from_sensory(None) == []
+
+
+def test_senses_from_sensory_both_in_canonical_order():
+    bucket = _bucket("both", "neutral visible text")
+    bucket["metadata"]["sensory"] = {"spicy": 0.8, "touch": {"edge_sting": 0.6}}
+    # 味觉 在 触觉 之前（SENSES 固定顺序）
+    assert senses_from_sensory(bucket) == ["味觉", "触觉"]
+
+
+def test_senses_from_sensory_scales_percentage_intensity():
+    bucket = _bucket("pct", "neutral visible text")
+    bucket["metadata"]["sensory"] = {"spicy": 90}  # >1 视作百分制 -> 0.9
+    assert senses_from_sensory(bucket) == ["味觉"]
 
 
 def test_sensory_engine_spicy_chain_and_time_decay(tmp_path):

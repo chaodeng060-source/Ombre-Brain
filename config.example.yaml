@@ -96,7 +96,9 @@ narrative:
 # On write, content describing a smell/taste/touch/sound auto-gets a `sense:` tag.
 # On breath, a sensory query lifts same-sense buckets (the Proust hook).
 # 写入时带感官描述的内容自动打 sense 标签；breath 时感官 query 让同感官桶上浮（普鲁斯特钩子）。
+# 结构化 sensory.spicy/touch 也会映射成 sense 通道（味觉/触觉）：合并时自动补、存量桶用 backfill_senses.py 补。
 # All values have safe code defaults; this block is optional.
+# Env overrides: OMBRE_SENSE_ENABLED (0/false 关), OMBRE_SENSE_RECALL_BOOST (float)。
 sense:
   enabled: true                   # Enable sense tagging + recall boost / 启用感官打标+召回上浮
   recall_boost: 1.25              # Score multiplier for same-sense buckets on a sensory query / 同感官桶召回分乘子
