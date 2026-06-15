@@ -15,8 +15,10 @@
 存储：一行一个 JSON 对象的 .jsonl，落在 <buckets_dir>/review_queue.jsonl。
 
 A pending-review queue shared by Z-axis fact evolution (#2) and relation safety
-gating (#3). Machines only enqueue candidates here; nothing mutates the store of
-truth without an explicit human resolve(). Append-only with enqueue-dedup.
+gating (#3). Machines only enqueue candidates here; the queue is append-only with
+enqueue-dedup, and resolve() is the only path that changes a row's pending status.
+(Note: #2 is an audit trail — ordinary merges still proceed; the queue records them
+for review rather than blocking the truth store.)
 """
 from __future__ import annotations
 
