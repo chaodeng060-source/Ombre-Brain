@@ -135,6 +135,53 @@ rrf:
   keyword_weight: 1.0             # keyword channel weight / 关键词通道权重
   vector_weight: 1.0              # vector channel weight / 向量通道权重
 
+# --- Intent-aware recall / 意图感知检索 ---
+# Classify breath(query=...) into fact/recall/relation/temporal, then assign
+# channel budgets before the existing RRF merge. The default policy mirrors the
+# pre-kernel-4 behavior, so low-confidence queries fall back to current recall.
+intent_recall:
+  enabled: true
+  min_confidence: 0.55
+  policies:
+    default:
+      keyword_top_k_multiplier: 1.0
+      vector_top_k_multiplier: 1.0
+      keyword_weight_multiplier: 1.0
+      vector_weight_multiplier: 1.0
+      relation_neighbor_limit: 5
+      relation_score_boost: 1.0
+      emotion_domain_boost: 1.0
+      temporal_recent_boost: 1.0
+      temporal_recent_days: 14
+    fact:
+      keyword_top_k_multiplier: 1.35
+      vector_top_k_multiplier: 1.15
+      keyword_weight_multiplier: 1.35
+      vector_weight_multiplier: 1.10
+      relation_neighbor_limit: 1
+    recall:
+      keyword_top_k_multiplier: 1.0
+      vector_top_k_multiplier: 1.25
+      keyword_weight_multiplier: 1.0
+      vector_weight_multiplier: 1.15
+      relation_neighbor_limit: 4
+    relation:
+      keyword_top_k_multiplier: 1.0
+      vector_top_k_multiplier: 1.35
+      keyword_weight_multiplier: 0.90
+      vector_weight_multiplier: 1.20
+      relation_neighbor_limit: 8
+      relation_score_boost: 1.20
+      emotion_domain_boost: 1.15
+    temporal:
+      keyword_top_k_multiplier: 1.30
+      vector_top_k_multiplier: 0.90
+      keyword_weight_multiplier: 1.25
+      vector_weight_multiplier: 0.85
+      relation_neighbor_limit: 2
+      temporal_recent_boost: 1.15
+      temporal_recent_days: 14
+
 # --- World axis / 世界轴 ---
 # 用来隔离不同剧情世界的记忆。日常聊天的桶 world 留空（不属于任何世界）；
 # 角色扮演场景的桶必须标具体 world；跨世界通用设定标 world="通用"，搜哪个世界都跟着出。

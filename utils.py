@@ -17,6 +17,8 @@ import logging
 from pathlib import Path
 from datetime import datetime, timedelta
 
+from intent_recall import DEFAULT_INTENT_RECALL_CONFIG
+
 
 # 6 类关系边：causes/contributes/improves/explains/updates 有向，kin 无向（仍单边记一次）
 RELATION_TYPES = frozenset({
@@ -98,6 +100,12 @@ def load_config(config_path: str = None) -> dict:
             "fuzzy_threshold": 50,
             "max_results": 5,
         },
+        "rrf": {
+            "k": 60,
+            "keyword_weight": 1.0,
+            "vector_weight": 1.0,
+        },
+        "intent_recall": DEFAULT_INTENT_RECALL_CONFIG,
         "merge": {
             "keyword_limit": 5,
             "vector_limit": 8,

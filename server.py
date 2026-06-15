@@ -77,6 +77,7 @@ from saga_engine import SagaEngine
 from sense_tagger import detect_senses, union_senses
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
+from intent_recall import bucket_intent_score_multiplier, resolve_intent_recall_policy
 from r2_storage import r2_storage
 from sensory_engine import SensoryEngine, format_body_state_block, senses_from_sensory
 from utils import (
@@ -1519,12 +1520,26 @@ async def breath(
     domain_filter = [d.strip() for d in domain.split(",") if d.strip()] or None
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
+    intent_policy = resolve_intent_recall_policy(
+        query,
+        config,
+        base_recall_limit=recall_limit,
+        requested_relation_depth=relation_depth,
+    )
+    if intent_policy["intent"] != "default":
+        logger.info(
+            "Intent-aware recall: "
+            f"intent={intent_policy['intent']} "
+            f"confidence={intent_policy['confidence']} "
+            f"keyword_top_k={intent_policy['keyword_top_k']} "
+            f"vector_top_k={intent_policy['vector_top_k']}"
+        )
 
     # Keyword channel (already filtered by world/domain/threshold inside)
     try:
         keyword_matches = await bucket_mgr.search(
             query,
-            limit=recall_limit,
+            limit=intent_policy["keyword_top_k"],
             domain_filter=domain_filter,
             world_filter=world_filter,
             query_valence=q_valence,
@@ -1538,7 +1553,10 @@ async def breath(
 
     # Vector channel — sim>0.5 floor blocks high-cosine noise
     try:
-        vector_raw = await embedding_engine.search_similar(query, top_k=recall_limit)
+        vector_raw = await embedding_engine.search_similar(
+            query,
+            top_k=intent_policy["vector_top_k"],
+        )
         vector_ranked = [(bid, sim) for bid, sim in vector_raw if sim > 0.5]
     except Exception as e:
         logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
@@ -1551,8 +1569,8 @@ async def breath(
         keyword_ranked,
         vector_ranked,
         k=rrf_cfg.get("k", 60),
-        keyword_weight=rrf_cfg.get("keyword_weight", 1.0),
-        vector_weight=rrf_cfg.get("vector_weight", 1.0),
+        keyword_weight=intent_policy["keyword_weight"],
+        vector_weight=intent_policy["vector_weight"],
     )
 
     # Materialize fused list: reuse keyword-channel buckets, fetch vector-only ones
@@ -1608,6 +1626,9 @@ async def breath(
                 b_sense = [b_sense]
             if b_sense and set(b_sense) & query_senses:
                 b["score"] = round(b["score"] * sense_boost, 2)
+        intent_multiplier = bucket_intent_score_multiplier(b, intent_policy)
+        if intent_multiplier != 1.0:
+            b["score"] = round(b["score"] * intent_multiplier, 2)
     matches.sort(key=lambda b: b["score"], reverse=True)
 
     matches = _filter_session_seen(matches, session_id)
@@ -1654,17 +1675,21 @@ async def breath(
     # --- 关系网召回：沿主结果桶的出边带 1 跳邻居（不进主排序，单独列在末尾）---
     matched_ids = {b["id"] for b in matches}
     remaining_relation_slots = max(0, max_results - len(result_ids))
-    if relation_depth >= 1 and matches and token_used < max_tokens and remaining_relation_slots:
+    relation_neighbor_cap = min(
+        int(intent_policy.get("relation_neighbor_limit", 5)),
+        remaining_relation_slots,
+    )
+    if intent_policy["relation_depth"] >= 1 and matches and token_used < max_tokens and relation_neighbor_cap:
         seen_neighbors = set()
         neighbor_msgs = []
         for bucket in matches:
-            if len(neighbor_msgs) >= min(5, remaining_relation_slots) or token_used >= max_tokens:
+            if len(neighbor_msgs) >= relation_neighbor_cap or token_used >= max_tokens:
                 break
             relations = bucket["metadata"].get("relations") or []
             if not isinstance(relations, list):
                 continue
             for r in relations:
-                if len(neighbor_msgs) >= min(5, remaining_relation_slots) or token_used >= max_tokens:
+                if len(neighbor_msgs) >= relation_neighbor_cap or token_used >= max_tokens:
                     break
                 if not isinstance(r, dict):
                     continue

@@ -55,8 +55,13 @@ class FakeDehydrator:
 
 
 class FakeEmbedding:
+    def __init__(self, hits=None):
+        self.hits = list(hits or [])
+        self.top_k_calls = []
+
     async def search_similar(self, query, top_k=20):
-        return []
+        self.top_k_calls.append(top_k)
+        return self.hits[:top_k]
 
 
 class FakeBucketMgr:
@@ -161,6 +166,53 @@ async def test_breath_uses_recall_pool_caps_output_and_dedups_session(tmp_path, 
     assert "[bucket_id:a]" not in second
     assert "[bucket_id:b]" not in second
     assert "[bucket_id:c]" in second
+
+
+@pytest.mark.asyncio
+async def test_breath_applies_intent_recall_channel_budgets(tmp_path, monkeypatch):
+    buckets = [
+        _bucket("a", "alpha", domain=["恋爱"]),
+        _bucket("b", "beta", domain=["工程"]),
+        _bucket("c", "gamma", domain=["工程"]),
+    ]
+    fake_mgr = FakeBucketMgr(buckets)
+    fake_embedding = FakeEmbedding()
+    monkeypatch.setitem(server.config, "buckets_dir", str(tmp_path))
+    monkeypatch.setitem(server.config, "random_surfacing", {})
+    monkeypatch.setitem(server.config, "rrf", {"k": 60, "keyword_weight": 1.0, "vector_weight": 1.0})
+    monkeypatch.setitem(
+        server.config,
+        "intent_recall",
+        {
+            "enabled": True,
+            "min_confidence": 0.55,
+            "policies": {
+                "relation": {
+                    "keyword_top_k_multiplier": 2.0,
+                    "vector_top_k_multiplier": 3.0,
+                    "keyword_weight_multiplier": 0.5,
+                    "vector_weight_multiplier": 2.0,
+                    "relation_neighbor_limit": 9,
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(server, "bucket_mgr", fake_mgr)
+    monkeypatch.setattr(server, "decay_engine", FakeDecay())
+    monkeypatch.setattr(server, "dehydrator", FakeDehydrator())
+    monkeypatch.setattr(server, "embedding_engine", fake_embedding)
+    monkeypatch.setattr(server, "_backfill_started", True)
+
+    result = await server.breath(
+        query="我俩最近怎么样",
+        max_results=1,
+        relation_depth=0,
+        include_images=False,
+    )
+
+    assert "[bucket_id:a]" in result
+    assert fake_mgr.search_limits[-1] == server.BREATH_RECALL_POOL_SIZE * 2
+    assert fake_embedding.top_k_calls[-1] == server.BREATH_RECALL_POOL_SIZE * 3
 
 
 @pytest.mark.asyncio
