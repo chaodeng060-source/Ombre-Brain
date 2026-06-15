@@ -62,7 +62,13 @@ def _safe_frontmatter(path: Path):
                 skip = True
                 continue
             cleaned.append(line)
-        return frontmatter.loads("---\n" + "".join(cleaned) + "---\n" + body)
+        cleaned_yaml = "".join(cleaned)
+        # closing --- 必须独占一行：若保留的末行无尾换行（yaml_part 本就不带
+        # 尾换行），重组会把它和 --- 黏成一行 → YAML 头解析失败、metadata 整段
+        # 被吞进 body=静默丢 id/domain/relations/resolved，巡检假干净。
+        if cleaned_yaml and not cleaned_yaml.endswith("\n"):
+            cleaned_yaml += "\n"
+        return frontmatter.loads("---\n" + cleaned_yaml + "---\n" + body)
 
 
 def _load_buckets(buckets_dir: Path) -> list[dict]:
@@ -84,13 +90,18 @@ def _load_buckets(buckets_dir: Path) -> list[dict]:
     return out
 
 
-def _parse_dt(s: str | None) -> datetime | None:
+def _parse_dt(s) -> datetime | None:
     if not s:
         return None
+    # frontmatter/YAML 会把未加引号的 ISO 时间直接读成 datetime/date 对象
+    # （只有带引号的才是 str）；两种都要吃，否则非字符串输入悄悄返回 None
+    # → stale_important 检查被跳过=漏检。
+    if isinstance(s, datetime):
+        return s.replace(tzinfo=None)
     try:
         # 真桶的时间戳带时区（如 +08:00），now=datetime.now() 是 naive；
         # 统一剥掉 tzinfo 归一成 naive，避免 aware/naive 相减崩溃。
-        return datetime.fromisoformat(s.replace("Z", "")).replace(tzinfo=None)
+        return datetime.fromisoformat(str(s).replace("Z", "")).replace(tzinfo=None)
     except Exception:
         return None
 

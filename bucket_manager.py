@@ -885,6 +885,11 @@ class BucketManager:
                     continue
                 cleaned_lines.append(line)
             cleaned_yaml = "".join(cleaned_lines)
+            # closing --- 必须独占一行：保留的末行若无尾换行（yaml_part 不带尾
+            # 换行），重组会把它和 --- 黏成一行 → YAML 头解析失败、metadata 整段
+            # 被吞进 body=静默丢字段。补一个尾换行守住。
+            if cleaned_yaml and not cleaned_yaml.endswith("\n"):
+                cleaned_yaml += "\n"
             cleaned_text = "---\n" + cleaned_yaml + "---\n" + body
             logger.warning(
                 f"Auto-cleaned 'content' from YAML header / "
