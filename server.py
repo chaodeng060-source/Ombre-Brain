@@ -84,6 +84,11 @@ from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
     world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
     rrf_fuse, parse_relative_time, PROTECTED_RESOLVE_DOMAINS,
+    SAFE_RELATION_TYPES, REVIEW_RELATION_TYPES,
+)
+from review_queue import (
+    ReviewQueue, make_relation_entry, make_z_conflict_entry, render_md as _render_review_md,
+    KIND_RELATION, KIND_Z_CONFLICT,
 )
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -104,6 +109,26 @@ saga_engine = SagaEngine(config, bucket_mgr, dehydrator)
 episode_engine = EpisodeEngine(config, bucket_mgr, embedding_engine, dehydrator, saga_engine=saga_engine)
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 sensory_engine = SensoryEngine(config["buckets_dir"])  # External body-state sidecar / 外部身体状态层
+
+# --- 待审队列（#2 Z轴事实演化 + #3 关系闸的共用 pending 存储）---
+# 落在 <buckets_dir>/review_queue.jsonl。两个闸默认**关**（gated），开了只是把
+# 机器自动推断的危险边 / 合并检出的事实冲突改挂 pending 给人审，不动现有部署路。
+_review_queue = None
+
+
+def _get_review_queue() -> ReviewQueue:
+    """懒构造，跟着运行时 buckets_dir 走（测试可改 config 后复位）。"""
+    global _review_queue
+    path = os.path.join(config["buckets_dir"], "review_queue.jsonl")
+    if _review_queue is None or str(_review_queue.path) != os.path.abspath(path) \
+            and str(_review_queue.path) != path:
+        _review_queue = ReviewQueue(path)
+    return _review_queue
+
+
+def _review_gate(name: str) -> bool:
+    """读 config.review_gate.<name>，默认 False（关）。"""
+    return bool((config.get("review_gate", {}) or {}).get(name, False))
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -1048,6 +1073,21 @@ async def _merge_or_create(
                     if not isinstance(prior, list):
                         prior = []
                     update_kwargs["supersedes"] = prior + audit_entries
+                    # #2 Z轴：除了把新值标权威 / 旧值留 historical，再额外挂一条 pending
+                    # 审计行，让人/patrol 能回看「这次合并把哪个事实值悄悄改了」。
+                    # 开关默认关；保护域桶在 _is_merge_protected_bucket 已被排除出本块，
+                    # 这里只会是普通桶（感情记忆绝不走到这）。合并照常进行，仅多一条可审清单。
+                    if _review_gate("fact_evolution_audit"):
+                        try:
+                            q = _get_review_queue()
+                            bname = bmeta.get("name", bucket["id"])
+                            for a in audit_entries:
+                                q.enqueue(make_z_conflict_entry(
+                                    bucket["id"], a["field"], a["old"], a["new"],
+                                    bucket_name=bname, reason="merge_supersede",
+                                ))
+                        except Exception as e:
+                            logger.warning(f"Z轴审计入队失败（不阻塞）/ z-audit enqueue failed: {e}")
                 # 感官标签并入（合并不丢已有 sense、补上新内容触到的感官）
                 # 结构化 sensory.spicy/touch 也映射成 sense 通道：闭环另一半——带 sensory.* 的桶
                 # 既能被读到点燃身体，也能被「味觉/触觉」类 query 上浮（普鲁斯特钩子，小卷 #1）。
@@ -1252,18 +1292,35 @@ async def _auto_infer_edges(
         return []
 
     cand_name_by_id = {c["id"]: c["name"] for c in candidates}
+    # #3 关系闸：只闸**机器自动推断**的边。开关默认关 → 行为不变（全部直接写）。
+    # 开了之后：safe 类（kin/explains）照写；危险类（因果/取代）改挂 pending 等人审，不写库。
+    gate_on = _review_gate("relation_review")
     added: list[dict] = []
+    queued = 0
     for edge in edges:
+        etype = edge.get("type", "")
+        if gate_on and etype in REVIEW_RELATION_TYPES:
+            try:
+                if _get_review_queue().enqueue(make_relation_entry(
+                    source_id, edge["target"], etype, edge.get("note", ""),
+                    target_name=cand_name_by_id.get(edge["target"], edge["target"]),
+                )):
+                    queued += 1
+            except Exception as e:
+                logger.warning(f"关系闸入队失败（不阻塞）/ relation review enqueue failed: {e}")
+            continue  # 危险边不直接写库
         ok = await bucket_mgr.add_relation(
-            source_id, edge["target"], edge["type"], edge.get("note", "")
+            source_id, edge["target"], etype, edge.get("note", "")
         )
         if ok:
             added.append({
-                "type": edge["type"],
+                "type": etype,
                 "target": edge["target"],
                 "target_name": cand_name_by_id.get(edge["target"], edge["target"]),
                 "note": edge.get("note", ""),
             })
+    if queued:
+        logger.info(f"关系闸：{queued} 条危险边挂 pending 待审（未写库）from {source_id}")
     if added:
         logger.info(
             f"Auto-edge inference added {len(added)} edge(s) / 自动建边 {len(added)} 条 "
@@ -2363,6 +2420,24 @@ async def switch_world(world: str = "") -> str:
 # Tool 5: pulse — Heartbeat, system status + memory listing
 # 工具 5：pulse — 脉搏，系统状态 + 记忆列表
 # =============================================================
+@mcp.tool()
+async def review_pending(kind: str = "") -> str:
+    """只读列出「待审队列」里的 pending 候选——机器自动推断的危险关系边（#3 关系闸）
+    和合并时检出的事实演化冲突（#2 Z轴），都先挂这等人显式裁决。
+
+    永不改库：本工具只把清单念出来，建边/supersede/resolve 都需人另外显式操作。
+    kind 可选过滤：'relation'（只看关系边）/ 'z_conflict'（只看事实冲突）/ 留空看全部。
+    """
+    k = (kind or "").strip().lower()
+    if k and k not in (KIND_RELATION, KIND_Z_CONFLICT):
+        return f"kind 只能是 '{KIND_RELATION}' / '{KIND_Z_CONFLICT}' 或留空。"
+    try:
+        items = await asyncio.to_thread(_get_review_queue().list_pending, k or None)
+    except Exception as e:
+        return f"读取待审队列失败: {e}"
+    return _render_review_md(items)
+
+
 @mcp.tool()
 async def pulse(include_archive: bool = False, full: bool = False, limit: int = 40) -> str:
     """系统状态+记忆桶导航。默认按权重只显示 Top-`limit` 个桶的目录化摘要(防止记忆增长撑爆工具返回上限);

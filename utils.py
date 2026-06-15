@@ -30,6 +30,24 @@ RELATION_TYPES = frozenset({
     "kin",          # 同类
 })
 
+# 关系闸（对位 lmc-5 的 Y 轴 safe/review 分级）：只闸**机器自动推断**的边。
+# 安全类描述性、连错也不改写真相，直接落库；危险类是「因果 / 取代」——
+# 连错会把虚构的因果链或「旧事实被新事实取代」悄悄写进记忆，必须先挂 pending 等人审。
+# 人通过 grow/trace 显式建的边不受这个闸（那是人的意志，见 add_relation）。
+SAFE_RELATION_TYPES = frozenset({
+    "kin",       # 同类分组：连错最多是分组松一点
+    "explains",  # 解释：描述性
+})
+REVIEW_RELATION_TYPES = frozenset({
+    "causes",       # 因果
+    "contributes",  # 因果/支持
+    "improves",     # 因果/支持
+    "updates",      # 取代/补正 = 事实演化，尤其危险（与 #2 Z 轴同源）
+})
+# 两集合必须恰好覆盖 RELATION_TYPES、互不相交（自动建边的每条都要能判 safe/review）。
+assert SAFE_RELATION_TYPES | REVIEW_RELATION_TYPES == RELATION_TYPES
+assert not (SAFE_RELATION_TYPES & REVIEW_RELATION_TYPES)
+
 # Domains where a bucket must never be marked resolved=True.
 # Not "problem-and-solution" structures — persistent states (relationships,
 # commitments, feelings, family, self-reflection). Resolving = forgetting.

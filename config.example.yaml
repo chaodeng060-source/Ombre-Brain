@@ -182,6 +182,17 @@ intent_recall:
       temporal_recent_boost: 1.15
       temporal_recent_days: 14
 
+# --- Review gates / 待审闸（对位 lmc-5 的 Z 轴事实演化 + Y 轴关系安全）---
+# 机器只提候选、不直接改写真相：开了之后，自动推断的「危险」关系边、合并时检出的
+# 事实冲突，都先挂进 <buckets_dir>/review_queue.jsonl 等人显式 resolve。
+# 默认全关 → 行为与现网一致；建议部署稳定后灰度逐个开。
+# 只读查看：python review_queue.py --path <buckets_dir>/review_queue.jsonl
+# 红线：保护域感情桶（恋爱/纪念日/约定/家庭/自省/feel）在合并层已被排除，
+#       绝不会被自动 supersede——这层闸只兜普通桶 + 机器自动建的因果/取代边。
+review_gate:
+  relation_review: false          # #3：自动建边时把 causes/contributes/improves/updates 挂 pending（kin/explains 仍直写）
+  fact_evolution_audit: false     # #2：合并检出事实冲突时额外挂一条 pending 审计行（合并照常进行）
+
 # --- World axis / 世界轴 ---
 # 用来隔离不同剧情世界的记忆。日常聊天的桶 world 留空（不属于任何世界）；
 # 角色扮演场景的桶必须标具体 world；跨世界通用设定标 world="通用"，搜哪个世界都跟着出。
