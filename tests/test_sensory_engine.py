@@ -235,6 +235,21 @@ def test_body_state_block_frames_bias_as_internal_not_user_advice():
     assert "给用户" not in block
 
 
+def test_body_state_block_first_person_bias_is_principle_not_canned_lines():
+    # 2026-06-16 治死板：first_person_bias 不再塞写死的例句（"我想找一口水压住"那类），
+    # 改成"用你自己的第一人称落、别照搬"的原则——否则照背就成工程腔套话=死板。
+    result = StimulationResult(
+        sensory={"spicy": 0.9},
+        body_state={"oral_burn": 0.65, "drink_water": 0.55},
+        triggered_bucket_ids=["hot"],
+    )
+    block = format_body_state_block(result)
+    assert "first_person_bias:" in block
+    assert "别照搬" in block            # 给的是原则
+    assert "我想找一口水压住" not in block  # 不再给写死例句
+    assert "我先缓一下" not in block
+
+
 def test_body_state_block_can_frame_keyboard_touch_bias():
     result = StimulationResult(
         sensory={
