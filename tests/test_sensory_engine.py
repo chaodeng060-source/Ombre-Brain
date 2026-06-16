@@ -145,6 +145,14 @@ def test_senses_from_sensory_scales_percentage_intensity():
     assert senses_from_sensory(bucket) == ["味觉"]
 
 
+def test_senses_from_sensory_ignores_content_keywords():
+    # 2026-06-16 真机 dry-run 回归锁：复盘/索引型桶正文「提到」感官桶名（如夜班整理报告
+    # 判重时点了辣椒酱、触觉盲测凉感），自身无结构化 sensory —— 绝不能因关键词被连坐打标。
+    # 旧实现走 extract_spicy/extract_touch 关键词兜底会误判 ['味觉','触觉']；结构化-only 后应为 []。
+    bucket = _bucket("digest", "疑似重复：辣椒酱与字节锚 ↔ 触觉盲测凉感，相似度0.86")
+    assert senses_from_sensory(bucket) == []
+
+
 def test_sensory_engine_spicy_chain_and_time_decay(tmp_path):
     engine = SensoryEngine(str(tmp_path))
     now = datetime(2026, 5, 23, 12, 0, tzinfo=timezone.utc)

@@ -216,12 +216,30 @@ def senses_from_sensory(bucket: dict) -> list[str]:
     注：嗅觉/听觉/视觉暂无结构化强度字段，故目前只产出 味觉/触觉 两路。"""
     if not isinstance(bucket, dict):
         return []
+    meta = bucket.get("metadata", {}) or {}
+    content = str(bucket.get("content") or "")
     hit: set[str] = set()
-    if extract_spicy(bucket) >= SPICY_TRIGGER_THRESHOLD:
+
+    # ⚠️只认结构化感官强度（metadata 字段 + content 里的 JSON / 显式 `辣:0.x` 数值声明），
+    # 刻意绕开 extract_spicy/extract_touch 的「关键词兜底」——否则任何「提到」辣/凉/触的桶都会
+    # 被连坐打标（2026-06-16 真机 dry-run 实锤：夜班整理报告正文点了辣椒酱桶的名→含"辣椒"→
+    # 被 _extract_keyword_spicy 误判味觉，885 桶报 46 个待补、约一半是这类复盘/索引型噪声）。
+    # 关键词义项归 detect_senses 在 merge 时负责；这里专补「有结构化强度但无关键词」的桶
+    # （小卷 #1 本意，docstring 亦言"结构化感官强度"）。
+    spicy = max(
+        _extract_structured_spicy(meta),
+        _extract_structured_spicy_from_text(content),
+    )
+    if spicy >= SPICY_TRIGGER_THRESHOLD:
         hit.add("味觉")
-    touch = extract_touch(bucket)
+
+    touch = _merge_touch(
+        _extract_structured_touch(meta),
+        _extract_structured_touch_from_text(content),
+    )
     if any(value >= TOUCH_TRIGGER_THRESHOLD for value in touch.values()):
         hit.add("触觉")
+
     return [s for s in SENSES if s in hit]
 
 
