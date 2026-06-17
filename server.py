@@ -750,7 +750,7 @@ async def dream_hook(request):
             )
 
         text = "[Ombre Brain - Dreaming]\n" + "\n---\n".join(parts)
-        return PlainTextResponse(_append_anchor_index(text, _format_anchor_index(picks)))
+        return PlainTextResponse(redact_text(_append_anchor_index(text, _format_anchor_index(picks))))
     except Exception as e:
         logger.warning(f"Dream hook failed: {e}")
         return PlainTextResponse("")
@@ -4001,9 +4001,10 @@ async def api_briefing(request):
             format=fmt,
         )
         if fmt == "json":
-            # briefing() 已 json.dumps 出 UTF-8 字符串，原样转发，标 application/json
-            return Response(content=text, media_type="application/json")
-        return PlainTextResponse(text)
+            # briefing() 已 json.dumps 出 UTF-8 字符串；整体过 redact 兜底（[REDACTED] 不含
+            # json 特殊字符、不破坏结构），覆盖 anchor label 等逐处未接的角落。
+            return Response(content=redact_text(text), media_type="application/json")
+        return PlainTextResponse(redact_text(text))
     except Exception as e:
         logger.error(f"/api/briefing failed / 失败: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)

@@ -96,3 +96,18 @@ def test_redact_obj_keeps_business_keys():
 def test_embedding_input_alias_same_behavior():
     s = "Bearer leaktoken123456789"
     assert redact_embedding_input(s) == redact_text(s)
+
+
+def test_redact_json_string_stays_valid():
+    # briefing json 出口靠"整体 redact 字符串"兜底，必须保证不破坏 json 结构
+    import json
+    payload = json.dumps(
+        {"slots": [{"text": "api_key=sk-leak123456789", "label": "正常名字"}],
+         "db": "postgresql://u:p@10.0.0.5:5432/x"},
+        ensure_ascii=False,
+    )
+    out = redact_text(payload)
+    parsed = json.loads(out)  # 仍能解析 = 结构没被替换破坏
+    assert "sk-leak123456789" not in out
+    assert "10.0.0.5" not in out
+    assert parsed["slots"][0]["label"] == "正常名字"
