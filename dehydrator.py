@@ -32,6 +32,7 @@ import asyncio
 from contextlib import closing
 from openai import AsyncOpenAI
 from utils import count_tokens_approx
+from redact import redact_embedding_input  # 出本地去外部 LLM 前脱敏
 
 logger = logging.getLogger("ombre_brain.dehydrator")
 
@@ -459,6 +460,10 @@ class Dehydrator:
         if not content or not content.strip():
             return "（空记忆 / empty memory）"
 
+        # 出本地脱敏：content 可能进外部 LLM（_api_dehydrate），先抹 secret。dehydrate 产
+        # 派生摘要、不写回库正文，脱敏安全（merge 才改 source of truth、绝不脱敏，见 merge）。
+        content = redact_embedding_input(content)
+
         # --- Content is short enough, no compression needed ---
         # --- 内容已经很短，不需要压缩 ---
         if count_tokens_approx(content) < 100:
@@ -490,6 +495,9 @@ class Dehydrator:
         """
         Merge new content with old memory, preventing infinite bucket growth.
         将新内容与旧记忆合并，避免桶无限膨胀。
+
+        ⚠ 绝不在此脱敏入参：merge 输出会写回 bucket 正文（改 source of truth），
+        脱敏会永久篡改记忆原文。脱敏只在 dehydrate/briefing（派生物）和输出出口做。
         """
         if not old_content and not new_content:
             return ""
@@ -886,6 +894,8 @@ class Dehydrator:
         """
         if not raw_material or not raw_material.strip():
             return "（记忆库当前空闲，没有可简报的素材。）"
+
+        raw_material = redact_embedding_input(raw_material)  # 出本地脱敏：素材进外部 LLM 前抹 secret
 
         if not self.api_available:
             raise RuntimeError("脱水 API 不可用，请配置 OMBRE_API_KEY")
