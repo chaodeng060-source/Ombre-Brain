@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from utils import count_tokens_approx, now_iso
+from redact import redact_text  # 导入页回显前脱敏，只抹 secret，不审查情感内容
 
 logger = logging.getLogger("ombre_brain.import")
 
@@ -747,7 +748,7 @@ class ImportEngine:
             if not lead_bucket:
                 continue
             patterns.append({
-                "pattern_content": lead_bucket["content"][:200],
+                "pattern_content": redact_text(lead_bucket["content"])[:200],
                 "pattern_name": lead_bucket["metadata"].get("name", lead_id),
                 "count": len(cluster_ids),
                 "bucket_ids": cluster_ids,

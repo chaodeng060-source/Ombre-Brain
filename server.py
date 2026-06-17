@@ -2733,7 +2733,7 @@ def _format_protected_verbatim(b: dict) -> str:
     meta = b.get("metadata", {}) or {}
     name = meta.get("name", b["id"])
     doms = ",".join(meta.get("domain", []) or [])
-    body = strip_wikilinks(b.get("content", "")).strip()
+    body = redact_text(strip_wikilinks(b.get("content", ""))).strip()
     return (
         f"【原文·{doms}】{name}（id={b['id']}）\n"
         f"{body}\n"
@@ -3081,7 +3081,7 @@ async def briefing(
                     "bucket_id": b["id"],
                     "label": meta.get("name", b["id"]),
                     "domain": meta.get("domain", []) or [],
-                    "text": strip_wikilinks(b.get("content", "")),
+                    "text": redact_text(strip_wikilinks(b.get("content", ""))),
                     "warn": (
                         f"原文逐字、未压缩。触及须 inspect 桶 id={b['id']}；"
                         f"禁止当 resolved/已完成/演的 处理。"
@@ -3092,7 +3092,7 @@ async def briefing(
                 slots.append({
                     "tier": 0,
                     "label": meta.get("name", b["id"]),
-                    "text": strip_wikilinks(b.get("content", "")),
+                    "text": redact_text(strip_wikilinks(b.get("content", ""))),
                 })
             if anchor_index:
                 slots.append({
@@ -3213,7 +3213,7 @@ async def briefing(
                 "bucket_id": b["id"],
                 "label": meta.get("name", b["id"]),
                 "domain": meta.get("domain", []) or [],
-                "text": strip_wikilinks(b.get("content", "")),
+                "text": redact_text(strip_wikilinks(b.get("content", ""))),
                 "warn": (
                     f"原文逐字、未压缩。触及须 inspect 桶 id={b['id']}；"
                     f"禁止当 resolved/已完成/演的 处理。"
@@ -3224,7 +3224,7 @@ async def briefing(
             slots.append({
                 "tier": 0,
                 "label": meta.get("name", b["id"]),
-                "text": strip_wikilinks(b.get("content", "")),
+                "text": redact_text(strip_wikilinks(b.get("content", ""))),
             })
         if result:
             slots.append({
@@ -3846,7 +3846,7 @@ async def api_import_results(request):
             results.append({
                 "id": b["id"],
                 "name": b["metadata"].get("name", ""),
-                "content": b["content"][:300],
+                "content": redact_text(b["content"])[:300],
                 "type": b["metadata"].get("type", ""),
                 "domain": b["metadata"].get("domain", []),
                 "tags": b["metadata"].get("tags", []),
