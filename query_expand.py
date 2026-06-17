@@ -14,6 +14,8 @@ import json
 import logging
 from typing import Any
 
+from redact import redact_embedding_input
+
 logger = logging.getLogger(__name__)
 
 EXPAND_PROMPT = """你是记忆检索的查询改写器。用户给一句"想找的记忆"，但他用的口语词\
@@ -66,12 +68,13 @@ async def expand_query(
     if not cfg["enabled"] or len(q) < cfg["min_query_len"] or client is None:
         return [q]
 
+    safe_q = redact_embedding_input(q)
     try:
         resp = await client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": EXPAND_PROMPT},
-                {"role": "user", "content": q[: cfg["max_query_chars"]]},
+                {"role": "user", "content": safe_q[: cfg["max_query_chars"]]},
             ],
             max_tokens=cfg["max_tokens"],
             temperature=cfg["temperature"],

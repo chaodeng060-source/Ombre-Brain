@@ -11,6 +11,7 @@ import re
 
 from openai import AsyncOpenAI
 import frontmatter
+from redact import redact_embedding_input
 
 ANALYZE_PROMPT = (
     "你是一个内容分析器。请分析以下文本，输出结构化的元数据。\n\n"
@@ -63,13 +64,14 @@ async def reclassify():
         content = post.content.strip()
         name = post.metadata.get("name", "")
         full_text = f"{name}\n{content}" if name else content
+        safe_text = redact_embedding_input(full_text)
 
         try:
             resp = await client.chat.completions.create(
                 model="deepseek-ai/DeepSeek-V3",
                 messages=[
                     {"role": "system", "content": ANALYZE_PROMPT},
-                    {"role": "user", "content": full_text[:2000]},
+                    {"role": "user", "content": safe_text[:2000]},
                 ],
                 max_tokens=256,
                 temperature=0.1,

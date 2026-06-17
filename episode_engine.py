@@ -40,6 +40,7 @@ import json
 import logging
 from datetime import datetime
 
+from redact import redact_embedding_input
 from utils import PROTECTED_RESOLVE_DOMAINS
 
 logger = logging.getLogger("ombre_brain.episode")
@@ -243,8 +244,8 @@ class EpisodeEngine:
         fragments = []
         for b in ordered:
             meta = b.get("metadata", {})
-            name = meta.get("name", b["id"])
-            body = (b.get("content", "") or "").strip()
+            name = redact_embedding_input(meta.get("name", b["id"]))
+            body = redact_embedding_input((b.get("content", "") or "").strip())
             fragments.append(f"[{meta.get('created', '?')}] {name}\n{body[:600]}")
         replay = "\n\n".join(fragments)
 

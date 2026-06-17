@@ -20,6 +20,7 @@ from pathlib import Path
 
 import httpx
 from openai import AsyncOpenAI
+from redact import redact_embedding_input
 
 logger = logging.getLogger("ombre_brain.embedding")
 
@@ -174,7 +175,7 @@ class EmbeddingEngine:
         if self._circuit_until > time.time():
             return []
 
-        truncated = text[:2000]
+        truncated = redact_embedding_input(text)[:2000]
         try:
             response = await self.client.embeddings.create(
                 model=self.model,

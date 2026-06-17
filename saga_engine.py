@@ -26,6 +26,8 @@
 import json
 import logging
 
+from redact import redact_embedding_input
+
 logger = logging.getLogger("ombre_brain.saga")
 
 
@@ -123,12 +125,13 @@ class SagaEngine:
         if not sagas:
             return None
         ep_meta = episode.get("metadata", {})
-        ep_name = ep_meta.get("name", episode["id"])
-        ep_summary = (episode.get("content", "") or "").strip()
+        ep_name = redact_embedding_input(ep_meta.get("name", episode["id"]))
+        ep_summary = redact_embedding_input((episode.get("content", "") or "").strip())
 
         sagas_info = "\n".join(
-            f"- ID: {s['id']}, 标题: {s.get('metadata', {}).get('name', '')}, "
-            f"简述: {(s.get('content', '') or '').strip()[:80]}"
+            f"- ID: {s['id']}, "
+            f"标题: {redact_embedding_input(s.get('metadata', {}).get('name', ''))}, "
+            f"简述: {redact_embedding_input((s.get('content', '') or '').strip())[:80]}"
             for s in sagas
         )
         prompt = (
@@ -161,7 +164,7 @@ class SagaEngine:
     # 用一个 episode 开一条新 saga 桶。
     # ---------------------------------------------------------
     async def _create_saga(self, episode: dict) -> dict | None:
-        ep_summary = (episode.get("content", "") or "").strip()
+        ep_summary = redact_embedding_input((episode.get("content", "") or "").strip())
         title, description = "", ""
         try:
             resp = await self.dehydrator.client.chat.completions.create(

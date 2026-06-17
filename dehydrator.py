@@ -529,6 +529,7 @@ class Dehydrator:
         Call LLM API for intelligent dehydration (via OpenAI-compatible client).
         调用 LLM API 执行智能脱水。
         """
+        content = redact_embedding_input(content)
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -626,6 +627,8 @@ class Dehydrator:
         if not content or not content.strip():
             return self._default_analysis()
 
+        content = redact_embedding_input(content)
+
         # --- Cache check: same content → same tags, skip API ---
         # --- 先查缓存：内容没变就不重新打标（键 = 实际发给 API 的 content[:2000]）---
         cache_key = content[:2000]
@@ -657,6 +660,7 @@ class Dehydrator:
         Call LLM API for content analysis / tagging.
         调用 LLM API 执行内容分析打标。
         """
+        content = redact_embedding_input(content)
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
@@ -748,6 +752,8 @@ class Dehydrator:
         if not content or not content.strip():
             return []
 
+        content = redact_embedding_input(content)
+
         # --- API digest (no local fallback) ---
         if not self.api_available:
             raise RuntimeError("脱水 API 不可用，请检查 config.yaml 中的 dehydration 配置")
@@ -778,6 +784,7 @@ class Dehydrator:
         3. 解析失败时重试（最多 3 次），仍失败走 _parse_digest 内的兜底修复
         实测三层叠加端到端 8/8 通过。
         """
+        content = redact_embedding_input(content)
         last_raw = ""
         for attempt in range(3):
             # 扫盘 #12：重试加指数退避（0/2/4s）；API 网络异常也算一次重试而不是
@@ -916,6 +923,7 @@ class Dehydrator:
         Call LLM API to compress raw bucket material into a briefing.
         调用 LLM API 把原始桶素材压成简报。
         """
+        raw_material = redact_embedding_input(raw_material)
         prompt = BRIEFING_PROMPT.format(max_chars=max_chars)
         # Briefing token budget: ~1.5 chars/token for Chinese, +30% headroom
         # 简报 token 预算：中文约 1.5 字/token，留 30% 余量
@@ -952,13 +960,15 @@ class Dehydrator:
             return []
 
         try:
+            safe_new_content = redact_embedding_input(new_content)
             cand_text = "\n".join(
-                f"- id={c.get('id', '')} | name={c.get('name', '')} | "
-                f"{(c.get('summary') or '')[:200]}"
+                f"- id={c.get('id', '')} | "
+                f"name={redact_embedding_input(c.get('name', ''))} | "
+                f"{redact_embedding_input(c.get('summary') or '')[:200]}"
                 for c in candidates[:8]
             )
             user_msg = (
-                f"新桶内容：\n{new_content[:1500]}\n\n"
+                f"新桶内容：\n{safe_new_content[:1500]}\n\n"
                 f"候选桶（最多 8 条）：\n{cand_text}"
             )
             # --- Cache check: same (new bucket + candidate set) → same edges ---

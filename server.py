@@ -86,7 +86,7 @@ from utils import (
     rrf_fuse, parse_relative_time, PROTECTED_RESOLVE_DOMAINS,
     SAFE_RELATION_TYPES, REVIEW_RELATION_TYPES,
 )
-from redact import redact_text  # 输出脱敏：记忆正文出前端/prompt 前抹 secret，不审查情感内容
+from redact import redact_embedding_input, redact_text  # 只抹 secret，不审查情感内容
 from review_queue import (
     ReviewQueue, make_relation_entry, make_z_conflict_entry, render_md as _render_review_md,
     KIND_RELATION, KIND_Z_CONFLICT,
@@ -368,8 +368,8 @@ async def _ds_semantic_select(
         raise RuntimeError("no DeepSeek client configured")
     lines = []
     for i, b in enumerate(buckets):
-        name = (b.get("metadata", {}) or {}).get("name") or b.get("id", "")
-        snippet = (b.get("content") or "").strip().replace("\n", " ")[:200]
+        name = redact_embedding_input((b.get("metadata", {}) or {}).get("name") or b.get("id", ""))
+        snippet = redact_embedding_input((b.get("content") or "").strip().replace("\n", " "))[:200]
         lines.append(f"[{i}] {name}: {snippet}")
     sys_prompt = (
         "你是记忆召回的相关性过滤器。给定用户查询和一组候选记忆条目，"
@@ -377,7 +377,7 @@ async def _ds_semantic_select(
         '只返回 JSON：{"keep": [相关条目的序号整数数组]}，不要解释。'
         "宁可多留也别漏掉明显相关的；只剔除与查询确实无关的。"
     )
-    user_prompt = f"查询：{query}\n\n候选：\n" + "\n".join(lines)
+    user_prompt = f"查询：{redact_embedding_input(query)}\n\n候选：\n" + "\n".join(lines)
     resp = await client.chat.completions.create(
         model=getattr(dehydrator, "model", "deepseek-chat"),
         messages=[
@@ -787,11 +787,21 @@ def _bucket_primary_domain_matches(meta: dict, domain: list) -> bool:
     return primary in _metadata_list(meta.get("domain", []))
 
 
+def _has_redactable_secret(value: str) -> bool:
+    if not value:
+        return False
+    text = str(value)
+    return redact_embedding_input(text) != text
+
+
 def _is_merge_protected_bucket(bucket: dict, incoming_domain: list = None, incoming_chord_tag: str = "") -> bool:
     meta = bucket.get("metadata", {}) or {}
     if meta.get("pinned") or meta.get("protected"):
         return True
     if meta.get("type") in ("permanent", "feel"):
+        return True
+
+    if _has_redactable_secret(bucket.get("content", "")):
         return True
 
     bucket_domains = set(_metadata_list(meta.get("domain", [])))
@@ -1034,16 +1044,19 @@ async def _merge_or_create(
     # 合并候选必须在同一个 world 内（避免日常桶被角色记忆合并污染或反过来）。
     # world="" 即日常桶，只在日常桶之间合并；通用桶单独按通用合并。
     world_filter = [(world or "").strip()]
-    try:
-        existing = await _find_merge_candidates(
-            content=content,
-            domain=domain,
-            world_filter=world_filter,
-            incoming_chord_tag=chord_tag,
-        )
-    except Exception as e:
-        logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
+    if _has_redactable_secret(content):
         existing = []
+    else:
+        try:
+            existing = await _find_merge_candidates(
+                content=content,
+                domain=domain,
+                world_filter=world_filter,
+                incoming_chord_tag=chord_tag,
+            )
+        except Exception as e:
+            logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
+            existing = []
 
     bucket = next((b for b in existing if _merge_candidate_passes_threshold(b)), None)
     if bucket:

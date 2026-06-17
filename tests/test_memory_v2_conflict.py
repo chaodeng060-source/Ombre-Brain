@@ -53,8 +53,10 @@ class FakeEmbedding:
     def __init__(self, hits):
         self.hits = hits
         self.generated = []
+        self.search_calls = []
 
     async def search_similar(self, query, top_k=8):
+        self.search_calls.append((query, top_k))
         return list(self.hits)
 
     async def generate_and_store(self, bucket_id, content):
@@ -146,3 +148,57 @@ async def test_protected_domain_vector_hit_creates_new_bucket(monkeypatch, merge
     assert mgr.updates == []
     assert dh.merge_calls == []
     assert mgr.created[-1]["content"] == "rule: drifted wording"
+
+
+@pytest.mark.asyncio
+async def test_secret_in_existing_bucket_creates_new_bucket(monkeypatch, merge_config):
+    old = _bucket("old", "api_key=sk-oldsecret123456789\nrule: keep local", domain=["ops"])
+    mgr = FakeBucketMgr([old], keyword_matches=[])
+    emb = FakeEmbedding([("old", 0.98)])
+    dh = FakeDehydrator()
+    monkeypatch.setattr(server, "bucket_mgr", mgr)
+    monkeypatch.setattr(server, "embedding_engine", emb)
+    monkeypatch.setattr(server, "dehydrator", dh)
+
+    bucket_id, display, is_merged = await server._merge_or_create(
+        content="rule: new plain local note",
+        tags=[],
+        importance=5,
+        domain=["ops"],
+        valence=0.5,
+        arousal=0.3,
+        name="ops-note",
+    )
+
+    assert (bucket_id, display, is_merged) == ("new-bucket", "ops-note", False)
+    assert mgr.updates == []
+    assert dh.merge_calls == []
+    assert mgr.created[-1]["content"] == "rule: new plain local note"
+
+
+@pytest.mark.asyncio
+async def test_secret_in_new_content_skips_merge_search_and_creates_new_bucket(monkeypatch, merge_config):
+    old = _bucket("old", "rule: existing plain local note", domain=["ops"])
+    mgr = FakeBucketMgr([old], keyword_matches=[old])
+    emb = FakeEmbedding([("old", 0.98)])
+    dh = FakeDehydrator()
+    monkeypatch.setattr(server, "bucket_mgr", mgr)
+    monkeypatch.setattr(server, "embedding_engine", emb)
+    monkeypatch.setattr(server, "dehydrator", dh)
+
+    content = "api_key=sk-newsecret123456789\nrule: keep this raw locally"
+    bucket_id, display, is_merged = await server._merge_or_create(
+        content=content,
+        tags=[],
+        importance=5,
+        domain=["ops"],
+        valence=0.5,
+        arousal=0.3,
+        name="ops-secret",
+    )
+
+    assert (bucket_id, display, is_merged) == ("new-bucket", "ops-secret", False)
+    assert emb.search_calls == []
+    assert mgr.updates == []
+    assert dh.merge_calls == []
+    assert mgr.created[-1]["content"] == content

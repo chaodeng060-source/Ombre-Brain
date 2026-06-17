@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 from utils import count_tokens_approx, now_iso
-from redact import redact_text  # 导入页回显前脱敏，只抹 secret，不审查情感内容
+from redact import redact_embedding_input, redact_text  # 只抹 secret，不审查情感内容
 
 logger = logging.getLogger("ombre_brain.import")
 
@@ -556,11 +556,12 @@ class ImportEngine:
         if not self.dehydrator.api_available:
             raise RuntimeError("API not available")
 
+        safe_chunk = redact_embedding_input(chunk_content)
         response = await self.dehydrator.client.chat.completions.create(
             model=self.dehydrator.model,
             messages=[
                 {"role": "system", "content": IMPORT_EXTRACT_PROMPT},
-                {"role": "user", "content": chunk_content[:12000]},
+                {"role": "user", "content": safe_chunk[:12000]},
             ],
             max_tokens=2048,
             temperature=0.0,
