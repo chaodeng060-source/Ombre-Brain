@@ -86,6 +86,7 @@ from utils import (
     rrf_fuse, parse_relative_time, PROTECTED_RESOLVE_DOMAINS,
     SAFE_RELATION_TYPES, REVIEW_RELATION_TYPES,
 )
+from redact import redact_text  # 输出脱敏：记忆正文出前端/prompt 前抹 secret，不审查情感内容
 from review_queue import (
     ReviewQueue, make_relation_entry, make_z_conflict_entry, render_md as _render_review_md,
     KIND_RELATION, KIND_Z_CONFLICT,
@@ -3281,7 +3282,7 @@ async def api_buckets(request):
                 "last_active": meta.get("last_active", ""),
                 "activation_count": meta.get("activation_count", 1),
                 "score": decay_engine.calculate_score(meta),
-                "content_preview": strip_wikilinks(b.get("content", ""))[:200],
+                "content_preview": redact_text(strip_wikilinks(b.get("content", "")))[:200],
             })
         result.sort(key=lambda x: x["score"], reverse=True)
         return JSONResponse(result)
@@ -3301,7 +3302,7 @@ async def api_bucket_detail(request):
     return JSONResponse({
         "id": bucket["id"],
         "metadata": meta,
-        "content": strip_wikilinks(bucket.get("content", "")),
+        "content": redact_text(strip_wikilinks(bucket.get("content", ""))),
         "score": decay_engine.calculate_score(meta),
     })
 
@@ -3458,7 +3459,7 @@ async def api_search(request):
                 "domain": meta.get("domain", []),
                 "valence": meta.get("valence", 0.5),
                 "arousal": meta.get("arousal", 0.3),
-                "content_preview": strip_wikilinks(b.get("content", ""))[:200],
+                "content_preview": redact_text(strip_wikilinks(b.get("content", "")))[:200],
             })
         return JSONResponse(result)
     except Exception as e:
