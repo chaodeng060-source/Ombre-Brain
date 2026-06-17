@@ -648,7 +648,7 @@ async def breath_hook(request):
 
         if not parts:
             return PlainTextResponse("")
-        return PlainTextResponse("[Ombre Brain - 记忆浮现]\n" + "\n---\n".join(parts))
+        return PlainTextResponse(redact_text("[Ombre Brain - 记忆浮现]\n" + "\n---\n".join(parts)))
     except Exception as e:
         logger.warning(f"Breath hook failed: {e}")
         return PlainTextResponse("")
@@ -746,7 +746,7 @@ async def dream_hook(request):
             parts.append(
                 f"{meta.get('name', b['id'])} {resolved_tag} "
                 f"V{meta.get('valence', 0.5):.1f}/A{meta.get('arousal', 0.3):.1f}\n"
-                f"{strip_wikilinks(b['content'][:200])}"
+                f"{redact_text(strip_wikilinks(b['content'][:200]))}"
             )
 
         text = "[Ombre Brain - Dreaming]\n" + "\n---\n".join(parts)
