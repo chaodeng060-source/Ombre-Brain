@@ -16,6 +16,8 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"                        # Local debug port (optional) / 本地调试端口
+    env_file:
+      - .env                               # Pass provider/R2/filter env without hard-coding secrets
     environment:
       - OMBRE_API_KEY=${OMBRE_API_KEY}      # From .env file / 从 .env 文件读取
       - OMBRE_TRANSPORT=streamable-http     # Claude.ai requires streamable-http
