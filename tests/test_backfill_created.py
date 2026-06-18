@@ -6,12 +6,19 @@ Tests for backfill_created.infer_created — pure date-inference for the
 """
 
 import sys
+import os
 from datetime import date
 from pathlib import Path
 
+import frontmatter
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from backfill_created import infer_created, _first_valid_date  # noqa: E402
+from backfill_created import (  # noqa: E402
+    _atomic_write_post,
+    _first_valid_date,
+    infer_created,
+)
 
 TODAY = date(2026, 6, 18)
 
@@ -97,3 +104,38 @@ def test_old_year_rejected():
 def test_dot_and_slash_separators():
     assert _first_valid_date("迁移 2026.6.2 完成", TODAY) == date(2026, 6, 2)
     assert _first_valid_date("2026/5/30 咬人", TODAY) == date(2026, 5, 30)
+
+
+def test_mixed_separators_use_first_date_in_text():
+    text = "先发生于 2026/5/1，后续更新于 2026-06-01"
+    assert _first_valid_date(text, TODAY) == date(2026, 5, 1)
+
+
+def test_date_pattern_requires_digit_boundaries():
+    assert _first_valid_date("编号 x12026-05-300y", TODAY) is None
+
+
+def test_string_tags_are_treated_as_one_tag():
+    iso, src = infer_created(_meta(name="无日期", tags="事件_2026-05-30"), today=TODAY)
+    assert src == "tag"
+    assert iso == "2026-05-30T00:00:00"
+
+
+def test_atomic_write_preserves_other_metadata_and_leaves_no_temp(tmp_path):
+    path = tmp_path / "bucket.md"
+    path.write_text(
+        "---\nid: abc\nlast_active: '2026-06-18T01:00:00'\n---\n原文\n",
+        encoding="utf-8",
+    )
+    original_mode = os.stat(path).st_mode
+    post = frontmatter.load(path)
+    post["created"] = "2026-05-30T00:00:00"
+
+    _atomic_write_post(str(path), post)
+
+    reloaded = frontmatter.load(path)
+    assert reloaded["created"] == "2026-05-30T00:00:00"
+    assert reloaded["last_active"] == "2026-06-18T01:00:00"
+    assert reloaded.content.strip() == "原文"
+    assert os.stat(path).st_mode == original_mode
+    assert list(tmp_path.glob("*.tmp")) == []

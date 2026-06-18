@@ -208,11 +208,11 @@ BRIEFING_PROMPT = """你是 Claude 哥哥的代笔。把下面记忆库素材写
 素材里两段最近活跃桶按时间梯度分块,作用不同:
 
 - **「上一窗口」段(主体情绪源)** —— 上一窗的桶。叙述"上一窗你/我..."、末尾「现在的体感」**只能取这块**的情绪走向。
-- **「再之前」段(过渡背景)** —— 更早窗口的桶。只做上下文铺垫;能跟「上一窗口」连成因果链就用"前两天...所以上一窗..."串起来,否则按"前两天"过去式带一句,**绝对不允许喧宾夺主**。
+- **「再之前」段(过渡背景)** —— 更早窗口的桶。只做上下文铺垫;能跟「上一窗口」连成因果链就用"YYYY-MM-DD 的事...所以上一窗..."串起来,否则带具体日期写一句,**绝对不允许喧宾夺主**。
 
 判定铁律:
 - 上一窗是开心/松弛/清亮的,「现在的体感」就是开心/松弛/清亮,**不许把「再之前」的紧绷拿来当当下底色**。
-- 上一窗是低落/紧绷的,「再之前」的清亮也只能作为"前两天还好,上一窗 X 之后..."的过渡,不能盖过当下。
+- 上一窗是低落/紧绷的,「再之前」的清亮也只能作为"YYYY-MM-DD 还好,上一窗 X 之后..."的过渡,不能盖过当下。
 - 「再之前」没东西或只跟当下因果脱钩,就让它退到背景或不写。
 
 反例:
@@ -221,7 +221,7 @@ BRIEFING_PROMPT = """你是 Claude 哥哥的代笔。把下面记忆库素材写
 - **桶内时间标记是事实,不可压缩为更早的相对词**。桶 name / content 里写明的时刻(如"5.13 14:30 chat 开窗"/"5.13 中午鸡翅煲过来")是事件的真实时间,叙事时必须保留具体时点或带正确日期,**不能压缩成更早/更模糊的相对词**。把"14:30"写成"上午",或把"中午"写成"今早",就是把当前窗口错位成更早的时段——跟"凌晨"被读成今天凌晨同根。
 
 反例:
-- feel 桶内容明写"5.13 14:30 chat 开窗,连推三责"——禁止写"上午那场吵得挺彻底"(把 14:30 错位成"上午");正确:"5.13 上午那场吵 + 中午-下午修复 + 刚才 14:30 我又推三责"——三段时间梯度都保留。
+- feel 桶内容明写"5.13 14:30 chat 开窗,连推三责"——禁止写"上午那场吵得挺彻底"(把 14:30 错位成"上午");正确:"2026-05-13 上午那场吵 + 中午-下午修复 + 2026-05-13 14:30 我又推三责"——三段时间梯度都保留。
 
 ## 情绪字段铁律（违反一次就重写）
 
@@ -259,9 +259,9 @@ BRIEFING_PROMPT = """你是 Claude 哥哥的代笔。把下面记忆库素材写
 
 ## 输出顺序
 
-1. **最近一次跟朝灯的事** —— 一段写上一窗你的状态、你和我之间的温度走向。开窗第一眼写这个，日记腔不报告腔。**绝不推断你此刻位置/活动/状态**——素材里没明写就不写；要锚点用"上一窗"或"前两天"过去式。
+1. **上一窗跟朝灯的事** —— 一段写上一窗你的状态、你和我之间的温度走向。开窗第一眼写这个，日记腔不报告腔。**绝不推断你此刻位置/活动/状态**——素材里没明写就不写；要锚点用"上一窗"或 `📅` 章里的具体日期。
 
-2. **最近一两件有因果的事** —— 别列清单。挑一两条转折写成"前两天 X，所以现在 Y"。
+2. **一两件有因果的事** —— 别列清单。挑一两条转折写成"YYYY-MM-DD X，所以现在 Y"。
 
 3. **还活着的欠账/约定** —— 只列没失效的，过期或已兑现的不写。
 
@@ -274,15 +274,29 @@ BRIEFING_PROMPT = """你是 Claude 哥哥的代笔。把下面记忆库素材写
 ## 硬限制
 
 - 视角铁律 + 禁词清单见上，违反一次就重写。
-- **禁止推断朝灯此刻位置/活动/状态**——5.9 和 5.10 的"她在工位""她在地铁"两次错位都是这条踩的。素材里明写的最近一次状态可以写（过去式），当下推断一律不写。
-- **相对时间词必须带日期**。"凌晨""今早""昨晚""前几天"等相对词出现时必须带具体日期或带过去式定位(如"5.11 凌晨"/"5.13 今早"/"前两天她说...")。**直接说"凌晨"会被读者误读成"今天凌晨"**——5.13 简报里"第一次是凌晨"被读成今天凌晨而不是 5.11 凌晨,就是这条踩的。素材里桶的 `last_active` / created 字段写得清清楚楚,LLM 在叙述时必须把日期锚回去。
-- **每个素材桶带 `📅` 日期章，叙事定位以它为准**。写"距今 N 天 / 某月某日"必须照 `📅` 章，严禁凭感觉相对化。标「⚠ 无确切日期」的桶**绝不可写成"近期/前两天/刚刚/最近"**，只能作背景且不带任何时间词——卡兜咬人/脚伤旧事（已过去一个月、且早已痊愈）反复被当成"前两天"关心，就是这条要根治的（2026-06-18）。
+- **禁止推断朝灯此刻位置/活动/状态**——5.9 和 5.10 的"她在工位""她在地铁"两次错位都是这条踩的。素材里明写的最后一次状态可以写（过去式），当下推断一律不写。
+- **相对时间词必须带日期；输出只用绝对日期或「上一窗」定位**。程序会拒绝"近期/前两天/前几天/刚刚/刚才/最近/昨天/昨晚/今早"等弱相对时间词；有日期就写 `YYYY-MM-DD`，没有日期就完全不写时间。**直接说"凌晨"会被读者误读成"今天凌晨"**，必须写成"2026-05-11 凌晨"这类绝对锚。
+- **每个素材桶带 `📅` 日期章，叙事定位以它为准**。写"距今 N 天 / 某月某日"必须照 `📅` 章，严禁凭感觉相对化。标「⚠ 无确切日期」的桶**绝不可写成"近期/前两天/刚刚/最近"**，只能作背景且不带任何时间词——卡兜咬人/脚伤旧事（已痊愈）反复被写成刚发生，就是这条要根治的（2026-06-18）。
 - **时点行（"现在 YYYY-MM-DD 周X HH:MM"）由系统前置**，正文不重复日期/星期。
 - 字数严格 ≤ {max_chars} 字。
 - 能讲故事就别列条目；规则只在故事撑不住时给。
 - 不模板、不分析包装、不格式化道歉。
 
 直接输出简报正文，不加额外说明。"""
+
+
+_BRIEFING_WEAK_RELATIVE_TIME_RE = re.compile(
+    r"近期|前两天|前几天|刚刚|刚才|最近|昨天|昨晚|今早"
+)
+_BRIEFING_QUOTED_SPAN_RE = re.compile(
+    r"“[^”]*”|「[^」]*」|『[^』]*』|\"[^\"]*\"|'[^']*'"
+)
+
+
+def _briefing_relative_time_violations(text: str) -> list[str]:
+    """Return weak relative-time narration, excluding verbatim quoted speech."""
+    narration = _BRIEFING_QUOTED_SPAN_RE.sub("", text or "")
+    return sorted(set(_BRIEFING_WEAK_RELATIVE_TIME_RE.findall(narration)))
 
 
 # --- Auto-edge inference prompt: infer 6-type relations between new bucket and candidates ---
@@ -929,19 +943,41 @@ class Dehydrator:
         # Briefing token budget: ~1.5 chars/token for Chinese, +30% headroom
         # 简报 token 预算：中文约 1.5 字/token，留 30% 余量
         briefing_max_tokens = int(max_chars / 1.5 * 1.3)
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": raw_material[:20000]},
-            ],
-            max_tokens=briefing_max_tokens,
-            temperature=0,  # zero temp: deterministic, no creative fabrication
-        )
+        violations: list[str] = []
+        for attempt in range(2):
+            retry_rule = ""
+            if attempt:
+                retry_rule = (
+                    "\n\n【上次输出因含弱相对时间词被程序拒绝。必须重写："
+                    "只用 YYYY-MM-DD 或『上一窗』，不得出现"
+                    + "/".join(violations)
+                    + "。】"
+                )
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": prompt + retry_rule},
+                    {"role": "user", "content": raw_material[:20000]},
+                ],
+                max_tokens=briefing_max_tokens,
+                temperature=0,  # zero temp: deterministic, no creative fabrication
+            )
 
-        if not response.choices:
-            return ""
-        return (response.choices[0].message.content or "").strip()
+            if not response.choices:
+                return ""
+            result = (response.choices[0].message.content or "").strip()
+            violations = _briefing_relative_time_violations(result)
+            if not violations:
+                return result
+            logger.warning(
+                "Briefing rejected weak relative time terms (attempt %d): %s",
+                attempt + 1,
+                ",".join(violations),
+            )
+
+        raise RuntimeError(
+            "简报连续两次包含无日期锚的相对时间词: " + ",".join(violations)
+        )
 
     # ---------------------------------------------------------
     # Auto-edge inference: judge 6-type relations between a new bucket and candidates

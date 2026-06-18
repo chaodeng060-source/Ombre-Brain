@@ -2738,11 +2738,9 @@ def _event_age_label(b: dict, now: datetime = None) -> str:
     有 created → "发生于 2026-05-30（距今 N 天）"；
     created 缺失/不可解析 → "⚠ 无确切日期，禁止叙述为「近期/前两天/刚刚」"。
 
-    根治：卡兜咬人/脚伤桶 created/last_active 双空，从「高权重未解决」「感情红线」
-    等非叙事池冒出来时素材里没有任何日期，LLM 自行编「前两天」。2026-06-08 的
-    _created_within_days 闸只管「最近活跃叙事段」，管不到权重/红线池——这里给所有
-    浮现桶强制盖章，没日期就显式禁止近期化，从素材层堵死相对化。
-    (2026-06-18 卡兜脚伤复发追加：created 闸拦不住缺日期的旧桶)
+    根治：旧桶从「高权重未解决」「感情红线」等非叙事池冒出来时，如果日期没有
+    跟着素材一起进入最终消费路径，LLM 会自行编「前两天」。2026-06-08 的
+    _created_within_days 闸只管「最近活跃」池；这里给所有简报路径统一盖章。
     """
     NO_DATE = "⚠ 无确切日期，禁止叙述为「近期/前两天/刚刚/最近」，只作背景、不带时间词"
     raw = (b.get("metadata", {}) or {}).get("created") or ""
@@ -2753,12 +2751,34 @@ def _event_age_label(b: dict, now: datetime = None) -> str:
     except Exception:
         return NO_DATE
     try:
-        ref = now or (datetime.now(ev.tzinfo) if ev.tzinfo is not None else datetime.now())
-        days = max(0, int((ref - ev).total_seconds() // 86400))
+        if ev.tzinfo is not None:
+            ref = now or datetime.now(ev.tzinfo)
+            if ref.tzinfo is None:
+                ref = ref.replace(tzinfo=ev.tzinfo)
+            event_date = ev.astimezone(_BJ_TZ).date()
+            ref_date = ref.astimezone(_BJ_TZ).date()
+        else:
+            # 历史 created 多为无时区字符串；其日期部分是唯一可审计的日历锚，
+            # 不擅自平移。当前日期统一取北京时间，避免 NAS 容器 UTC 跨日错标。
+            ref = now or datetime.now(_BJ_TZ)
+            if ref.tzinfo is not None:
+                ref = ref.astimezone(_BJ_TZ).replace(tzinfo=None)
+            event_date = ev.date()
+            ref_date = ref.date()
+        days = (ref_date - event_date).days
     except Exception:
         return NO_DATE
+    date_text = event_date.isoformat()
+    if days < 0:
+        return f"⚠ 日期 {date_text} 晚于当前日期，禁止叙述为已发生事件"
     when = "今天" if days == 0 else ("昨天" if days == 1 else f"距今 {days} 天")
-    return f"发生于 {ev.strftime('%Y-%m-%d')}（{when}）"
+    return f"发生于 {date_text}（{when}）"
+
+
+def _format_dated_raw_slot_text(b: dict) -> str:
+    """JSON 原文 slot 的正文；日期必须进入 consumer 实际读取的 text 字段。"""
+    body = redact_text(strip_wikilinks(b.get("content", ""))).strip()
+    return f"📅 {_event_age_label(b)}\n{body}"
 
 
 def _is_protected_domain_bucket(b: dict) -> bool:
@@ -3125,7 +3145,9 @@ async def briefing(
                     "bucket_id": b["id"],
                     "label": meta.get("name", b["id"]),
                     "domain": meta.get("domain", []) or [],
-                    "text": redact_text(strip_wikilinks(b.get("content", ""))),
+                    "created": meta.get("created"),
+                    "age_label": _event_age_label(b),
+                    "text": _format_dated_raw_slot_text(b),
                     "warn": (
                         f"原文逐字、未压缩。触及须 inspect 桶 id={b['id']}；"
                         f"禁止当 resolved/已完成/演的 处理。"
@@ -3136,7 +3158,10 @@ async def briefing(
                 slots.append({
                     "tier": 0,
                     "label": meta.get("name", b["id"]),
-                    "text": redact_text(strip_wikilinks(b.get("content", ""))),
+                    "bucket_id": b["id"],
+                    "created": meta.get("created"),
+                    "age_label": _event_age_label(b),
+                    "text": _format_dated_raw_slot_text(b),
                 })
             if anchor_index:
                 slots.append({
@@ -3257,7 +3282,9 @@ async def briefing(
                 "bucket_id": b["id"],
                 "label": meta.get("name", b["id"]),
                 "domain": meta.get("domain", []) or [],
-                "text": redact_text(strip_wikilinks(b.get("content", ""))),
+                "created": meta.get("created"),
+                "age_label": _event_age_label(b),
+                "text": _format_dated_raw_slot_text(b),
                 "warn": (
                     f"原文逐字、未压缩。触及须 inspect 桶 id={b['id']}；"
                     f"禁止当 resolved/已完成/演的 处理。"
@@ -3268,7 +3295,10 @@ async def briefing(
             slots.append({
                 "tier": 0,
                 "label": meta.get("name", b["id"]),
-                "text": redact_text(strip_wikilinks(b.get("content", ""))),
+                "bucket_id": b["id"],
+                "created": meta.get("created"),
+                "age_label": _event_age_label(b),
+                "text": _format_dated_raw_slot_text(b),
             })
         if result:
             slots.append({

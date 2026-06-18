@@ -9,7 +9,8 @@ import server
 
 
 def _pbucket(bid, content, domain, *, importance=10, pinned=True,
-             last_active="2026-05-30T10:00:00"):
+             last_active="2026-05-30T10:00:00",
+             created="2026-05-30T10:00:00"):
     return {
         "id": bid,
         "content": content,
@@ -17,7 +18,7 @@ def _pbucket(bid, content, domain, *, importance=10, pinned=True,
             "id": bid, "name": bid, "importance": importance,
             "type": "dynamic", "domain": domain, "tags": [],
             "valence": 0.5, "arousal": 0.3, "pinned": pinned,
-            "last_active": last_active,
+            "last_active": last_active, "created": created,
         },
     }
 
@@ -93,9 +94,25 @@ async def test_protected_bucket_as_json_slot(monkeypatch, tmp_path):
 
     assert len(pslots) == 1
     assert pslots[0]["bucket_id"] == "anniv"
+    assert pslots[0]["created"] == "2026-05-30T10:00:00"
+    assert pslots[0]["age_label"].startswith("发生于 2026-05-30")
+    assert pslots[0]["text"].startswith("📅 发生于 2026-05-30")
     assert secret in pslots[0]["text"]
     assert "inspect" in pslots[0]["warn"]
     assert pslots[0]["tier"] == 0
+
+
+@pytest.mark.asyncio
+async def test_protected_json_slot_puts_missing_date_warning_in_text(monkeypatch, tmp_path):
+    bucket = _pbucket("nodate", "旧事件原文", ["家庭"], created=None)
+    _wire(monkeypatch, tmp_path, [bucket])
+
+    out = await server.briefing(max_chars=300, session_id="t3-nodate",
+                                include_body_state=False, format="json")
+    slot = next(s for s in json.loads(out)["slots"] if s.get("protected"))
+
+    assert slot["created"] is None
+    assert slot["text"].startswith("📅 ⚠ 无确切日期")
 
 
 @pytest.mark.asyncio
@@ -128,5 +145,6 @@ async def test_protected_verbatim_limit_keeps_most_recent(monkeypatch, tmp_path)
     ids = {s["bucket_id"] for s in pslots}
 
     assert len(pslots) == 6                     # 默认上限 6，防膨胀
+    assert all(s["text"].startswith("📅 发生于") for s in pslots)
     assert "vow7" in ids and "vow6" in ids       # 最近的保真
     assert "vow0" not in ids and "vow1" not in ids  # 最老两条让位（仍走压缩 pool）

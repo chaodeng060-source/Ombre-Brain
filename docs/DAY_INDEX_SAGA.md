@@ -61,7 +61,7 @@ tags: [saga, day_index]
 episode 走 embedding cosine≥0.78 + 3 天跨度；day_index 走**同日历日**硬聚类，且**专吃 episode 吃不到的豁免桶**。
 
 ```
-for 每个日历日 D（北京时区，取自 created）:
+for 每个可信事件日 D（北京时区，取自经审计的 event date）:
     members = 该日所有 dynamic 桶（含豁免桶；排除 type∈{episode,saga,permanent,feel} 与已认领）
     if len(members) < day_index.min_buckets_per_day(默认 8): 跳过   # 只收拾爆量日
     按 facet 粗分：
@@ -71,7 +71,13 @@ for 每个日历日 D（北京时区，取自 created）:
     产出索引提案（date, facet, member_ids, 草拟 title+arc）
 ```
 
-**前置依赖**：聚类按 `created` 日历日 → 依赖 `backfill_created.py` 先把缺 `created` 的桶补齐（卡兜/LMC 方案桶现为 `创建:?`）。无 created 的桶不参与索引（保守跳过），待回填后下轮纳入。
+**前置依赖**：先审计日期语义，不能把“可解析的 `created`”直接等同于“事件发生日”。
+现有 `created` 有时是桶写入/导入时间；`backfill_created.py` 也只补缺失或损坏值，
+不会纠正“格式合法但语义是入库时间”的记录。day-index 只接收可证明的事件日：
+明确日期桶优先；日期来源不明的桶保守跳过并进入人工报告，不自动归日。
+
+2026-06-18 NAS 只读核验：候选 backfill 对 BucketManager 返回的 1006 个桶全部判定为
+`already-has-created`，实际可回填 0。这个结果只说明字段齐全，不证明事件时间轴已可靠。
 
 > feel 桶不进 member（红线 2/3：温度桶永远独立浮现）。但 feel 可在索引 content 里被**提及**、不被**收编**。
 
@@ -118,12 +124,13 @@ class DayIndexEngine:
 
 | 阶段 | 做什么 | 碰 NAS？ | 可回滚 |
 |---|---|---|---|
-| P0 | `backfill_created.py --go`（已写好，等回家跑） | 写 created（保留 last_active） | created 可重算 |
+| P0 | NAS 容器内只跑 `backfill_created.py` dry-run + 日期语义审计报告；当前结果为 0 可回填 | 否 | — |
+| P0b | 仅在人审报告、备份和变更清单齐全后，批准特定缺失桶回填 | 写 created（保留 last_active） | 按变更清单恢复备份值 |
 | P1 | `day_index_engine.py` + 纯函数测试；`run_cycle(apply=False)` 出**索引提案报告**，零写入 | 否 | — |
 | P2 | 朝灯审提案 → `apply=True` 建索引桶（只增，不碰原桶） | 仅新增 saga 桶 | 删索引桶即还原 |
 | P3 | pulse/briefing 折叠（config flag 默认关，验证后开） | 否（纯展示） | 关 flag 即恢复 |
 
-每阶段独立可停。P1/P3 不可逆风险为零；P2 只增桶、删了就回到原样；P0 是数据补全、可重算。
+每阶段独立可停。P1/P3 不可逆风险为零；P2 只增桶、删了就回到原样；P0b 必须保留逐桶变更清单，不能把“可重算”当作回滚。
 
 ---
 
@@ -140,4 +147,3 @@ day_index 是 X 线（LMC-5 narrative timeline）的**最底层**：先把「同
 - `_collapse_by_day_index`：成员≥阈值折叠、protected/pinned 不折叠、有 query 不折叠。
 - 幂等：同输入跑两次不重复建索引。
 - 红线回归：索引建立后，成员原桶 search/inspect 仍命中、正文未变、last_active 未 bump。
-```

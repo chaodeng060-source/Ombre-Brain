@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Backfill the `created` (event-time) field on existing buckets.
+Backfill missing or malformed `created` fields on existing buckets.
 
 给「没有 created / created 损坏」的存量桶补上事件发生时间，从桶名、tags（必要时
-正文）里的 `YYYY-MM-DD` 推断。这是「全库时间标 + 按时间推进的故事线泳道」的地基：
-saga 泳道、因果边都已在库里，缺的就是每个桶在时间轴上的可靠坐标。
+正文）里的 `YYYY-MM-DD` 推断。它只补齐可审计的格式缺口，不把 `created` 自动宣称为
+可靠事件时间；故事线若要按事件日聚类，还必须另做日期语义审计。
 
-为什么要补：卡兜咬人桶 created/last_active 双空，简报里只能显示「⚠ 无确切日期」
-（见 server._event_age_label，2026-06-18）。补上 created 后，它会显示成
-「发生于 2026-05-30（距今 N 天）」，朝灯的时间感不再漂（她以为一个月，其实 19 天）。
+为什么要补：缺失或损坏的 created 会让简报只能显示「⚠ 无确切日期」。本脚本只
+处理这种格式缺口；它不能证明一个已有 created 的值就是事件发生时间，也不会把
+合法的入库时间擅自改成事件时间。2026-06-18 NAS dry-run 为 0 可回填。
 
 与 bucket_mgr.update 的区别（关键）：
     update() 会无条件把 last_active 刷成 now。一旦回填全库，等于把所有桶的衰减
@@ -21,17 +21,22 @@ saga 泳道、因果边都已在库里，缺的就是每个桶在时间轴上的
       正文里的日期未必是事件日期），且日期必须真实存在、不晚于今天、年份 ≥ 2024。
     - 推断不出日期的桶**不写**，让它在简报里诚实显示「无确切日期」，绝不瞎填。
     - 默认 dry-run，只打印将怎么改；真正写入要带 --go。
+    - 写入使用同目录临时文件 + fsync + os.replace，避免中断留下半个 frontmatter。
 
 Usage:
     OMBRE_BUCKETS_DIR=/data python backfill_created.py                 # dry-run（默认）
     OMBRE_BUCKETS_DIR=/data python backfill_created.py --scan-content  # dry-run + 扫正文
     OMBRE_BUCKETS_DIR=/data python backfill_created.py --go            # 实际写入
+    docker exec ombre-brain python /app/backfill_created.py            # NAS 容器 dry-run
 """
 
 import argparse
 import asyncio
+import os
 import re
+import stat
 import sys
+import tempfile
 from datetime import date, datetime
 
 import frontmatter
@@ -42,30 +47,28 @@ from bucket_manager import BucketManager  # noqa: E402
 
 _MIN_YEAR = 2024
 
-# 支持 2026-05-30 / 2026.5.30 / 2026/5/30 三种写法
-_DATE_PATTERNS = [
-    re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})"),
-    re.compile(r"(\d{4})\.(\d{1,2})\.(\d{1,2})"),
-    re.compile(r"(\d{4})/(\d{1,2})/(\d{1,2})"),
-]
+# 支持 2026-05-30 / 2026.5.30 / 2026/5/30；统一按文本位置取第一条。
+# 数字边界避免从 12026-05-300 这类更长编号里截出伪日期。
+_DATE_PATTERN = re.compile(
+    r"(?<!\d)(\d{4})([-./])(\d{1,2})\2(\d{1,2})(?!\d)"
+)
 
 
 def _first_valid_date(text, today: date) -> date | None:
     """文本里第一个合法、年份≥2024、不晚于今天的日期；没有→None。"""
     if not isinstance(text, str):
         return None
-    for pat in _DATE_PATTERNS:
-        for m in pat.finditer(text):
-            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-            if y < _MIN_YEAR:
-                continue
-            try:
-                dt = date(y, mo, d)
-            except ValueError:
-                continue
-            if dt > today:        # 未来日期不可能是事件发生时间
-                continue
-            return dt
+    for m in _DATE_PATTERN.finditer(text):
+        y, mo, d = int(m.group(1)), int(m.group(3)), int(m.group(4))
+        if y < _MIN_YEAR:
+            continue
+        try:
+            dt = date(y, mo, d)
+        except ValueError:
+            continue
+        if dt > today:        # 未来日期不可能是事件发生时间
+            continue
+        return dt
     return None
 
 
@@ -92,7 +95,12 @@ def infer_created(meta: dict, content: str = "", today: date = None,
     if dt:
         return f"{dt.isoformat()}T00:00:00", "name"
 
-    for t in (meta.get("tags") or []):
+    tags = meta.get("tags") or []
+    if isinstance(tags, str):
+        tags = [tags]
+    elif not isinstance(tags, (list, tuple, set)):
+        tags = []
+    for t in tags:
         dt = _first_valid_date(str(t), today)
         if dt:
             return f"{dt.isoformat()}T00:00:00", "tag"
@@ -103,6 +111,32 @@ def infer_created(meta: dict, content: str = "", today: date = None,
             return f"{dt.isoformat()}T00:00:00", "content"
 
     return None, "no-date-found"
+
+
+def _atomic_write_post(fp: str, post) -> None:
+    """Write frontmatter in the same directory, fsync, then atomically replace."""
+    target = os.path.abspath(fp)
+    parent = os.path.dirname(target)
+    mode = stat.S_IMODE(os.stat(target).st_mode)
+    fd, tmp = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=parent,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(frontmatter.dumps(post))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 async def backfill(go: bool = False, scan_content: bool = False):
@@ -151,8 +185,7 @@ async def backfill(go: bool = False, scan_content: bool = False):
                 continue
             post = mgr._safe_load_post(fp)
             post["created"] = iso          # 只动 created，last_active 原样保留
-            with open(fp, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+            _atomic_write_post(fp, post)
             ok += 1
         except Exception as e:
             fail += 1
