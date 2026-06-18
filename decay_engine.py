@@ -24,6 +24,8 @@ import asyncio
 import logging
 from datetime import datetime
 
+from utils import event_at_from_metadata
+
 logger = logging.getLogger("ombre_brain.decay")
 
 
@@ -180,9 +182,9 @@ class DecayEngine:
     # 检索期遗忘曲线因子（breath 检索模式排序用）
     #
     # Ebbinghaus: decay = exp(-ln2 × age_days / half_life_eff)
-    # - Age uses `created`, NOT last_active — search hits call touch(),
+    # - Age uses `event_at`, NOT last_active — search hits call touch(),
     #   so last_active would self-reinforce ("retrieved → forever fresh").
-    #   年龄用 created 而非 last_active——检索命中会 touch 刷新 last_active，
+    #   年龄用 event_at 而非 last_active——检索命中会 touch 刷新 last_active，
     #   用它会自强化成「被检索到的永远新」死循环。
     # - Rehearsal: activation_count stretches the half-life
     #   (ebbingflow "Episode half-life ×2 = oft-retold memories live longer",
@@ -200,7 +202,7 @@ class DecayEngine:
         if metadata.get("type") in ("permanent", "feel"):
             return 1.0
 
-        created_str = metadata.get("created", "")
+        created_str = event_at_from_metadata(metadata) or ""
         try:
             created = datetime.fromisoformat(str(created_str))
             age_days = max(0.0, (datetime.now() - created).total_seconds() / 86400)

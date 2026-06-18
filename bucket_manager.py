@@ -25,12 +25,13 @@
 # 被谁依赖：server.py, decay_engine.py
 # ============================================================
 
+import asyncio
 import os
 import math
 import logging
 import re
-import shutil
 from collections import Counter
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -42,19 +43,22 @@ from rapidfuzz import fuzz
 from utils import (
     generate_bucket_id, sanitize_name, safe_path, now_iso, world_matches,
     RELATION_TYPES, PROTECTED_RESOLVE_DOMAINS, ResolvedGuardError,
+    DATE_PRECISIONS, event_at_from_metadata, normalize_event_at,
 )
+from mutation_audit import MutationAuditLog
+from storage_safety import advisory_file_lock, atomic_write_post
 
 logger = logging.getLogger("ombre_brain.bucket")
 
 
 def _bucket_in_time_range(bucket: dict, after: datetime = None, before: datetime = None) -> bool:
     """
-    Check if a bucket's `created` timestamp falls within [after, before].
+    Check if a bucket's event timestamp falls within [after, before].
     Buckets with unparseable timestamps are kept (conservative).
     Either bound may be None (open-ended).
     """
     meta = bucket.get("metadata", {}) or {}
-    raw = meta.get("created") or meta.get("last_active") or ""
+    raw = event_at_from_metadata(meta, fallback_last_active=True) or ""
     try:
         created = datetime.fromisoformat(str(raw))
     except (ValueError, TypeError):
@@ -121,6 +125,41 @@ class BucketManager:
         self.w_time = scoring.get("time_proximity", 2.5)
         self.w_importance = scoring.get("importance", 1.0)
         self.content_weight = scoring.get("content_weight", 3.0)
+        self.audit_log = MutationAuditLog(
+            self.base_dir,
+            config.get("audit", {}),
+        )
+        self._locks_dir = os.path.join(self.base_dir, ".locks")
+        self._bucket_locks: dict[str, asyncio.Lock] = {}
+
+    def _lock_for(self, bucket_id: str) -> asyncio.Lock:
+        lock = self._bucket_locks.get(bucket_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._bucket_locks[bucket_id] = lock
+        return lock
+
+    @asynccontextmanager
+    async def _write_guard(self, bucket_id: str):
+        """Serialize writes in this process and across maintenance processes."""
+        async with self._lock_for(bucket_id):
+            lock_name = re.sub(r"[^A-Za-z0-9_.-]", "_", bucket_id)
+            lock_path = os.path.join(self._locks_dir, f"{lock_name}.lock")
+            with advisory_file_lock(lock_path):
+                yield
+
+    @staticmethod
+    def _post_snapshot(post, file_path: str = "") -> dict:
+        snapshot = {
+            "metadata": dict(post.metadata),
+            "content": post.content,
+        }
+        if file_path:
+            snapshot["path"] = os.path.abspath(file_path)
+        return snapshot
+
+    def _atomic_write_post(self, file_path: str, post) -> None:
+        atomic_write_post(file_path, post)
 
     # ---------------------------------------------------------
     # Create a new bucket
@@ -142,10 +181,31 @@ class BucketManager:
         chord_tag: str = None,
         tier: int = None,
         sense: list[str] = None,
+        event_at=None,
+        date_precision: str = None,
+        date_source: str = None,
+        date_confidence: float = None,
+        actor: str = "system",
     ) -> str:
         bucket_id = generate_bucket_id()
         domain = domain or ["未分类"]
         tags = list(tags) if tags else []
+        recorded_at = now_iso()
+        if event_at is None:
+            normalized_event_at = recorded_at
+            inferred_precision = "second"
+            effective_date_source = date_source or "recorded_at_default"
+            effective_confidence = 0.5 if date_confidence is None else float(date_confidence)
+        else:
+            normalized_event_at, inferred_precision = normalize_event_at(event_at)
+            effective_date_source = date_source or "explicit"
+            effective_confidence = 1.0 if date_confidence is None else float(date_confidence)
+        effective_precision = date_precision or inferred_precision
+        if effective_precision not in DATE_PRECISIONS:
+            raise ValueError(
+                f"date_precision must be one of {sorted(DATE_PRECISIONS)}"
+            )
+        effective_confidence = max(0.0, min(1.0, effective_confidence))
 
         # --- Stamp creation date into name and tags (skip feel buckets) ---
         # --- 时间戳进桶名+标签（feel 桶铁律：不动）---
@@ -172,8 +232,14 @@ class BucketManager:
             "arousal": max(0.0, min(1.0, arousal)),
             "importance": max(1, min(10, importance)),
             "type": bucket_type,
-            "created": now_iso(),
-            "last_active": now_iso(),
+            "event_at": normalized_event_at,
+            "recorded_at": recorded_at,
+            "date_precision": effective_precision,
+            "date_source": effective_date_source,
+            "date_confidence": effective_confidence,
+            # Transitional read compatibility for older clients and vault views.
+            "created": normalized_event_at,
+            "last_active": recorded_at,
             "activation_count": 1,
         }
         if pinned:
@@ -207,8 +273,6 @@ class BucketManager:
         # 防御性：确保 metadata 里没有 content 键，否则会和 body 撞 Post() 参数
         metadata.pop("content", None)
 
-        post = frontmatter.Post(linked_content, **metadata)
-
         if bucket_type == "permanent" or pinned:
             type_dir = self.permanent_dir
             if pinned and bucket_type != "permanent":
@@ -232,12 +296,24 @@ class BucketManager:
             filename = f"{bucket_id}.md"
         file_path = safe_path(target_dir, filename)
 
-        try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-        except OSError as e:
-            logger.error(f"Failed to write bucket file / 写入桶文件失败: {file_path}: {e}")
-            raise
+        post = frontmatter.Post(linked_content, **metadata)
+        async with self._write_guard(bucket_id):
+            event_id = self.audit_log.begin(
+                actor=actor,
+                action="create",
+                bucket_id=bucket_id,
+                before=None,
+                after=self._post_snapshot(post, file_path),
+                details={"path": os.path.abspath(file_path)},
+            )
+            try:
+                self._atomic_write_post(file_path, post)
+                self._bucket_path_cache[bucket_id] = file_path
+                self.audit_log.commit(event_id)
+            except Exception as e:
+                self.audit_log.fail(event_id, e)
+                logger.error(f"Failed to write bucket file / 写入桶文件失败: {file_path}: {e}")
+                raise
 
         logger.info(
             f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
@@ -263,90 +339,143 @@ class BucketManager:
         filename = os.path.basename(file_path)
         new_path = safe_path(target_dir, filename)
         if os.path.normpath(file_path) != os.path.normpath(new_path):
-            os.rename(file_path, new_path)
+            os.replace(file_path, new_path)
             logger.info(f"Moved bucket / 移动记忆桶: {filename} → {target_dir}/")
         return new_path
 
     # ---------------------------------------------------------
     # Update bucket
     # ---------------------------------------------------------
-    async def update(self, bucket_id: str, **kwargs) -> bool:
-        file_path = self._find_bucket_file(bucket_id)
-        if not file_path:
-            return False
+    async def update(self, bucket_id: str, actor: str = "system", **kwargs) -> bool:
+        async with self._write_guard(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return False
 
-        try:
-            post = self._safe_load_post(file_path)
-            old_domain = post.get("domain", ["未分类"])
-            old_type = post.get("type", "dynamic")
-            old_pinned = post.get("pinned", False)
+            event_id = None
+            try:
+                post = self._safe_load_post(file_path)
+                before = self._post_snapshot(post, file_path)
+                old_domain = post.get("domain", ["未分类"])
+                old_type = post.get("type", "dynamic")
+                old_pinned = post.get("pinned", False)
 
-            # Guard: protected-domain (or feel-type) buckets can never be resolved.
-            # 守卫：保护域桶（或 feel 类型）禁止 resolved=1（5.10 黑洞事件根治）
-            if kwargs.get("resolved") is True:
-                cur_domain = old_domain if isinstance(old_domain, list) else [old_domain]
-                hit = [d for d in cur_domain if d in PROTECTED_RESOLVE_DOMAINS]
-                if hit or old_type == "feel":
-                    label = ",".join(hit) if hit else f"type={old_type}"
-                    logger.warning(
-                        f"[ResolvedGuard] refused resolved=True on {bucket_id} (protected: {label})"
+                # Guard: protected-domain (or feel-type) buckets can never be resolved.
+                # 守卫：保护域桶（或 feel 类型）禁止 resolved=1（5.10 黑洞事件根治）
+                if kwargs.get("resolved") is True:
+                    cur_domain = old_domain if isinstance(old_domain, list) else [old_domain]
+                    hit = [d for d in cur_domain if d in PROTECTED_RESOLVE_DOMAINS]
+                    if hit or old_type == "feel":
+                        label = ",".join(hit) if hit else f"type={old_type}"
+                        logger.warning(
+                            f"[ResolvedGuard] refused resolved=True on {bucket_id} (protected: {label})"
+                        )
+                        raise ResolvedGuardError(
+                            f"桶 {bucket_id} 属于保护域 [{label}]，禁止 resolved=1"
+                        )
+
+                if "recorded_at" in kwargs:
+                    raise ValueError("recorded_at is immutable after bucket creation")
+
+                time_value = kwargs.get("event_at")
+                legacy_time_value = kwargs.get("created")
+                if time_value is not None or legacy_time_value is not None:
+                    normalized, inferred_precision = normalize_event_at(
+                        time_value if time_value is not None else legacy_time_value
                     )
-                    raise ResolvedGuardError(
-                        f"桶 {bucket_id} 属于保护域 [{label}]，禁止 resolved=1"
+                    kwargs["event_at"] = normalized
+                    kwargs["created"] = normalized
+                    kwargs.setdefault("date_precision", inferred_precision)
+                    kwargs.setdefault(
+                        "date_source",
+                        "explicit_update" if time_value is not None else "legacy_created_update",
+                    )
+                    kwargs.setdefault("date_confidence", 1.0 if time_value is not None else 0.5)
+
+                if "date_precision" in kwargs and kwargs["date_precision"] not in DATE_PRECISIONS:
+                    raise ValueError(
+                        f"date_precision must be one of {sorted(DATE_PRECISIONS)}"
+                    )
+                if kwargs.get("date_confidence") is not None:
+                    kwargs["date_confidence"] = max(
+                        0.0, min(1.0, float(kwargs["date_confidence"]))
                     )
 
-            for key, value in kwargs.items():
-                if value is not None:
-                    if key == "content":
-                        # 'content' is body, not metadata — avoid Post() collision
-                        # 'content' 是正文不是元数据 — 防止 Post() 撞键
-                        post.content = value
+                changed_fields = []
+                for key, value in kwargs.items():
+                    if value is not None:
+                        if key == "content":
+                            if post.content != value:
+                                changed_fields.append(key)
+                            post.content = value
+                        else:
+                            if post.get(key) != value:
+                                changed_fields.append(key)
+                            post[key] = value
+
+                post["last_active"] = now_iso()
+                if "last_active" not in changed_fields:
+                    changed_fields.append("last_active")
+
+                new_pinned = post.get("pinned", False)
+                new_type = post.get("type", "dynamic")
+                new_domain = post.get("domain", ["未分类"])
+
+                need_move = False
+                target_type_dir = None
+
+                if new_pinned and not old_pinned:
+                    target_type_dir = self.permanent_dir
+                    need_move = True
+                elif not new_pinned and old_pinned:
+                    target_type_dir = self.dynamic_dir if new_type != "feel" else self.feel_dir
+                    need_move = True
+                elif new_type != old_type:
+                    if new_type == "permanent":
+                        target_type_dir = self.permanent_dir
+                    elif new_type == "feel":
+                        target_type_dir = self.feel_dir
                     else:
-                        post[key] = value
+                        target_type_dir = self.dynamic_dir
+                    need_move = True
+                elif new_domain != old_domain:
+                    if new_pinned or new_type == "permanent":
+                        target_type_dir = self.permanent_dir
+                    elif new_type == "feel":
+                        target_type_dir = self.feel_dir
+                    else:
+                        target_type_dir = self.dynamic_dir
+                    need_move = True
 
-            post["last_active"] = now_iso()
+                action = "update"
+                if "resolved" in kwargs and kwargs["resolved"] != before["metadata"].get("resolved"):
+                    action = "resolve" if kwargs["resolved"] else "unresolve"
+                event_id = self.audit_log.begin(
+                    actor=actor,
+                    action=action,
+                    bucket_id=bucket_id,
+                    before=before,
+                    after=self._post_snapshot(post, file_path),
+                    details={
+                        "changed_fields": sorted(set(changed_fields)),
+                        "move_requested": bool(need_move),
+                    },
+                )
 
-            new_pinned = post.get("pinned", False)
-            new_type = post.get("type", "dynamic")
-            new_domain = post.get("domain", ["未分类"])
+                self._atomic_write_post(file_path, post)
 
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
+                if need_move and target_type_dir:
+                    new_path = self._move_bucket(file_path, target_type_dir, new_domain)
+                    self._bucket_path_cache[bucket_id] = new_path
 
-            need_move = False
-            target_type_dir = None
+                self.audit_log.commit(event_id)
 
-            if new_pinned and not old_pinned:
-                target_type_dir = self.permanent_dir
-                need_move = True
-            elif not new_pinned and old_pinned:
-                target_type_dir = self.dynamic_dir if new_type != "feel" else self.feel_dir
-                need_move = True
-            elif new_type != old_type:
-                if new_type == "permanent":
-                    target_type_dir = self.permanent_dir
-                elif new_type == "feel":
-                    target_type_dir = self.feel_dir
-                else:
-                    target_type_dir = self.dynamic_dir
-                need_move = True
-            elif new_domain != old_domain:
-                if new_pinned or new_type == "permanent":
-                    target_type_dir = self.permanent_dir
-                elif new_type == "feel":
-                    target_type_dir = self.feel_dir
-                else:
-                    target_type_dir = self.dynamic_dir
-                need_move = True
-
-            if need_move and target_type_dir:
-                self._move_bucket(file_path, target_type_dir, new_domain)
-
-        except ResolvedGuardError:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to update bucket / 更新桶失败: {bucket_id}: {e}")
-            return False
+            except ResolvedGuardError:
+                raise
+            except Exception as e:
+                self.audit_log.fail(event_id, e)
+                logger.error(f"Failed to update bucket / 更新桶失败: {bucket_id}: {e}")
+                return False
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
         return True
@@ -355,7 +484,8 @@ class BucketManager:
     # Relation edges (6 类关系边：只在 source 桶记出边，反向遍历得入边)
     # ---------------------------------------------------------
     async def add_relation(
-        self, source_id: str, target_id: str, rel_type: str, note: str = ""
+        self, source_id: str, target_id: str, rel_type: str, note: str = "",
+        actor: str = "system",
     ) -> bool:
         if rel_type not in RELATION_TYPES:
             logger.warning(f"Unknown relation type / 未知关系类型: {rel_type}")
@@ -365,89 +495,125 @@ class BucketManager:
         if not await self.get(target_id):
             logger.warning(f"Relation target not found / 关系目标桶不存在: {target_id}")
             return False
-        file_path = self._find_bucket_file(source_id)
-        if not file_path:
-            return False
-        try:
-            post = self._safe_load_post(file_path)
-            relations = list(post.get("relations") or [])
-            for r in relations:
-                if isinstance(r, dict) and r.get("type") == rel_type and r.get("target") == target_id:
-                    return True  # 幂等：已有同 type+target 的边就不重复
-            edge = {"type": rel_type, "target": target_id}
-            if note and note.strip():
-                edge["note"] = note.strip()
-            relations.append(edge)
-            post["relations"] = relations
-            post["last_active"] = now_iso()
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-            logger.info(f"Added relation / 加边: {source_id} -[{rel_type}]-> {target_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to add relation / 加边失败 {source_id}->{target_id}: {e}")
-            return False
+        async with self._write_guard(source_id):
+            file_path = self._find_bucket_file(source_id)
+            if not file_path:
+                return False
+            event_id = None
+            try:
+                post = self._safe_load_post(file_path)
+                relations = list(post.get("relations") or [])
+                for r in relations:
+                    if isinstance(r, dict) and r.get("type") == rel_type and r.get("target") == target_id:
+                        return True  # 幂等：已有同 type+target 的边就不重复
+                before = self._post_snapshot(post, file_path)
+                edge = {"type": rel_type, "target": target_id}
+                if note and note.strip():
+                    edge["note"] = note.strip()
+                relations.append(edge)
+                post["relations"] = relations
+                post["last_active"] = now_iso()
+                event_id = self.audit_log.begin(
+                    actor=actor,
+                    action="add_relation",
+                    bucket_id=source_id,
+                    before=before,
+                    after=self._post_snapshot(post, file_path),
+                    details={"edge": edge},
+                )
+                self._atomic_write_post(file_path, post)
+                self.audit_log.commit(event_id)
+                logger.info(f"Added relation / 加边: {source_id} -[{rel_type}]-> {target_id}")
+                return True
+            except Exception as e:
+                self.audit_log.fail(event_id, e)
+                logger.error(f"Failed to add relation / 加边失败 {source_id}->{target_id}: {e}")
+                return False
 
     async def remove_relation(
-        self, source_id: str, target_id: str, rel_type: str = ""
+        self, source_id: str, target_id: str, rel_type: str = "",
+        actor: str = "system",
     ) -> int:
-        file_path = self._find_bucket_file(source_id)
-        if not file_path:
-            return 0
-        try:
-            post = self._safe_load_post(file_path)
-            relations = list(post.get("relations") or [])
-            if not relations:
+        async with self._write_guard(source_id):
+            file_path = self._find_bucket_file(source_id)
+            if not file_path:
                 return 0
-            kept = []
-            removed = 0
-            for r in relations:
-                if not isinstance(r, dict):
-                    kept.append(r)
-                    continue
-                if r.get("target") != target_id:
-                    kept.append(r)
-                    continue
-                if rel_type and r.get("type") != rel_type:
-                    kept.append(r)
-                    continue
-                removed += 1
-            if removed == 0:
+            event_id = None
+            try:
+                post = self._safe_load_post(file_path)
+                relations = list(post.get("relations") or [])
+                if not relations:
+                    return 0
+                kept = []
+                removed_edges = []
+                for r in relations:
+                    if not isinstance(r, dict):
+                        kept.append(r)
+                        continue
+                    if r.get("target") != target_id:
+                        kept.append(r)
+                        continue
+                    if rel_type and r.get("type") != rel_type:
+                        kept.append(r)
+                        continue
+                    removed_edges.append(r)
+                if not removed_edges:
+                    return 0
+                before = self._post_snapshot(post, file_path)
+                if kept:
+                    post["relations"] = kept
+                else:
+                    post.metadata.pop("relations", None)
+                post["last_active"] = now_iso()
+                event_id = self.audit_log.begin(
+                    actor=actor,
+                    action="remove_relation",
+                    bucket_id=source_id,
+                    before=before,
+                    after=self._post_snapshot(post, file_path),
+                    details={"removed_edges": removed_edges},
+                )
+                self._atomic_write_post(file_path, post)
+                self.audit_log.commit(event_id)
+                removed = len(removed_edges)
+                logger.info(f"Removed {removed} relation(s) / 删边: {source_id}->{target_id}")
+                return removed
+            except Exception as e:
+                self.audit_log.fail(event_id, e)
+                logger.error(f"Failed to remove relation / 删边失败 {source_id}->{target_id}: {e}")
                 return 0
-            if kept:
-                post["relations"] = kept
-            else:
-                post.metadata.pop("relations", None)
-            post["last_active"] = now_iso()
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-            logger.info(f"Removed {removed} relation(s) / 删边: {source_id}->{target_id}")
-            return removed
-        except Exception as e:
-            logger.error(f"Failed to remove relation / 删边失败 {source_id}->{target_id}: {e}")
-            return 0
 
     # ---------------------------------------------------------
     # Delete bucket
     # ---------------------------------------------------------
-    async def delete(self, bucket_id: str) -> bool:
-        file_path = self._find_bucket_file(bucket_id)
-        if not file_path:
-            return False
-
-        try:
-            post = self._safe_load_post(file_path)
-            if post.get("protected", False):
-                logger.warning(f"Cannot delete protected bucket / 受保护的桶不可删除: {bucket_id}")
+    async def delete(self, bucket_id: str, actor: str = "system") -> bool:
+        async with self._write_guard(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
                 return False
-        except Exception as e:
-            logger.warning(f"Failed to check protection on {bucket_id}: {e}")
 
-        try:
-            os.remove(file_path)
-        except OSError as e:
-            logger.error(f"Failed to delete bucket file / 删除桶文件失败: {bucket_id}: {e}")
-            return False
+            event_id = None
+            try:
+                post = self._safe_load_post(file_path)
+                if post.get("protected", False):
+                    logger.warning(f"Cannot delete protected bucket / 受保护的桶不可删除: {bucket_id}")
+                    return False
+                before = self._post_snapshot(post, file_path)
+                event_id = self.audit_log.begin(
+                    actor=actor,
+                    action="delete",
+                    bucket_id=bucket_id,
+                    before=before,
+                    after=None,
+                    details={"path": os.path.abspath(file_path)},
+                )
+                os.remove(file_path)
+                self._bucket_path_cache.pop(bucket_id, None)
+                self.audit_log.commit(event_id)
+            except Exception as e:
+                self.audit_log.fail(event_id, e)
+                logger.error(f"Failed to delete bucket file / 删除桶文件失败: {bucket_id}: {e}")
+                return False
 
         logger.info(f"Deleted bucket / 删除记忆桶: {bucket_id}")
         return True
@@ -455,23 +621,38 @@ class BucketManager:
     # ---------------------------------------------------------
     # Touch bucket
     # ---------------------------------------------------------
-    async def touch(self, bucket_id: str) -> None:
-        file_path = self._find_bucket_file(bucket_id)
-        if not file_path:
-            return
+    async def touch(self, bucket_id: str, actor: str = "system:touch") -> None:
+        current_time = None
+        async with self._write_guard(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return
 
-        try:
-            post = self._safe_load_post(file_path)
-            post["last_active"] = now_iso()
-            post["activation_count"] = post.get("activation_count", 0) + 1
-
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-
-            current_time = datetime.fromisoformat(str(post.get("created", post.get("last_active", ""))))
+            event_id = None
+            try:
+                post = self._safe_load_post(file_path)
+                before = self._post_snapshot(post, file_path)
+                post["last_active"] = now_iso()
+                post["activation_count"] = post.get("activation_count", 0) + 1
+                event_id = self.audit_log.begin(
+                    actor=actor,
+                    action="touch",
+                    bucket_id=bucket_id,
+                    before=before,
+                    after=self._post_snapshot(post, file_path),
+                    details={"activation_increment": 1},
+                )
+                self._atomic_write_post(file_path, post)
+                self.audit_log.commit(event_id)
+                current_time = datetime.fromisoformat(
+                    str(event_at_from_metadata(post.metadata, fallback_last_active=True))
+                )
+            except Exception as e:
+                self.audit_log.fail(event_id, e)
+                logger.warning(f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}")
+                return
+        if current_time is not None:
             await self._time_ripple(bucket_id, current_time)
-        except Exception as e:
-            logger.warning(f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}")
 
     async def _time_ripple(self, source_id: str, reference_time: datetime, hours: float = 48.0) -> None:
         try:
@@ -490,7 +671,7 @@ class BucketManager:
             if meta.get("pinned") or meta.get("protected") or meta.get("type") in ("permanent", "feel"):
                 continue
 
-            created_str = meta.get("created", meta.get("last_active", ""))
+            created_str = event_at_from_metadata(meta, fallback_last_active=True) or ""
             try:
                 created = datetime.fromisoformat(str(created_str))
                 delta_hours = abs((reference_time - created).total_seconds()) / 3600
@@ -498,18 +679,30 @@ class BucketManager:
                 continue
 
             if delta_hours <= hours:
-                file_path = self._find_bucket_file(bucket["id"])
-                if not file_path:
-                    continue
-                try:
-                    post = self._safe_load_post(file_path)
-                    current_count = post.get("activation_count", 1)
-                    post["activation_count"] = round(current_count + 0.3, 1)
-                    with open(file_path, "w", encoding="utf-8") as f:
-                        f.write(frontmatter.dumps(post))
-                    rippled += 1
-                except Exception:
-                    continue
+                async with self._write_guard(bucket["id"]):
+                    event_id = None
+                    try:
+                        file_path = self._find_bucket_file(bucket["id"])
+                        if not file_path:
+                            continue
+                        post = self._safe_load_post(file_path)
+                        before = self._post_snapshot(post, file_path)
+                        current_count = post.get("activation_count", 1)
+                        post["activation_count"] = round(current_count + 0.3, 1)
+                        event_id = self.audit_log.begin(
+                            actor="system:time_ripple",
+                            action="time_ripple",
+                            bucket_id=bucket["id"],
+                            before=before,
+                            after=self._post_snapshot(post, file_path),
+                            details={"source_id": source_id, "activation_increment": 0.3},
+                        )
+                        self._atomic_write_post(file_path, post)
+                        self.audit_log.commit(event_id)
+                        rippled += 1
+                    except Exception as e:
+                        self.audit_log.fail(event_id, e)
+                        continue
 
     # ---------------------------------------------------------
     # Multi-dimensional search (core feature)
@@ -787,33 +980,117 @@ class BucketManager:
     # ---------------------------------------------------------
     # Archive bucket
     # ---------------------------------------------------------
-    async def archive(self, bucket_id: str) -> bool:
-        file_path = self._find_bucket_file(bucket_id)
-        if not file_path:
-            return False
+    async def archive(self, bucket_id: str, actor: str = "system") -> bool:
+        async with self._write_guard(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return False
 
-        try:
-            post = self._safe_load_post(file_path)
-            domain = post.get("domain", ["未分类"])
-            primary_domain = sanitize_name(domain[0]) if domain else "未分类"
-            archive_subdir = os.path.join(self.archive_dir, primary_domain)
-            os.makedirs(archive_subdir, exist_ok=True)
+            event_id = None
+            try:
+                post = self._safe_load_post(file_path)
+                before = self._post_snapshot(post, file_path)
+                domain = post.get("domain", ["未分类"])
+                primary_domain = sanitize_name(domain[0]) if domain else "未分类"
+                archive_subdir = os.path.join(self.archive_dir, primary_domain)
+                os.makedirs(archive_subdir, exist_ok=True)
 
-            dest = safe_path(archive_subdir, os.path.basename(file_path))
+                dest = safe_path(archive_subdir, os.path.basename(file_path))
 
-            post["type"] = "archived"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(frontmatter.dumps(post))
-
-            shutil.move(file_path, str(dest))
-        except Exception as e:
-            logger.error(
-                f"Failed to archive bucket / 归档桶失败: {bucket_id}: {e}"
-            )
-            return False
+                post["type"] = "archived"
+                event_id = self.audit_log.begin(
+                    actor=actor,
+                    action="archive",
+                    bucket_id=bucket_id,
+                    before=before,
+                    after=self._post_snapshot(post, str(dest)),
+                    details={
+                        "source_path": os.path.abspath(file_path),
+                        "destination_path": os.path.abspath(str(dest)),
+                    },
+                )
+                self._atomic_write_post(file_path, post)
+                os.replace(file_path, str(dest))
+                self._bucket_path_cache[bucket_id] = str(dest)
+                self.audit_log.commit(event_id)
+            except Exception as e:
+                self.audit_log.fail(event_id, e)
+                logger.error(
+                    f"Failed to archive bucket / 归档桶失败: {bucket_id}: {e}"
+                )
+                return False
 
         logger.info(f"Archived bucket / 归档记忆桶: {bucket_id} → archive/{primary_domain}/")
         return True
+
+    async def relocate(
+        self,
+        bucket_id: str,
+        *,
+        actor: str = "system:relocate",
+        rename_from_metadata: bool = False,
+    ) -> bool:
+        """Move a bucket to the directory implied by its metadata, with audit."""
+        async with self._write_guard(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return False
+
+            event_id = None
+            try:
+                post = self._safe_load_post(file_path)
+                domain = post.get("domain", ["未分类"])
+                bucket_type = post.get("type", "dynamic")
+                if post.get("pinned") or bucket_type == "permanent":
+                    target_type_dir = self.permanent_dir
+                elif bucket_type == "feel":
+                    target_type_dir = self.feel_dir
+                elif bucket_type == "archived":
+                    target_type_dir = self.archive_dir
+                else:
+                    target_type_dir = self.dynamic_dir
+
+                primary_domain = (
+                    "沉淀物"
+                    if bucket_type == "feel"
+                    else sanitize_name(domain[0]) if domain else "未分类"
+                )
+                target_dir = os.path.join(target_type_dir, primary_domain)
+                os.makedirs(target_dir, exist_ok=True)
+                filename = os.path.basename(file_path)
+                if rename_from_metadata:
+                    bucket_name = sanitize_name(post.get("name", "")) or bucket_id
+                    filename = (
+                        f"{bucket_name}_{bucket_id}.md"
+                        if bucket_name != bucket_id
+                        else f"{bucket_id}.md"
+                    )
+                destination = safe_path(target_dir, filename)
+                if os.path.normcase(os.path.abspath(file_path)) == os.path.normcase(
+                    os.path.abspath(str(destination))
+                ):
+                    return True
+
+                before = self._post_snapshot(post, file_path)
+                event_id = self.audit_log.begin(
+                    actor=actor,
+                    action="relocate",
+                    bucket_id=bucket_id,
+                    before=before,
+                    after=self._post_snapshot(post, str(destination)),
+                    details={
+                        "source_path": os.path.abspath(file_path),
+                        "destination_path": os.path.abspath(str(destination)),
+                    },
+                )
+                os.replace(file_path, str(destination))
+                self._bucket_path_cache[bucket_id] = str(destination)
+                self.audit_log.commit(event_id)
+                return True
+            except Exception as e:
+                self.audit_log.fail(event_id, e)
+                logger.error(f"Failed to relocate bucket / 移动桶失败: {bucket_id}: {e}")
+                return False
 
     # ---------------------------------------------------------
     # Internal: find bucket file

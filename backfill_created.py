@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
-Backfill missing or malformed `created` fields on existing buckets.
+Migrate legacy `created` metadata to the split v2 time model.
 
-给「没有 created / created 损坏」的存量桶补上事件发生时间，从桶名、tags（必要时
-正文）里的 `YYYY-MM-DD` 推断。它只补齐可审计的格式缺口，不把 `created` 自动宣称为
-可靠事件时间；故事线若要按事件日聚类，还必须另做日期语义审计。
-
-为什么要补：缺失或损坏的 created 会让简报只能显示「⚠ 无确切日期」。本脚本只
-处理这种格式缺口；它不能证明一个已有 created 的值就是事件发生时间，也不会把
-合法的入库时间擅自改成事件时间。2026-06-18 NAS dry-run 为 0 可回填。
+为存量桶补齐 `event_at`、`recorded_at`、`date_precision`、`date_source`、
+`date_confidence`。事件日期优先从桶名、tags（可选正文）推断；只能沿用旧
+`created` 时会明确标成 `legacy_created`、置信度 0.3，避免把历史歧义伪装成真相。
 
 与 bucket_mgr.update 的区别（关键）：
     update() 会无条件把 last_active 刷成 now。一旦回填全库，等于把所有桶的衰减
-    时钟集体清零、搅乱未解决权重池。本脚本**只写 created、原样保留 last_active**，
+    时钟集体清零、搅乱未解决权重池。本脚本**只写时间模型字段、原样保留 last_active**，
     直接复用 bucket_manager 的 frontmatter 序列化，不走 update。
 
 安全性：
-    - 幂等：已有可解析 created 的桶跳过，不覆盖。
+    - 幂等：时间模型字段完整的桶跳过，不覆盖。
     - 保守：只认 name → tags（默认）里的日期；--scan-content 才扫正文（置信度低，
       正文里的日期未必是事件日期），且日期必须真实存在、不晚于今天、年份 ≥ 2024。
     - 推断不出日期的桶**不写**，让它在简报里诚实显示「无确切日期」，绝不瞎填。
@@ -34,16 +30,14 @@ import argparse
 import asyncio
 import os
 import re
-import stat
 import sys
-import tempfile
 from datetime import date, datetime
-
-import frontmatter
 
 sys.path.insert(0, ".")
 from utils import load_config           # noqa: E402
 from bucket_manager import BucketManager  # noqa: E402
+from storage_safety import atomic_write_post as _atomic_write_post  # noqa: E402
+from utils import normalize_event_at, now_iso  # noqa: E402
 
 _MIN_YEAR = 2024
 
@@ -113,30 +107,70 @@ def infer_created(meta: dict, content: str = "", today: date = None,
     return None, "no-date-found"
 
 
-def _atomic_write_post(fp: str, post) -> None:
-    """Write frontmatter in the same directory, fsync, then atomically replace."""
-    target = os.path.abspath(fp)
-    parent = os.path.dirname(target)
-    mode = stat.S_IMODE(os.stat(target).st_mode)
-    fd, tmp = tempfile.mkstemp(
-        prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=parent,
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
-            handle.write(frontmatter.dumps(post))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp, mode)
-        os.replace(tmp, target)
-    except Exception:
+def infer_time_metadata(
+    meta: dict,
+    *,
+    content: str = "",
+    today: date = None,
+    scan_content: bool = False,
+    recorded_at: str = None,
+) -> dict:
+    """Build missing v2 time fields without overstating legacy date certainty."""
+    today = today or date.today()
+    updates = {}
+
+    event_at = meta.get("event_at")
+    inferred_source = ""
+    if event_at:
         try:
-            os.close(fd)
-        except OSError:
-            pass
-        raise
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+            event_at, inferred_precision = normalize_event_at(event_at)
+            inferred_source = meta.get("date_source") or "existing_event_at"
+        except (TypeError, ValueError):
+            event_at = None
+
+    if not event_at:
+        inference_meta = dict(meta)
+        inference_meta.pop("created", None)
+        event_at, inferred_source = infer_created(
+            inference_meta,
+            content=content,
+            today=today,
+            scan_content=scan_content,
+        )
+        inferred_precision = "day" if event_at else "unknown"
+
+    if not event_at and meta.get("created"):
+        try:
+            event_at, inferred_precision = normalize_event_at(meta["created"])
+            inferred_source = "legacy_created"
+        except (TypeError, ValueError):
+            event_at = None
+
+    if event_at:
+        confidence_by_source = {
+            "existing_event_at": 1.0,
+            "name": 0.9,
+            "tag": 0.8,
+            "content": 0.5,
+            "legacy_created": 0.3,
+        }
+        updates["event_at"] = event_at
+        updates["created"] = event_at
+        updates["date_precision"] = meta.get("date_precision") or inferred_precision
+        updates["date_source"] = meta.get("date_source") or inferred_source
+        updates["date_confidence"] = meta.get(
+            "date_confidence",
+            confidence_by_source.get(inferred_source, 0.5),
+        )
+
+    if not meta.get("recorded_at"):
+        updates["recorded_at"] = recorded_at or now_iso()
+
+    return {
+        key: value
+        for key, value in updates.items()
+        if meta.get(key) != value
+    }
 
 
 async def backfill(go: bool = False, scan_content: bool = False):
@@ -149,22 +183,39 @@ async def backfill(go: bool = False, scan_content: bool = False):
 
     todo, skipped, nodate = [], 0, []
     for b in buckets:
-        iso, source = infer_created(
-            b["metadata"], content=b.get("content", ""),
-            today=today, scan_content=scan_content,
+        fp = b.get("path") or mgr._find_bucket_file(b["id"])
+        file_recorded_at = None
+        if fp:
+            try:
+                file_recorded_at = datetime.fromtimestamp(
+                    os.path.getmtime(fp)
+                ).isoformat(timespec="seconds")
+            except OSError:
+                pass
+        updates = infer_time_metadata(
+            b["metadata"],
+            content=b.get("content", ""),
+            today=today,
+            scan_content=scan_content,
+            recorded_at=file_recorded_at,
         )
-        if source == "already-has-created":
+        if not updates:
             skipped += 1
-        elif iso is None:
+        elif "event_at" not in updates and not b["metadata"].get("event_at"):
             nodate.append(b)
+            todo.append((b, updates))
         else:
-            todo.append((b, iso, source))
+            todo.append((b, updates))
 
-    print(f"已有 created（跳过）: {skipped}")
-    print(f"可回填: {len(todo)}    推断不出日期（保持「无确切日期」）: {len(nodate)}")
-    for b, iso, source in todo:
+    print(f"时间字段已完整（跳过）: {skipped}")
+    print(f"可迁移: {len(todo)}    推断不出事件日期: {len(nodate)}")
+    for b, updates in todo:
         name = b["metadata"].get("name", b["id"])
-        print(f"  [{source:7}] {b['id'][:12]} ({name[:30]}) -> created={iso}")
+        print(
+            f"  [{updates.get('date_source', 'recorded-only'):16}] "
+            f"{b['id'][:12]} ({name[:30]}) -> "
+            f"event_at={updates.get('event_at', '(unknown)')}"
+        )
     if nodate:
         print("  -- 无日期可推断（不写，简报里诚实显示「无确切日期」）--")
         for b in nodate[:50]:
@@ -176,16 +227,32 @@ async def backfill(go: bool = False, scan_content: bool = False):
         return
 
     ok = fail = 0
-    for b, iso, _source in todo:
+    for b, updates in todo:
         try:
             fp = mgr._find_bucket_file(b["id"])
             if not fp:
                 fail += 1
                 print(f"  FAIL (file not found): {b['id']}")
                 continue
-            post = mgr._safe_load_post(fp)
-            post["created"] = iso          # 只动 created，last_active 原样保留
-            _atomic_write_post(fp, post)
+            async with mgr._write_guard(b["id"]):
+                post = mgr._safe_load_post(fp)
+                before = mgr._post_snapshot(post, fp)
+                for key, value in updates.items():
+                    post[key] = value
+                event_id = mgr.audit_log.begin(
+                    actor="migration:time_fields_v2",
+                    action="migrate_time_fields",
+                    bucket_id=b["id"],
+                    before=before,
+                    after=mgr._post_snapshot(post, fp),
+                    details={"changed_fields": sorted(updates)},
+                )
+                try:
+                    mgr._atomic_write_post(fp, post)
+                    mgr.audit_log.commit(event_id)
+                except Exception as write_error:
+                    mgr.audit_log.fail(event_id, write_error)
+                    raise
             ok += 1
         except Exception as e:
             fail += 1
