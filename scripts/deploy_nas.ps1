@@ -62,7 +62,14 @@ function Invoke-Remote {
     )
 
     $target = "${RemoteUser}@${RemoteHost}"
-    Invoke-Checked $Title @("ssh", "-i", $KeyPath, $target, "bash", "-lc", $Script)
+    # OpenSSH concatenates remote argv without preserving argument boundaries.
+    # Passing `bash -lc $Script` therefore turns only the first word into bash's
+    # command and lets later lines run in the parent shell without `set -e`.
+    # Base64 keeps the complete script as one payload and pipes it to bash stdin.
+    $normalized = $Script -replace "`r`n", "`n"
+    $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($normalized))
+    $remoteCommand = "printf '%s' '$payload' | base64 -d | bash -se"
+    Invoke-Checked $Title @("ssh", "-i", $KeyPath, $target, $remoteCommand)
 }
 
 function Assert-CleanTrackedWorktree {
@@ -121,8 +128,9 @@ try {
     $backupScript = @"
 set -euo pipefail
 mkdir -p '$BackupDir'
-tar --exclude='.env' --exclude='__pycache__' --exclude='.pytest_cache' -czf '$backupPath' -C '$RemoteDir' .
+tar --exclude='.env*' --exclude='__pycache__' --exclude='.pytest_cache' -czf '$backupPath' -C '$RemoteDir' .
 test -f '$backupPath'
+tar -tzf '$backupPath' >/dev/null
 "@
     Invoke-Remote "Backup current NAS source" $backupScript
 
@@ -132,6 +140,7 @@ mkdir -p '$RemoteDir'
 tar -xf '$remoteArchive' -C '$RemoteDir'
 rm -f '$remoteArchive'
 cd '$RemoteDir'
+printf '%s\n' '$head' > '.ombre-deployed-commit'
 docker compose -f docker-compose.yml build '$Service'
 docker stop '$Service' >/dev/null 2>&1 || true
 docker rm '$Service' >/dev/null 2>&1 || true
