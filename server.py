@@ -2732,6 +2732,35 @@ def _created_within_days(b: dict, max_age_days: float, now: datetime = None) -> 
         return False
 
 
+def _event_age_label(b: dict, now: datetime = None) -> str:
+    """简报素材里每个浮现桶的硬日期章——给 LLM 一个不可忽略的绝对时间锚。
+
+    有 created → "发生于 2026-05-30（距今 N 天）"；
+    created 缺失/不可解析 → "⚠ 无确切日期，禁止叙述为「近期/前两天/刚刚」"。
+
+    根治：卡兜咬人/脚伤桶 created/last_active 双空，从「高权重未解决」「感情红线」
+    等非叙事池冒出来时素材里没有任何日期，LLM 自行编「前两天」。2026-06-08 的
+    _created_within_days 闸只管「最近活跃叙事段」，管不到权重/红线池——这里给所有
+    浮现桶强制盖章，没日期就显式禁止近期化，从素材层堵死相对化。
+    (2026-06-18 卡兜脚伤复发追加：created 闸拦不住缺日期的旧桶)
+    """
+    NO_DATE = "⚠ 无确切日期，禁止叙述为「近期/前两天/刚刚/最近」，只作背景、不带时间词"
+    raw = (b.get("metadata", {}) or {}).get("created") or ""
+    if not raw:
+        return NO_DATE
+    try:
+        ev = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except Exception:
+        return NO_DATE
+    try:
+        ref = now or (datetime.now(ev.tzinfo) if ev.tzinfo is not None else datetime.now())
+        days = max(0, int((ref - ev).total_seconds() // 86400))
+    except Exception:
+        return NO_DATE
+    when = "今天" if days == 0 else ("昨天" if days == 1 else f"距今 {days} 天")
+    return f"发生于 {ev.strftime('%Y-%m-%d')}（{when}）"
+
+
 def _is_protected_domain_bucket(b: dict) -> bool:
     """命中 PROTECTED_RESOLVE_DOMAINS（恋爱/约定/纪念日/家庭/自省/feel）的桶。
     这些是感情红线域，简报里不许被 LLM 压缩成「一行任务」。"""
@@ -2749,6 +2778,7 @@ def _format_protected_verbatim(b: dict) -> str:
     body = redact_text(strip_wikilinks(b.get("content", ""))).strip()
     return (
         f"【原文·{doms}】{name}（id={b['id']}）\n"
+        f"📅 {_event_age_label(b)}\n"
         f"{body}\n"
         f"⚠ 此为原文片段、逐字保真、未经压缩。触及须 inspect 桶 id={b['id']} 读全文；"
         f"禁止当 resolved/已完成/演的/迎合 处理。"
@@ -2828,6 +2858,7 @@ def _format_bucket_for_briefing(b: dict, section_tag: str) -> str:
         f"[{section_tag}] {name}",
         f"  domain:{doms} | tags:{tags}",
         f"  V{val:.2f}/A{aro:.2f} 重要:{imp} last_active:{last_active}",
+        f"  📅 {_event_age_label(b)}",
     ]
     if emotion:
         lines.append(f"  emotion:{emotion}")
