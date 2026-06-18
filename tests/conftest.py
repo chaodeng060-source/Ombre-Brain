@@ -30,6 +30,7 @@ def test_config(tmp_path):
 
     return {
         "buckets_dir": buckets_dir,
+        "audit": {"enabled": False},
         "matching": {"fuzzy_threshold": 50, "max_results": 10},
         "wikilink": {"enabled": False},
         "scoring_weights": {

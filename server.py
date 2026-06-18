@@ -85,6 +85,7 @@ from utils import (
     world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
     rrf_fuse, parse_relative_time, PROTECTED_RESOLVE_DOMAINS,
     SAFE_RELATION_TYPES, REVIEW_RELATION_TYPES,
+    event_at_from_metadata,
 )
 from redact import redact_embedding_input, redact_text  # 只抹 secret，不审查情感内容
 from review_queue import (
@@ -675,7 +676,7 @@ def _sample_dream_material(candidates: list[dict], n: int = 0) -> list[dict]:
         n = random.randint(8, 14)
 
     def _created(b):
-        return b["metadata"].get("created", "")
+        return event_at_from_metadata(b["metadata"]) or ""
 
     by_recent = sorted(candidates, key=_created, reverse=True)
     unresolved_old = sorted(
@@ -1555,7 +1556,10 @@ async def breath(
             if created_after is not None or created_before is not None:
                 from bucket_manager import _bucket_in_time_range
                 feels = [f for f in feels if _bucket_in_time_range(f, created_after, created_before)]
-            feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+            feels.sort(
+                key=lambda b: event_at_from_metadata(b["metadata"]) or "",
+                reverse=True,
+            )
             if not feels:
                 return _append_body_state_block(
                     "没有留下过 feel。",
@@ -1567,7 +1571,7 @@ async def breath(
             results = []
             shown_feels = []
             for f in feels:
-                created = f["metadata"].get("created", "")
+                created = event_at_from_metadata(f["metadata"]) or ""
                 entry = f"[{created}] [bucket_id:{f['id']}]\n{strip_wikilinks(f['content'])}"
                 results.append(entry)
                 shown_feels.append(f)
@@ -2546,7 +2550,10 @@ async def dream() -> str:
     ]
 
     # --- Sort by creation time desc, take top 10 ---
-    candidates.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+    candidates.sort(
+        key=lambda b: event_at_from_metadata(b["metadata"]) or "",
+        reverse=True,
+    )
     recent = candidates[:10]
 
     if not recent:
@@ -2559,7 +2566,7 @@ async def dream() -> str:
         domains = ",".join(meta.get("domain", []))
         val = meta.get("valence", 0.5)
         aro = meta.get("arousal", 0.3)
-        created = meta.get("created", "")
+        created = event_at_from_metadata(meta) or ""
         parts.append(
             f"[{meta.get('name', b['id'])}]{resolved_tag} "
             f"主题:{domains} V{val:.1f}/A{aro:.1f} "
@@ -2707,17 +2714,17 @@ def _split_recent_by_time_gap(
 
 
 def _created_within_days(b: dict, max_age_days: float, now: datetime = None) -> bool:
-    """桶的 created（事件真正发生时间）是否落在最近 max_age_days 天内。
+    """桶的 event_at（事件真正发生时间）是否落在最近 max_age_days 天内。
 
     用于简报「最近活跃」叙事段的绝对年龄闸：last_active 会被 inspect/
     backfill_relations/touch/update 等维护操作 bump，旧桶会冒充「最近活跃」
-    被 LLM 写成「前两天」。改用 created 判事件年龄，旧桶踢出叙事段
+    被 LLM 写成「前两天」。改用 event_at 判事件年龄，旧桶踢出叙事段
     （仍可走 pinned/protected/未解决权重池）。
 
-    created 缺失或不可解析 → False（保守踢出，宁缺毋滥防旧桶漏网）。
+    event_at 缺失或不可解析 → False（保守踢出，宁缺毋滥防旧桶漏网）。
     (2026-06-08 修：朝灯戳穿一个月前的卡兜事被当成前两天)
     """
-    raw = (b.get("metadata", {}) or {}).get("created") or ""
+    raw = event_at_from_metadata(b.get("metadata", {}) or {}) or ""
     if not raw:
         return False
     try:
@@ -2735,15 +2742,15 @@ def _created_within_days(b: dict, max_age_days: float, now: datetime = None) -> 
 def _event_age_label(b: dict, now: datetime = None) -> str:
     """简报素材里每个浮现桶的硬日期章——给 LLM 一个不可忽略的绝对时间锚。
 
-    有 created → "发生于 2026-05-30（距今 N 天）"；
-    created 缺失/不可解析 → "⚠ 无确切日期，禁止叙述为「近期/前两天/刚刚」"。
+    有 event_at → "发生于 2026-05-30（距今 N 天）"；
+    event_at 缺失/不可解析 → "⚠ 无确切日期，禁止叙述为「近期/前两天/刚刚」"。
 
     根治：旧桶从「高权重未解决」「感情红线」等非叙事池冒出来时，如果日期没有
     跟着素材一起进入最终消费路径，LLM 会自行编「前两天」。2026-06-08 的
     _created_within_days 闸只管「最近活跃」池；这里给所有简报路径统一盖章。
     """
     NO_DATE = "⚠ 无确切日期，禁止叙述为「近期/前两天/刚刚/最近」，只作背景、不带时间词"
-    raw = (b.get("metadata", {}) or {}).get("created") or ""
+    raw = event_at_from_metadata(b.get("metadata", {}) or {}) or ""
     if not raw:
         return NO_DATE
     try:
@@ -3145,7 +3152,8 @@ async def briefing(
                     "bucket_id": b["id"],
                     "label": meta.get("name", b["id"]),
                     "domain": meta.get("domain", []) or [],
-                    "created": meta.get("created"),
+                    "event_at": event_at_from_metadata(meta),
+                    "created": event_at_from_metadata(meta),
                     "age_label": _event_age_label(b),
                     "text": _format_dated_raw_slot_text(b),
                     "warn": (
@@ -3159,7 +3167,8 @@ async def briefing(
                     "tier": 0,
                     "label": meta.get("name", b["id"]),
                     "bucket_id": b["id"],
-                    "created": meta.get("created"),
+                    "event_at": event_at_from_metadata(meta),
+                    "created": event_at_from_metadata(meta),
                     "age_label": _event_age_label(b),
                     "text": _format_dated_raw_slot_text(b),
                 })
@@ -3282,7 +3291,8 @@ async def briefing(
                 "bucket_id": b["id"],
                 "label": meta.get("name", b["id"]),
                 "domain": meta.get("domain", []) or [],
-                "created": meta.get("created"),
+                "event_at": event_at_from_metadata(meta),
+                "created": event_at_from_metadata(meta),
                 "age_label": _event_age_label(b),
                 "text": _format_dated_raw_slot_text(b),
                 "warn": (
@@ -3296,7 +3306,8 @@ async def briefing(
                 "tier": 0,
                 "label": meta.get("name", b["id"]),
                 "bucket_id": b["id"],
-                "created": meta.get("created"),
+                "event_at": event_at_from_metadata(meta),
+                "created": event_at_from_metadata(meta),
                 "age_label": _event_age_label(b),
                 "text": _format_dated_raw_slot_text(b),
             })
@@ -3352,7 +3363,12 @@ async def api_buckets(request):
                 "resolved": meta.get("resolved", False),
                 "pinned": meta.get("pinned", False),
                 "digested": meta.get("digested", False),
-                "created": meta.get("created", ""),
+                "event_at": event_at_from_metadata(meta) or "",
+                "recorded_at": meta.get("recorded_at", ""),
+                "date_precision": meta.get("date_precision", "unknown"),
+                "date_source": meta.get("date_source", ""),
+                "date_confidence": meta.get("date_confidence"),
+                "created": event_at_from_metadata(meta) or "",
                 "last_active": meta.get("last_active", ""),
                 "activation_count": meta.get("activation_count", 1),
                 "score": decay_engine.calculate_score(meta),
@@ -3914,7 +3930,10 @@ async def api_import_results(request):
         limit = int(request.query_params.get("limit", "50"))
         all_buckets = await bucket_mgr.list_all(include_archive=False)
         # Sort by created time, newest first
-        all_buckets.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+        all_buckets.sort(
+            key=lambda b: event_at_from_metadata(b["metadata"]) or "",
+            reverse=True,
+        )
         results = []
         for b in all_buckets[:limit]:
             results.append({
@@ -3925,7 +3944,12 @@ async def api_import_results(request):
                 "domain": b["metadata"].get("domain", []),
                 "tags": b["metadata"].get("tags", []),
                 "importance": b["metadata"].get("importance", 5),
-                "created": b["metadata"].get("created", ""),
+                "event_at": event_at_from_metadata(b["metadata"]) or "",
+                "recorded_at": b["metadata"].get("recorded_at", ""),
+                "date_precision": b["metadata"].get("date_precision", "unknown"),
+                "date_source": b["metadata"].get("date_source", ""),
+                "date_confidence": b["metadata"].get("date_confidence"),
+                "created": event_at_from_metadata(b["metadata"]) or "",
             })
         return JSONResponse({"buckets": results, "total": len(all_buckets)})
     except Exception as e:
@@ -3960,9 +3984,8 @@ async def api_import_review(request):
             elif action == "noise":
                 await bucket_mgr.update(bid, resolved=True, importance=1)
             elif action == "delete":
-                file_path = bucket_mgr._find_bucket_file(bid)
-                if file_path:
-                    os.remove(file_path)
+                if not await bucket_mgr.delete(bid):
+                    raise RuntimeError(f"delete failed: {bid}")
             applied += 1
         except Exception as e:
             logger.warning(f"Review action failed for {bid}: {e}")

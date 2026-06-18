@@ -22,7 +22,15 @@
 - `importance`（1~10）、`activation_count`（被想起次数）
 - `resolved`（已解决/沉底）、`digested`（已消化/写过 feel）、`pinned`（钉选）
 - `world`（世界归属，可选；空=日常桶；"通用"=跨世界设定，永远跟着任何 world filter 出）
-- `created`、`last_active` 时间戳
+- `event_at`（事件发生时间）、`recorded_at`（入库时间）、`last_active`（最近激活）
+- `date_precision`、`date_source`、`date_confidence` 记录事件日期的精度、依据和可信度
+- `created` 暂时保留为 `event_at` 的兼容别名，新增逻辑不得再把它当入库时间
+
+**写入完整性与审计**
+- 所有桶写入都使用“同目录临时文件 → `fsync` → `os.replace`”原子替换
+- 每个 bucket id 同时持有进程内异步锁和 `<buckets_dir>/.locks/` 跨进程文件锁
+- `<buckets_dir>/.audit/mutations.sqlite3` 记录 actor、action、修改前后全文和状态
+- 审计先落 `pending` 再改 Markdown，成功后转 `committed`；中途崩溃会留下可恢复的 `pending`
 
 **四种检索模式**
 1. **自动浮现**（`breath()` 无参数）：按衰减分排序推送，钉选桶始终展示，Top-1 固定 + Top-20 随机打乱（引入多样性），有 token 预算（默认 10000）
@@ -531,7 +539,12 @@ activation_count: 3
 resolved: false
 pinned: false
 digested: false
-created: 2026-04-17T10:00:00+08:00
+event_at: 2026-04-17T10:00:00+08:00
+recorded_at: 2026-04-18T09:15:00+08:00
+date_precision: second
+date_source: explicit
+date_confidence: 1.0
+created: 2026-04-17T10:00:00+08:00  # deprecated compatibility alias
 last_active: 2026-04-17T14:00:00+08:00
 type: dynamic
 ---

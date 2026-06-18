@@ -11,7 +11,9 @@ import re
 
 from openai import AsyncOpenAI
 import frontmatter
+from bucket_manager import BucketManager
 from redact import redact_embedding_input
+from utils import load_config
 
 ANALYZE_PROMPT = (
     "你是一个内容分析器。请分析以下文本，输出结构化的元数据。\n\n"
@@ -56,6 +58,9 @@ async def reclassify():
     )
 
     files = sorted(glob.glob(os.path.join(UNCLASS_DIR, "*.md")))
+    config = load_config()
+    config["buckets_dir"] = os.path.dirname(DATA_DIR)
+    bucket_mgr = BucketManager(config)
     print(f"找到 {len(files)} 个未分类文件\n")
 
     for fpath in files:
@@ -90,31 +95,31 @@ async def reclassify():
         new_valence = max(0.0, min(1.0, float(result.get("valence", 0.5))))
         new_arousal = max(0.0, min(1.0, float(result.get("arousal", 0.3))))
 
-        post.metadata["domain"] = new_domain
-        post.metadata["tags"] = new_tags
-        post.metadata["valence"] = new_valence
-        post.metadata["arousal"] = new_arousal
-        if new_name:
-            post.metadata["name"] = new_name
-
-        # 写回文件
-        with open(fpath, "w", encoding="utf-8") as f:
-            f.write(frontmatter.dumps(post))
-
-        # 移动到正确目录
-        primary = sanitize(new_domain[0]) if new_domain else "未分类"
-        target_dir = os.path.join(DATA_DIR, primary)
-        os.makedirs(target_dir, exist_ok=True)
-
         bid = post.metadata.get("id", "")
-        new_filename = f"{new_name}_{bid}.md" if new_name and new_name != bid else basename
-        dest = os.path.join(target_dir, new_filename)
+        if not bid:
+            print(f"  X 缺少 bucket id: {basename}")
+            continue
+        updates = {
+            "domain": new_domain,
+            "tags": new_tags,
+            "valence": new_valence,
+            "arousal": new_arousal,
+        }
+        if new_name:
+            updates["name"] = new_name
+        if not await bucket_mgr.update(
+            bid,
+            actor="maintenance:reclassify_api",
+            **updates,
+        ):
+            print(f"  X 写入失败 {basename}")
+            continue
 
-        if dest != fpath:
-            os.rename(fpath, dest)
+        # BucketManager moves the file to the domain directory atomically.
+        primary = sanitize(new_domain[0]) if new_domain else "未分类"
 
         print(f"  OK {basename}")
-        print(f"     -> {primary}/{new_filename}")
+        print(f"     -> {primary}/")
         print(f"     domain={new_domain} tags={new_tags} V={new_valence} A={new_arousal}")
         print()
 

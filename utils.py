@@ -15,7 +15,7 @@ import uuid
 import yaml
 import logging
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from intent_recall import DEFAULT_INTENT_RECALL_CONFIG
 
@@ -76,6 +76,11 @@ def load_config(config_path: str = None) -> dict:
         "log_level": "INFO",
         "buckets_dir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "buckets"),
         "merge_threshold": 75,
+        "audit": {
+            "enabled": True,
+            # Empty means <buckets_dir>/.audit/mutations.sqlite3.
+            "path": "",
+        },
         "dehydration": {
             "model": "deepseek-chat",
             "base_url": "https://api.deepseek.com/v1",
@@ -337,9 +342,82 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+DATE_PRECISIONS = frozenset({"second", "minute", "hour", "day", "month", "year", "unknown"})
+
+
+def infer_date_precision(value) -> str:
+    """Infer the calendar precision represented by an event timestamp."""
+    if isinstance(value, datetime):
+        return "second"
+    if isinstance(value, date):
+        return "day"
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{4}", text):
+        return "year"
+    if re.fullmatch(r"\d{4}-\d{2}", text):
+        return "month"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return "day"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}", text):
+        return "hour"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", text):
+        return "minute"
+    if "T" in text:
+        return "second"
+    return "unknown"
+
+
+def normalize_event_at(value) -> tuple[str, str]:
+    """Return a validated ISO timestamp and its inferred precision."""
+    precision = infer_date_precision(value)
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds"), precision
+    if isinstance(value, date):
+        return f"{value.isoformat()}T00:00:00", precision
+
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("event_at cannot be empty")
+    if precision == "year":
+        text = f"{text}-01-01T00:00:00"
+    elif precision == "month":
+        text = f"{text}-01T00:00:00"
+    elif precision == "day":
+        text = f"{text}T00:00:00"
+    elif precision == "hour":
+        text = f"{text}:00:00"
+    elif precision == "minute":
+        text = f"{text}:00"
+
+    datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return text, precision
+
+
+def event_at_from_metadata(metadata: dict, *, fallback_last_active: bool = False):
+    """Read event time with legacy `created` compatibility."""
+    metadata = metadata or {}
+    event_at = metadata.get("event_at")
+    legacy_created = metadata.get("created")
+    # Transitional compatibility: older tools may still edit only `created`.
+    # Honor that override only when event_at was originally a low-confidence
+    # record-time default. Explicit/inferred event_at remains authoritative.
+    if (
+        event_at
+        and legacy_created
+        and event_at != legacy_created
+        and metadata.get("date_source") == "recorded_at_default"
+    ):
+        value = legacy_created
+    else:
+        value = event_at or legacy_created
+    if not value and fallback_last_active:
+        value = metadata.get("last_active")
+    return value
+
+
 # --- Time string parsing / 时间字符串解析 ---
-# Used by breath() since/until params and bucket_manager.search created range.
-# 给 breath since/until 和 bucket_manager.search created 范围过滤用。
+# Used by breath() since/until params and bucket_manager.search event range.
+# 给 breath since/until 和 bucket_manager.search 事件时间范围过滤用。
 #
 # Supports three forms / 支持三种格式：
 #   - ISO 8601: "2026-05-01" / "2026-05-01T12:00:00"

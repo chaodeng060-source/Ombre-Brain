@@ -27,6 +27,7 @@ import json
 import logging
 
 from redact import redact_embedding_input
+from utils import event_at_from_metadata
 
 logger = logging.getLogger("ombre_brain.saga")
 
@@ -94,7 +95,8 @@ class SagaEngine:
         # Newest episodes first; bound work per cycle.
         # 新 episode 优先；限制每轮工作量。
         unclaimed.sort(
-            key=lambda e: e.get("metadata", {}).get("created", ""), reverse=True
+            key=lambda e: event_at_from_metadata(e.get("metadata", {})) or "",
+            reverse=True,
         )
         created = extended = 0
 

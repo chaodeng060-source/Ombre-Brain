@@ -11,7 +11,6 @@ import math
 from datetime import datetime
 from typing import Any
 
-
 INTENT_DEFAULT = "default"
 INTENT_FACT = "fact"
 INTENT_RECALL = "recall"
@@ -310,7 +309,7 @@ def _metadata_terms(meta: dict[str, Any]) -> set[str]:
 
 
 def _is_recent(meta: dict[str, Any], days: float, now: datetime | None = None) -> bool:
-    raw = meta.get("created") or meta.get("last_active") or ""
+    raw = meta.get("event_at") or meta.get("created") or meta.get("last_active") or ""
     if not raw:
         return False
     try:

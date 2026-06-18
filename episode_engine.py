@@ -41,7 +41,7 @@ import logging
 from datetime import datetime
 
 from redact import redact_embedding_input
-from utils import PROTECTED_RESOLVE_DOMAINS
+from utils import PROTECTED_RESOLVE_DOMAINS, event_at_from_metadata
 
 logger = logging.getLogger("ombre_brain.episode")
 
@@ -129,7 +129,7 @@ class EpisodeEngine:
 
     @staticmethod
     def _created_dt(meta: dict) -> datetime | None:
-        raw = meta.get("created") or meta.get("last_active")
+        raw = event_at_from_metadata(meta, fallback_last_active=True)
         try:
             return datetime.fromisoformat(str(raw))
         except (ValueError, TypeError):
@@ -246,7 +246,7 @@ class EpisodeEngine:
             meta = b.get("metadata", {})
             name = redact_embedding_input(meta.get("name", b["id"]))
             body = redact_embedding_input((b.get("content", "") or "").strip())
-            fragments.append(f"[{meta.get('created', '?')}] {name}\n{body[:600]}")
+            fragments.append(f"[{event_at_from_metadata(meta) or '?'}] {name}\n{body[:600]}")
         replay = "\n\n".join(fragments)
 
         try:
@@ -293,8 +293,8 @@ class EpisodeEngine:
             await self.bucket_mgr.update(
                 episode_id,
                 source_buckets=source_ids,
-                span_start=ordered[0].get("metadata", {}).get("created"),
-                span_end=ordered[-1].get("metadata", {}).get("created"),
+                span_start=event_at_from_metadata(ordered[0].get("metadata", {})),
+                span_end=event_at_from_metadata(ordered[-1].get("metadata", {})),
             )
             logger.info(
                 f"[Episode] created {episode_id} ({name}) from {len(source_ids)} events / "
