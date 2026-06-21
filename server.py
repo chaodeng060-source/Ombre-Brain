@@ -40,6 +40,7 @@ import threading
 import base64
 import mimetypes
 import re
+import time
 import httpx
 import jieba
 from urllib.parse import urlparse
@@ -2033,6 +2034,8 @@ async def hold(
 @mcp.tool()
 async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
     """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。world留空走全局current_world。chord_tag=可选和弦记号串作为整段日记的色调,会打到所有子桶上(子桶共用同一色调)。"""
+    _grow_t0 = time.perf_counter()
+    _content_len = len(content.strip()) if content else 0
     await decay_engine.ensure_started()
 
     if not content or not content.strip():
@@ -2049,13 +2052,17 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
     if len(content.strip()) < 30:
         logger.info(f"grow short-content fast path: {len(content.strip())} chars")
         try:
+            _t_a = time.perf_counter()
             analysis = await dehydrator.analyze(content)
+            _ela_a = time.perf_counter() - _t_a
         except Exception as e:
             logger.warning(f"Fast-path analyze failed / 快速路径打标失败: {e}")
             analysis = {
                 "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
                 "tags": [], "suggested_name": "",
             }
+            _ela_a = time.perf_counter() - _t_a
+        _t_m = time.perf_counter()
         _bid, result_name, is_merged = await _merge_or_create(
             content=content.strip(),
             tags=analysis.get("tags", []),
@@ -2067,26 +2074,45 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
             world=effective_world,
             chord_tag=chord_tag,
         )
+        _ela_m = time.perf_counter() - _t_m
+        _ela_total = time.perf_counter() - _grow_t0
+        logger.info(
+            f"grow.timing path=fast chars={_content_len} "
+            f"analyze={_ela_a:.2f}s merge={_ela_m:.2f}s total={_ela_total:.2f}s "
+            f"action={'merged' if is_merged else 'created'}"
+        )
         action = "合并" if is_merged else "新建"
         return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
 
     # --- Step 1: let API split and organize / 让 API 拆分整理 ---
     try:
+        _t_d = time.perf_counter()
         items = await dehydrator.digest(content)
+        _ela_d = time.perf_counter() - _t_d
     except Exception as e:
         logger.error(f"Diary digest failed / 日记整理失败: {e}")
+        logger.info(
+            f"grow.timing path=long chars={_content_len} digest_failed=1 "
+            f"total={time.perf_counter() - _grow_t0:.2f}s"
+        )
         return f"日记整理失败: {e}"
 
     if not items:
+        logger.info(
+            f"grow.timing path=long chars={_content_len} digest={_ela_d:.2f}s items=0 "
+            f"total={time.perf_counter() - _grow_t0:.2f}s"
+        )
         return "内容为空或整理失败。"
 
     results = []
     created = 0
     merged = 0
+    _item_elapsed = []  # per-item merge_or_create elapsed seconds
 
     # --- Step 2: merge or create each item (with per-item error handling) ---
     # --- 逐条合并或新建（单条失败不影响其他）---
-    for item in items:
+    for _i, item in enumerate(items):
+        _t_i = time.perf_counter()
         try:
             _bid, result_name, is_merged = await _merge_or_create(
                 content=item["content"],
@@ -2112,6 +2138,17 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
                 f"{item.get('name', '?')}: {e}"
             )
             results.append(f"⚠️{item.get('name', '?')}")
+        finally:
+            _item_elapsed.append(time.perf_counter() - _t_i)
+
+    _ela_total = time.perf_counter() - _grow_t0
+    _items_sum = sum(_item_elapsed)
+    _items_max = max(_item_elapsed) if _item_elapsed else 0.0
+    logger.info(
+        f"grow.timing path=long chars={_content_len} digest={_ela_d:.2f}s "
+        f"items={len(items)} items_sum={_items_sum:.2f}s items_max={_items_max:.2f}s "
+        f"created={created} merged={merged} total={_ela_total:.2f}s"
+    )
 
     return f"{len(items)}条|新{created}合{merged}\n" + "\n".join(results)
 
