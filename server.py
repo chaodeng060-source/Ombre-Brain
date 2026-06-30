@@ -2356,6 +2356,65 @@ async def inspect(bucket_id: str) -> str:
 
 
 # =============================================================
+# Tool: update_bucket — 改桶正文/元数据,用于事实订正/合并/清整
+# 受 ResolvedGuard 限制(feel-type / 保护域桶禁止 resolved=1)。
+# 改 pinned/type/domain 会触发桶文件移动到对应目录。
+# =============================================================
+@mcp.tool()
+async def update_bucket(
+    bucket_id: str,
+    content: str = "",
+    chord_tag: str = "",
+    name: str = "",
+) -> str:
+    """按 ID 改桶正文/元数据。content=新正文(空字符串=不改);chord_tag=色调记号串(空=不改);name=桶名(空=不改)。返回处理结果。"""
+    if not bucket_id or not bucket_id.strip():
+        return "请提供有效的 bucket_id。"
+
+    kwargs: dict = {}
+    if content:
+        kwargs["content"] = content
+    if chord_tag:
+        kwargs["chord_tag"] = chord_tag
+    if name:
+        kwargs["name"] = name
+
+    if not kwargs:
+        return "至少要传一个改动 (content / chord_tag / name)。"
+
+    try:
+        ok = await bucket_mgr.update(bucket_id.strip(), **kwargs)
+    except Exception as e:
+        return f"改桶失败: {e}"
+
+    if not ok:
+        return f"桶不存在或改写失败: {bucket_id}"
+    return f"已更新桶 {bucket_id}: {', '.join(kwargs.keys())}"
+
+
+# =============================================================
+# Tool: delete_bucket — 删桶(不可恢复)
+# 受保护桶(protected=True)拒删。需 confirm=True 防误删。
+# =============================================================
+@mcp.tool()
+async def delete_bucket(bucket_id: str, confirm: bool = False) -> str:
+    """按 ID 删桶(不可恢复)。需传 confirm=True 才执行(防误删)。受保护桶拒删。"""
+    if not bucket_id or not bucket_id.strip():
+        return "请提供有效的 bucket_id。"
+    if not confirm:
+        return "需 confirm=True 才执行删除(防误删)。"
+
+    try:
+        ok = await bucket_mgr.delete(bucket_id.strip())
+    except Exception as e:
+        return f"删桶失败: {e}"
+
+    if not ok:
+        return f"桶不存在 / 受保护 / 文件删除失败: {bucket_id}"
+    return f"已删除桶 {bucket_id}"
+
+
+# =============================================================
 # Tool: backfill_relations — run auto-edge inference on existing buckets
 # 工具：backfill_relations — 给老桶批量自动建边
 # Hold-time auto-edge only fires on new buckets; this tool fills in the
