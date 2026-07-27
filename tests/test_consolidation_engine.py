@@ -91,10 +91,17 @@ class FakeBucketMgr:
         return True
 
 
-def _engine(buckets, vecs=None, cfg=None):
+def _engine(buckets, vecs=None, cfg=None, metabolism_mode="apply"):
     bm = FakeBucketMgr(buckets)
     emb = FakeEmbedding(vecs or {})
-    eng = ConsolidationEngine({"consolidation": cfg or {}}, bm, emb)
+    eng = ConsolidationEngine(
+        {
+            "consolidation": cfg or {},
+            "metabolism": {"mode": metabolism_mode},
+        },
+        bm,
+        emb,
+    )
     return eng, bm, emb
 
 
@@ -184,3 +191,68 @@ def test_auto_digest_hides_shorter_when_enabled():
     digest_updates = [u for u in bm.updates if u[1].get("digested")]
     assert len(digest_updates) == 1
     assert digest_updates[0][0] == "SHORT"  # the shorter (less complete) one hidden
+
+
+def test_report_only_never_mutates_or_writes_report_bucket():
+    buckets = [
+        _bucket("LONG", content="x" * 100),
+        _bucket("SHORT", content="x"),
+        _bucket("OLD", days_ago=40),
+    ]
+    vecs = {
+        "LONG": [1.0, 0.0],
+        "SHORT": [1.0, 0.0],
+        "OLD": [0.0, 1.0],
+    }
+    eng, bm, _ = _engine(
+        buckets,
+        vecs,
+        cfg={"auto_digest_near_identical": True},
+        metabolism_mode="report_only",
+    )
+
+    result = asyncio.run(eng.run_consolidation_cycle())
+
+    assert result["ok"] is True
+    assert result["mode"] == "report_only"
+    assert result["would_digest"] == ["SHORT"]
+    assert result["would_create_report"] is True
+    assert result["report_bucket_id"] is None
+    assert bm.updates == []
+    assert bm.created == []
+    assert bm.archive_called is False
+    assert bm.delete_called is False
+
+
+def test_report_only_read_failure_is_red_not_empty_green():
+    class BrokenBucketMgr(FakeBucketMgr):
+        async def list_all(self, include_archive=False):
+            raise RuntimeError("storage unavailable")
+
+    bm = BrokenBucketMgr([])
+    eng = ConsolidationEngine(
+        {"metabolism": {"mode": "report_only"}},
+        bm,
+        FakeEmbedding({}),
+    )
+
+    result = asyncio.run(eng.run_consolidation_cycle())
+
+    assert result["ok"] is False
+    assert result["errors"] == [
+        "find_duplicates.list_all:RuntimeError",
+        "find_stale.list_all:RuntimeError",
+    ]
+    assert bm.updates == [] and bm.created == []
+
+
+def test_metabolism_mode_rejects_truthy_aliases():
+    try:
+        ConsolidationEngine(
+            {"metabolism": {"mode": True}},
+            FakeBucketMgr([]),
+            FakeEmbedding({}),
+        )
+        assert False, "mode must be an exact enum"
+    except ValueError:
+        pass

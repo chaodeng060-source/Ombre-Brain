@@ -65,9 +65,14 @@ dehydration:
   max_tokens: 1024
   temperature: 0.1
 
+# --- XYZME metabolism / M 轴代谢 ---
+# report_only 是安全默认：只计算候选，不 resolve/archive/digest，也不把报告写回记忆库。
+# 只有人工明确改成 apply 才保留旧的自动变更行为；不接受 yes/true 等模糊别名。
+metabolism:
+  mode: report_only               # exact enum: report_only | apply
+
 # --- Decay parameters / 记忆衰减参数 ---
-# Simulates Ebbinghaus forgetting curve, auto-archives inactive memories
-# 模拟艾宾浩斯遗忘曲线，自动归档不活跃的记忆
+# 计算艾宾浩斯衰减候选；是否自动归档由 metabolism.mode 控制。
 decay:
   lambda: 0.05                    # Decay rate / 衰减速率（越大遗忘越快）
   threshold: 0.3                  # Archive threshold / 归档阈值

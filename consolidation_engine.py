@@ -2,14 +2,14 @@
 # Module: Memory Consolidation Engine (consolidation_engine.py)
 # 模块：记忆整理引擎（夜班）
 #
-# Server-side nightly tidy: finds near-duplicate pairs and stale buckets,
-# writes a review report. REPORT-FIRST and SAFE-BY-DEFAULT:
+# Server-side nightly tidy: finds near-duplicate pairs and stale buckets.
+# REPORT-FIRST and SAFE-BY-DEFAULT:
 #   - NEVER deletes, archives, or merges buckets.
-#   - Only optionally digests (=hide, reversible) near-identical pairs,
-#     and that is OFF by default.
-# 服务端每晚整理：找出疑似重复对 + 疑似过期桶，写一条复盘报告。
-# 报告优先、默认安全：绝不删除/归档/合并；只在显式开启时 digest（隐藏，可逆）
-# 近乎相同的对，且该行为默认关闭。
+#   - report_only never writes a report into the recall corpus.
+#   - Legacy digest/report writes require metabolism.mode=apply.
+# 服务端每晚整理：找出疑似重复对 + 疑似过期桶。
+# 默认 report_only：不删除/归档/合并/digest，也不把巡检报告写回召回语料。
+# 旧写入行为必须显式设置 metabolism.mode=apply。
 #
 # Rationale: a server-side loop runs unattended — it has no human judgment,
 # so it must not make destructive or fuzzy-merge decisions. The judgment-heavy
@@ -45,6 +45,13 @@ class ConsolidationEngine:
     """
 
     def __init__(self, config: dict, bucket_mgr, embedding_engine):
+        metabolism_cfg = config.get("metabolism", {}) or {}
+        self.metabolism_mode = str(
+            metabolism_cfg.get("mode", "report_only")
+        ).strip()
+        if self.metabolism_mode not in {"report_only", "apply"}:
+            raise ValueError("metabolism.mode must be exactly 'report_only' or 'apply'")
+
         cfg = config.get("consolidation", {})
         self.enabled = cfg.get("enabled", True)
         self.interval_hours = cfg.get("interval_hours", 24)
@@ -66,6 +73,7 @@ class ConsolidationEngine:
 
         self._task: asyncio.Task | None = None
         self._running = False
+        self._read_errors: list[str] = []
 
     @property
     def is_running(self) -> bool:
@@ -110,6 +118,7 @@ class ConsolidationEngine:
             buckets = await self.bucket_mgr.list_all(include_archive=False)
         except Exception as e:
             logger.error(f"find_duplicates list failed / 列桶失败: {e}")
+            self._read_errors.append(f"find_duplicates.list_all:{type(e).__name__}")
             return []
 
         candidates = [b for b in buckets if not self._is_exempt(b.get("metadata", {}))]
@@ -119,7 +128,10 @@ class ConsolidationEngine:
         for b in candidates:
             try:
                 emb = await self.embedding_engine.get_embedding(b["id"])
-            except Exception:
+            except Exception as exc:
+                self._read_errors.append(
+                    f"find_duplicates.embedding:{b['id']}:{type(exc).__name__}"
+                )
                 emb = None
             if emb is not None:
                 embs[b["id"]] = emb
@@ -131,7 +143,10 @@ class ConsolidationEngine:
             for b in ids[i + 1:]:
                 try:
                     sim = self.embedding_engine._cosine_similarity(embs[a], embs[b])
-                except Exception:
+                except Exception as exc:
+                    self._read_errors.append(
+                        f"find_duplicates.cosine:{a}:{b}:{type(exc).__name__}"
+                    )
                     continue
                 if sim >= threshold:
                     ma = by_id[a]["metadata"]
@@ -159,6 +174,7 @@ class ConsolidationEngine:
             buckets = await self.bucket_mgr.list_all(include_archive=False)
         except Exception as e:
             logger.error(f"find_stale list failed / 列桶失败: {e}")
+            self._read_errors.append(f"find_stale.list_all:{type(e).__name__}")
             return []
 
         stale = []
@@ -188,13 +204,30 @@ class ConsolidationEngine:
     # 一轮整理。报告优先，绝不删除。
     # ---------------------------------------------------------
     async def run_consolidation_cycle(self) -> dict:
+        self._read_errors = []
         dups = await self.find_duplicates()
         stale = await self.find_stale()
+        if self._read_errors:
+            result = {
+                "ok": False,
+                "mode": self.metabolism_mode,
+                "dup_pairs": 0,
+                "stale_count": 0,
+                "auto_digested": 0,
+                "would_digest": [],
+                "would_create_report": False,
+                "report_bucket_id": None,
+                "errors": list(self._read_errors),
+            }
+            logger.error("Consolidation read failed / 整理读取失败: %s", result)
+            return result
 
         # --- Optional, OFF by default: digest (hide, reversible) the shorter of
         #     a near-identical pair. Never delete; never touch exempt buckets. ---
         # --- 可选，默认关：把近乎相同的对里较短的那条 digest（隐藏，可逆）。永不删。 ---
         auto_digested = 0
+        operation_errors: list[str] = []
+        would_digest: list[str] = []
         if self.auto_digest_near_identical:
             digested_ids: set[str] = set()
             for p in dups:
@@ -204,26 +237,38 @@ class ConsolidationEngine:
                 loser = p["a_id"] if p["a_len"] <= p["b_len"] else p["b_id"]
                 if loser in digested_ids:
                     continue
-                try:
-                    ok = await self.bucket_mgr.update(loser, digested=True)
-                    if ok:
-                        auto_digested += 1
-                        digested_ids.add(loser)
-                        logger.info(f"Auto-digested near-identical / 近重自动隐藏: {loser}")
-                except Exception as e:
-                    logger.warning(f"Auto-digest failed / 自动隐藏失败 {loser}: {e}")
+                would_digest.append(str(loser))
+                digested_ids.add(loser)
+                if self.metabolism_mode == "apply":
+                    try:
+                        ok = await self.bucket_mgr.update(loser, digested=True)
+                        if ok:
+                            auto_digested += 1
+                            logger.info(f"Auto-digested near-identical / 近重自动隐藏: {loser}")
+                    except Exception as e:
+                        logger.warning(f"Auto-digest failed / 自动隐藏失败 {loser}: {e}")
+                        operation_errors.append(
+                            f"auto_digest:{loser}:{type(e).__name__}"
+                        )
 
         # --- Write ONE review report bucket if there is anything to review. ---
         # --- 有东西要复盘才写一条报告桶（避免空夜刷桶）。 ---
         report_id = None
-        if dups or stale:
+        if self.metabolism_mode == "apply" and (dups or stale):
             report_id = await self._write_report(dups, stale, auto_digested)
 
         result = {
+            "ok": not operation_errors,
+            "mode": self.metabolism_mode,
             "dup_pairs": len(dups),
             "stale_count": len(stale),
             "auto_digested": auto_digested,
+            "would_digest": would_digest,
+            "would_create_report": bool(dups or stale),
+            "duplicate_candidates": dups,
+            "stale_candidates": stale,
             "report_bucket_id": report_id,
+            "errors": operation_errors,
         }
         logger.info(f"Consolidation cycle complete / 整理周期完成: {result}")
         return result

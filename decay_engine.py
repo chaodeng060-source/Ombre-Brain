@@ -2,8 +2,9 @@
 # Module: Memory Decay Engine (decay_engine.py)
 # 模块：记忆衰减引擎
 #
-# Simulates human forgetting curve; auto-decays inactive memories and archives them.
-# 模拟人类遗忘曲线，自动衰减不活跃记忆并归档。
+# Simulates a forgetting curve. The safe default reports candidates only;
+# automatic resolve/archive requires metabolism.mode=apply.
+# 模拟人类遗忘曲线。安全默认只报告候选；自动结案/归档需显式 apply。
 #
 # Core formula (improved Ebbinghaus + emotion coordinates):
 # 核心公式（改进版艾宾浩斯遗忘曲线 + 情感坐标）：
@@ -39,6 +40,13 @@ class DecayEngine:
     """
 
     def __init__(self, config: dict, bucket_mgr):
+        metabolism_cfg = config.get("metabolism", {}) or {}
+        self.metabolism_mode = str(
+            metabolism_cfg.get("mode", "report_only")
+        ).strip()
+        if self.metabolism_mode not in {"report_only", "apply"}:
+            raise ValueError("metabolism.mode must be exactly 'report_only' or 'apply'")
+
         # --- Load decay parameters / 加载衰减参数 ---
         decay_cfg = config.get("decay", {})
         self.decay_lambda = decay_cfg.get("lambda", 0.05)
@@ -252,11 +260,24 @@ class DecayEngine:
             buckets = await self.bucket_mgr.list_all(include_archive=False)
         except Exception as e:
             logger.error(f"Failed to list buckets for decay / 衰减周期列桶失败: {e}")
-            return {"checked": 0, "archived": 0, "lowest_score": 0, "error": str(e)}
+            return {
+                "ok": False,
+                "mode": self.metabolism_mode,
+                "checked": 0,
+                "archived": 0,
+                "auto_resolved": 0,
+                "would_archive": [],
+                "would_auto_resolve": [],
+                "lowest_score": 0,
+                "errors": [f"list_all:{type(e).__name__}"],
+            }
 
         checked = 0
         archived = 0
         auto_resolved = 0
+        would_archive: list[str] = []
+        would_auto_resolve: list[str] = []
+        errors: list[str] = []
         lowest_score = float("inf")
 
         for bucket in buckets:
@@ -280,16 +301,26 @@ class DecayEngine:
                 except (ValueError, TypeError):
                     days_since = 999
                 if imp <= 4 and days_since > 30:
-                    try:
-                        await self.bucket_mgr.update(bucket["id"], resolved=True)
-                        auto_resolved += 1
+                    would_auto_resolve.append(str(bucket["id"]))
+                    if self.metabolism_mode == "report_only":
                         logger.info(
-                            f"Auto-resolved / 自动结案: "
-                            f"{meta.get('name', bucket['id'])} "
-                            f"(imp={imp}, days={days_since:.0f})"
+                            "M report-only would resolve / 只读代谢候选结案: %s",
+                            bucket["id"],
                         )
-                    except Exception as e:
-                        logger.warning(f"Auto-resolve failed / 自动结案失败: {e}")
+                    else:
+                        try:
+                            await self.bucket_mgr.update(bucket["id"], resolved=True)
+                            auto_resolved += 1
+                            logger.info(
+                                f"Auto-resolved / 自动结案: "
+                                f"{meta.get('name', bucket['id'])} "
+                                f"(imp={imp}, days={days_since:.0f})"
+                            )
+                        except Exception as e:
+                            logger.warning(f"Auto-resolve failed / 自动结案失败: {e}")
+                            errors.append(
+                                f"auto_resolve:{bucket['id']}:{type(e).__name__}"
+                            )
 
             try:
                 score = self.calculate_score(meta)
@@ -298,6 +329,9 @@ class DecayEngine:
                     f"Score calculation failed for {bucket.get('id', '?')} / "
                     f"计算得分失败: {e}"
                 )
+                errors.append(
+                    f"score:{bucket.get('id', '?')}:{type(e).__name__}"
+                )
                 continue
 
             lowest_score = min(lowest_score, score)
@@ -305,26 +339,41 @@ class DecayEngine:
             # --- Below threshold → archive (simulate forgetting) ---
             # --- 低于阈值 → 归档（模拟遗忘）---
             if score < self.threshold:
-                try:
-                    success = await self.bucket_mgr.archive(bucket["id"])
-                    if success:
-                        archived += 1
-                        logger.info(
-                            f"Decay archived / 衰减归档: "
-                            f"{meta.get('name', bucket['id'])} "
-                            f"(score={score:.4f}, threshold={self.threshold})"
-                        )
-                except Exception as e:
-                    logger.warning(
-                        f"Archive failed for {bucket.get('id', '?')} / "
-                        f"归档失败: {e}"
+                would_archive.append(str(bucket["id"]))
+                if self.metabolism_mode == "report_only":
+                    logger.info(
+                        "M report-only would archive / 只读代谢候选归档: %s",
+                        bucket["id"],
                     )
+                else:
+                    try:
+                        success = await self.bucket_mgr.archive(bucket["id"])
+                        if success:
+                            archived += 1
+                            logger.info(
+                                f"Decay archived / 衰减归档: "
+                                f"{meta.get('name', bucket['id'])} "
+                                f"(score={score:.4f}, threshold={self.threshold})"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"Archive failed for {bucket.get('id', '?')} / "
+                            f"归档失败: {e}"
+                        )
+                        errors.append(
+                            f"archive:{bucket.get('id', '?')}:{type(e).__name__}"
+                        )
 
         result = {
+            "ok": not errors,
+            "mode": self.metabolism_mode,
             "checked": checked,
             "archived": archived,
             "auto_resolved": auto_resolved,
+            "would_archive": would_archive,
+            "would_auto_resolve": would_auto_resolve,
             "lowest_score": lowest_score if checked > 0 else 0,
+            "errors": errors,
         }
         logger.info(f"Decay cycle complete / 衰减周期完成: {result}")
         return result
