@@ -1,5 +1,7 @@
 """Z-axis integration tests for canonical fact slots and recall gating."""
 
+import asyncio
+
 import server
 
 
@@ -147,3 +149,17 @@ def test_pair_validation_rechecks_registry_context_and_existing_slot(monkeypatch
         historical,
         "profile.job",
     )
+
+
+def test_z_apply_is_fail_closed_until_pair_transaction_exists():
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    response = loop.run_until_complete(
+        server._apply_review_queue_lifecycle({"key": "anything"})
+    )
+    assert response.status_code == 409
+    assert b'"memory_mutated":false' in response.body
+    assert b'"queue_mutated":false' in response.body

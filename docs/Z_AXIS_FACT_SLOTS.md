@@ -21,11 +21,11 @@
 
 pinned/protected、保护域（恋爱、纪念日、约定、家庭、自省、feel）以及 `feel`、`episode`、`saga` 类型不进入 Z 轴审计或过滤。
 
-当前阶段没有自动 supersede、自动改 status 或自动写 `fact_key`。人工裁决只接受
-`config.fact_slots.registry` 已登记的规范 key，并通过 review queue 的显式
-`apply-lifecycle` 事务把当前桶写成 `fact_status=current`、历史桶写成
-`fact_status=historical`；正文和两只桶都保留。`lifecycle/active_fact` 是遗留字段，
-不会再由新裁决写入，也不参与召回真值判断。
+当前阶段没有自动 supersede、自动改 status 或自动写 `fact_key`。review queue
+只接受 `config.fact_slots.registry` 已登记的规范 key 并生成待审候选，不改桶。
+`apply-lifecycle` 暂停使用：Markdown 双桶写入尚无持久事务与崩溃恢复，不能用
+“写两次再按字节回滚”冒充原子提交。`lifecycle/active_fact` 是遗留字段，不再由
+新流程写入，也不参与召回真值判断。
 
 `breath` 只在精确事实意图且查询未要求历史时过滤已登记的 `historical`。空注册表、
 未登记 key、非法 status 均 fail-open；受保护桶仍不由普通 lifecycle 事务改写。

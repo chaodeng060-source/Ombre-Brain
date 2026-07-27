@@ -91,12 +91,10 @@ def test_z_pair_uses_canonical_fact_contract():
     assert current == {
         "fact_status": "current",
         "fact_key": "profile.city",
-        "supersedes_bucket_ids": ["old"],
     }
     assert historical == {
         "fact_status": "historical",
         "fact_key": "profile.city",
-        "superseded_by_bucket_id": "new",
     }
     assert "active_fact" not in current and "lifecycle" not in historical
 

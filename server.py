@@ -86,21 +86,22 @@ from fact_slots import (
     registered_fact_key,
 )
 from query_expand import expand_query
+from recall_support import expand_relation_graph
 from r2_storage import r2_storage
 from sensory_engine import SensoryEngine, format_body_state_block, senses_from_sensory
 from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
     world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
     rrf_fuse, parse_relative_time, PROTECTED_RESOLVE_DOMAINS,
-    SAFE_RELATION_TYPES, REVIEW_RELATION_TYPES, default_graph_relation_allowed,
+    SAFE_RELATION_TYPES, REVIEW_RELATION_TYPES,
     event_at_from_metadata, now_iso,
 )
 from redact import redact_embedding_input, redact_text  # 只抹 secret，不审查情感内容
 from review_queue import (
     ReviewQueue, make_relation_entry, make_z_conflict_entry, make_z_pair_entry,
     render_md as _render_review_md,
-    KIND_RELATION, KIND_Z_CONFLICT, STATUS_APPLIED,
-    lifecycle_updates, query_requests_history, rest_resolve_status_allowed,
+    KIND_RELATION, KIND_Z_CONFLICT,
+    query_requests_history, rest_resolve_status_allowed,
 )
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -171,6 +172,88 @@ def _z_pair_validation_error(current: dict, historical: dict, fact_key: str) -> 
         if existing and existing != canonical:
             return f"{label} bucket already belongs to a different fact_key"
     return ""
+
+
+def _relation_recall_neighbors(
+    buckets,
+    seed_ids,
+    *,
+    query: str,
+    intent: str,
+    world_filter,
+    domain_filter,
+    created_after,
+    created_before,
+    max_depth: int,
+    max_results: int,
+    excluded_ids=None,
+):
+    """Build a bounded, typed Y-axis expansion from already-loaded buckets."""
+    candidates = [bucket for bucket in buckets if isinstance(bucket, dict)]
+    wf_set = {str(value).strip() for value in world_filter} if world_filter is not None else None
+    domain_set = {str(value).strip().lower() for value in (domain_filter or [])}
+
+    def eligible(bucket):
+        metadata = bucket.get("metadata", {}) or {}
+        if wf_set is not None and not world_matches(metadata.get("world", ""), wf_set):
+            return False
+        if domain_set:
+            bucket_domains = {
+                str(value).strip().lower()
+                for value in _metadata_list(metadata.get("domain", []))
+            }
+            if not bucket_domains.intersection(domain_set):
+                return False
+        if created_after is not None or created_before is not None:
+            from bucket_manager import _bucket_in_time_range
+            if not _bucket_in_time_range(bucket, created_after, created_before):
+                return False
+        return True
+
+    candidates = [bucket for bucket in candidates if eligible(bucket)]
+    candidates = _filter_z_fact_candidates(candidates, query=query, intent=intent)
+    allowed_node_ids = {
+        str(bucket.get("id"))
+        for bucket in candidates
+        if bucket.get("id")
+    }
+    allowed_node_ids.difference_update({
+        str(value)
+        for value in (excluded_ids or [])
+        if str(value)
+    })
+
+    relation_cfg = config.get("relation_recall", {}) or {}
+    raw_allowed_types = relation_cfg.get("allowed_types", SAFE_RELATION_TYPES)
+    if isinstance(raw_allowed_types, str):
+        raw_allowed_types = [raw_allowed_types]
+    elif not isinstance(raw_allowed_types, (list, tuple, set, frozenset)):
+        raw_allowed_types = []
+    configured_types = {
+        str(value).strip()
+        for value in raw_allowed_types
+    }
+    allowed_types = configured_types.intersection(SAFE_RELATION_TYPES)
+
+    def threshold(name: str, default: float) -> float:
+        try:
+            value = float(relation_cfg.get(name, default))
+        except (TypeError, ValueError):
+            return default
+        return value if 0.0 <= value <= 1.0 else default
+
+    return expand_relation_graph(
+        buckets,
+        seed_ids,
+        allowed_types=allowed_types,
+        max_depth=max_depth,
+        max_results=max_results,
+        allowed_node_ids=allowed_node_ids,
+        hop_min_strength={
+            1: threshold("hop1_min_strength", 0.4),
+            2: threshold("hop2_min_strength", 0.7),
+        },
+    )
 
 
 def _review_gate(name: str) -> bool:
@@ -1354,7 +1437,7 @@ async def breath(
     include_body_state: bool = True,
     reset_body_state: bool = False,
 ) -> str | list[TextContent | ImageContent]:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认6000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制注入数量上限(默认8,最大50; 内部仍先召回20条给过滤器)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿关系边召回邻居的跳数(默认1,0=不走关系边),目前 MVP 只走 1 跳出边,最多附加 5 条。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。session_id=同一会话内对已浮现动态桶去重。include_images=True时,白名单图桶会随文本返回 MCP image content。include_body_state=False时只关闭外部身体状态块,不改变记忆检索。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认6000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制注入数量上限(默认8,最大50; 内部仍先召回20条给过滤器)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿安全关系边双向召回邻居的跳数(默认1,0=关闭,最大2)，关联证据单独列出且不改变主排序。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。session_id=同一会话内对已浮现动态桶去重。include_images=True时,白名单图桶会随文本返回 MCP image content。include_body_state=False时只关闭外部身体状态块,不改变记忆检索。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。"""
     await decay_engine.ensure_started()
     await consolidation_engine.ensure_started()
     await episode_engine.ensure_started()
@@ -1774,76 +1857,85 @@ async def breath(
             logger.warning(f"Failed to dehydrate search result / 检索结果脱水失败: {e}")
             continue
 
-    # --- Relation expansion: 1-hop out-edges of matched buckets ---
-    # --- 关系网召回：沿主结果桶的出边带 1 跳邻居（不进主排序，单独列在末尾）---
-    matched_ids = {b["id"] for b in matches}
+    # --- Typed relation expansion: bounded, bidirectional, at most 2 hops ---
+    # --- Y 轴关系召回：只从实际展示的主结果出发，关联证据不进主排序 ---
     remaining_relation_slots = max(0, max_results - len(result_ids))
     relation_neighbor_cap = min(
         int(intent_policy.get("relation_neighbor_limit", 5)),
         remaining_relation_slots,
     )
-    if intent_policy["relation_depth"] >= 1 and matches and token_used < max_tokens and relation_neighbor_cap:
-        seen_neighbors = set()
+    if (
+        intent_policy["relation_depth"] >= 1
+        and result_ids
+        and token_used < max_tokens
+        and relation_neighbor_cap
+    ):
         neighbor_msgs = []
-        for bucket in matches:
-            if len(neighbor_msgs) >= relation_neighbor_cap or token_used >= max_tokens:
+        try:
+            graph_buckets = await bucket_mgr.list_all(include_archive=False)
+            bucket_by_id = {
+                str(bucket.get("id")): bucket
+                for bucket in graph_buckets
+                if isinstance(bucket, dict) and bucket.get("id")
+            }
+            relation_neighbors = _relation_recall_neighbors(
+                graph_buckets,
+                result_ids,
+                query=query,
+                intent=intent_policy["intent"],
+                world_filter=world_filter,
+                domain_filter=domain_filter,
+                created_after=created_after,
+                created_before=created_before,
+                max_depth=intent_policy["relation_depth"],
+                max_results=relation_neighbor_cap,
+                excluded_ids=_load_session_seen_ids(session_id),
+            )
+        except Exception as exc:
+            logger.warning("Relation graph expansion failed / 关系网扩展失败: %s", type(exc).__name__)
+            relation_neighbors = []
+            bucket_by_id = {}
+
+        for relation_neighbor in relation_neighbors:
+            if token_used >= max_tokens:
                 break
-            relations = bucket["metadata"].get("relations") or []
-            if not isinstance(relations, list):
+            neighbor = bucket_by_id.get(relation_neighbor.bucket_id)
+            if not neighbor:
                 continue
-            for r in relations:
-                if len(neighbor_msgs) >= relation_neighbor_cap or token_used >= max_tokens:
+            try:
+                clean_meta = {
+                    key: value
+                    for key, value in neighbor["metadata"].items()
+                    if key != "tags"
+                }
+                summary = await dehydrator.dehydrate(
+                    strip_wikilinks(neighbor["content"]),
+                    clean_meta,
+                )
+                summary_tokens = count_tokens_approx(summary)
+                if token_used + summary_tokens > max_tokens:
                     break
-                if not isinstance(r, dict):
-                    continue
-                rel_type = str(r.get("type") or "").strip()
-                # Default recall traverses descriptive Y edges only. Causal
-                # and update edges remain review-only and cannot enter replies.
-                if not default_graph_relation_allowed(rel_type):
-                    continue
-                t_id = r.get("target")
-                if not t_id or t_id in matched_ids or t_id in seen_neighbors:
-                    continue
-                try:
-                    neighbor = await bucket_mgr.get(t_id)
-                except Exception:
-                    continue
-                if not neighbor:
-                    continue
-                if not _filter_z_fact_candidates(
-                    [neighbor],
-                    query=query,
-                    intent=intent_policy["intent"],
-                ):
-                    continue
-                if wf_set is not None and not world_matches(
-                    neighbor["metadata"].get("world", ""), wf_set
-                ):
-                    continue
-                try:
-                    clean_meta = {k: v for k, v in neighbor["metadata"].items() if k != "tags"}
-                    summary = await dehydrator.dehydrate(
-                        strip_wikilinks(neighbor["content"]), clean_meta
-                    )
-                    summary_tokens = count_tokens_approx(summary)
-                    if token_used + summary_tokens > max_tokens:
-                        break
-                    prefix = _recall_prefix(
-                        t_id,
-                        "association",
-                        "y_relation",
-                        relation=f"{rel_type}←{bucket['id']}",
-                    )
-                    neighbor_msgs.append(
-                        f"{prefix} {summary}"
-                    )
-                    token_used += summary_tokens
-                    seen_neighbors.add(t_id)
-                    result_buckets.append(neighbor)
-                    result_ids.append(t_id)
-                except Exception as e:
-                    logger.warning(f"Failed to dehydrate neighbor / 邻居脱水失败: {e}")
-                    continue
+                prefix = _recall_prefix(
+                    relation_neighbor.bucket_id,
+                    "association",
+                    "y_relation",
+                    relation=(
+                        f"{relation_neighbor.relation_type}:"
+                        f"{relation_neighbor.direction}:"
+                        f"d{relation_neighbor.depth}"
+                        f"←{relation_neighbor.via_id}"
+                    ),
+                )
+                neighbor_msgs.append(f"{prefix} {summary}")
+                token_used += summary_tokens
+                result_buckets.append(neighbor)
+                result_ids.append(relation_neighbor.bucket_id)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to dehydrate relation neighbor / 关系邻居脱水失败: %s",
+                    type(exc).__name__,
+                )
+                continue
         if neighbor_msgs:
             results.append("--- 关系网邻居 ---\n" + "\n---\n".join(neighbor_msgs))
 
@@ -1857,7 +1949,7 @@ async def breath(
     if len(matches) < 3 and random_chance > 0 and random.random() < random_chance:
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
-            matched_ids = {b["id"] for b in matches}
+            matched_ids = set(result_ids)
             seen_ids = _load_session_seen_ids(session_id)
             low_weight = [
                 b for b in all_buckets
@@ -1866,6 +1958,11 @@ async def breath(
                 and decay_engine.calculate_score(b["metadata"]) < 2.0
                 and (wf_set is None or world_matches(b["metadata"].get("world", ""), wf_set))
             ]
+            low_weight = _filter_z_fact_candidates(
+                low_weight,
+                query=query,
+                intent=intent_policy["intent"],
+            )
             if low_weight:
                 remaining_slots = max(0, max_results - len(result_ids))
                 drifted = random.sample(low_weight, min(random.randint(1, 3), len(low_weight), remaining_slots))
@@ -4112,124 +4209,22 @@ async def api_review_queue_candidate(request):
     })
 
 
-def _z_lifecycle_apply_allowed(bucket):
-    metadata = bucket.get("metadata") if isinstance(bucket, dict) else None
-    if not isinstance(metadata, dict):
-        return False
-    domains = metadata.get("domain") or []
-    if isinstance(domains, str):
-        domains = [domains]
-    return not (
-        metadata.get("pinned")
-        or metadata.get("protected")
-        or metadata.get("type") in ("permanent", "feel")
-        or any(domain in PROTECTED_RESOLVE_DOMAINS for domain in domains)
-    )
-
-
-_z_lifecycle_apply_lock = asyncio.Lock()
-
-
 @mcp.custom_route("/api/review_queue/apply-lifecycle", methods=["POST"])
 async def api_review_queue_apply_lifecycle(request):
-    """Apply one Z pair with file rollback; never rewrite bucket content."""
+    """Retired until paired Markdown writes have a durable transaction."""
     from starlette.responses import JSONResponse
     if not _review_write_api_enabled():
         return JSONResponse({"error": "OMBRE_API_TOKEN required for review queue writes"}, status_code=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON"}, status_code=400)
-    if not isinstance(body, dict):
-        return JSONResponse({"error": "JSON object required"}, status_code=400)
-    if body.get("confirm") != "preserve_both_mark_lifecycle":
-        return JSONResponse({"error": "explicit confirmation required"}, status_code=409)
-    async with _z_lifecycle_apply_lock:
-        return await _apply_review_queue_lifecycle(body)
+    return await _apply_review_queue_lifecycle({})
 
 
 async def _apply_review_queue_lifecycle(body):
     from starlette.responses import JSONResponse
-    key = str(body.get("key") or "").strip()
-    entry = next(
-        (item for item in _get_review_queue().list_pending(KIND_Z_CONFLICT) if item.get("key") == key),
-        None,
-    )
-    if not entry:
-        return JSONResponse({"error": "pending lifecycle candidate not found"}, status_code=404)
-    canonical = registered_fact_key(entry.get("fact_key"), _fact_slot_registry())
-    if canonical is None:
-        return JSONResponse({
-            "error": "pending candidate has no currently registered fact_key; re-enqueue it",
-        }, status_code=409)
-    entry = {**entry, "fact_key": canonical}
-    try:
-        current_update, historical_update = lifecycle_updates(entry)
-    except ValueError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=409)
-    current_id = entry["current_bucket_id"]
-    historical_id = entry["historical_bucket_id"]
-    current = await bucket_mgr.get(current_id)
-    historical = await bucket_mgr.get(historical_id)
-    if not current or not historical:
-        return JSONResponse({"error": "bucket not found"}, status_code=404)
-    validation_error = _z_pair_validation_error(current, historical, canonical)
-    if validation_error:
-        return JSONResponse({"error": validation_error}, status_code=409)
-    if not _z_lifecycle_apply_allowed(current) or not _z_lifecycle_apply_allowed(historical):
-        return JSONResponse({"error": "protected bucket requires separate manual handling"}, status_code=409)
-
-    paths = [bucket_mgr._find_bucket_file(current_id), bucket_mgr._find_bucket_file(historical_id)]
-    if not all(paths):
-        return JSONResponse({"error": "bucket path unavailable"}, status_code=503)
-    backups = []
-    try:
-        for path in paths:
-            with open(path, "rb") as handle:
-                backups.append(handle.read())
-        if not await bucket_mgr.update(current_id, actor="human:lmc5_z_review", **current_update):
-            raise RuntimeError("current update failed")
-        if not await bucket_mgr.update(historical_id, actor="human:lmc5_z_review", **historical_update):
-            raise RuntimeError("historical update failed")
-        current_after = await bucket_mgr.get(current_id)
-        historical_after = await bucket_mgr.get(historical_id)
-        current_meta = current_after.get("metadata", {}) if current_after else {}
-        historical_meta = historical_after.get("metadata", {}) if historical_after else {}
-        if any(current_meta.get(k) != v for k, v in current_update.items()):
-            raise RuntimeError("current verification failed")
-        if any(historical_meta.get(k) != v for k, v in historical_update.items()):
-            raise RuntimeError("historical verification failed")
-        if not await asyncio.to_thread(
-            _get_review_queue().resolve,
-            key,
-            STATUS_APPLIED,
-            verdict_note="preserve both; explicit lifecycle metadata applied",
-        ):
-            raise RuntimeError("queue resolve failed")
-    except Exception as exc:
-        for path, original in zip(paths, backups):
-            temp = path + ".zrollback.tmp"
-            with open(temp, "wb") as handle:
-                handle.write(original)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp, path)
-        logger.warning("lifecycle transaction rolled back: %s", type(exc).__name__)
-        return JSONResponse({
-            "ok": False,
-            "memory_mutated": False,
-            "rolled_back": True,
-            "error": "lifecycle transaction failed",
-        }, status_code=500)
     return JSONResponse({
-        "ok": True,
-        "status": "applied",
-        "memory_mutated": True,
-        "content_mutated": False,
-        "both_buckets_preserved": True,
-        "verified": True,
-        "rolled_back": False,
-    })
+        "error": "Z apply is disabled until a durable paired-write transaction is available",
+        "memory_mutated": False,
+        "queue_mutated": False,
+    }, status_code=409)
 
 
 @mcp.custom_route("/api/review_queue/apply-protected-overlay", methods=["POST"])

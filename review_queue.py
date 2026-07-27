@@ -63,12 +63,10 @@ def lifecycle_updates(entry: dict) -> tuple[dict, dict]:
         {
             "fact_status": "current",
             "fact_key": fact_key,
-            "supersedes_bucket_ids": [historical_id],
         },
         {
             "fact_status": "historical",
             "fact_key": fact_key,
-            "superseded_by_bucket_id": current_id,
         },
     )
 
