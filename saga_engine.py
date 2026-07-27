@@ -207,8 +207,11 @@ class SagaEngine:
                 arousal=float(ep_meta.get("arousal", 0.3)),
                 bucket_type="saga",
                 tags=["saga"],
+                x_provenance={
+                    "source_kind": "saga",
+                    "episode_buckets": [episode["id"]],
+                },
             )
-            await self.bucket_mgr.update(saga_id, episode_buckets=[episode["id"]])
             logger.info(f"[Saga] created {saga_id} ({title}) / 开新故事线")
             return await self.bucket_mgr.get(saga_id)
         except Exception as e:

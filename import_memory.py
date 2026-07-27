@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from utils import count_tokens_approx, now_iso
+from utils import count_tokens_approx, normalize_event_at, now_iso
 from redact import redact_embedding_input, redact_text  # 只抹 secret，不审查情感内容
 
 logger = logging.getLogger("ombre_brain.import")
@@ -253,6 +253,52 @@ def chunk_turns(turns: list[dict], target_tokens: int = 10000) -> list[dict]:
     return chunks
 
 
+def _real_import_timestamp(value) -> tuple[str, str] | None:
+    """Return a real, parseable source timestamp; never invent a fallback."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return normalize_event_at(value.strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _import_extraction_input(content: str) -> str:
+    """Return the exact bounded, redacted text sent to the import model."""
+    if not isinstance(content, str):
+        raise ValueError("import content must be a string")
+    return redact_embedding_input(content)[:12000]
+
+
+def build_import_x_provenance(chunk: dict, chunk_index: int) -> dict:
+    """Build truthful provenance for the exact import extraction input."""
+    if not isinstance(chunk, dict) or not isinstance(chunk.get("content"), str):
+        raise ValueError("import chunk content must be a string")
+    if type(chunk_index) is not int or chunk_index < 0:
+        raise ValueError("chunk_index must be a non-negative integer")
+
+    provenance = {
+        "source_kind": "import",
+        "source_digest": hashlib.sha256(
+            _import_extraction_input(chunk["content"]).encode("utf-8")
+        ).hexdigest(),
+        "source_chunk_ordinal": chunk_index,
+    }
+    start = _real_import_timestamp(chunk.get("timestamp_start"))
+    end = _real_import_timestamp(chunk.get("timestamp_end"))
+    if start and end:
+        try:
+            start_dt = datetime.fromisoformat(start[0].replace("Z", "+00:00"))
+            end_dt = datetime.fromisoformat(end[0].replace("Z", "+00:00"))
+            compatible = (start_dt.tzinfo is None) == (end_dt.tzinfo is None)
+            if compatible and start_dt <= end_dt:
+                provenance["span_start"] = start[0]
+                provenance["span_end"] = end[0]
+        except (TypeError, ValueError):
+            pass
+    return provenance
+
+
 # ============================================================
 # Import State — persistent progress tracking
 # 导入状态 — 持久化进度追踪
@@ -477,7 +523,11 @@ class ImportEngine:
 
             chunk = self._chunks[i]
             try:
-                await self._process_single_chunk(chunk, preserve_raw)
+                await self._process_single_chunk(
+                    chunk,
+                    preserve_raw,
+                    chunk_index=i,
+                )
             except Exception as e:
                 err_msg = f"Chunk {i}: {str(e)[:200]}"
                 logger.warning(f"Import chunk error: {err_msg}")
@@ -494,11 +544,27 @@ class ImportEngine:
         logger.info(f"Import completed: {self.state.data['memories_created']} created, {self.state.data['memories_merged']} merged")
         return self.state.to_dict()
 
-    async def _process_single_chunk(self, chunk: dict, preserve_raw: bool):
+    async def _process_single_chunk(
+        self,
+        chunk: dict,
+        preserve_raw: bool,
+        *,
+        chunk_index: int,
+    ):
         """Extract memories from a single chunk and store them."""
         content = chunk["content"]
         if not content.strip():
             return
+        x_provenance = build_import_x_provenance(chunk, chunk_index)
+        source_time = _real_import_timestamp(chunk.get("timestamp_start"))
+        time_kwargs = {}
+        if source_time:
+            time_kwargs = {
+                "event_at": source_time[0],
+                "date_precision": source_time[1],
+                "date_source": "import_source_timestamp",
+                "date_confidence": 1.0,
+            }
 
         # --- LLM extraction ---
         try:
@@ -527,6 +593,8 @@ class ImportEngine:
                         valence=item.get("valence", 0.5),
                         arousal=item.get("arousal", 0.3),
                         name=item.get("name"),
+                        x_provenance=x_provenance,
+                        **time_kwargs,
                     )
                     if self.embedding_engine:
                         try:
@@ -537,16 +605,15 @@ class ImportEngine:
                     self.state.data["memories_created"] += 1
                 else:
                     # Normal mode: go through merge-or-create pipeline
-                    is_merged = await self._merge_or_create_item(item)
+                    is_merged = await self._merge_or_create_item(
+                        item,
+                        x_provenance=x_provenance,
+                        time_kwargs=time_kwargs,
+                    )
                     if is_merged:
                         self.state.data["memories_merged"] += 1
                     else:
                         self.state.data["memories_created"] += 1
-
-                # Patch timestamp if available
-                if chunk.get("timestamp_start"):
-                    # We don't have update support for created, so skip
-                    pass
 
             except Exception as e:
                 logger.warning(f"Failed to store memory: {item.get('name', '?')}: {e}")
@@ -556,12 +623,12 @@ class ImportEngine:
         if not self.dehydrator.api_available:
             raise RuntimeError("API not available")
 
-        safe_chunk = redact_embedding_input(chunk_content)
+        safe_chunk = _import_extraction_input(chunk_content)
         response = await self.dehydrator.client.chat.completions.create(
             model=self.dehydrator.model,
             messages=[
                 {"role": "system", "content": IMPORT_EXTRACT_PROMPT},
-                {"role": "user", "content": safe_chunk[:12000]},
+                {"role": "user", "content": safe_chunk},
             ],
             max_tokens=2048,
             temperature=0.0,
@@ -619,7 +686,13 @@ class ImportEngine:
 
         return validated
 
-    async def _merge_or_create_item(self, item: dict) -> bool:
+    async def _merge_or_create_item(
+        self,
+        item: dict,
+        *,
+        x_provenance: dict | None = None,
+        time_kwargs: dict | None = None,
+    ) -> bool:
         """Try to merge with existing bucket, or create new. Returns is_merged."""
         content = item["content"]
         domain = item.get("domain", ["未分类"])
@@ -672,6 +745,8 @@ class ImportEngine:
             valence=valence,
             arousal=arousal,
             name=name or None,
+            x_provenance=x_provenance,
+            **(time_kwargs or {}),
         )
         if self.embedding_engine:
             try:

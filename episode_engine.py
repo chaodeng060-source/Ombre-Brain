@@ -287,14 +287,16 @@ class EpisodeEngine:
                 arousal=sum(arousals) / len(arousals),
                 bucket_type="episode",
                 tags=["episode"],
-            )
-            # Evidence chain + span as frontmatter (canonical; updates own bucket only).
-            # 证据链 + 时间跨度写进 frontmatter（只动自己这个新桶）。
-            await self.bucket_mgr.update(
-                episode_id,
-                source_buckets=source_ids,
-                span_start=event_at_from_metadata(ordered[0].get("metadata", {})),
-                span_end=event_at_from_metadata(ordered[-1].get("metadata", {})),
+                x_provenance={
+                    "source_kind": "episode",
+                    "source_buckets": source_ids,
+                    "span_start": event_at_from_metadata(
+                        ordered[0].get("metadata", {})
+                    ),
+                    "span_end": event_at_from_metadata(
+                        ordered[-1].get("metadata", {})
+                    ),
+                },
             )
             logger.info(
                 f"[Episode] created {episode_id} ({name}) from {len(source_ids)} events / "

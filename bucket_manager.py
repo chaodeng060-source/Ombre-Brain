@@ -47,6 +47,7 @@ from utils import (
 )
 from mutation_audit import MutationAuditLog
 from storage_safety import advisory_file_lock, atomic_write_post
+from x_provenance import normalize_x_provenance, validate_x_provenance_update
 
 logger = logging.getLogger("ombre_brain.bucket")
 
@@ -186,6 +187,7 @@ class BucketManager:
         date_source: str = None,
         date_confidence: float = None,
         actor: str = "system",
+        x_provenance: dict = None,
     ) -> str:
         bucket_id = generate_bucket_id()
         domain = domain or ["未分类"]
@@ -242,6 +244,11 @@ class BucketManager:
             "last_active": recorded_at,
             "activation_count": 1,
         }
+        if x_provenance is not None:
+            # X provenance is part of the bucket's first durable write.  It
+            # must never be patched in after create, because a failed second
+            # write would leave a derived memory with no evidence chain.
+            metadata.update(normalize_x_provenance(x_provenance))
         if pinned:
             metadata["pinned"] = True
         if protected:
@@ -359,6 +366,10 @@ class BucketManager:
                 old_domain = post.get("domain", ["未分类"])
                 old_type = post.get("type", "dynamic")
                 old_pinned = post.get("pinned", False)
+
+                # Provenance rewrites (and invalid saga list edits) must fail
+                # before last_active or any other frontmatter can change.
+                validate_x_provenance_update(post.metadata, kwargs)
 
                 # Guard: protected-domain (or feel-type) buckets can never be resolved.
                 # 守卫：保护域桶（或 feel 类型）禁止 resolved=1（5.10 黑洞事件根治）
