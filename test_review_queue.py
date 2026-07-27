@@ -7,7 +7,8 @@ import os
 import tempfile
 
 from review_queue import (
-    ReviewQueue, make_relation_entry, make_z_conflict_entry, render_md,
+    ReviewQueue, lifecycle_updates, make_relation_entry, make_z_conflict_entry,
+    make_z_pair_entry, render_md,
     KIND_RELATION, KIND_Z_CONFLICT,
     STATUS_PENDING, STATUS_APPLIED, STATUS_REJECTED,
 )
@@ -73,6 +74,45 @@ def test_z_conflict_key_varies_by_value():
     q.enqueue(make_z_conflict_entry("buk1", "number", "3", "5"))
     q.enqueue(make_z_conflict_entry("buk1", "number", "5", "9"))
     assert len(q.list_pending()) == 2
+
+
+def test_z_pair_uses_canonical_fact_contract():
+    entry = make_z_pair_entry(
+        "new",
+        "old",
+        fact_key="profile.city",
+        current_name="杭州",
+        historical_name="北京",
+    )
+    current, historical = lifecycle_updates(entry)
+
+    assert entry["fact_key"] == "profile.city"
+    assert entry["field"] == "fact_status"
+    assert current == {
+        "fact_status": "current",
+        "fact_key": "profile.city",
+        "supersedes_bucket_ids": ["old"],
+    }
+    assert historical == {
+        "fact_status": "historical",
+        "fact_key": "profile.city",
+        "superseded_by_bucket_id": "new",
+    }
+    assert "active_fact" not in current and "lifecycle" not in historical
+
+
+def test_z_pair_key_includes_fact_slot():
+    city = make_z_pair_entry("new", "old", fact_key="profile.city")
+    job = make_z_pair_entry("new", "old", fact_key="profile.job")
+    assert city["key"] != job["key"]
+
+
+def test_z_pair_rejects_missing_fact_key():
+    try:
+        make_z_pair_entry("new", "old", fact_key="")
+        assert False, "fact_key must be explicit"
+    except ValueError:
+        pass
 
 
 def test_entry_shapes():

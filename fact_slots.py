@@ -95,6 +95,19 @@ def registered_fact_key(raw_key, registry: Mapping | None) -> str | None:
     return key if key in slots else None
 
 
+def fact_slot_applies_to_bucket(
+    raw_key,
+    bucket: dict,
+    registry: Mapping | None,
+) -> bool:
+    """Validate one registered slot against its deterministic bucket context."""
+    canonical = registered_fact_key(raw_key, registry)
+    if canonical is None or is_fact_slot_exempt(bucket):
+        return False
+    spec = registry.get(canonical, {}) if isinstance(registry, Mapping) else {}
+    return _slot_context_matches(bucket, spec)
+
+
 def _slot_context_matches(bucket: dict | None, spec) -> bool:
     """Apply optional deterministic bucket constraints from one registry entry."""
     if not isinstance(spec, Mapping):

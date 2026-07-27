@@ -56,19 +56,17 @@ def lifecycle_updates(entry: dict) -> tuple[dict, dict]:
         raise ValueError("not a cross-bucket lifecycle candidate")
     current_id = str(entry.get("current_bucket_id") or "").strip()
     historical_id = str(entry.get("historical_bucket_id") or "").strip()
-    fact_key = str(entry.get("key") or "").strip()
+    fact_key = str(entry.get("fact_key") or "").strip().lower()
     if not current_id or not historical_id or not fact_key or current_id == historical_id:
         raise ValueError("invalid lifecycle candidate")
     return (
         {
-            "lifecycle": "current",
-            "active_fact": True,
+            "fact_status": "current",
             "fact_key": fact_key,
             "supersedes_bucket_ids": [historical_id],
         },
         {
-            "lifecycle": "historical",
-            "active_fact": False,
+            "fact_status": "historical",
             "fact_key": fact_key,
             "superseded_by_bucket_id": current_id,
         },
@@ -76,12 +74,16 @@ def lifecycle_updates(entry: dict) -> tuple[dict, dict]:
 
 
 def historical_recall_suppressed(metadata: dict) -> bool:
-    """Suppress only when all explicit Z lifecycle signals agree."""
+    """Legacy helper for callers that already validated the fact-key registry.
+
+    New recall code must additionally validate ``fact_key`` against the
+    configured registry.  The old ``lifecycle/active_fact`` pair is not a
+    second truth source.
+    """
     if not isinstance(metadata, dict):
         return False
     return (
-        str(metadata.get("lifecycle") or "").strip().lower() == "historical"
-        and metadata.get("active_fact") is False
+        str(metadata.get("fact_status") or "").strip().lower() == "historical"
         and bool(str(metadata.get("fact_key") or "").strip())
         and bool(str(metadata.get("superseded_by_bucket_id") or "").strip())
     )
@@ -223,6 +225,7 @@ def make_z_pair_entry(
     current_bucket_id: str,
     historical_bucket_id: str,
     *,
+    fact_key: str,
     current_name: str = "",
     historical_name: str = "",
     reason: str = "cross_bucket_currentness",
@@ -236,17 +239,21 @@ def make_z_pair_entry(
         raise ValueError("both bucket ids are required")
     if current_bucket_id == historical_bucket_id:
         raise ValueError("current and historical candidates must differ")
+    fact_key = str(fact_key or "").strip().lower()
+    if not fact_key:
+        raise ValueError("fact_key is required")
     return {
-        "key": "zpair|" + _short_hash(current_bucket_id, historical_bucket_id),
+        "key": "zpair|" + _short_hash(fact_key, current_bucket_id, historical_bucket_id),
         "kind": KIND_Z_CONFLICT,
         "status": STATUS_PENDING,
         "candidate_type": "cross_bucket_lifecycle",
+        "fact_key": fact_key,
         "bucket_id": current_bucket_id,
         "bucket_name": current_name,
         "current_bucket_id": current_bucket_id,
         "historical_bucket_id": historical_bucket_id,
         "historical_bucket_name": historical_name,
-        "field": "lifecycle",
+        "field": "fact_status",
         "old": historical_name or "历史候选",
         "new": current_name or "当前候选",
         "reason": reason,

@@ -21,6 +21,14 @@
 
 pinned/protected、保护域（恋爱、纪念日、约定、家庭、自省、feel）以及 `feel`、`episode`、`saga` 类型不进入 Z 轴审计或过滤。
 
-当前阶段没有自动 supersede、自动改 status、自动写 `fact_key`，也没有新的写接口。后续若增加人工裁决，必须继续走现有 mutation audit / review queue，并单独设计迁移事务与回滚。
+当前阶段没有自动 supersede、自动改 status 或自动写 `fact_key`。人工裁决只接受
+`config.fact_slots.registry` 已登记的规范 key，并通过 review queue 的显式
+`apply-lifecycle` 事务把当前桶写成 `fact_status=current`、历史桶写成
+`fact_status=historical`；正文和两只桶都保留。`lifecycle/active_fact` 是遗留字段，
+不会再由新裁决写入，也不参与召回真值判断。
+
+`breath` 只在精确事实意图且查询未要求历史时过滤已登记的 `historical`。空注册表、
+未登记 key、非法 status 均 fail-open；受保护桶仍不由普通 lifecycle 事务改写。
+旧的 `apply-protected-overlay` 接口已停用：保护记忆不会再被旁路 overlay 隐藏。
 
 `patrol.py` 可读取生产 Markdown 桶，也可读取备份工具生成的 `<12hex>.json` 桶快照；`body_state.json` 等不符合桶 schema 的 sidecar 会被忽略。两种输入都只读。

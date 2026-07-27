@@ -80,6 +80,11 @@ from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from intent_recall import bucket_intent_score_multiplier, resolve_intent_recall_policy
 from fact_conflicts import build_supersedes_audit
+from fact_slots import (
+    fact_slot_applies_to_bucket,
+    filter_fact_slot_candidates,
+    registered_fact_key,
+)
 from query_expand import expand_query
 from r2_storage import r2_storage
 from sensory_engine import SensoryEngine, format_body_state_block, senses_from_sensory
@@ -92,11 +97,10 @@ from utils import (
 )
 from redact import redact_embedding_input, redact_text  # 只抹 secret，不审查情感内容
 from review_queue import (
-    CurrentnessOverlay, ReviewQueue, make_currentness_overlay_entry,
-    make_relation_entry, make_z_conflict_entry, make_z_pair_entry,
+    ReviewQueue, make_relation_entry, make_z_conflict_entry, make_z_pair_entry,
     render_md as _render_review_md,
-    KIND_RELATION, KIND_Z_CONFLICT, STATUS_APPLIED, historical_recall_suppressed,
-    lifecycle_updates, rest_resolve_status_allowed,
+    KIND_RELATION, KIND_Z_CONFLICT, STATUS_APPLIED,
+    lifecycle_updates, query_requests_history, rest_resolve_status_allowed,
 )
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -122,7 +126,6 @@ sensory_engine = SensoryEngine(config["buckets_dir"])  # External body-state sid
 # 落在 <buckets_dir>/review_queue.jsonl。两个闸默认**关**（gated），开了只是把
 # 机器自动推断的危险边 / 合并检出的事实冲突改挂 pending 给人审，不动现有部署路。
 _review_queue = None
-_z_currentness_overlay = None
 
 
 def _get_review_queue() -> ReviewQueue:
@@ -135,20 +138,39 @@ def _get_review_queue() -> ReviewQueue:
     return _review_queue
 
 
-def _get_z_currentness_overlay() -> CurrentnessOverlay:
-    global _z_currentness_overlay
-    path = os.path.join(config["buckets_dir"], "z_currentness_overrides.jsonl")
-    if _z_currentness_overlay is None or str(_z_currentness_overlay.path) != path:
-        _z_currentness_overlay = CurrentnessOverlay(path)
-    return _z_currentness_overlay
+def _fact_slot_registry() -> dict:
+    cfg = config.get("fact_slots", {}) or {}
+    if not cfg.get("enabled", False):
+        return {}
+    registry = cfg.get("registry", {}) or {}
+    return registry if isinstance(registry, dict) else {}
 
 
-def _z_recall_suppressed(bucket, query: str) -> bool:
-    metadata = bucket.get("metadata", {}) if isinstance(bucket, dict) else {}
-    return historical_recall_suppressed(metadata) or _get_z_currentness_overlay().suppresses(
-        str(bucket.get("id") or ""),
-        query,
+def _filter_z_fact_candidates(buckets, *, query: str, intent: str):
+    """Apply the canonical Z gate only to exact-current fact questions."""
+    candidates = list(buckets)
+    if query_requests_history(query):
+        return candidates
+    return filter_fact_slot_candidates(
+        candidates,
+        intent=intent,
+        registry=_fact_slot_registry(),
     )
+
+
+def _z_pair_validation_error(current: dict, historical: dict, fact_key: str) -> str:
+    registry = _fact_slot_registry()
+    canonical = registered_fact_key(fact_key, registry)
+    if canonical is None:
+        return "fact_key is no longer registered"
+    for label, bucket in (("current", current), ("historical", historical)):
+        if not fact_slot_applies_to_bucket(canonical, bucket, registry):
+            return f"{label} bucket is outside the registered fact-slot context"
+        metadata = bucket.get("metadata", {}) if isinstance(bucket, dict) else {}
+        existing = str(metadata.get("fact_key") or "").strip().lower()
+        if existing and existing != canonical:
+            return f"{label} bucket already belongs to a different fact_key"
+    return ""
 
 
 def _review_gate(name: str) -> bool:
@@ -1606,10 +1628,11 @@ async def breath(
                 existing = keyword_by_id.get(bucket["id"])
                 if existing is None or bucket.get("score", 0) > existing.get("score", 0):
                     keyword_by_id[bucket["id"]] = bucket
-        keyword_matches = [
-            bucket for bucket in keyword_by_id.values()
-            if not _z_recall_suppressed(bucket, query)
-        ]
+        keyword_matches = _filter_z_fact_candidates(
+            keyword_by_id.values(),
+            query=query,
+            intent=intent_policy["intent"],
+        )
     except Exception as e:
         logger.error(f"Keyword search failed / 关键词检索失败: {e}")
         return "检索过程出错，请稍后重试。"
@@ -1655,8 +1678,6 @@ async def breath(
             if not b:
                 continue
             meta = b["metadata"]
-            if _z_recall_suppressed(b, query):
-                continue
             if meta.get("pinned") or meta.get("protected"):
                 continue
             if wf_set is not None and not world_matches(meta.get("world", ""), wf_set):
@@ -1676,6 +1697,12 @@ async def breath(
                     continue
             b["score"] = round(fused_score * 1000, 2)
             b["vector_match"] = True
+        if not _filter_z_fact_candidates(
+            [b],
+            query=query,
+            intent=intent_policy["intent"],
+        ):
+            continue
         matches.append(b)
 
     # --- Forgetting curve on fused ranking (ebbingflow 偷师) ---
@@ -1783,7 +1810,11 @@ async def breath(
                     continue
                 if not neighbor:
                     continue
-                if _z_recall_suppressed(neighbor, query):
+                if not _filter_z_fact_candidates(
+                    [neighbor],
+                    query=query,
+                    intent=intent_policy["intent"],
+                ):
                     continue
                 if wf_set is not None and not world_matches(
                     neighbor["metadata"].get("world", ""), wf_set
@@ -4035,6 +4066,12 @@ async def api_review_queue_candidate(request):
         return JSONResponse({"error": "JSON object required"}, status_code=400)
     current_id = str(body.get("current_bucket_id") or "").strip()
     historical_id = str(body.get("historical_bucket_id") or "").strip()
+    fact_key = registered_fact_key(body.get("fact_key"), _fact_slot_registry())
+    if fact_key is None:
+        return JSONResponse(
+            {"error": "fact_key must be registered in config.fact_slots.registry"},
+            status_code=400,
+        )
     id_pattern = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
     if not id_pattern.fullmatch(current_id) or not id_pattern.fullmatch(historical_id):
         return JSONResponse({"error": "invalid bucket id"}, status_code=400)
@@ -4044,6 +4081,9 @@ async def api_review_queue_candidate(request):
     historical = await bucket_mgr.get(historical_id)
     if not current or not historical:
         return JSONResponse({"error": "bucket not found"}, status_code=404)
+    validation_error = _z_pair_validation_error(current, historical, fact_key)
+    if validation_error:
+        return JSONResponse({"error": validation_error}, status_code=409)
 
     def _name(bucket):
         metadata = bucket.get("metadata") if isinstance(bucket.get("metadata"), dict) else {}
@@ -4052,6 +4092,7 @@ async def api_review_queue_candidate(request):
     entry = make_z_pair_entry(
         current_id,
         historical_id,
+        fact_key=fact_key,
         current_name=_name(current),
         historical_name=_name(historical),
         reason=str(body.get("reason") or "cross_bucket_currentness")[:160],
@@ -4116,6 +4157,12 @@ async def _apply_review_queue_lifecycle(body):
     )
     if not entry:
         return JSONResponse({"error": "pending lifecycle candidate not found"}, status_code=404)
+    canonical = registered_fact_key(entry.get("fact_key"), _fact_slot_registry())
+    if canonical is None:
+        return JSONResponse({
+            "error": "pending candidate has no currently registered fact_key; re-enqueue it",
+        }, status_code=409)
+    entry = {**entry, "fact_key": canonical}
     try:
         current_update, historical_update = lifecycle_updates(entry)
     except ValueError as exc:
@@ -4126,6 +4173,9 @@ async def _apply_review_queue_lifecycle(body):
     historical = await bucket_mgr.get(historical_id)
     if not current or not historical:
         return JSONResponse({"error": "bucket not found"}, status_code=404)
+    validation_error = _z_pair_validation_error(current, historical, canonical)
+    if validation_error:
+        return JSONResponse({"error": validation_error}, status_code=409)
     if not _z_lifecycle_apply_allowed(current) or not _z_lifecycle_apply_allowed(historical):
         return JSONResponse({"error": "protected bucket requires separate manual handling"}, status_code=409)
 
@@ -4184,79 +4234,15 @@ async def _apply_review_queue_lifecycle(body):
 
 @mcp.custom_route("/api/review_queue/apply-protected-overlay", methods=["POST"])
 async def api_review_queue_apply_protected_overlay(request):
-    """Apply a reviewed read-time overlay while leaving protected buckets untouched."""
+    """Retired: protected/narrative memories are outside Z currentness."""
     from starlette.responses import JSONResponse
     if not _review_write_api_enabled():
         return JSONResponse({"error": "OMBRE_API_TOKEN required for review queue writes"}, status_code=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON"}, status_code=400)
-    if not isinstance(body, dict):
-        return JSONResponse({"error": "JSON object required"}, status_code=400)
-    if body.get("confirm") != "preserve_protected_buckets_apply_read_overlay":
-        return JSONResponse({"error": "explicit confirmation required"}, status_code=409)
-    async with _z_lifecycle_apply_lock:
-        key = str(body.get("key") or "").strip()
-        entry = next(
-            (item for item in _get_review_queue().list_pending(KIND_Z_CONFLICT) if item.get("key") == key),
-            None,
-        )
-        if not entry:
-            return JSONResponse({"error": "pending lifecycle candidate not found"}, status_code=404)
-        current = await bucket_mgr.get(entry.get("current_bucket_id"))
-        historical = await bucket_mgr.get(entry.get("historical_bucket_id"))
-        if not current or not historical:
-            return JSONResponse({"error": "bucket not found"}, status_code=404)
-        if _z_lifecycle_apply_allowed(current) and _z_lifecycle_apply_allowed(historical):
-            return JSONResponse({"error": "unprotected pair must use lifecycle transaction"}, status_code=409)
-        overlay = _get_z_currentness_overlay()
-        existed = overlay.path.exists()
-        original = overlay.path.read_bytes() if existed else b""
-        try:
-            overlay_entry = make_currentness_overlay_entry(entry)
-            await asyncio.to_thread(overlay.add, overlay_entry)
-            historical_id = entry["historical_bucket_id"]
-            if not overlay.suppresses(historical_id, "current default"):
-                raise RuntimeError("overlay verification failed")
-            if overlay.suppresses(historical_id, "以前"):
-                raise RuntimeError("history escape verification failed")
-            if not await asyncio.to_thread(
-                _get_review_queue().resolve,
-                key,
-                STATUS_APPLIED,
-                verdict_note="protected buckets preserved; reviewed read overlay applied",
-            ):
-                raise RuntimeError("queue resolve failed")
-        except Exception as exc:
-            if existed:
-                temp = str(overlay.path) + ".rollback.tmp"
-                with open(temp, "wb") as handle:
-                    handle.write(original)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temp, overlay.path)
-            elif overlay.path.exists():
-                overlay.path.unlink()
-            logger.warning("protected currentness overlay rolled back: %s", type(exc).__name__)
-            return JSONResponse({
-                "ok": False,
-                "memory_mutated": False,
-                "retrieval_policy_mutated": False,
-                "rolled_back": True,
-                "error": "protected overlay transaction failed",
-            }, status_code=500)
-        return JSONResponse({
-            "ok": True,
-            "status": "applied",
-            "memory_mutated": False,
-            "content_mutated": False,
-            "both_buckets_preserved": True,
-            "retrieval_policy_mutated": True,
-            "history_queries_preserved": True,
-            "verified": True,
-            "rolled_back": False,
-        })
+    return JSONResponse({
+        "error": "protected memories are exempt from Z currentness filtering",
+        "memory_mutated": False,
+        "retrieval_policy_mutated": False,
+    }, status_code=409)
 
 
 @mcp.custom_route("/", methods=["GET"])
