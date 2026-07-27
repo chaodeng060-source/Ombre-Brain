@@ -33,6 +33,7 @@
 import os
 import sys
 import json
+import hashlib
 import random
 import logging
 import asyncio
@@ -87,6 +88,11 @@ from fact_slots import (
 )
 from query_expand import expand_query
 from recall_support import expand_relation_graph
+from e_axis_shadow import (
+    EAxisShadowStore,
+    build_failure_record,
+    build_shadow_annotation,
+)
 from r2_storage import r2_storage
 from sensory_engine import SensoryEngine, format_body_state_block, senses_from_sensory
 from utils import (
@@ -127,6 +133,7 @@ sensory_engine = SensoryEngine(config["buckets_dir"])  # External body-state sid
 # 落在 <buckets_dir>/review_queue.jsonl。两个闸默认**关**（gated），开了只是把
 # 机器自动推断的危险边 / 合并检出的事实冲突改挂 pending 给人审，不动现有部署路。
 _review_queue = None
+_e_axis_shadow_store = None
 
 
 def _get_review_queue() -> ReviewQueue:
@@ -137,6 +144,14 @@ def _get_review_queue() -> ReviewQueue:
             and str(_review_queue.path) != path:
         _review_queue = ReviewQueue(path)
     return _review_queue
+
+
+def _get_e_axis_shadow_store() -> EAxisShadowStore:
+    global _e_axis_shadow_store
+    path = os.path.join(config["buckets_dir"], ".axis", "e-shadow.jsonl")
+    if _e_axis_shadow_store is None or str(_e_axis_shadow_store.path) != path:
+        _e_axis_shadow_store = EAxisShadowStore(path)
+    return _e_axis_shadow_store
 
 
 def _fact_slot_registry() -> dict:
@@ -4238,6 +4253,104 @@ async def api_review_queue_apply_protected_overlay(request):
         "memory_mutated": False,
         "retrieval_policy_mutated": False,
     }, status_code=409)
+
+
+@mcp.custom_route("/api/e-axis/shadow", methods=["POST"])
+async def api_e_axis_shadow(request):
+    """Persist a strictly validated E annotation outside the recall corpus."""
+    from starlette.responses import JSONResponse
+
+    if not _review_write_api_enabled():
+        return JSONResponse({"error": "OMBRE_API_TOKEN required for E shadow writes"}, status_code=503)
+    e_cfg = config.get("e_axis_shadow", {}) or {}
+    if e_cfg.get("enabled", True) is not True:
+        return JSONResponse({"error": "E shadow is disabled"}, status_code=409)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    required = {
+        "bucket_id",
+        "source_digest",
+        "scorer",
+        "model",
+        "rubric_version",
+        "score",
+    }
+    if type(body) is not dict or set(body) != required:
+        return JSONResponse({"error": "exact E shadow request schema required"}, status_code=400)
+
+    bucket_id = str(body.get("bucket_id") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,160}", bucket_id):
+        return JSONResponse({"error": "invalid bucket_id"}, status_code=400)
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return JSONResponse({"error": "bucket not found"}, status_code=404)
+    current_digest = hashlib.sha256(
+        str(bucket.get("content") or "").encode("utf-8")
+    ).hexdigest()
+
+    scorer = body.get("scorer")
+    model = body.get("model")
+    rubric_version = body.get("rubric_version")
+    supplied_digest = str(body.get("source_digest") or "").strip().lower()
+    store = _get_e_axis_shadow_store()
+    if supplied_digest != current_digest:
+        failure = build_failure_record(
+            bucket_id=bucket_id,
+            source_digest=current_digest,
+            scorer=scorer,
+            model=model,
+            rubric_version=rubric_version,
+            category="source_digest.mismatch",
+        )
+        try:
+            await asyncio.to_thread(store.append, failure)
+        except Exception as exc:
+            logger.warning("E shadow failure ledger unavailable: %s", type(exc).__name__)
+        return JSONResponse({"error": "source_digest does not match current content"}, status_code=409)
+
+    min_confidence = e_cfg.get("min_confidence", 0.3)
+    if type(min_confidence) not in (int, float):
+        min_confidence = 0.3
+    min_confidence = max(0.0, min(1.0, float(min_confidence)))
+    annotation, error = build_shadow_annotation(
+        bucket_id=bucket_id,
+        source_digest=current_digest,
+        scorer=scorer,
+        model=model,
+        rubric_version=rubric_version,
+        score=body.get("score"),
+        min_confidence=min_confidence,
+    )
+    if error:
+        failure = build_failure_record(
+            bucket_id=bucket_id,
+            source_digest=current_digest,
+            scorer=scorer,
+            model=model,
+            rubric_version=rubric_version,
+            category=error,
+        )
+        try:
+            await asyncio.to_thread(store.append, failure)
+        except Exception as exc:
+            logger.warning("E shadow failure ledger unavailable: %s", type(exc).__name__)
+        return JSONResponse({"error": error, "shadow_only": True}, status_code=422)
+
+    try:
+        added = await asyncio.to_thread(store.append, annotation)
+    except Exception as exc:
+        logger.warning("E shadow ledger unavailable: %s", type(exc).__name__)
+        return JSONResponse({"error": "E shadow ledger unavailable"}, status_code=503)
+    return JSONResponse({
+        "ok": True,
+        "annotation_key": annotation["annotation_key"],
+        "added": added,
+        "shadow_only": True,
+        "affects_ranking": False,
+        "memory_mutated": False,
+    })
 
 
 @mcp.custom_route("/", methods=["GET"])

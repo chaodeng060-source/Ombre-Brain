@@ -71,6 +71,13 @@ dehydration:
 metabolism:
   mode: report_only               # exact enum: report_only | apply
 
+# --- XYZME experience axis / E 轴体验信号 ---
+# 严格验证后只写 <buckets_dir>/.axis/e-shadow.jsonl；绝不覆盖现有 valence/arousal，
+# 不参与 decay、RRF、relation 或任何排序。每条标注必须绑定当前正文 SHA-256。
+e_axis_shadow:
+  enabled: true
+  min_confidence: 0.3
+
 # --- Decay parameters / 记忆衰减参数 ---
 # 计算艾宾浩斯衰减候选；是否自动归档由 metabolism.mode 控制。
 decay:
