@@ -92,6 +92,8 @@ from e_axis_shadow import (
     EAxisShadowStore,
     build_failure_record,
     build_shadow_annotation,
+    normalize_min_confidence,
+    strict_json_loads,
 )
 from r2_storage import r2_storage
 from sensory_engine import SensoryEngine, format_body_state_block, senses_from_sensory
@@ -4266,7 +4268,7 @@ async def api_e_axis_shadow(request):
     if e_cfg.get("enabled", True) is not True:
         return JSONResponse({"error": "E shadow is disabled"}, status_code=409)
     try:
-        body = await request.json()
+        body = strict_json_loads(await request.body())
     except Exception:
         return JSONResponse({"error": "invalid JSON"}, status_code=400)
     required = {
@@ -4310,10 +4312,12 @@ async def api_e_axis_shadow(request):
             logger.warning("E shadow failure ledger unavailable: %s", type(exc).__name__)
         return JSONResponse({"error": "source_digest does not match current content"}, status_code=409)
 
-    min_confidence = e_cfg.get("min_confidence", 0.3)
-    if type(min_confidence) not in (int, float):
-        min_confidence = 0.3
-    min_confidence = max(0.0, min(1.0, float(min_confidence)))
+    min_confidence = normalize_min_confidence(e_cfg.get("min_confidence", 0.3))
+    if min_confidence is None:
+        return JSONResponse(
+            {"error": "invalid E shadow min_confidence config"},
+            status_code=503,
+        )
     annotation, error = build_shadow_annotation(
         bucket_id=bucket_id,
         source_digest=current_digest,
