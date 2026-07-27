@@ -2561,7 +2561,10 @@ async def review_pending(kind: str = "") -> str:
     if k and k not in (KIND_RELATION, KIND_Z_CONFLICT):
         return f"kind 只能是 '{KIND_RELATION}' / '{KIND_Z_CONFLICT}' 或留空。"
     try:
-        items = await asyncio.to_thread(_get_review_queue().list_pending, k or None)
+        # The queue is a small local JSONL ledger.  Reading it inline avoids
+        # depending on the process-wide default executor, which can be
+        # unavailable during MCP shutdown and made this read-only tool hang.
+        items = _get_review_queue().list_pending(k or None)
     except Exception as e:
         return f"读取待审队列失败: {e}"
     return _render_review_md(items)
