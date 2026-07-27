@@ -11,7 +11,6 @@ import math
 from datetime import datetime
 from typing import Any
 
-
 INTENT_DEFAULT = "default"
 INTENT_FACT = "fact"
 INTENT_RECALL = "recall"
@@ -87,13 +86,14 @@ DEFAULT_INTENT_RECALL_CONFIG: dict[str, Any] = {
 
 
 _FACT_TERMS = (
-    "哪天", "哪日", "几号", "日期", "什么时候", "具体", "准确", "精确",
+    "哪天", "哪日", "几号", "日期", "具体", "准确", "精确",
     "生日", "生理期", "经期", "电话", "地址", "名字", "是谁", "多少",
     "deadline", "due date", "exact", "when was",
 )
 _RECALL_TERMS = (
-    "回顾", "总结", "概括", "复盘", "想起来", "记得", "之前聊过",
-    "讲过什么", "发生过什么", "哪些事", "recap", "summary",
+    "回顾", "回忆", "总结", "概括", "复盘", "想起来", "记得", "之前聊过",
+    "讲过什么", "发生过什么", "发生的事", "哪些事", "工作台",
+    "recap", "summary",
 )
 _RELATION_TERMS = (
     "我俩", "我们俩", "我们之间", "关系", "相处", "亲密", "恋爱", "感情",
@@ -103,7 +103,7 @@ _RELATION_TERMS = (
 _TEMPORAL_TERMS = (
     "最近", "这几天", "这段时间", "这周", "上周", "昨天", "前天", "今天",
     "刚才", "刚刚", "上次", "之前", "后来", "之后", "时间线", "timeline",
-    "变化", "趋势", "顺序", "先后",
+    "变化", "趋势", "顺序", "先后", "什么时候",
 )
 
 _TIE_PRIORITY = {
@@ -151,6 +151,9 @@ def classify_query_intent(query: str) -> dict[str, Any]:
     if ("哪天" in q or "几号" in q) and ("生理期" in q or "经期" in q):
         scores[INTENT_FACT] = scores.get(INTENT_FACT, 0.0) + 2.0
         matched.setdefault(INTENT_FACT, []).append("period_date_compound")
+    if "什么时候" in q and any(term in q for term in ("搬到", "搬家", "迁移", "切到", "部署", "上线")):
+        scores[INTENT_TEMPORAL] = scores.get(INTENT_TEMPORAL, 0.0) + 2.0
+        matched.setdefault(INTENT_TEMPORAL, []).append("migration_timeline_compound")
     if "时间线" in q or "timeline" in q:
         scores[INTENT_TEMPORAL] = scores.get(INTENT_TEMPORAL, 0.0) + 1.5
 
@@ -310,7 +313,7 @@ def _metadata_terms(meta: dict[str, Any]) -> set[str]:
 
 
 def _is_recent(meta: dict[str, Any], days: float, now: datetime | None = None) -> bool:
-    raw = meta.get("created") or meta.get("last_active") or ""
+    raw = meta.get("event_at") or meta.get("created") or meta.get("last_active") or ""
     if not raw:
         return False
     try:

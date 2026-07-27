@@ -8,15 +8,13 @@ Ombre Brain 手动记忆写入工具
 """
 
 import os
-import uuid
 import argparse
-from datetime import datetime
+import asyncio
 
-VAULT_DIR = os.path.expanduser("~/Documents/Obsidian Vault/Ombre Brain/dynamic")
+from bucket_manager import BucketManager
+from utils import load_config
 
-
-def gen_id():
-    return uuid.uuid4().hex[:12]
+VAULT_ROOT = os.path.expanduser("~/Documents/Obsidian Vault/Ombre Brain")
 
 
 def write_memory(
@@ -27,38 +25,25 @@ def write_memory(
     importance: int = 7,
     valence: float = 0.5,
     arousal: float = 0.3,
+    event_at: str = None,
 ):
-    mid = gen_id()
-    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-
-    # YAML frontmatter
-    domain_yaml = "\n".join(f"- {d}" for d in domain)
-    tags_yaml = "\n".join(f"- {t}" for t in tags)
-
-    md = f"""---
-activation_count: 1
-arousal: {arousal}
-created: '{now}'
-domain:
-{domain_yaml}
-id: {mid}
-importance: {importance}
-last_active: '{now}'
-name: {name}
-tags:
-{tags_yaml}
-type: dynamic
-valence: {valence}
----
-
-{content}
-"""
-
-    path = os.path.join(VAULT_DIR, f"{mid}.md")
-    os.makedirs(VAULT_DIR, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(md)
-
+    config = load_config()
+    config["buckets_dir"] = os.environ.get("OMBRE_BUCKETS_DIR", VAULT_ROOT)
+    manager = BucketManager(config)
+    mid = asyncio.run(
+        manager.create(
+            content=content,
+            name=name,
+            domain=domain,
+            tags=tags,
+            importance=importance,
+            valence=valence,
+            arousal=arousal,
+            event_at=event_at,
+            actor="cli:write_memory",
+        )
+    )
+    path = manager._find_bucket_file(mid)
     print(f"✓ 已写入: {path}")
     print(f"  ID: {mid} | 名称: {name}")
     return mid
@@ -85,6 +70,7 @@ if __name__ == "__main__":
     parser.add_argument("--importance", type=int, default=7)
     parser.add_argument("--valence", type=float, default=0.5)
     parser.add_argument("--arousal", type=float, default=0.3)
+    parser.add_argument("--event-at", help="事件发生时间（ISO 8601）；留空则按写入时刻并标低置信度")
     args = parser.parse_args()
 
     if args.name and args.content and args.domain:
@@ -96,6 +82,7 @@ if __name__ == "__main__":
             importance=args.importance,
             valence=args.valence,
             arousal=args.arousal,
+            event_at=args.event_at,
         )
     else:
         interactive()

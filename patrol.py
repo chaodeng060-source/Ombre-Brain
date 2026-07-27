@@ -19,12 +19,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
 import frontmatter
+
+from fact_slots import audit_fact_slots
+from fact_conflicts import scan_cross_bucket_z_conflicts
+from utils import RELATION_TYPES, load_config
 
 # 与 utils.PROTECTED_RESOLVE_DOMAINS 保持一致（resolve=遗忘的禁区）。
 # 这里硬编一份副本，让 patrol 不依赖 server 运行时即可独立巡检。
@@ -87,6 +93,30 @@ def _load_buckets(buckets_dir: Path) -> list[dict]:
             })
         except Exception as e:  # 坏文件也是巡检要报的
             out.append({"__broken__": str(p.name), "__error__": str(e)})
+
+    # 本地/NAS 备份工具会把每个 Markdown 桶序列化成 <12hex>.json 快照。
+    # patrol 同时读取这种只读备份格式；body_state.json 等运行时 sidecar
+    # 没有 bucket schema，直接忽略，避免把它们误报成坏桶。
+    for p in sorted(buckets_dir.rglob("*.json")):
+        looks_like_snapshot = bool(re.fullmatch(r"[0-9a-fA-F]{12}", p.stem))
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception as e:
+            if looks_like_snapshot:
+                out.append({"__broken__": str(p.name), "__error__": str(e)})
+            continue
+        if not isinstance(data, dict):
+            continue
+        meta = data.get("metadata")
+        if not isinstance(meta, dict) or "content" not in data:
+            if looks_like_snapshot:
+                out.append({"__broken__": str(p.name), "__error__": "invalid bucket snapshot schema"})
+            continue
+        out.append({
+            "id": data.get("id") or meta.get("id") or p.stem,
+            "metadata": dict(meta),
+            "content": data.get("content", "") or "",
+        })
     return out
 
 
@@ -106,7 +136,7 @@ def _parse_dt(s) -> datetime | None:
         return None
 
 
-def patrol(buckets_dir: Path, now: datetime) -> dict:
+def patrol(buckets_dir: Path, now: datetime, fact_slot_registry: dict | None = None) -> dict:
     raw = _load_buckets(buckets_dir)
     broken = [b for b in raw if b.get("__broken__")]
     buckets = [b for b in raw if not b.get("__broken__")]
@@ -121,6 +151,11 @@ def patrol(buckets_dir: Path, now: datetime) -> dict:
     by_domain: Counter = Counter()
     dangling: list[dict] = []          # 关系指向不存在的桶（断边）
     non_reciprocal: list[dict] = []    # A→B 有边、B→A 没有（信息性，不一定是病）
+    self_loops: list[dict] = []        # 自环永远无效
+    duplicate_edges: list[dict] = []   # 同 source/type/target 重复
+    reciprocal_kin: list[dict] = []    # kin 是对称关系，反向重复存储是脏边
+    invalid_relation_types: list[dict] = []
+    invalid_relation_strengths: list[dict] = []
     oversized: list[dict] = []         # content 过长 → 拆线候选
     name_index: defaultdict = defaultdict(list)  # 重名 → 重复候选
     protected_resolved: list[dict] = []          # 保护域被 resolve（5.10 守卫验证）
@@ -128,13 +163,18 @@ def patrol(buckets_dir: Path, now: datetime) -> dict:
 
     # 先建反向关系索引，判互惠
     fwd_edges: defaultdict = defaultdict(set)
+    typed_edges: set[tuple[str, str, str]] = set()
     for b in buckets:
         meta = b.get("metadata", {})
         bid = b.get("id") or meta.get("id")
         for rel in meta.get("relations", []) or []:
+            if not isinstance(rel, dict):
+                continue
             tgt = rel.get("target")
+            rel_type = rel.get("type")
             if tgt:
                 fwd_edges[bid].add(tgt)
+                typed_edges.add((str(bid), str(tgt), str(rel_type or "")))
 
     for b in buckets:
         meta = b.get("metadata", {})
@@ -152,12 +192,35 @@ def patrol(buckets_dir: Path, now: datetime) -> dict:
         name_index[name].append(bid)
 
         # 断边 / 互惠
+        seen_edges: set[tuple[str, str]] = set()
         for rel in meta.get("relations", []) or []:
+            if not isinstance(rel, dict):
+                invalid_relation_types.append({"from": bid, "target": "", "type": type(rel).__name__})
+                continue
             tgt = rel.get("target")
+            rel_type = str(rel.get("type") or "")
+            edge_key = (rel_type, str(tgt or ""))
+            if edge_key in seen_edges:
+                duplicate_edges.append({"from": bid, "target": tgt, "type": rel_type})
+            seen_edges.add(edge_key)
+            if tgt == bid:
+                self_loops.append({"from": bid, "target": tgt, "type": rel_type})
+            if rel_type not in RELATION_TYPES:
+                invalid_relation_types.append({"from": bid, "target": tgt, "type": rel_type})
+            if "strength" in rel:
+                try:
+                    strength = float(rel["strength"])
+                    valid_strength = 0.0 <= strength <= 1.0
+                except (TypeError, ValueError):
+                    valid_strength = False
+                if not valid_strength:
+                    invalid_relation_strengths.append({
+                        "from": bid, "target": tgt, "type": rel_type, "strength": rel.get("strength")
+                    })
             if tgt and tgt not in ids:
-                dangling.append({"from": bid, "name": name, "target": tgt, "type": rel.get("type")})
+                dangling.append({"from": bid, "name": name, "target": tgt, "type": rel_type})
             elif tgt and bid not in fwd_edges.get(tgt, set()):
-                non_reciprocal.append({"from": bid, "target": tgt, "type": rel.get("type")})
+                non_reciprocal.append({"from": bid, "target": tgt, "type": rel_type})
 
         # 拆线候选
         if len(content) > OVERSIZED_CHARS:
@@ -175,6 +238,11 @@ def patrol(buckets_dir: Path, now: datetime) -> dict:
                                     "days": (now - la).days})
 
     duplicates = {n: ids_ for n, ids_ in name_index.items() if len(ids_) > 1}
+    fact_report = audit_fact_slots(buckets, fact_slot_registry or {})
+    z_conflicts = scan_cross_bucket_z_conflicts(buckets)
+    for source_id, target_id, rel_type in sorted(typed_edges):
+        if rel_type == "kin" and (target_id, source_id, rel_type) in typed_edges and source_id < target_id:
+            reciprocal_kin.append({"from": source_id, "target": target_id, "type": rel_type})
 
     return {
         "total": len(buckets),
@@ -183,8 +251,15 @@ def patrol(buckets_dir: Path, now: datetime) -> dict:
         "by_domain": dict(by_domain.most_common(12)),
         "dangling": dangling,
         "non_reciprocal": non_reciprocal,
+        "self_loops": self_loops,
+        "duplicate_edges": duplicate_edges,
+        "reciprocal_kin": reciprocal_kin,
+        "invalid_relation_types": invalid_relation_types,
+        "invalid_relation_strengths": invalid_relation_strengths,
         "oversized": sorted(oversized, key=lambda x: -x["chars"])[:15],
         "duplicates": duplicates,
+        **fact_report,
+        "z_conflicts": z_conflicts,
         "protected_resolved": protected_resolved,
         "stale_important": sorted(stale_important, key=lambda x: -x["days"])[:20],
     }
@@ -212,11 +287,31 @@ def render_md(report: dict, buckets_dir: Path, now: datetime) -> str:
                 L.append(f"- {fmt(it)}")
         L.append("")
 
+    def fmt_z_conflict(item):
+        fields = ", ".join(
+            f"{c['field']}: {c['old']} → {c['new']}"
+            for c in item.get("fields", [])
+        )
+        return (
+            f"`{item['left_id']}` {item['left_name']} ↔ "
+            f"`{item['right_id']}` {item['right_name']} —— {fields}"
+        )
+
     section("🔴 保护域被 resolve（5.10 守卫·必须为 0）", report["protected_resolved"],
             lambda x: f"`{x['id']}` {x['name']} —— domains={x['domains']}",
             empty="守卫完好，无保护域被遗忘")
     section("🔗 断边（关系指向不存在的桶）", report["dangling"],
             lambda x: f"`{x['from']}` ({x['name']}) --{x['type']}--> `{x['target']}` ❌不存在")
+    section("⛔ 关系自环（必须为 0）", report["self_loops"],
+            lambda x: f"`{x['from']}` --{x['type']}--> 自己")
+    section("♻️ 重复关系边", report["duplicate_edges"],
+            lambda x: f"`{x['from']}` --{x['type']}--> `{x['target']}` 重复")
+    section("↔️ kin 双向重复存储", report["reciprocal_kin"],
+            lambda x: f"`{x['from']}` ↔ `{x['target']}`（只需存一条）")
+    section("❓ 未知关系类型", report["invalid_relation_types"],
+            lambda x: f"`{x['from']}` --{x['type']}--> `{x['target']}`")
+    section("📏 非法关系强度", report["invalid_relation_strengths"],
+            lambda x: f"`{x['from']}` --{x['type']}--> `{x['target']}` strength={x['strength']}")
     section("✂️ 拆线候选（content 过长，仅提示）", report["oversized"],
             lambda x: f"`{x['id']}` {x['name']} —— {x['chars']} 字")
     dups = report["duplicates"]
@@ -227,6 +322,29 @@ def render_md(report: dict, buckets_dir: Path, now: datetime) -> str:
         for n, ids_ in list(dups.items())[:20]:
             L.append(f"- 「{n}」×{len(ids_)}：{ids_}")
     L.append("")
+    fact_conflicts = report["fact_conflicts"]
+    L.append(f"## 🧾 重复当前事实槽（{len(fact_conflicts)}）")
+    if not fact_conflicts:
+        L.append("- ✅ 无重复 current fact_key")
+    else:
+        for fact_key, bucket_ids in list(fact_conflicts.items())[:20]:
+            L.append(f"- `{fact_key}`：{bucket_ids}")
+    L.append("")
+    section("🧭 事实槽迁移候选（只读建议）", report["migration_candidates"],
+            lambda x: f"`{x['id']}` → `{x['fact_key']}` values={x['values']}")
+    section("⚠️ 多槽迁移候选（需人工拆分）", report["ambiguous_candidates"],
+            lambda x: f"`{x['id']}` → {x['fact_keys']}")
+    section("❓ 未登记 fact_key", report["invalid_fact_keys"],
+            lambda x: f"`{x['id']}` fact_key=`{x['fact_key']}`")
+    section("❓ 非法 fact_status", report["invalid_fact_statuses"],
+            lambda x: f"`{x['id']}` `{x['fact_key']}` status=`{x['status']}`")
+    section("🧹 遗留 active_fact 字段", report["legacy_active_fact"],
+            lambda x: f"`{x['id']}` active_fact={x['value']}（只报告，不作为真值）")
+    section("🛡️ 已排除的保护/叙事事实元数据", report["exempt_fact_metadata"],
+            lambda x: f"`{x['id']}` fact_key=`{x['fact_key']}`")
+    section("⚠️ Z轴跨桶事实冲突候选（只报告，不入队、不改库）", report.get("z_conflicts", []),
+            fmt_z_conflict,
+            empty="未发现同名/同域跨桶事实冲突候选")
     section("🕰️ 陈旧但重要（importance≥{}, >{}天未激活·只提示绝不自动忘）".format(STALE_IMPORTANCE, STALE_DAYS),
             report["stale_important"],
             lambda x: f"`{x['id']}` {x['name']} —— imp={x['importance']}, {x['days']}天")
@@ -244,6 +362,8 @@ def main():
                     help="桶目录（默认 $OMBRE_BUCKETS_DIR 或 /data/buckets）")
     ap.add_argument("--out", default=None, help="报告落点（默认打印到 stdout）")
     ap.add_argument("--now", default=None, help="覆盖当前时间（ISO，便于测试）")
+    ap.add_argument("--config", default=os.environ.get("OMBRE_CONFIG"),
+                    help="可选 config.yaml，用于读取 fact_slots.registry")
     args = ap.parse_args()
 
     buckets_dir = Path(args.buckets)
@@ -251,7 +371,11 @@ def main():
         raise SystemExit(f"桶目录不存在：{buckets_dir}")
     now = _parse_dt(args.now) or datetime.now()
 
-    report = patrol(buckets_dir, now)
+    registry = {}
+    if args.config:
+        cfg = load_config(args.config)
+        registry = ((cfg.get("fact_slots", {}) or {}).get("registry", {}) or {})
+    report = patrol(buckets_dir, now, fact_slot_registry=registry)
     md = render_md(report, buckets_dir, now)
 
     if args.out:

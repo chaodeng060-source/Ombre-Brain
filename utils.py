@@ -15,7 +15,7 @@ import uuid
 import yaml
 import logging
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from intent_recall import DEFAULT_INTENT_RECALL_CONFIG
 
@@ -48,6 +48,11 @@ REVIEW_RELATION_TYPES = frozenset({
 assert SAFE_RELATION_TYPES | REVIEW_RELATION_TYPES == RELATION_TYPES
 assert not (SAFE_RELATION_TYPES & REVIEW_RELATION_TYPES)
 
+
+def default_graph_relation_allowed(value) -> bool:
+    """Return whether an edge type may participate in default recall expansion."""
+    return str(value or "").strip() in SAFE_RELATION_TYPES
+
 # Domains where a bucket must never be marked resolved=True.
 # Not "problem-and-solution" structures — persistent states (relationships,
 # commitments, feelings, family, self-reflection). Resolving = forgetting.
@@ -76,6 +81,11 @@ def load_config(config_path: str = None) -> dict:
         "log_level": "INFO",
         "buckets_dir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "buckets"),
         "merge_threshold": 75,
+        "audit": {
+            "enabled": True,
+            # Empty means <buckets_dir>/.audit/mutations.sqlite3.
+            "path": "",
+        },
         "dehydration": {
             "model": "deepseek-chat",
             "base_url": "https://api.deepseek.com/v1",
@@ -123,7 +133,38 @@ def load_config(config_path: str = None) -> dict:
             "keyword_weight": 1.0,
             "vector_weight": 1.0,
         },
+        # Stage-0 query expansion is deliberately limited to memory-shaped
+        # intents. Exact fact lookups keep the user's literal query untouched.
+        "query_expansion": {
+            "enabled": False,
+            "allowed_intents": ["recall", "relation", "temporal"],
+            "max_angles": 2,
+            "max_tokens": 120,
+            "temperature": 0.3,
+            "min_query_len": 4,
+            "max_query_chars": 500,
+        },
+        "recall_evidence_roles": {
+            "enabled": False,
+        },
+        "relation_recall": {
+            "allowed_types": sorted(SAFE_RELATION_TYPES),
+            "hop1_min_strength": 0.4,
+            "hop2_min_strength": 0.7,
+        },
+        # Optional deterministic Z-axis slots.  Empty registry means no bucket
+        # is treated as a versioned fact; models cannot mint slot names.
+        "fact_slots": {
+            "enabled": True,
+            "registry": {},
+        },
         "intent_recall": DEFAULT_INTENT_RECALL_CONFIG,
+        # Safety gates default closed-to-write: inferred causal/update edges
+        # and detected fact conflicts are review material, not silent truth.
+        "review_gate": {
+            "relation_review": True,
+            "fact_evolution_audit": True,
+        },
         "merge": {
             "keyword_limit": 5,
             "vector_limit": 8,
@@ -146,6 +187,7 @@ def load_config(config_path: str = None) -> dict:
         )
 
     config = defaults.copy()
+    file_config = {}
     if os.path.exists(config_path):
         try:
             with open(config_path, "r", encoding="utf-8") as f:
@@ -162,6 +204,13 @@ def load_config(config_path: str = None) -> dict:
                 f"Failed to parse config file, using defaults / "
                 f"配置文件解析失败，使用默认配置: {e}"
             )
+
+    legacy_qe = file_config.get("query_expand") if isinstance(file_config, dict) else None
+    if isinstance(legacy_qe, dict) and "query_expansion" not in file_config:
+        config["query_expansion"] = _deep_merge(
+            config.get("query_expansion", {}) or {},
+            legacy_qe,
+        )
 
     # --- Dehydration env overrides ---
     env_api_key = os.environ.get("OMBRE_API_KEY", "")
@@ -337,9 +386,82 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+DATE_PRECISIONS = frozenset({"second", "minute", "hour", "day", "month", "year", "unknown"})
+
+
+def infer_date_precision(value) -> str:
+    """Infer the calendar precision represented by an event timestamp."""
+    if isinstance(value, datetime):
+        return "second"
+    if isinstance(value, date):
+        return "day"
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d{4}", text):
+        return "year"
+    if re.fullmatch(r"\d{4}-\d{2}", text):
+        return "month"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return "day"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}", text):
+        return "hour"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", text):
+        return "minute"
+    if "T" in text:
+        return "second"
+    return "unknown"
+
+
+def normalize_event_at(value) -> tuple[str, str]:
+    """Return a validated ISO timestamp and its inferred precision."""
+    precision = infer_date_precision(value)
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds"), precision
+    if isinstance(value, date):
+        return f"{value.isoformat()}T00:00:00", precision
+
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("event_at cannot be empty")
+    if precision == "year":
+        text = f"{text}-01-01T00:00:00"
+    elif precision == "month":
+        text = f"{text}-01T00:00:00"
+    elif precision == "day":
+        text = f"{text}T00:00:00"
+    elif precision == "hour":
+        text = f"{text}:00:00"
+    elif precision == "minute":
+        text = f"{text}:00"
+
+    datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return text, precision
+
+
+def event_at_from_metadata(metadata: dict, *, fallback_last_active: bool = False):
+    """Read event time with legacy `created` compatibility."""
+    metadata = metadata or {}
+    event_at = metadata.get("event_at")
+    legacy_created = metadata.get("created")
+    # Transitional compatibility: older tools may still edit only `created`.
+    # Honor that override only when event_at was originally a low-confidence
+    # record-time default. Explicit/inferred event_at remains authoritative.
+    if (
+        event_at
+        and legacy_created
+        and event_at != legacy_created
+        and metadata.get("date_source") == "recorded_at_default"
+    ):
+        value = legacy_created
+    else:
+        value = event_at or legacy_created
+    if not value and fallback_last_active:
+        value = metadata.get("last_active")
+    return value
+
+
 # --- Time string parsing / 时间字符串解析 ---
-# Used by breath() since/until params and bucket_manager.search created range.
-# 给 breath since/until 和 bucket_manager.search created 范围过滤用。
+# Used by breath() since/until params and bucket_manager.search event range.
+# 给 breath since/until 和 bucket_manager.search 事件时间范围过滤用。
 #
 # Supports three forms / 支持三种格式：
 #   - ISO 8601: "2026-05-01" / "2026-05-01T12:00:00"

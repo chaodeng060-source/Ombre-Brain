@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
 重分类脚本：根据新的域列表，重新分析已有桶的 domain 并搬到对应子目录。
-纯标准库，读 frontmatter + 正文内容做关键词匹配。
+写入和移动统一经过 BucketManager 的原子写、单桶锁和审计日志。
 """
 
+import asyncio
 import os
 import re
-import shutil
 
-VAULT_DIR = os.path.expanduser("~/Documents/Obsidian Vault/Ombre Brain")
+from bucket_manager import BucketManager
+from utils import load_config
+
+VAULT_DIR = os.environ.get(
+    "OMBRE_BUCKETS_DIR",
+    os.path.expanduser("~/Documents/Obsidian Vault/Ombre Brain"),
+)
 DYNAMIC_DIR = os.path.join(VAULT_DIR, "dynamic")
 
 # 新域关键词表（和 dehydrator.py 的 _local_analyze 一致）
@@ -100,24 +106,7 @@ def classify(body, old_domains):
     return old_domains  # 匹配不上就保留旧的
 
 
-def update_domain_in_file(filepath, new_domains):
-    """更新文件中 frontmatter 的 domain 字段。"""
-    with open(filepath, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    # 替换 domain 块
-    domain_yaml = "domain:\n" + "".join(f"- {d}\n" for d in new_domains)
-    content = re.sub(
-        r"domain:\s*\n(?:\s*-\s*.+\n?)+",
-        domain_yaml,
-        content,
-        count=1
-    )
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(content)
-
-
-def reclassify():
+async def reclassify():
     if not os.path.exists(DYNAMIC_DIR):
         print("目录不存在")
         return
@@ -134,6 +123,9 @@ def reclassify():
         return
 
     print(f"扫描到 {len(all_files)} 个桶文件\n")
+    config = load_config()
+    config["buckets_dir"] = VAULT_DIR
+    manager = BucketManager(config)
 
     for filepath in sorted(all_files):
         meta, yaml_text, body = parse_md(filepath)
@@ -161,11 +153,21 @@ def reclassify():
         changed = (new_domains != old_domains) or (filepath != new_path)
 
         if changed:
-            # 更新 frontmatter
-            update_domain_in_file(filepath, new_domains)
-            # 移动文件
-            if filepath != new_path:
-                shutil.move(filepath, new_path)
+            if new_domains != old_domains:
+                if not await manager.update(
+                    bucket_id,
+                    actor="maintenance:reclassify_domains",
+                    domain=new_domains,
+                ):
+                    print(f"  ✗ 更新失败: {name}")
+                    continue
+            if not await manager.relocate(
+                bucket_id,
+                actor="maintenance:reclassify_domains",
+                rename_from_metadata=True,
+            ):
+                print(f"  ✗ 移动失败: {name}")
+                continue
             print(f"  ✓ {name}")
             print(f"    {','.join(old_domains)} → {','.join(new_domains)}")
             print(f"    → {primary}/{new_filename}")
@@ -195,4 +197,4 @@ def reclassify():
 
 
 if __name__ == "__main__":
-    reclassify()
+    asyncio.run(reclassify())

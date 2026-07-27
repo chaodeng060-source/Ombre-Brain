@@ -5,14 +5,20 @@
 旧结构: dynamic/{bucket_id}.md
 新结构: dynamic/{primary_domain}/{name}_{bucket_id}.md
 
-纯标准库，无外部依赖。
+所有移动都经过 BucketManager 的单桶锁和审计日志。
 """
 
+import asyncio
 import os
 import re
-import shutil
 
-VAULT_DIR = os.path.expanduser("~/Documents/Obsidian Vault/Ombre Brain")
+from bucket_manager import BucketManager
+from utils import load_config
+
+VAULT_DIR = os.environ.get(
+    "OMBRE_BUCKETS_DIR",
+    os.path.expanduser("~/Documents/Obsidian Vault/Ombre Brain"),
+)
 DYNAMIC_DIR = os.path.join(VAULT_DIR, "dynamic")
 
 
@@ -51,7 +57,7 @@ def parse_frontmatter(filepath):
     return meta
 
 
-def migrate():
+async def migrate():
     if not os.path.exists(DYNAMIC_DIR):
         print(f"目录不存在: {DYNAMIC_DIR}")
         return
@@ -65,6 +71,9 @@ def migrate():
         return
 
     print(f"发现 {len(files)} 个待迁移文件\n")
+    config = load_config()
+    config["buckets_dir"] = VAULT_DIR
+    manager = BucketManager(config)
 
     for filename in sorted(files):
         old_path = os.path.join(DYNAMIC_DIR, filename)
@@ -83,19 +92,15 @@ def migrate():
         domain = meta.get("domain", ["未分类"])
         primary_domain = sanitize_name(domain[0]) if domain else "未分类"
 
-        # 构造新路径
-        domain_dir = os.path.join(DYNAMIC_DIR, primary_domain)
-        os.makedirs(domain_dir, exist_ok=True)
-
-        if name and name != bucket_id:
-            new_filename = f"{sanitize_name(name)}_{bucket_id}.md"
-        else:
-            new_filename = f"{bucket_id}.md"
-
-        new_path = os.path.join(domain_dir, new_filename)
-
-        # 移动
-        shutil.move(old_path, new_path)
+        if not await manager.relocate(
+            bucket_id,
+            actor="migration:domain_layout",
+            rename_from_metadata=True,
+        ):
+            print(f"  ✗ 移动失败 {filename}")
+            continue
+        new_path = manager._find_bucket_file(bucket_id) or ""
+        new_filename = os.path.basename(new_path)
         print(f"  ✓ {filename}")
         print(f"    → {primary_domain}/{new_filename}")
 
@@ -115,4 +120,4 @@ def migrate():
 
 
 if __name__ == "__main__":
-    migrate()
+    asyncio.run(migrate())

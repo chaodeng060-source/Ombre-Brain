@@ -18,7 +18,7 @@ A pending-review queue shared by Z-axis fact evolution (#2) and relation safety
 gating (#3). Machines only enqueue candidates here; the queue is append-only with
 enqueue-dedup, and resolve() is the only path that changes a row's pending status.
 (Note: #2 is an audit trail — ordinary merges still proceed; the queue records them
-for review rather than blocking the truth store.)
+for review rather than blocking the truth store.  Safety gates default enabled.)
 """
 from __future__ import annotations
 
@@ -39,6 +39,123 @@ STATUS_PENDING = "pending"
 STATUS_REVIEWED = "reviewed"   # 人看过、判定保留候选（不应用）
 STATUS_APPLIED = "applied"     # 人确认应用（真去建边 / 真去 supersede）
 STATUS_REJECTED = "rejected"   # 人否决候选
+
+# REST/UI may only acknowledge or reject a candidate.  ``applied`` is kept in
+# the storage state machine for a future explicit memory-write transaction, but
+# marking a queue row applied is not itself such a transaction.
+REST_SAFE_RESOLVE_STATUSES = {STATUS_REVIEWED, STATUS_REJECTED}
+
+
+def rest_resolve_status_allowed(status: str) -> bool:
+    return str(status or "").strip() in REST_SAFE_RESOLVE_STATUSES
+
+
+def lifecycle_updates(entry: dict) -> tuple[dict, dict]:
+    """Build paired metadata updates for an approved cross-bucket candidate."""
+    if entry.get("candidate_type") != "cross_bucket_lifecycle":
+        raise ValueError("not a cross-bucket lifecycle candidate")
+    current_id = str(entry.get("current_bucket_id") or "").strip()
+    historical_id = str(entry.get("historical_bucket_id") or "").strip()
+    fact_key = str(entry.get("key") or "").strip()
+    if not current_id or not historical_id or not fact_key or current_id == historical_id:
+        raise ValueError("invalid lifecycle candidate")
+    return (
+        {
+            "lifecycle": "current",
+            "active_fact": True,
+            "fact_key": fact_key,
+            "supersedes_bucket_ids": [historical_id],
+        },
+        {
+            "lifecycle": "historical",
+            "active_fact": False,
+            "fact_key": fact_key,
+            "superseded_by_bucket_id": current_id,
+        },
+    )
+
+
+def historical_recall_suppressed(metadata: dict) -> bool:
+    """Suppress only when all explicit Z lifecycle signals agree."""
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        str(metadata.get("lifecycle") or "").strip().lower() == "historical"
+        and metadata.get("active_fact") is False
+        and bool(str(metadata.get("fact_key") or "").strip())
+        and bool(str(metadata.get("superseded_by_bucket_id") or "").strip())
+    )
+
+
+HISTORICAL_QUERY_CUES = (
+    "以前", "过去", "上次", "历史", "当时", "之前", "曾经", "那次",
+    "old", "previous", "historical", "before", "back then",
+)
+
+
+def query_requests_history(query: str) -> bool:
+    normalized = str(query or "").strip().lower()
+    return any(cue in normalized for cue in HISTORICAL_QUERY_CUES)
+
+
+def make_currentness_overlay_entry(entry: dict, now: Optional[datetime] = None) -> dict:
+    current_update, historical_update = lifecycle_updates(entry)
+    return {
+        "key": entry["key"],
+        "status": "active",
+        "current_bucket_id": entry["current_bucket_id"],
+        "historical_bucket_id": entry["historical_bucket_id"],
+        "fact_key": current_update["fact_key"],
+        "source": "reviewed_protected_overlay",
+        "created": _now_iso(now),
+    }
+
+
+class CurrentnessOverlay:
+    """Append-only reviewed currentness map that never rewrites protected buckets."""
+
+    def __init__(self, path: str | os.PathLike):
+        self.path = Path(path)
+
+    def _load(self) -> list[dict]:
+        if not self.path.exists():
+            return []
+        rows = []
+        with open(self.path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    value = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(value, dict):
+                    rows.append(value)
+        return rows
+
+    def add(self, entry: dict) -> bool:
+        key = str(entry.get("key") or "").strip()
+        if not key:
+            raise ValueError("overlay entry requires key")
+        if any(row.get("key") == key and row.get("status") == "active" for row in self._load()):
+            return False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.chmod(self.path, 0o600)
+        return True
+
+    def suppresses(self, bucket_id: str, query: str) -> bool:
+        if query_requests_history(query):
+            return False
+        return any(
+            row.get("status") == "active"
+            and row.get("historical_bucket_id") == bucket_id
+            and row.get("current_bucket_id")
+            for row in self._load()
+        )
 
 
 def _now_iso(now: Optional[datetime] = None) -> str:
@@ -98,6 +215,42 @@ def make_z_conflict_entry(
         "old": old[:240],
         "new": new[:240],
         "reason": reason,
+        "created": _now_iso(now),
+    }
+
+
+def make_z_pair_entry(
+    current_bucket_id: str,
+    historical_bucket_id: str,
+    *,
+    current_name: str = "",
+    historical_name: str = "",
+    reason: str = "cross_bucket_currentness",
+    source: str = "quality_benchmark",
+    now: Optional[datetime] = None,
+) -> dict:
+    """Cross-bucket currentness candidate; enqueue only, never mutates buckets."""
+    current_bucket_id = str(current_bucket_id).strip()
+    historical_bucket_id = str(historical_bucket_id).strip()
+    if not current_bucket_id or not historical_bucket_id:
+        raise ValueError("both bucket ids are required")
+    if current_bucket_id == historical_bucket_id:
+        raise ValueError("current and historical candidates must differ")
+    return {
+        "key": "zpair|" + _short_hash(current_bucket_id, historical_bucket_id),
+        "kind": KIND_Z_CONFLICT,
+        "status": STATUS_PENDING,
+        "candidate_type": "cross_bucket_lifecycle",
+        "bucket_id": current_bucket_id,
+        "bucket_name": current_name,
+        "current_bucket_id": current_bucket_id,
+        "historical_bucket_id": historical_bucket_id,
+        "historical_bucket_name": historical_name,
+        "field": "lifecycle",
+        "old": historical_name or "历史候选",
+        "new": current_name or "当前候选",
+        "reason": reason,
+        "source": source,
         "created": _now_iso(now),
     }
 
