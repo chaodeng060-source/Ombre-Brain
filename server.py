@@ -79,19 +79,24 @@ from sense_tagger import detect_senses, union_senses
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from intent_recall import bucket_intent_score_multiplier, resolve_intent_recall_policy
+from fact_conflicts import build_supersedes_audit
+from query_expand import expand_query
 from r2_storage import r2_storage
 from sensory_engine import SensoryEngine, format_body_state_block, senses_from_sensory
 from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
     world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
     rrf_fuse, parse_relative_time, PROTECTED_RESOLVE_DOMAINS,
-    SAFE_RELATION_TYPES, REVIEW_RELATION_TYPES,
-    event_at_from_metadata,
+    SAFE_RELATION_TYPES, REVIEW_RELATION_TYPES, default_graph_relation_allowed,
+    event_at_from_metadata, now_iso,
 )
 from redact import redact_embedding_input, redact_text  # 只抹 secret，不审查情感内容
 from review_queue import (
-    ReviewQueue, make_relation_entry, make_z_conflict_entry, render_md as _render_review_md,
-    KIND_RELATION, KIND_Z_CONFLICT,
+    CurrentnessOverlay, ReviewQueue, make_currentness_overlay_entry,
+    make_relation_entry, make_z_conflict_entry, make_z_pair_entry,
+    render_md as _render_review_md,
+    KIND_RELATION, KIND_Z_CONFLICT, STATUS_APPLIED, historical_recall_suppressed,
+    lifecycle_updates, rest_resolve_status_allowed,
 )
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
@@ -117,6 +122,7 @@ sensory_engine = SensoryEngine(config["buckets_dir"])  # External body-state sid
 # 落在 <buckets_dir>/review_queue.jsonl。两个闸默认**关**（gated），开了只是把
 # 机器自动推断的危险边 / 合并检出的事实冲突改挂 pending 给人审，不动现有部署路。
 _review_queue = None
+_z_currentness_overlay = None
 
 
 def _get_review_queue() -> ReviewQueue:
@@ -129,9 +135,43 @@ def _get_review_queue() -> ReviewQueue:
     return _review_queue
 
 
+def _get_z_currentness_overlay() -> CurrentnessOverlay:
+    global _z_currentness_overlay
+    path = os.path.join(config["buckets_dir"], "z_currentness_overrides.jsonl")
+    if _z_currentness_overlay is None or str(_z_currentness_overlay.path) != path:
+        _z_currentness_overlay = CurrentnessOverlay(path)
+    return _z_currentness_overlay
+
+
+def _z_recall_suppressed(bucket, query: str) -> bool:
+    metadata = bucket.get("metadata", {}) if isinstance(bucket, dict) else {}
+    return historical_recall_suppressed(metadata) or _get_z_currentness_overlay().suppresses(
+        str(bucket.get("id") or ""),
+        query,
+    )
+
+
 def _review_gate(name: str) -> bool:
-    """读 config.review_gate.<name>，默认 False（关）。"""
-    return bool((config.get("review_gate", {}) or {}).get(name, False))
+    """Read config.review_gate.<name>; fail safe when omitted."""
+    return bool((config.get("review_gate", {}) or {}).get(name, True))
+
+
+def _recall_prefix(
+    bucket_id: str,
+    role: str,
+    layer: str,
+    *,
+    marker: str = "",
+    relation: str = "",
+) -> str:
+    """Prefix recall snippets with evidence roles when explicitly enabled."""
+    if (config.get("recall_evidence_roles", {}) or {}).get("enabled", False):
+        parts = [f"[role:{role}]", f"[layer:{layer}]"]
+        if relation:
+            parts.append(f"[relation:{relation}]")
+        parts.append(f"[bucket_id:{bucket_id}]")
+        return " ".join(parts)
+    return f"{marker} [bucket_id:{bucket_id}]" if marker else f"[bucket_id:{bucket_id}]"
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -916,86 +956,7 @@ async def _find_merge_candidates(
     return candidates
 
 
-_KV_CONFLICT_RE = re.compile(r"(?im)^\s*([A-Za-z0-9_\-\u4e00-\u9fff]{2,40})\s*[:：=]\s*([^\n#;；]+?)\s*$")
-_DATE_CONFLICT_RE = re.compile(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b|\b\d{1,2}月\d{1,2}[日号]?\b")
-_NUMBER_CONFLICT_RE = re.compile(
-    r"(?<![\w.])\d+(?:\.\d+)?\s*(?:kg|g|mg|ml|cm|mm|km|斤|克|毫克|毫升|天|次|小时|分钟|分|度|℃|%|元|块|h|m)\b",
-    re.IGNORECASE,
-)
-_NEGATION_CONFLICT_RE = re.compile(r"\b(no|not|never|none|without|cancelled|canceled)\b|不再|不是|没有|没|无|取消|别|不要")
 _ARBITRATION_CONTEXT_BLOCK_RE = re.compile(r"\n?\[ARBITRATION_CONTEXT\].*?\[/ARBITRATION_CONTEXT\]\n?", re.DOTALL)
-
-
-def _extract_key_values_for_conflict(text: str) -> dict:
-    pairs = {}
-    for match in _KV_CONFLICT_RE.finditer(text or ""):
-        key = match.group(1).strip().lower()
-        value = match.group(2).strip()
-        if key and value:
-            pairs[key] = value[:180]
-    return pairs
-
-
-def _detect_merge_conflicts(old_content: str, new_content: str) -> list[dict]:
-    old_text = strip_wikilinks(old_content or "")
-    new_text = strip_wikilinks(new_content or "")
-    conflicts: list[dict] = []
-    seen_fields: set[str] = set()
-
-    old_kv = _extract_key_values_for_conflict(old_text)
-    new_kv = _extract_key_values_for_conflict(new_text)
-    for field, old_value in old_kv.items():
-        new_value = new_kv.get(field)
-        if new_value is not None and old_value != new_value:
-            conflicts.append({"field": field, "old": old_value, "new": new_value})
-            seen_fields.add(field)
-
-    old_dates = sorted({m.group(0) for m in _DATE_CONFLICT_RE.finditer(old_text)})
-    new_dates = sorted({m.group(0) for m in _DATE_CONFLICT_RE.finditer(new_text)})
-    if old_dates and new_dates and old_dates != new_dates and "date" not in seen_fields:
-        conflicts.append({
-            "field": "date",
-            "old": ", ".join(old_dates)[:180],
-            "new": ", ".join(new_dates)[:180],
-        })
-
-    old_without_dates = _DATE_CONFLICT_RE.sub(" ", old_text)
-    new_without_dates = _DATE_CONFLICT_RE.sub(" ", new_text)
-    old_numbers = sorted({m.group(0).strip() for m in _NUMBER_CONFLICT_RE.finditer(old_without_dates)})
-    new_numbers = sorted({m.group(0).strip() for m in _NUMBER_CONFLICT_RE.finditer(new_without_dates)})
-    if old_numbers and new_numbers and old_numbers != new_numbers and "number" not in seen_fields:
-        conflicts.append({
-            "field": "number",
-            "old": ", ".join(old_numbers)[:180],
-            "new": ", ".join(new_numbers)[:180],
-        })
-
-    old_negated = bool(_NEGATION_CONFLICT_RE.search(old_text))
-    new_negated = bool(_NEGATION_CONFLICT_RE.search(new_text))
-    if old_negated != new_negated:
-        conflicts.append({
-            "field": "negation",
-            "old": "negated" if old_negated else "affirmed",
-            "new": "negated" if new_negated else "affirmed",
-        })
-    return conflicts
-
-
-def _build_supersedes_audit(bucket: dict, new_content: str) -> list[dict]:
-    conflicts = _detect_merge_conflicts(bucket.get("content", ""), new_content)
-    if not conflicts:
-        return []
-    at = datetime.now(_BJ_TZ).isoformat(timespec="seconds")
-    return [
-        {
-            "field": c["field"],
-            "old": c["old"],
-            "new": c["new"],
-            "at": at,
-            "bucket_id": bucket.get("id", ""),
-        }
-        for c in conflicts
-    ]
 
 
 def _with_arbitration_context(content: str, audit_entries: list[dict]) -> str:
@@ -1068,7 +1029,7 @@ async def _merge_or_create(
         bmeta = bucket["metadata"]
         if not _is_merge_protected_bucket(bucket, domain, chord_tag):
             try:
-                audit_entries = _build_supersedes_audit(bucket, content)
+                audit_entries = build_supersedes_audit(bucket, content)
                 merge_content = _with_arbitration_context(content, audit_entries)
                 merged = await dehydrator.merge(bucket["content"], merge_content)
                 merged = _strip_arbitration_context(merged) or merged
@@ -1611,29 +1572,59 @@ async def breath(
             f"vector_top_k={intent_policy['vector_top_k']}"
         )
 
+    query_angles = [query]
+    qe_cfg = config.get("query_expansion", {}) or {}
+    qe_allowed = set(qe_cfg.get("allowed_intents") or ["recall", "relation", "temporal"])
+    if qe_cfg.get("enabled", False) and intent_policy.get("intent") in qe_allowed:
+        try:
+            query_angles = await expand_query(
+                query,
+                getattr(dehydrator, "client", None),
+                getattr(dehydrator, "model", "deepseek-chat"),
+                qe_cfg,
+            ) or [query]
+        except Exception as e:
+            logger.warning(f"Query expansion failed, using original / 查询扩展失败，回退原词: {e}")
+            query_angles = [query]
+    if query_angles[0] != query:
+        query_angles = [query] + [q for q in query_angles if q != query]
+
     # Keyword channel (already filtered by world/domain/threshold inside)
+    keyword_by_id: dict[str, dict] = {}
     try:
-        keyword_matches = await bucket_mgr.search(
-            query,
-            limit=intent_policy["keyword_top_k"],
-            domain_filter=domain_filter,
-            world_filter=world_filter,
-            query_valence=q_valence,
-            query_arousal=q_arousal,
-            created_after=created_after,
-            created_before=created_before,
-        )
+        for angle in query_angles:
+            for bucket in await bucket_mgr.search(
+                angle,
+                limit=intent_policy["keyword_top_k"],
+                domain_filter=domain_filter,
+                world_filter=world_filter,
+                query_valence=q_valence,
+                query_arousal=q_arousal,
+                created_after=created_after,
+                created_before=created_before,
+            ):
+                existing = keyword_by_id.get(bucket["id"])
+                if existing is None or bucket.get("score", 0) > existing.get("score", 0):
+                    keyword_by_id[bucket["id"]] = bucket
+        keyword_matches = [
+            bucket for bucket in keyword_by_id.values()
+            if not _z_recall_suppressed(bucket, query)
+        ]
     except Exception as e:
         logger.error(f"Keyword search failed / 关键词检索失败: {e}")
         return "检索过程出错，请稍后重试。"
 
     # Vector channel — sim>0.5 floor blocks high-cosine noise
+    vector_scores: dict[str, float] = {}
     try:
-        vector_raw = await embedding_engine.search_similar(
-            query,
-            top_k=intent_policy["vector_top_k"],
-        )
-        vector_ranked = [(bid, sim) for bid, sim in vector_raw if sim > 0.5]
+        for angle in query_angles:
+            for bid, sim in await embedding_engine.search_similar(
+                angle,
+                top_k=intent_policy["vector_top_k"],
+            ):
+                if sim > 0.5 and sim > vector_scores.get(bid, 0.0):
+                    vector_scores[bid] = sim
+        vector_ranked = list(vector_scores.items())
     except Exception as e:
         logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
         vector_ranked = []
@@ -1664,6 +1655,8 @@ async def breath(
             if not b:
                 continue
             meta = b["metadata"]
+            if _z_recall_suppressed(b, query):
+                continue
             if meta.get("pinned") or meta.get("protected"):
                 continue
             if wf_set is not None and not world_matches(meta.get("world", ""), wf_set):
@@ -1736,9 +1729,16 @@ async def breath(
                 break
             await bucket_mgr.touch(bucket["id"])
             if bucket.get("vector_match"):
-                summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
+                prefix = _recall_prefix(
+                    bucket["id"],
+                    "main",
+                    "curated_rrf",
+                    marker="[语义关联]",
+                )
+                summary = f"{prefix} {summary}"
             else:
-                summary = f"[bucket_id:{bucket['id']}] {summary}"
+                prefix = _recall_prefix(bucket["id"], "main", "curated_rrf")
+                summary = f"{prefix} {summary}"
             results.append(summary)
             result_buckets.append(bucket)
             result_ids.append(bucket["id"])
@@ -1769,6 +1769,11 @@ async def breath(
                     break
                 if not isinstance(r, dict):
                     continue
+                rel_type = str(r.get("type") or "").strip()
+                # Default recall traverses descriptive Y edges only. Causal
+                # and update edges remain review-only and cannot enter replies.
+                if not default_graph_relation_allowed(rel_type):
+                    continue
                 t_id = r.get("target")
                 if not t_id or t_id in matched_ids or t_id in seen_neighbors:
                     continue
@@ -1777,6 +1782,8 @@ async def breath(
                 except Exception:
                     continue
                 if not neighbor:
+                    continue
+                if _z_recall_suppressed(neighbor, query):
                     continue
                 if wf_set is not None and not world_matches(
                     neighbor["metadata"].get("world", ""), wf_set
@@ -1790,9 +1797,14 @@ async def breath(
                     summary_tokens = count_tokens_approx(summary)
                     if token_used + summary_tokens > max_tokens:
                         break
-                    rel_type = r.get("type", "?")
+                    prefix = _recall_prefix(
+                        t_id,
+                        "association",
+                        "y_relation",
+                        relation=f"{rel_type}←{bucket['id']}",
+                    )
                     neighbor_msgs.append(
-                        f"[关系:{rel_type}←{bucket['id']}] [bucket_id:{t_id}] {summary}"
+                        f"{prefix} {summary}"
                     )
                     token_used += summary_tokens
                     seen_neighbors.add(t_id)
@@ -1925,11 +1937,14 @@ async def hold(
         # Feel valence/arousal = model's own perspective
         feel_valence = valence if 0 <= valence <= 1 else 0.5
         feel_arousal = arousal if 0 <= arousal <= 1 else 0.3
+        # 2026-07-12 修：原先硬编码空 tags/domain，调用方传的字段全丢，
+        # imprint 写进来的记忆全变'未分类'。改用调用方实际传入的值。
+        feel_domain = [d.strip() for d in (domain or "").split(",") if d.strip()]
         bucket_id = await bucket_mgr.create(
             content=content,
-            tags=[],
+            tags=extra_tags,
             importance=5,
-            domain=[],
+            domain=feel_domain,
             valence=feel_valence,
             arousal=feel_arousal,
             name=None,
@@ -3802,6 +3817,445 @@ async def api_breath_debug(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+OMBRE_RECALL_TRACE_MAX_BYTES = 2_000_000
+
+
+def _append_recall_status_trace(record: dict) -> None:
+    """Content-free, bounded P0 recall trace outside the bucket vault."""
+    path = os.environ.get("OMBRE_RECALL_TRACE_PATH", "").strip()
+    if not path:
+        path = os.path.join(os.path.dirname(config["buckets_dir"]), "recall_status_trace.jsonl")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) >= OMBRE_RECALL_TRACE_MAX_BYTES:
+            os.unlink(path)
+        payload = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        logger.warning("recall status trace append skipped: %s", type(exc).__name__)
+
+
+async def _probe_anchor_status(query: str) -> dict:
+    """Run the read-only recall candidate path without touching bucket access time."""
+    started = time.monotonic()
+    recall_limit = BREATH_RECALL_POOL_SIZE
+    intent_policy = resolve_intent_recall_policy(
+        query,
+        config,
+        base_recall_limit=recall_limit,
+        requested_relation_depth=0,
+    )
+    # Hot-path arbitration is deterministic: do not call the generative query
+    # expander before every Claude turn. Normal breath keeps its existing
+    # expansion behavior; P0 trace makes this boundary explicit.
+    query_angles = [query]
+    qe_cfg = config.get("query_expansion", {}) or {}
+
+    world_filter = _resolve_world_filter("", config.get("current_world", ""))
+    wf_set = {str(value).strip() for value in world_filter} if world_filter is not None else None
+    keyword_by_id: dict[str, dict] = {}
+    keyword_error = False
+    try:
+        keyword_batches = await asyncio.gather(*(
+            bucket_mgr.search(
+                angle,
+                limit=intent_policy["keyword_top_k"],
+                world_filter=world_filter,
+            )
+            for angle in query_angles
+        ))
+        for batch in keyword_batches:
+            for bucket in batch:
+                existing = keyword_by_id.get(bucket["id"])
+                if existing is None or bucket.get("score", 0) > existing.get("score", 0):
+                    keyword_by_id[bucket["id"]] = bucket
+    except Exception as exc:
+        logger.warning("anchor status keyword search failed: %s", type(exc).__name__)
+        keyword_error = True
+
+    vector_scores: dict[str, float] = {}
+    vector_status = "ok"
+    vector_batches = await asyncio.gather(*(
+        embedding_engine.search_similar_with_status(
+            angle, top_k=intent_policy["vector_top_k"]
+        )
+        for angle in query_angles
+    ))
+    for hits, status in vector_batches:
+        if status != "ok":
+            vector_status = status if status in {"empty", "timeout", "error", "circuit_open"} else "error"
+            break
+        for bucket_id, similarity in hits:
+            if similarity > 0.5 and similarity > vector_scores.get(bucket_id, 0.0):
+                vector_scores[bucket_id] = similarity
+
+    matches: list[dict] = []
+    if vector_status == "ok" and not keyword_error:
+        keyword_ranked = [(bucket["id"], bucket.get("score", 0)) for bucket in keyword_by_id.values()]
+        fused_pairs = rrf_fuse(
+            keyword_ranked,
+            list(vector_scores.items()),
+            k=(config.get("rrf", {}) or {}).get("k", 60),
+            keyword_weight=intent_policy["keyword_weight"],
+            vector_weight=intent_policy["vector_weight"],
+        )
+        for bucket_id, fused_score in fused_pairs[:recall_limit]:
+            bucket = keyword_by_id.get(bucket_id) or await bucket_mgr.get(bucket_id)
+            if not bucket:
+                continue
+            meta = bucket.get("metadata", {})
+            if meta.get("pinned") or meta.get("protected"):
+                continue
+            if wf_set is not None and not world_matches(meta.get("world", ""), wf_set):
+                continue
+            bucket["score"] = round(fused_score * 1000, 2)
+            matches.append(bucket)
+        matches = await _ds_filter_candidates(query, matches, mode="search", max_results=2)
+
+    has_evidence = bool(matches) if vector_status == "ok" and not keyword_error else False
+    if keyword_error and vector_status == "ok":
+        vector_status = "error"
+    record = {
+        "ts": now_iso(),
+        "query_len": len(query),
+        "intent": intent_policy.get("intent", "default"),
+        "angle_count": len(query_angles),
+        "query_expansion_skipped_hot_path": bool(qe_cfg.get("enabled", False)),
+        "vector_status": vector_status,
+        "keyword_candidate_count": len(keyword_by_id),
+        "vector_candidate_count": len(vector_scores),
+        "final_candidate_count": len(matches),
+        "has_evidence": has_evidence,
+        "timing_ms": round((time.monotonic() - started) * 1000, 2),
+    }
+    _append_recall_status_trace(record)
+    return record
+
+
+@mcp.custom_route("/api/anchor-status", methods=["GET"])
+async def api_anchor_status(request):
+    """Content-free Anchor health/evidence probe for twin cold-store arbitration."""
+    from starlette.responses import JSONResponse
+    query = request.query_params.get("q", "").strip()
+    if not query:
+        return JSONResponse({"error": "missing q parameter"}, status_code=400)
+    if len(query) > 500:
+        return JSONResponse({"error": "q too long"}, status_code=400)
+    try:
+        result = await _probe_anchor_status(query)
+        return JSONResponse(result)
+    except Exception as exc:
+        logger.warning("anchor status probe failed: %s", type(exc).__name__)
+        return JSONResponse({
+            "vector_status": "error",
+            "has_evidence": False,
+            "final_candidate_count": 0,
+        })
+
+
+@mcp.custom_route("/api/review_queue", methods=["GET"])
+async def api_review_queue(request):
+    """Return the real pending review queue; never substitute demo rows."""
+    from starlette.responses import JSONResponse
+    kind = (request.query_params.get("kind") or "").strip().lower()
+    if kind and kind not in (KIND_RELATION, KIND_Z_CONFLICT):
+        return JSONResponse({"error": "invalid kind"}, status_code=400)
+    try:
+        items = await asyncio.to_thread(_get_review_queue().list_pending, kind or None)
+    except Exception as exc:
+        logger.warning("review queue read failed: %s", type(exc).__name__)
+        return JSONResponse({"error": "review queue unavailable"}, status_code=503)
+    return JSONResponse({"items": items, "total": len(items), "status": "ready"})
+
+
+def _review_write_api_enabled() -> bool:
+    return bool(os.environ.get("OMBRE_API_TOKEN", "").strip())
+
+
+@mcp.custom_route("/api/review_queue/resolve", methods=["POST"])
+async def api_review_queue_resolve(request):
+    """Acknowledge/reject a pending row without applying memory mutations."""
+    from starlette.responses import JSONResponse
+    if not _review_write_api_enabled():
+        return JSONResponse({"error": "OMBRE_API_TOKEN required for review queue writes"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON object required"}, status_code=400)
+    key = str(body.get("key") or "").strip()
+    status = str(body.get("status") or "").strip()
+    verdict_note = str(body.get("verdict_note") or "").strip()[:500]
+    if not key:
+        return JSONResponse({"error": "key required"}, status_code=400)
+    if not rest_resolve_status_allowed(status):
+        return JSONResponse({
+            "error": "REST resolve only supports reviewed/rejected; applied requires an explicit memory transaction",
+        }, status_code=409)
+    try:
+        changed = await asyncio.to_thread(
+            _get_review_queue().resolve,
+            key,
+            status,
+            verdict_note=verdict_note,
+        )
+    except Exception as exc:
+        logger.warning("review queue resolve failed: %s", type(exc).__name__)
+        return JSONResponse({"error": "review queue unavailable"}, status_code=503)
+    if not changed:
+        return JSONResponse({"error": "pending review item not found"}, status_code=404)
+    return JSONResponse({
+        "ok": True,
+        "key": key,
+        "status": status,
+        "memory_mutated": False,
+    })
+
+
+@mcp.custom_route("/api/review_queue/candidate", methods=["POST"])
+async def api_review_queue_candidate(request):
+    """Enqueue a cross-bucket Z candidate without changing either bucket."""
+    from starlette.responses import JSONResponse
+    if not _review_write_api_enabled():
+        return JSONResponse({"error": "OMBRE_API_TOKEN required for review queue writes"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON object required"}, status_code=400)
+    current_id = str(body.get("current_bucket_id") or "").strip()
+    historical_id = str(body.get("historical_bucket_id") or "").strip()
+    id_pattern = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
+    if not id_pattern.fullmatch(current_id) or not id_pattern.fullmatch(historical_id):
+        return JSONResponse({"error": "invalid bucket id"}, status_code=400)
+    if current_id == historical_id:
+        return JSONResponse({"error": "bucket ids must differ"}, status_code=400)
+    current = await bucket_mgr.get(current_id)
+    historical = await bucket_mgr.get(historical_id)
+    if not current or not historical:
+        return JSONResponse({"error": "bucket not found"}, status_code=404)
+
+    def _name(bucket):
+        metadata = bucket.get("metadata") if isinstance(bucket.get("metadata"), dict) else {}
+        return str(metadata.get("name") or "")[:160]
+
+    entry = make_z_pair_entry(
+        current_id,
+        historical_id,
+        current_name=_name(current),
+        historical_name=_name(historical),
+        reason=str(body.get("reason") or "cross_bucket_currentness")[:160],
+        source=str(body.get("source") or "quality_benchmark")[:80],
+    )
+    try:
+        added = await asyncio.to_thread(_get_review_queue().enqueue, entry)
+    except Exception as exc:
+        logger.warning("review queue candidate enqueue failed: %s", type(exc).__name__)
+        return JSONResponse({"error": "review queue unavailable"}, status_code=503)
+    return JSONResponse({
+        "ok": True,
+        "key": entry["key"],
+        "status": "pending",
+        "added": added,
+        "memory_mutated": False,
+    })
+
+
+def _z_lifecycle_apply_allowed(bucket):
+    metadata = bucket.get("metadata") if isinstance(bucket, dict) else None
+    if not isinstance(metadata, dict):
+        return False
+    domains = metadata.get("domain") or []
+    if isinstance(domains, str):
+        domains = [domains]
+    return not (
+        metadata.get("pinned")
+        or metadata.get("protected")
+        or metadata.get("type") in ("permanent", "feel")
+        or any(domain in PROTECTED_RESOLVE_DOMAINS for domain in domains)
+    )
+
+
+_z_lifecycle_apply_lock = asyncio.Lock()
+
+
+@mcp.custom_route("/api/review_queue/apply-lifecycle", methods=["POST"])
+async def api_review_queue_apply_lifecycle(request):
+    """Apply one Z pair with file rollback; never rewrite bucket content."""
+    from starlette.responses import JSONResponse
+    if not _review_write_api_enabled():
+        return JSONResponse({"error": "OMBRE_API_TOKEN required for review queue writes"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON object required"}, status_code=400)
+    if body.get("confirm") != "preserve_both_mark_lifecycle":
+        return JSONResponse({"error": "explicit confirmation required"}, status_code=409)
+    async with _z_lifecycle_apply_lock:
+        return await _apply_review_queue_lifecycle(body)
+
+
+async def _apply_review_queue_lifecycle(body):
+    from starlette.responses import JSONResponse
+    key = str(body.get("key") or "").strip()
+    entry = next(
+        (item for item in _get_review_queue().list_pending(KIND_Z_CONFLICT) if item.get("key") == key),
+        None,
+    )
+    if not entry:
+        return JSONResponse({"error": "pending lifecycle candidate not found"}, status_code=404)
+    try:
+        current_update, historical_update = lifecycle_updates(entry)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    current_id = entry["current_bucket_id"]
+    historical_id = entry["historical_bucket_id"]
+    current = await bucket_mgr.get(current_id)
+    historical = await bucket_mgr.get(historical_id)
+    if not current or not historical:
+        return JSONResponse({"error": "bucket not found"}, status_code=404)
+    if not _z_lifecycle_apply_allowed(current) or not _z_lifecycle_apply_allowed(historical):
+        return JSONResponse({"error": "protected bucket requires separate manual handling"}, status_code=409)
+
+    paths = [bucket_mgr._find_bucket_file(current_id), bucket_mgr._find_bucket_file(historical_id)]
+    if not all(paths):
+        return JSONResponse({"error": "bucket path unavailable"}, status_code=503)
+    backups = []
+    try:
+        for path in paths:
+            with open(path, "rb") as handle:
+                backups.append(handle.read())
+        if not await bucket_mgr.update(current_id, actor="human:lmc5_z_review", **current_update):
+            raise RuntimeError("current update failed")
+        if not await bucket_mgr.update(historical_id, actor="human:lmc5_z_review", **historical_update):
+            raise RuntimeError("historical update failed")
+        current_after = await bucket_mgr.get(current_id)
+        historical_after = await bucket_mgr.get(historical_id)
+        current_meta = current_after.get("metadata", {}) if current_after else {}
+        historical_meta = historical_after.get("metadata", {}) if historical_after else {}
+        if any(current_meta.get(k) != v for k, v in current_update.items()):
+            raise RuntimeError("current verification failed")
+        if any(historical_meta.get(k) != v for k, v in historical_update.items()):
+            raise RuntimeError("historical verification failed")
+        if not await asyncio.to_thread(
+            _get_review_queue().resolve,
+            key,
+            STATUS_APPLIED,
+            verdict_note="preserve both; explicit lifecycle metadata applied",
+        ):
+            raise RuntimeError("queue resolve failed")
+    except Exception as exc:
+        for path, original in zip(paths, backups):
+            temp = path + ".zrollback.tmp"
+            with open(temp, "wb") as handle:
+                handle.write(original)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+        logger.warning("lifecycle transaction rolled back: %s", type(exc).__name__)
+        return JSONResponse({
+            "ok": False,
+            "memory_mutated": False,
+            "rolled_back": True,
+            "error": "lifecycle transaction failed",
+        }, status_code=500)
+    return JSONResponse({
+        "ok": True,
+        "status": "applied",
+        "memory_mutated": True,
+        "content_mutated": False,
+        "both_buckets_preserved": True,
+        "verified": True,
+        "rolled_back": False,
+    })
+
+
+@mcp.custom_route("/api/review_queue/apply-protected-overlay", methods=["POST"])
+async def api_review_queue_apply_protected_overlay(request):
+    """Apply a reviewed read-time overlay while leaving protected buckets untouched."""
+    from starlette.responses import JSONResponse
+    if not _review_write_api_enabled():
+        return JSONResponse({"error": "OMBRE_API_TOKEN required for review queue writes"}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON object required"}, status_code=400)
+    if body.get("confirm") != "preserve_protected_buckets_apply_read_overlay":
+        return JSONResponse({"error": "explicit confirmation required"}, status_code=409)
+    async with _z_lifecycle_apply_lock:
+        key = str(body.get("key") or "").strip()
+        entry = next(
+            (item for item in _get_review_queue().list_pending(KIND_Z_CONFLICT) if item.get("key") == key),
+            None,
+        )
+        if not entry:
+            return JSONResponse({"error": "pending lifecycle candidate not found"}, status_code=404)
+        current = await bucket_mgr.get(entry.get("current_bucket_id"))
+        historical = await bucket_mgr.get(entry.get("historical_bucket_id"))
+        if not current or not historical:
+            return JSONResponse({"error": "bucket not found"}, status_code=404)
+        if _z_lifecycle_apply_allowed(current) and _z_lifecycle_apply_allowed(historical):
+            return JSONResponse({"error": "unprotected pair must use lifecycle transaction"}, status_code=409)
+        overlay = _get_z_currentness_overlay()
+        existed = overlay.path.exists()
+        original = overlay.path.read_bytes() if existed else b""
+        try:
+            overlay_entry = make_currentness_overlay_entry(entry)
+            await asyncio.to_thread(overlay.add, overlay_entry)
+            historical_id = entry["historical_bucket_id"]
+            if not overlay.suppresses(historical_id, "current default"):
+                raise RuntimeError("overlay verification failed")
+            if overlay.suppresses(historical_id, "以前"):
+                raise RuntimeError("history escape verification failed")
+            if not await asyncio.to_thread(
+                _get_review_queue().resolve,
+                key,
+                STATUS_APPLIED,
+                verdict_note="protected buckets preserved; reviewed read overlay applied",
+            ):
+                raise RuntimeError("queue resolve failed")
+        except Exception as exc:
+            if existed:
+                temp = str(overlay.path) + ".rollback.tmp"
+                with open(temp, "wb") as handle:
+                    handle.write(original)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp, overlay.path)
+            elif overlay.path.exists():
+                overlay.path.unlink()
+            logger.warning("protected currentness overlay rolled back: %s", type(exc).__name__)
+            return JSONResponse({
+                "ok": False,
+                "memory_mutated": False,
+                "retrieval_policy_mutated": False,
+                "rolled_back": True,
+                "error": "protected overlay transaction failed",
+            }, status_code=500)
+        return JSONResponse({
+            "ok": True,
+            "status": "applied",
+            "memory_mutated": False,
+            "content_mutated": False,
+            "both_buckets_preserved": True,
+            "retrieval_policy_mutated": True,
+            "history_queries_preserved": True,
+            "verified": True,
+            "rolled_back": False,
+        })
+
+
 @mcp.custom_route("/", methods=["GET"])
 async def root_redirect(request):
     """根路径跳转到 /dashboard，避免存根书签打不开(404)。"""
@@ -4094,6 +4548,74 @@ async def api_import_review(request):
 # Twin REST endpoints — bridge for Telegram bot (and other thin frontends)
 # Twin REST 接口 —— 给 Telegram bot（及其他薄前端）用的桥接
 # =============================================================
+@mcp.custom_route("/api/breath", methods=["POST"])
+async def api_breath(request):
+    """HTTP bridge to the read-only ``breath`` tool.
+
+    The bridge deliberately exposes only the search arguments needed by thin
+    frontends.  Images and the external body-state block are always disabled,
+    so the JSON response is text-only and cannot carry image payloads or mutate
+    body state.  Search-mode access metadata has the same touch semantics as a
+    direct MCP ``breath`` call.
+    """
+    from starlette.responses import JSONResponse
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON object required"}, status_code=400)
+
+    query = str(body.get("query") or "").strip()
+    if not query:
+        return JSONResponse({"error": "query required"}, status_code=400)
+
+    def _int_arg(name, default):
+        try:
+            return int(body.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _float_arg(name, default=-1.0):
+        try:
+            return float(body.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
+    try:
+        result = await breath(
+            query=query,
+            max_tokens=_int_arg("max_tokens", BREATH_DEFAULT_MAX_TOKENS),
+            domain=str(body.get("domain") or ""),
+            valence=_float_arg("valence"),
+            arousal=_float_arg("arousal"),
+            max_results=_int_arg("max_results", BREATH_DEFAULT_MAX_RESULTS),
+            world=str(body.get("world") or ""),
+            relation_depth=_int_arg("relation_depth", 1),
+            since=str(body.get("since") or ""),
+            until=str(body.get("until") or ""),
+            session_id=str(body.get("session_id") or ""),
+            include_images=False,
+            include_body_state=False,
+            reset_body_state=False,
+        )
+    except Exception:
+        logger.exception("HTTP breath bridge failed")
+        return JSONResponse({"error": "breath failed"}, status_code=500)
+
+    if isinstance(result, str):
+        text = result
+    elif isinstance(result, list):
+        text = "\n".join(
+            value for item in result
+            if isinstance((value := getattr(item, "text", None)), str)
+        )
+    else:
+        text = str(result)
+    return JSONResponse({"raw": text})
+
+
 @mcp.custom_route("/api/hold", methods=["POST"])
 async def api_hold(request):
     """HTTP bridge to hold tool. Body: {content, tags?, importance?, pinned?, source?,

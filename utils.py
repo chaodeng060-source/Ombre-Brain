@@ -48,6 +48,11 @@ REVIEW_RELATION_TYPES = frozenset({
 assert SAFE_RELATION_TYPES | REVIEW_RELATION_TYPES == RELATION_TYPES
 assert not (SAFE_RELATION_TYPES & REVIEW_RELATION_TYPES)
 
+
+def default_graph_relation_allowed(value) -> bool:
+    """Return whether an edge type may participate in default recall expansion."""
+    return str(value or "").strip() in SAFE_RELATION_TYPES
+
 # Domains where a bucket must never be marked resolved=True.
 # Not "problem-and-solution" structures — persistent states (relationships,
 # commitments, feelings, family, self-reflection). Resolving = forgetting.
@@ -128,7 +133,38 @@ def load_config(config_path: str = None) -> dict:
             "keyword_weight": 1.0,
             "vector_weight": 1.0,
         },
+        # Stage-0 query expansion is deliberately limited to memory-shaped
+        # intents. Exact fact lookups keep the user's literal query untouched.
+        "query_expansion": {
+            "enabled": False,
+            "allowed_intents": ["recall", "relation", "temporal"],
+            "max_angles": 2,
+            "max_tokens": 120,
+            "temperature": 0.3,
+            "min_query_len": 4,
+            "max_query_chars": 500,
+        },
+        "recall_evidence_roles": {
+            "enabled": False,
+        },
+        "relation_recall": {
+            "allowed_types": sorted(SAFE_RELATION_TYPES),
+            "hop1_min_strength": 0.4,
+            "hop2_min_strength": 0.7,
+        },
+        # Optional deterministic Z-axis slots.  Empty registry means no bucket
+        # is treated as a versioned fact; models cannot mint slot names.
+        "fact_slots": {
+            "enabled": True,
+            "registry": {},
+        },
         "intent_recall": DEFAULT_INTENT_RECALL_CONFIG,
+        # Safety gates default closed-to-write: inferred causal/update edges
+        # and detected fact conflicts are review material, not silent truth.
+        "review_gate": {
+            "relation_review": True,
+            "fact_evolution_audit": True,
+        },
         "merge": {
             "keyword_limit": 5,
             "vector_limit": 8,
@@ -151,6 +187,7 @@ def load_config(config_path: str = None) -> dict:
         )
 
     config = defaults.copy()
+    file_config = {}
     if os.path.exists(config_path):
         try:
             with open(config_path, "r", encoding="utf-8") as f:
@@ -167,6 +204,13 @@ def load_config(config_path: str = None) -> dict:
                 f"Failed to parse config file, using defaults / "
                 f"配置文件解析失败，使用默认配置: {e}"
             )
+
+    legacy_qe = file_config.get("query_expand") if isinstance(file_config, dict) else None
+    if isinstance(legacy_qe, dict) and "query_expansion" not in file_config:
+        config["query_expansion"] = _deep_merge(
+            config.get("query_expansion", {}) or {},
+            legacy_qe,
+        )
 
     # --- Dehydration env overrides ---
     env_api_key = os.environ.get("OMBRE_API_KEY", "")

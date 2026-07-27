@@ -13,6 +13,7 @@ from review_queue import (
 )
 from utils import (
     RELATION_TYPES, SAFE_RELATION_TYPES, REVIEW_RELATION_TYPES,
+    default_graph_relation_allowed,
 )
 
 
@@ -110,3 +111,10 @@ def test_relation_partition_covers_all_types():
     # 危险类就是「因果 / 取代」那四个
     assert REVIEW_RELATION_TYPES == {"causes", "contributes", "improves", "updates"}
     assert SAFE_RELATION_TYPES == {"kin", "explains"}
+
+
+def test_default_graph_expansion_rejects_review_and_unknown_edges():
+    assert all(default_graph_relation_allowed(value) for value in SAFE_RELATION_TYPES)
+    assert not any(default_graph_relation_allowed(value) for value in REVIEW_RELATION_TYPES)
+    assert default_graph_relation_allowed(" made_up ") is False
+    assert default_graph_relation_allowed(None) is False

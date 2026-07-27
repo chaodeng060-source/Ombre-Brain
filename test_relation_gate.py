@@ -51,7 +51,7 @@ class _FakeDehydrator:
         ]
 
 
-def _setup(monkeypatch_gate: bool):
+def _setup(monkeypatch_gate: bool | None):
     tmpdir = tempfile.mkdtemp(prefix="relgate_")
     fake_mgr = _FakeBucketMgr()
     server.embedding_engine = _FakeEmbedding()
@@ -61,7 +61,10 @@ def _setup(monkeypatch_gate: bool):
     # 直接塞队列实例，避免 _get_review_queue 跟着 config.buckets_dir 跑偏
     server._get_review_queue = lambda: server._review_queue
     server.config = dict(server.config)
-    server.config["review_gate"] = {"relation_review": monkeypatch_gate}
+    if monkeypatch_gate is None:
+        server.config.pop("review_gate", None)
+    else:
+        server.config["review_gate"] = {"relation_review": monkeypatch_gate}
     return fake_mgr, server._review_queue
 
 
@@ -84,6 +87,21 @@ def test_gate_on_diverts_dangerous_edge():
     assert len(pend) == 1 and pend[0]["rel_type"] == "causes"  # 危险 causes 改入队
     assert pend[0]["source_id"] == "src" and pend[0]["target_id"] == "buk_cause"
     assert pend[0]["target_name"] == "因果桶"
+
+
+def test_gate_defaults_on_when_config_is_missing():
+    mgr, q = _setup(monkeypatch_gate=None)
+    added = run(server._auto_infer_edges("src", "源内容", world=""))
+    assert [t for _, _, t in mgr.added] == ["kin"]
+    assert [entry["type"] for entry in added] == ["kin"]
+    assert len(q.list_pending(KIND_RELATION)) == 1
+
+
+def test_review_write_api_requires_configured_bearer(monkeypatch):
+    monkeypatch.delenv("OMBRE_API_TOKEN", raising=False)
+    assert server._review_write_api_enabled() is False
+    monkeypatch.setenv("OMBRE_API_TOKEN", "test-only-token")
+    assert server._review_write_api_enabled() is True
 
 
 def _tool_fn(t):

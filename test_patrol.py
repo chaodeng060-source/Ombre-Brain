@@ -3,10 +3,11 @@
 回归锁定（小卷 review 抓的两处静默失效）：
   - 脏 content 键 frontmatter 重组不丢 metadata（closing --- 须独占行）
   - _parse_dt 吃 frontmatter 直接给的 datetime 对象（不止 str）
-另覆盖：递归扫 .md（非旧的顶层 .json）、保护域 resolved 命中、
-       陈旧重要命中、整体跑通不炸。
+另覆盖：递归扫 .md、读取备份 JSON 快照并忽略 sidecar、保护域 resolved
+       命中、陈旧重要命中、整体跑通不炸。
 """
 import tempfile
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -95,3 +96,64 @@ def test_patrol_end_to_end_flags():
     assert any(x["id"] == "love" for x in rep["protected_resolved"])
     assert any(x["id"] == "old" for x in rep["stale_important"])
     assert "巡检" in patrol.render_md(rep, Path(d), now)   # render 不炸
+
+
+def test_patrol_reports_relation_hygiene_and_duplicate_fact_slots():
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "dynamic/a.md",
+               "---\nid: a\nname: A\ntype: dynamic\nfact_key: profile.city\n"
+               "relations:\n"
+               "- {type: kin, target: b, strength: 0.9}\n"
+               "- {type: kin, target: b, strength: 0.9}\n"
+               "- {type: kin, target: a}\n"
+               "- {type: made_up, target: b}\n"
+               "- {type: explains, target: b, strength: 2.0}\n"
+               "---\nA body\n")
+        _write(d, "dynamic/b.md",
+               "---\nid: b\nname: B\ntype: dynamic\nfact_key: profile.city\n"
+               "relations:\n- {type: kin, target: a}\n"
+               "---\nB body\n")
+        rep = patrol.patrol(
+            Path(d),
+            datetime(2026, 6, 19, 0, 0, 0),
+            fact_slot_registry={"profile.city": {"aliases": ["城市"]}},
+        )
+
+    assert rep["self_loops"]
+    assert rep["duplicate_edges"]
+    assert rep["reciprocal_kin"] == [{"from": "a", "target": "b", "type": "kin"}]
+    assert any(item["type"] == "made_up" for item in rep["invalid_relation_types"])
+    assert any(item["strength"] == 2.0 for item in rep["invalid_relation_strengths"])
+    assert rep["fact_conflicts"] == {"profile.city": ["a", "b"]}
+
+
+def test_patrol_reads_json_backup_snapshots_and_ignores_sidecars():
+    with tempfile.TemporaryDirectory() as d:
+        snapshot = {
+            "id": "abcdef123456",
+            "metadata": {
+                "id": "abcdef123456",
+                "name": "城市事实",
+                "type": "dynamic",
+                "domain": ["生活"],
+            },
+            "content": "居住城市: 杭州",
+        }
+        Path(d, "abcdef123456.json").write_text(
+            json.dumps(snapshot, ensure_ascii=False), encoding="utf-8"
+        )
+        Path(d, "body_state.json").write_text(
+            json.dumps({"arousal": 0.5}), encoding="utf-8"
+        )
+
+        rep = patrol.patrol(
+            Path(d),
+            datetime(2026, 6, 19, 0, 0, 0),
+            fact_slot_registry={"profile.city": {"aliases": ["居住城市"]}},
+        )
+
+    assert rep["total"] == 1
+    assert rep["broken"] == []
+    assert rep["migration_candidates"] == [
+        {"id": "abcdef123456", "fact_key": "profile.city", "values": ["杭州"]}
+    ]

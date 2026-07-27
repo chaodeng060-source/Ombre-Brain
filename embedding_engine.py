@@ -170,10 +170,22 @@ class EmbeddingEngine:
             return False
 
     async def _generate_embedding(self, text: str) -> list[float]:
+        embedding, _status = await self._generate_embedding_with_status(text)
+        return embedding
+
+    async def _generate_embedding_with_status(self, text: str) -> tuple[list[float], str]:
+        """Generate one query/document vector with an explicit health status.
+
+        Existing callers keep using ``_generate_embedding`` and retain the same
+        fail-soft behavior. Recall arbitration uses this status so timeout/error/
+        circuit-open can never be mistaken for a healthy empty result.
+        """
+        if not self.enabled or self.client is None:
+            return [], "error"
         # --- Circuit open: endpoint deemed unreachable, skip API entirely (instant) ---
         # --- 熔断打开：端点已判定不可达，直接跳过 API（瞬返），不再空转等超时 ---
         if self._circuit_until > time.time():
-            return []
+            return [], "circuit_open"
 
         truncated = redact_embedding_input(text)[:2000]
         try:
@@ -183,8 +195,9 @@ class EmbeddingEngine:
             )
             self._consec_fail = 0  # success resets the breaker
             if response.data and len(response.data) > 0:
-                return response.data[0].embedding
-            return []
+                embedding = response.data[0].embedding
+                return (embedding, "ok") if embedding else ([], "empty")
+            return [], "empty"
         except Exception as e:
             self._consec_fail += 1
             if self._consec_fail >= self._circuit_threshold and self._circuit_until <= time.time():
@@ -194,7 +207,8 @@ class EmbeddingEngine:
                     f"{self._consec_fail} consecutive failures / 向量化熔断打开，冷却期内跳过"
                 )
             logger.warning(f"Embedding API call failed: {e}")
-            return []
+            is_timeout = isinstance(e, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException))
+            return [], "timeout" if is_timeout else "error"
 
     def _store_embedding(self, bucket_id: str, embedding: list[float]):
         from utils import now_iso
@@ -223,22 +237,30 @@ class EmbeddingEngine:
         return None
 
     async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
+        results, _status = await self.search_similar_with_status(query, top_k=top_k)
+        return results
+
+    async def search_similar_with_status(
+        self,
+        query: str,
+        top_k: int = 10,
+    ) -> tuple[list[tuple[str, float]], str]:
         if not self.enabled:
-            return []
+            return [], "error"
 
         try:
-            query_embedding = await self._generate_embedding(query)
+            query_embedding, status = await self._generate_embedding_with_status(query)
             if not query_embedding:
-                return []
+                return [], status
         except Exception as e:
             logger.warning(f"Query embedding failed: {e}")
-            return []
+            return [], "error"
 
         with closing(sqlite3.connect(self.db_path)) as conn:
             rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
 
         if not rows:
-            return []
+            return [], "ok"
 
         results = []
         for bucket_id, emb_json in rows:
@@ -250,7 +272,7 @@ class EmbeddingEngine:
                 continue
 
         results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
+        return results[:top_k], "ok"
 
     def _max_similarity(self, query_emb: list[float], stored) -> float:
         """对一个桶的 stored 向量取与 query 的最高余弦相似度。
