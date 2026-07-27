@@ -91,6 +91,33 @@ def test_disabled_or_empty_registry_is_fail_open(monkeypatch):
     ) == buckets
 
 
+def test_historical_wrong_registry_context_is_fail_open(monkeypatch):
+    candidate = _bucket("historical", key="profile.city", status="historical")
+    candidate["metadata"]["domain"] = ["工作"]
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            **server.config,
+            "fact_slots": {
+                "enabled": True,
+                "registry": {
+                    "profile.city": {
+                        "aliases": ["城市"],
+                        "domains": ["生活"],
+                    },
+                },
+            },
+        },
+    )
+
+    assert server._filter_z_fact_candidates(
+        [candidate],
+        query="具体地址是多少",
+        intent="fact",
+    ) == [candidate]
+
+
 def test_pair_validation_rechecks_registry_context_and_existing_slot(monkeypatch):
     _configure(monkeypatch)
     current = _bucket("current")

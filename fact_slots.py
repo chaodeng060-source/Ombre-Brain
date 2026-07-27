@@ -261,9 +261,9 @@ def filter_fact_slot_candidates(
             kept.append(bucket)
             continue
         meta = _metadata(bucket)
-        canonical = registered_fact_key(meta.get("fact_key"), registry)
+        applies = fact_slot_applies_to_bucket(meta.get("fact_key"), bucket, registry)
         status = str(meta.get("fact_status") or FACT_STATUS_CURRENT).strip().lower()
-        if canonical is not None and status == FACT_STATUS_HISTORICAL:
+        if applies and status == FACT_STATUS_HISTORICAL:
             continue
         kept.append(bucket)
     return kept
