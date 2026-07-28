@@ -436,6 +436,7 @@ Sensitive config via env vars:
 - `OMBRE_API_KEY` — LLM API 密钥
 - `OMBRE_TRANSPORT` — 覆盖传输方式
 - `OMBRE_BUCKETS_DIR` — 覆盖存储路径
+- `OMBRE_HOOK_TOKEN` — LMC-5 生命周期 hook 的共享密钥（启用时必填）
 
 ## 衰减公式 / Decay Formula
 
@@ -673,7 +674,7 @@ When connecting via tunnel, ensure:
 
 ---
 
-### Session Start Hook（自动 breath）
+### Claude 生命周期 Hooks（自动写入与召回）
 
 部署后，如果你使用 Claude Code，可以在项目内激活自动浮现 hook：
 `.claude/settings.json` 已配置好 `SessionStart` hook，每次新会话或恢复会话时自动触发 `breath`，把最高权重未解决记忆推入上下文。
@@ -682,7 +683,14 @@ When connecting via tunnel, ensure:
 
 可以通过 `OMBRE_HOOK_URL` 环境变量指定服务器地址（默认 `http://localhost:8000`），或者设置 `OMBRE_HOOK_SKIP=1` 临时禁用。
 
-If using Claude Code, `.claude/settings.json` configures a `SessionStart` hook that auto-calls `breath` on each new or resumed session, surfacing your highest-weight unresolved memories as context. Only active in remote HTTP mode. Set `OMBRE_HOOK_SKIP=1` to disable temporarily.
+LMC-5 另外接入两条显式生命周期闭环：
+
+- `UserPromptSubmit`：只有记忆、时间线或历史事实问题命中意图门时才调用 `/lmc5/recall-hook`；服务故障时不阻断聊天。
+- `SessionEnd`：先把完整 transcript 的原始 JSONL 原子落进本机私有 outbox，再送入 `/lmc5/raw-events` 永久账本；只有精确 durable ACK 后才删除。断网或 503 时保留，下一次启动/恢复会自动补送，绝不伪报归档成功。
+
+这两条私有桥接要求服务端和 hook 进程配置同一个高熵 `OMBRE_HOOK_TOKEN`。反向代理后的来源 IP 不作为认证依据；未配置 token 时服务端会拒绝请求。`OMBRE_HOOK_TIMEOUT_SECONDS` 可覆盖默认 12 秒 HTTP 超时，`OMBRE_HOOK_OUTBOX_DIR` 可指定待发箱的绝对路径。私有 token 只允许通过 HTTPS 发送；明文 HTTP 仅允许 loopback，且客户端拒绝重定向。
+
+If using Claude Code, `.claude/settings.json` configures `SessionStart`, intent-gated `UserPromptSubmit` recall, and fail-closed `SessionEnd` raw-event ingestion. The two LMC-5 private bridges require the same high-entropy `OMBRE_HOOK_TOKEN` on the server and hook process. Set `OMBRE_HOOK_SKIP=1` to disable hooks temporarily.
 
 ## 更新 / How to Update
 

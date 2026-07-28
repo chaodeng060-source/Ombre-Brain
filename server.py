@@ -34,9 +34,11 @@ import os
 import sys
 import json
 import hashlib
+import hmac
 import random
 import logging
 import asyncio
+import contextvars
 import threading
 import base64
 import mimetypes
@@ -112,6 +114,13 @@ from review_queue import (
     KIND_RELATION, KIND_Z_CONFLICT,
     query_requests_history, rest_resolve_status_allowed,
 )
+from lmc5_ledger import (
+    LMC5Ledger,
+    LedgerConflictError,
+    LedgerCorruptionError,
+    LedgerError,
+    LedgerValidationError,
+)
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -137,6 +146,16 @@ sensory_engine = SensoryEngine(config["buckets_dir"])  # External body-state sid
 # 机器自动推断的危险边 / 合并检出的事实冲突改挂 pending 给人审，不动现有部署路。
 _review_queue = None
 _e_axis_shadow_store = None
+_lmc5_ledger = None
+_lmc5_ledger_lock = threading.Lock()
+_strict_recall_errors = contextvars.ContextVar(
+    "ombre_strict_recall_errors",
+    default=False,
+)
+
+
+class RecallOperationalError(RuntimeError):
+    """A required recall channel failed instead of returning valid evidence."""
 
 
 def _get_review_queue() -> ReviewQueue:
@@ -155,6 +174,73 @@ def _get_e_axis_shadow_store() -> EAxisShadowStore:
     if _e_axis_shadow_store is None or str(_e_axis_shadow_store.path) != path:
         _e_axis_shadow_store = EAxisShadowStore(path)
     return _e_axis_shadow_store
+
+
+def _get_lmc5_ledger() -> LMC5Ledger:
+    """Return the append-only raw/chunk/candidate ledger for this vault."""
+    global _lmc5_ledger
+    path = os.path.join(
+        config["buckets_dir"],
+        ".lmc5",
+        "pipeline.sqlite3",
+    )
+    expected_path = os.path.abspath(path)
+    if _lmc5_ledger is None or os.fspath(_lmc5_ledger.path) != expected_path:
+        with _lmc5_ledger_lock:
+            if (
+                _lmc5_ledger is None
+                or os.fspath(_lmc5_ledger.path) != expected_path
+            ):
+                _lmc5_ledger = LMC5Ledger(path)
+    return _lmc5_ledger
+
+
+def _hook_auth_state(request) -> str:
+    """Authenticate private hook bridges without trusting proxy source IPs.
+
+    The memory service is commonly reached through a local reverse proxy, so
+    ``request.client.host`` cannot distinguish a real localhost hook from an
+    Internet request.  A configured shared token is therefore mandatory.
+    """
+    expected = os.environ.get("OMBRE_HOOK_TOKEN", "")
+    if not expected:
+        return "unconfigured"
+    supplied = ""
+    try:
+        supplied = str(request.headers.get("x-ombre-hook-token") or "")
+    except Exception:
+        supplied = ""
+    if supplied and hmac.compare_digest(supplied, expected):
+        return "authorized"
+    return "forbidden"
+
+
+async def _await_daemon_thread(function):
+    """Await one blocking call without retaining a process-wide executor.
+
+    The service is long-lived, while CLI/tests may import and exit immediately.
+    A one-shot daemon worker avoids both event-loop blocking and a persistent
+    default-executor thread keeping short-lived processes alive.
+    """
+    finished = threading.Event()
+    outcome = {}
+
+    def run():
+        try:
+            outcome["value"] = function()
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            finished.set()
+
+    threading.Thread(target=run, daemon=True).start()
+    # Polling avoids depending on a cross-thread selector wakeup after an
+    # fsync-heavy SQLite call; the short sleep still yields the event loop.
+    while not finished.is_set():
+        await asyncio.sleep(0.01)
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
 
 
 def _fact_slot_registry() -> dict:
@@ -967,6 +1053,197 @@ async def dream_hook(request):
     except Exception as e:
         logger.warning(f"Dream hook failed: {e}")
         return PlainTextResponse("")
+
+
+# =============================================================
+# LMC-5 hook bridges: exact SessionEnd ingest + per-turn recall
+# LMC-5 挂钩桥：SessionEnd 原始事件入账 + 每轮召回
+# =============================================================
+_LMC5_HOOK_MAX_BODY_BYTES = 32 * 1024 * 1024
+_LMC5_HOOK_MAX_EVENTS = 5000
+_LMC5_RECALL_MAX_BODY_BYTES = 64 * 1024
+_LMC5_RECALL_MAX_PROMPT_CHARS = 20000
+
+
+async def _read_bounded_json_object(request, *, max_bytes: int) -> dict:
+    raw = await request.body()
+    if len(raw) > max_bytes:
+        raise ValueError("request body too large")
+    try:
+        body = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid JSON") from exc
+    if not isinstance(body, dict):
+        raise ValueError("JSON object required")
+    return body
+
+
+@mcp.custom_route("/lmc5/raw-events", methods=["POST"])
+async def lmc5_raw_events_hook(request):
+    """Atomically append one SessionEnd transcript batch.
+
+    ``payload`` is the exact JSONL source line, not a model summary. The
+    ledger owns deduplication by ``(session_id, source_event_id)`` and rolls
+    the whole batch back on any identity conflict.
+    """
+    from starlette.responses import JSONResponse
+
+    auth_state = _hook_auth_state(request)
+    if auth_state == "unconfigured":
+        return JSONResponse(
+            {"error": "hook authentication is not configured"},
+            status_code=503,
+        )
+    if auth_state != "authorized":
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    try:
+        body = await _read_bounded_json_object(
+            request,
+            max_bytes=_LMC5_HOOK_MAX_BODY_BYTES,
+        )
+        if set(body) != {"schema_version", "session_id", "events"}:
+            raise ValueError("raw-event contract fields do not match")
+        if body["schema_version"] != 1:
+            raise ValueError("unsupported schema_version")
+        session_id = body["session_id"]
+        events = body["events"]
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id required")
+        if not isinstance(events, list) or not events:
+            raise ValueError("non-empty events list required")
+        if len(events) > _LMC5_HOOK_MAX_EVENTS:
+            raise ValueError("too many events")
+
+        normalized = []
+        for event in events:
+            if not isinstance(event, dict) or set(event) != {
+                "source_event_id",
+                "payload",
+            }:
+                raise ValueError("event contract fields do not match")
+            source_event_id = event["source_event_id"]
+            payload = event["payload"]
+            if not isinstance(source_event_id, str) or not source_event_id.strip():
+                raise ValueError("source_event_id required")
+            if not isinstance(payload, str) or not payload.strip():
+                raise ValueError("exact JSONL payload required")
+            # Retain the exact line, but require every event to be an
+            # independently valid JSON object before the atomic ledger call.
+            parsed = json.loads(payload)
+            if not isinstance(parsed, dict):
+                raise ValueError("transcript event must be a JSON object")
+            normalized.append(
+                {
+                    "session_id": session_id,
+                    "source_event_id": source_event_id,
+                    "payload": payload,
+                }
+            )
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    try:
+        # One SQLite transaction with bounded input.  Keep it in this request
+        # rather than acknowledging before a detached worker has fsynced it.
+        # Ledger setup and FULL-synchronous SQLite writes can wait on a busy
+        # writer.  Keep the HTTP event loop responsive, but await the worker
+        # before issuing the durable acknowledgement.
+        results = await _await_daemon_thread(
+            lambda: _get_lmc5_ledger().append_raw_events(normalized)
+        )
+    except LedgerConflictError:
+        return JSONResponse({"error": "raw event identity conflict"}, status_code=409)
+    except LedgerValidationError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except LedgerCorruptionError:
+        logger.exception("LMC-5 raw-event ledger is corrupt")
+        return JSONResponse({"error": "raw-event ledger unavailable"}, status_code=503)
+    except LedgerError:
+        logger.exception("LMC-5 raw-event ingest failed")
+        return JSONResponse({"error": "raw-event ingest failed"}, status_code=500)
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "session_id": session_id,
+            "acknowledged": len(results),
+            "inserted": sum(1 for result in results if result.created),
+        }
+    )
+
+
+@mcp.custom_route("/lmc5/recall-hook", methods=["POST"])
+async def lmc5_recall_hook(request):
+    """Run the normal authoritative recall pipeline for one user prompt."""
+    from starlette.responses import JSONResponse
+
+    auth_state = _hook_auth_state(request)
+    if auth_state == "unconfigured":
+        return JSONResponse(
+            {"error": "hook authentication is not configured"},
+            status_code=503,
+        )
+    if auth_state != "authorized":
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    try:
+        body = await _read_bounded_json_object(
+            request,
+            max_bytes=_LMC5_RECALL_MAX_BODY_BYTES,
+        )
+        allowed_fields = {"schema_version", "prompt", "session_id"}
+        if set(body) - allowed_fields or not {"schema_version", "prompt"} <= set(body):
+            raise ValueError("recall-hook contract fields do not match")
+        if body["schema_version"] != 1:
+            raise ValueError("unsupported schema_version")
+        prompt = body["prompt"]
+        session_id = body.get("session_id", "")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt required")
+        if len(prompt) > _LMC5_RECALL_MAX_PROMPT_CHARS:
+            raise ValueError("prompt too large")
+        if not isinstance(session_id, str) or len(session_id) > 512:
+            raise ValueError("invalid session_id")
+    except (ValueError, TypeError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    strict_token = _strict_recall_errors.set(True)
+    try:
+        result = await breath(
+            query=prompt.strip(),
+            max_tokens=min(BREATH_DEFAULT_MAX_TOKENS, 6000),
+            max_results=BREATH_DEFAULT_MAX_RESULTS,
+            relation_depth=2,
+            session_id=session_id.strip(),
+            include_images=False,
+            include_body_state=False,
+            reset_body_state=False,
+        )
+    except Exception:
+        logger.exception("LMC-5 per-turn recall failed")
+        return JSONResponse({"error": "recall failed"}, status_code=500)
+    finally:
+        _strict_recall_errors.reset(strict_token)
+
+    if isinstance(result, str):
+        if result in {
+            "检索过程出错，请稍后重试。",
+            "记忆系统暂时无法访问。",
+            "读取 feel 失败。",
+        }:
+            logger.error("LMC-5 recall returned an operational failure sentinel")
+            return JSONResponse({"error": "recall failed"}, status_code=500)
+        context = result
+    elif isinstance(result, list):
+        context = "\n".join(
+            value
+            for item in result
+            if isinstance((value := getattr(item, "text", None)), str)
+        )
+    else:
+        context = str(result)
+    return JSONResponse({"ok": True, "context": context})
 
 
 # =============================================================
@@ -1810,6 +2087,8 @@ async def breath(
         )
     except Exception as e:
         logger.error(f"Keyword search failed / 关键词检索失败: {e}")
+        if _strict_recall_errors.get():
+            raise RecallOperationalError("keyword_search_failed") from e
         return "检索过程出错，请稍后重试。"
 
     # Vector channel — sim>0.5 floor blocks high-cosine noise
@@ -1825,6 +2104,8 @@ async def breath(
         vector_ranked = list(vector_scores.items())
     except Exception as e:
         logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
+        if _strict_recall_errors.get():
+            raise RecallOperationalError("vector_search_failed") from e
         vector_ranked = []
 
     # RRF fusion of two ranked channels

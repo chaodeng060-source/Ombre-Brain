@@ -122,13 +122,15 @@
 **`pulse`** — 系统状态：
 - 返回各类型桶数量、衰减引擎状态、未解决/钉选/feel 统计
 
-**REST API（17 个端点）**
+**REST API（核心端点）**
 
 | 端点 | 方法 | 功能 |
 |---|---|---|
 | `/health` | GET | 健康检查 |
 | `/breath-hook` | GET | SessionStart 钩子 |
 | `/dream-hook` | GET | Dream 钩子 |
+| `/lmc5/recall-hook` | POST | UserPromptSubmit 按需召回（私有 token） |
+| `/lmc5/raw-events` | POST | SessionEnd 原始 JSONL 原子入账（私有 token） |
 | `/dashboard` | GET | Dashboard 页面 |
 | `/api/buckets` | GET | 桶列表 |
 | `/api/bucket/{id}` | GET | 桶详情 |
@@ -166,7 +168,11 @@
 - 向量搜索不可用 → 纯 fuzzy match
 - 逐条错误隔离（grow 中单条失败不影响其他）
 
-**安全**：路径遍历防护（`safe_path()`）、API Key 脱敏、API Key 不持久化到 yaml、输入范围钳制
+LMC-5 生命周期钩子使用不同的失败策略：
+- `UserPromptSubmit` 先经过意图门，只对记忆/时间线问题召回；服务故障时 fail-open，不阻断对话。
+- `SessionEnd` 先完整校验 transcript，再原子写入本机私有 outbox；只有服务端整批永久入账并返回精确 durable ACK 后才删除。断网/503 时保留，后续 SessionStart/resume 自动补送，不把失败冒充已归档。
+
+**安全**：路径遍历防护（`safe_path()`）、API Key 脱敏、API Key 不持久化到 yaml、输入范围钳制；LMC-5 私有 hook 不信任反向代理后的来源 IP，必须配置共享 `OMBRE_HOOK_TOKEN`
 
 **监控**：结构化日志、Health 端点、Breath Debug 端点、Dashboard 统计栏、衰减周期日志
 
@@ -183,6 +189,9 @@
 | `OMBRE_CURRENT_WORLD` | 全局当前世界指针，覆盖 config + sidecar | 否 | `""` → 日常模式 |
 | `OMBRE_HOOK_URL` | SessionStart 钩子调用的服务器 URL | 否 | `"http://localhost:8000"` |
 | `OMBRE_HOOK_SKIP` | 设为 `"1"` 跳过 SessionStart 钩子 | 否 | 未设置（不跳过） |
+| `OMBRE_HOOK_TOKEN` | LMC-5 SessionEnd / UserPromptSubmit 私有桥接共享 token | 启用 LMC-5 hook 时必填 | 无；未配置时服务端返回 503 |
+| `OMBRE_HOOK_TIMEOUT_SECONDS` | LMC-5 hook HTTP 请求超时（秒） | 否 | `12` |
+| `OMBRE_HOOK_OUTBOX_DIR` | SessionEnd 私有待发箱绝对路径 | 否 | 系统 state 目录下的 `ombre-lmc5/outbox` |
 
 环境变量优先级：`环境变量 > config.yaml > 硬编码默认值`。所有环境变量在 `utils.py` 中读取并注入 config dict。
 

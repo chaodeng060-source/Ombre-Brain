@@ -6,10 +6,23 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"$CLAUDE_PROJECT_DIR/.claude/hooks/session_breath.py\"",
-            "shell": "/bin/bash",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.claude/hooks/run_lmc5_hook.mjs",
+              "session-breath"
+            ],
             "timeout": 12,
             "statusMessage": "Ombre Brain 正在浮现记忆..."
+          },
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.claude/hooks/run_lmc5_hook.mjs",
+              "retry-outbox"
+            ],
+            "timeout": 12,
+            "statusMessage": "Ombre Brain 正在补送待归档事件..."
           }
         ]
       },
@@ -18,10 +31,55 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python \"$CLAUDE_PROJECT_DIR/.claude/hooks/session_breath.py\"",
-            "shell": "/bin/bash",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.claude/hooks/run_lmc5_hook.mjs",
+              "session-breath"
+            ],
             "timeout": 12,
             "statusMessage": "Ombre Brain 正在浮现记忆..."
+          },
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.claude/hooks/run_lmc5_hook.mjs",
+              "retry-outbox"
+            ],
+            "timeout": 12,
+            "statusMessage": "Ombre Brain 正在补送待归档事件..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.claude/hooks/run_lmc5_hook.mjs",
+              "user-prompt-submit"
+            ],
+            "timeout": 15,
+            "statusMessage": "Ombre Brain 正在按需召回..."
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PROJECT_DIR}/.claude/hooks/run_lmc5_hook.mjs",
+              "session-end"
+            ],
+            "timeout": 60,
+            "statusMessage": "Ombre Brain 正在归档本轮原始事件..."
           }
         ]
       }
