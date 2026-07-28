@@ -5,12 +5,14 @@ safe/review 关系分级覆盖完整、render_md 不炸。
 """
 import os
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 
 from review_queue import (
     ReviewQueue, lifecycle_updates, make_relation_entry, make_z_conflict_entry,
     make_z_pair_entry, render_md,
     KIND_RELATION, KIND_Z_CONFLICT,
     STATUS_PENDING, STATUS_APPLIED, STATUS_REJECTED,
+    ReviewQueueCorruptError,
 )
 from utils import (
     RELATION_TYPES, SAFE_RELATION_TYPES, REVIEW_RELATION_TYPES,
@@ -31,6 +33,26 @@ def test_enqueue_idempotent():
     # 重新构造同一条（key 只由 source/type/target 决定）也算重复
     assert q.enqueue(make_relation_entry("a", "b", "causes", "别的备注")) is False
     assert len(q.list_pending()) == 1
+
+
+def test_enqueue_is_idempotent_across_concurrent_writers():
+    q = _q()
+    entry = make_relation_entry("a", "b", "causes")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: q.enqueue(entry), range(32)))
+    assert results.count(True) == 1
+    assert len(q.list_pending()) == 1
+
+
+def test_corrupt_row_fails_closed_instead_of_looking_empty():
+    q = _q()
+    os.makedirs(q.path.parent, exist_ok=True)
+    q.path.write_text("{not json}\n", encoding="utf-8")
+    try:
+        q.list_pending()
+        assert False, "corrupt review queue must fail closed"
+    except ReviewQueueCorruptError:
+        pass
 
 
 def test_list_pending_by_kind():

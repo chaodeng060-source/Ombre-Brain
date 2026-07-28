@@ -29,6 +29,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from storage_safety import advisory_file_lock, atomic_write_text
+
 
 # 队列里两类条目（kind）：
 KIND_RELATION = "relation"    # #3：机器自动推断的「危险」关系边（因果/取代类）
@@ -44,6 +46,10 @@ STATUS_REJECTED = "rejected"   # 人否决候选
 # the storage state machine for a future explicit memory-write transaction, but
 # marking a queue row applied is not itself such a transaction.
 REST_SAFE_RESOLVE_STATUSES = {STATUS_REVIEWED, STATUS_REJECTED}
+
+
+class ReviewQueueCorruptError(RuntimeError):
+    """The durable review ledger cannot be trusted and must not be treated as empty."""
 
 
 def rest_resolve_status_allowed(status: str) -> bool:
@@ -265,26 +271,38 @@ class ReviewQueue:
 
     def __init__(self, path: str | os.PathLike):
         self.path = Path(path)
+        self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
 
     # ---- 读 ----
-    def _load(self) -> list[dict]:
+    def _load_unlocked(self) -> list[dict]:
         if not self.path.exists():
             return []
         out: list[dict] = []
         with open(self.path, "r", encoding="utf-8") as f:
-            for line in f:
+            for line_number, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    out.append(json.loads(line))
-                except Exception:
-                    # 坏行不致命：跳过（队列是辅助清单，不该因一行脏数据炸掉）。
-                    continue
+                    row = json.loads(line)
+                except Exception as exc:
+                    raise ReviewQueueCorruptError(
+                        f"review queue contains invalid JSON at line {line_number}"
+                    ) from exc
+                if not isinstance(row, dict) or not str(row.get("key") or "").strip():
+                    raise ReviewQueueCorruptError(
+                        f"review queue contains an invalid row at line {line_number}"
+                    )
+                out.append(row)
         return out
 
-    def _keys(self) -> set[str]:
-        return {e.get("key") for e in self._load() if e.get("key")}
+    def _load(self) -> list[dict]:
+        with advisory_file_lock(self.lock_path):
+            return self._load_unlocked()
+
+    @staticmethod
+    def _keys(rows: list[dict]) -> set[str]:
+        return {e.get("key") for e in rows if e.get("key")}
 
     def list_pending(self, kind: Optional[str] = None) -> list[dict]:
         items = [e for e in self._load() if e.get("status") == STATUS_PENDING]
@@ -301,12 +319,20 @@ class ReviewQueue:
         key = entry.get("key")
         if not key:
             raise ValueError("review_queue entry 缺 key")
-        if key in self._keys():
-            return False
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        return True
+        with advisory_file_lock(self.lock_path):
+            rows = self._load_unlocked()
+            if key in self._keys(rows):
+                return False
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            payload = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
+            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            try:
+                os.write(fd, payload)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.chmod(self.path, 0o600)
+            return True
 
     def resolve(self, key: str, status: str, *, verdict_note: str = "",
                 now: Optional[datetime] = None) -> bool:
@@ -314,22 +340,23 @@ class ReviewQueue:
         唯一会重写文件的路径——机器永不调它。返回是否命中。"""
         if status not in (STATUS_REVIEWED, STATUS_APPLIED, STATUS_REJECTED):
             raise ValueError(f"非法 resolve 状态: {status}")
-        rows = self._load()
-        hit = False
-        for r in rows:
-            if r.get("key") == key and r.get("status") == STATUS_PENDING:
-                r["status"] = status
-                r["resolved_at"] = _now_iso(now)
-                if verdict_note:
-                    r["verdict_note"] = verdict_note
-                hit = True
-        if hit:
-            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                for r in rows:
-                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
-            os.replace(tmp, self.path)
-        return hit
+        with advisory_file_lock(self.lock_path):
+            rows = self._load_unlocked()
+            hit = False
+            for r in rows:
+                if r.get("key") == key and r.get("status") == STATUS_PENDING:
+                    r["status"] = status
+                    r["resolved_at"] = _now_iso(now)
+                    if verdict_note:
+                        r["verdict_note"] = verdict_note
+                    hit = True
+            if hit:
+                atomic_write_text(
+                    self.path,
+                    "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
+                )
+                os.chmod(self.path, 0o600)
+            return hit
 
 
 def render_md(items: list[dict], now: Optional[datetime] = None) -> str:
