@@ -136,6 +136,624 @@ def test_chunks_bind_exact_sources_and_coverage_does_not_use_max_watermark(tmp_p
         )
 
 
+def test_pending_proposer_chunks_require_a_successful_terminal_outcome(tmp_path):
+    ledger = _ledger(tmp_path)
+    for index in range(1, 4):
+        event_id = f"event-{index}"
+        chunk_id = f"chunk-{index}"
+        ledger.append_raw_event("s", event_id, f"raw-{index}")
+        ledger.record_event_chunk(
+            chunk_id,
+            f"chunk-body-{index}",
+            [EventIdentity("s", event_id)],
+        )
+
+    page = ledger.list_pending_proposer_chunks(limit=2)
+    assert [chunk.chunk_id for chunk in page] == ["chunk-1", "chunk-2"]
+    assert page[0].content == b"chunk-body-1"
+    assert page[0].source_event_ids == (EventIdentity("s", "event-1"),)
+    assert [
+        chunk.chunk_id
+        for chunk in ledger.list_pending_proposer_chunks(
+            after=page[-1].row_id
+        )
+    ] == ["chunk-3"]
+
+    ledger.record_chunk_proposer_outcome(
+        "attempt-error",
+        "chunk-1",
+        "retryable_error",
+        error_code="model.timeout",
+    )
+    ledger.record_chunk_proposer_outcome(
+        "attempt-zero",
+        "chunk-2",
+        "zero_candidates",
+    )
+    with ledger.transaction() as transaction:
+        transaction.record_candidate(
+            "candidate-3", "Y", "candidate", ["chunk-3"]
+        )
+        transaction.record_chunk_proposer_outcome(
+            "attempt-candidate",
+            "chunk-3",
+            "candidates_persisted",
+            candidate_keys=["candidate-3"],
+        )
+
+    assert [
+        chunk.chunk_id for chunk in ledger.list_pending_proposer_chunks()
+    ] == ["chunk-1"]
+    ledger.record_chunk_proposer_outcome(
+        "attempt-retry-success",
+        "chunk-1",
+        "zero_candidates",
+    )
+    assert ledger.list_pending_proposer_chunks() == ()
+
+    for bad_limit in (0, 1001, True):
+        with pytest.raises(LedgerValidationError):
+            ledger.list_pending_proposer_chunks(limit=bad_limit)
+    for bad_after in (-1, True):
+        with pytest.raises(LedgerValidationError):
+            ledger.list_pending_proposer_chunks(after=bad_after)
+
+
+def test_proposer_outcome_replay_is_exact_and_success_is_terminal(tmp_path):
+    ledger = _ledger(tmp_path)
+    _seed_chunk(ledger)
+    ledger.append_raw_event("session-a", "event-2", "second")
+    ledger.record_event_chunk(
+        "chunk-2", "second chunk", [EventIdentity("session-a", "event-2")]
+    )
+
+    first = ledger.record_chunk_proposer_outcome(
+        "attempt-1",
+        "chunk-1",
+        "retryable_error",
+        error_code="provider.busy",
+    )
+    replay = ledger.record_chunk_proposer_outcome(
+        "attempt-1",
+        "chunk-1",
+        "retryable_error",
+        error_code="provider.busy",
+    )
+    assert first.created is True
+    assert replay.created is False
+    assert replay.outcome_id == first.outcome_id
+
+    with pytest.raises(LedgerConflictError):
+        ledger.record_chunk_proposer_outcome(
+            "attempt-1",
+            "chunk-1",
+            "retryable_error",
+            error_code="provider.timeout",
+        )
+    with pytest.raises(LedgerConflictError):
+        ledger.record_chunk_proposer_outcome(
+            "attempt-1",
+            "chunk-2",
+            "retryable_error",
+            error_code="provider.busy",
+        )
+    with pytest.raises(LedgerConflictError):
+        ledger.record_chunk_proposer_outcome(
+            "attempt-1",
+            "chunk-1",
+            "zero_candidates",
+        )
+
+    success = ledger.record_chunk_proposer_outcome(
+        "attempt-2",
+        "chunk-1",
+        "zero_candidates",
+    )
+    assert success.outcome == "zero_candidates"
+    with pytest.raises(LedgerStateError):
+        ledger.record_chunk_proposer_outcome(
+            "attempt-after-success",
+            "chunk-1",
+            "retryable_error",
+            error_code="provider.busy",
+        )
+    assert ledger.record_chunk_proposer_outcome(
+        "attempt-2",
+        "chunk-1",
+        "zero_candidates",
+    ).created is False
+
+
+def test_candidates_persisted_requires_atomic_linked_candidates(tmp_path):
+    ledger = _ledger(tmp_path)
+    _seed_chunk(ledger)
+    ledger.append_raw_event("session-a", "event-2", "second")
+    ledger.record_event_chunk(
+        "chunk-2", "second chunk", [EventIdentity("session-a", "event-2")]
+    )
+
+    ledger.record_candidate(
+        "candidate-2", "Z", "second candidate", ["chunk-2"]
+    )
+    with pytest.raises(LedgerStateError):
+        ledger.record_chunk_proposer_outcome(
+            "wrong-source-attempt",
+            "chunk-1",
+            "candidates_persisted",
+            candidate_keys=["candidate-2"],
+        )
+
+    with ledger.transaction() as transaction:
+        transaction.record_candidate(
+            "candidate-1", "Z", "first candidate", ["chunk-1"]
+        )
+        outcome = transaction.record_chunk_proposer_outcome(
+            "attempt-candidates",
+            "chunk-1",
+            "candidates_persisted",
+            candidate_keys=["candidate-1"],
+        )
+    assert outcome.candidate_keys == ("candidate-1",)
+
+    with pytest.raises(LedgerConflictError):
+        ledger.record_chunk_proposer_outcome(
+            "attempt-candidates",
+            "chunk-1",
+            "candidates_persisted",
+            candidate_keys=["candidate-2"],
+        )
+
+    with pytest.raises(LedgerStateError):
+        with ledger.transaction() as transaction:
+            transaction.record_candidate(
+                "rolled-back-candidate",
+                "X",
+                "must roll back",
+                ["chunk-1"],
+            )
+            transaction.record_chunk_proposer_outcome(
+                "rolled-back-attempt",
+                "chunk-2",
+                "candidates_persisted",
+                candidate_keys=["rolled-back-candidate"],
+            )
+    assert [
+        record.idempotency_key for record in ledger.list_candidates("pending")
+    ] == ["candidate-2", "candidate-1"]
+
+
+def test_multi_chunk_outcomes_share_one_atomic_transaction(tmp_path):
+    ledger = _ledger(tmp_path)
+    _seed_chunk(ledger)
+    ledger.append_raw_event("session-a", "event-2", "second")
+    ledger.record_event_chunk(
+        "chunk-2", "second chunk", [EventIdentity("session-a", "event-2")]
+    )
+
+    with pytest.raises(LedgerStateError):
+        with ledger.transaction() as transaction:
+            transaction.record_chunk_proposer_outcome(
+                "attempt-chunk-1",
+                "chunk-1",
+                "zero_candidates",
+            )
+            transaction.record_chunk_proposer_outcome(
+                "attempt-missing",
+                "missing-chunk",
+                "zero_candidates",
+            )
+    assert [
+        chunk.chunk_id for chunk in ledger.list_pending_proposer_chunks()
+    ] == ["chunk-1", "chunk-2"]
+
+    with ledger.transaction() as transaction:
+        first = transaction.record_chunk_proposer_outcome(
+            "attempt-chunk-1",
+            "chunk-1",
+            "zero_candidates",
+        )
+        second = transaction.record_chunk_proposer_outcome(
+            "attempt-chunk-2",
+            "chunk-2",
+            "zero_candidates",
+        )
+    assert first.created is True
+    assert second.created is True
+    assert ledger.list_pending_proposer_chunks() == ()
+
+
+def test_concurrent_proposer_replay_creates_exactly_once(tmp_path):
+    ledger = _ledger(tmp_path)
+    _seed_chunk(ledger)
+
+    def write_once(_index: int):
+        return ledger.record_chunk_proposer_outcome(
+            "shared-attempt",
+            "chunk-1",
+            "zero_candidates",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(write_once, range(24)))
+
+    assert sum(result.created for result in results) == 1
+    assert len({result.outcome_id for result in results}) == 1
+    assert ledger.list_pending_proposer_chunks() == ()
+
+
+def test_different_keys_concurrently_compete_for_one_terminal_outcome(tmp_path):
+    ledger = _ledger(tmp_path)
+    _seed_chunk(ledger)
+
+    def write_once(index: int):
+        try:
+            return ledger.record_chunk_proposer_outcome(
+                f"attempt-{index}",
+                "chunk-1",
+                "zero_candidates",
+            )
+        except LedgerStateError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(write_once, range(24)))
+
+    winners = [result for result in results if result is not None]
+    assert len(winners) == 1
+    assert winners[0].created is True
+    assert ledger.verify_integrity()["chunk_proposer_outcomes"] == 1
+
+
+@pytest.mark.parametrize(
+    ("outcome", "candidate_keys", "error_code"),
+    [
+        ("zero_candidates", ["candidate"], None),
+        ("zero_candidates", [], "unexpected.error"),
+        ("candidates_persisted", [], None),
+        ("candidates_persisted", ["candidate"], "unexpected.error"),
+        ("retryable_error", ["candidate"], "provider.busy"),
+        ("retryable_error", [], None),
+        ("retryable_error", "candidate", "provider.busy"),
+    ],
+)
+def test_proposer_outcome_shape_is_fail_closed(
+    tmp_path, outcome, candidate_keys, error_code
+):
+    ledger = _ledger(tmp_path)
+    _seed_chunk(ledger)
+    ledger.record_candidate("candidate", "X", "body", ["chunk-1"])
+
+    with pytest.raises(LedgerValidationError):
+        ledger.record_chunk_proposer_outcome(
+            "attempt",
+            "chunk-1",
+            outcome,
+            candidate_keys=candidate_keys,
+            error_code=error_code,
+        )
+
+
+def test_proposer_errors_are_machine_codes_and_history_is_append_only(tmp_path):
+    ledger = _ledger(tmp_path)
+    _seed_chunk(ledger)
+
+    with pytest.raises(LedgerValidationError):
+        ledger.record_chunk_proposer_outcome(
+            "attempt",
+            "chunk-1",
+            "retryable_error",
+            error_code="model returned private conversation text",
+        )
+
+    recorded = ledger.record_chunk_proposer_outcome(
+        "attempt",
+        "chunk-1",
+        "retryable_error",
+        error_code="model.invalid_json",
+    )
+    with sqlite3.connect(ledger.path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            connection.execute(
+                """
+                UPDATE chunk_proposer_outcomes
+                SET error_code = 'model.other'
+                WHERE id = ?
+                """,
+                (recorded.outcome_id,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO chunk_proposer_outcomes(
+                    idempotency_key, chunk_id, outcome, error_code,
+                    candidate_count, candidate_set_digest, created_at
+                ) VALUES (?, ?, 'retryable_error', ?, 0, ?, ?)
+                """,
+                (
+                    "bad-attempt",
+                    "chunk-1",
+                    "free form error sentence",
+                    hashlib.sha256(b"[]").hexdigest(),
+                    "2026-07-28T00:00:00+00:00",
+                ),
+            )
+
+
+def test_persisted_candidate_set_is_sealed_against_late_insert(tmp_path):
+    ledger = _ledger(tmp_path)
+    _seed_chunk(ledger)
+    first = ledger.record_candidate(
+        "candidate-1", "X", "first", ["chunk-1"]
+    )
+    second = ledger.record_candidate(
+        "candidate-2", "Y", "second", ["chunk-1"]
+    )
+    outcome = ledger.record_chunk_proposer_outcome(
+        "attempt",
+        "chunk-1",
+        "candidates_persisted",
+        candidate_keys=["candidate-1"],
+    )
+
+    with sqlite3.connect(ledger.path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        with pytest.raises(sqlite3.IntegrityError, match="sealed"):
+            connection.execute(
+                """
+                INSERT INTO chunk_proposer_outcome_candidates(
+                    outcome_id, candidate_id
+                ) VALUES (?, ?)
+                """,
+                (outcome.outcome_id, second.candidate_id),
+            )
+    assert ledger.record_chunk_proposer_outcome(
+        "attempt",
+        "chunk-1",
+        "candidates_persisted",
+        candidate_keys=["candidate-1"],
+    ).created is False
+    assert first.candidate_id != second.candidate_id
+    assert ledger.verify_integrity()["chunk_proposer_outcomes"] == 1
+
+
+def test_terminal_outcome_rejects_late_error_at_database_boundary(tmp_path):
+    ledger = _ledger(tmp_path)
+    _seed_chunk(ledger)
+    ledger.record_chunk_proposer_outcome(
+        "success",
+        "chunk-1",
+        "zero_candidates",
+    )
+
+    with sqlite3.connect(ledger.path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        with pytest.raises(sqlite3.IntegrityError, match="already terminal"):
+            connection.execute(
+                """
+                INSERT INTO chunk_proposer_outcomes(
+                    idempotency_key, chunk_id, outcome, error_code,
+                    candidate_count, candidate_set_digest, created_at
+                ) VALUES (?, ?, 'retryable_error', ?, 0, ?, ?)
+                """,
+                (
+                    "late-error",
+                    "chunk-1",
+                    "provider.busy",
+                    hashlib.sha256(b"[]").hexdigest(),
+                    "2026-07-28T00:00:00+00:00",
+                ),
+            )
+    assert ledger.verify_integrity()["chunk_proposer_outcomes"] == 1
+
+
+def test_existing_schema_version_is_extended_in_place(tmp_path):
+    ledger = _ledger(tmp_path)
+    _seed_chunk(ledger)
+    with sqlite3.connect(ledger.path) as connection:
+        connection.execute("DROP TABLE chunk_proposer_outcome_candidates")
+        connection.execute("DROP TABLE chunk_proposer_outcomes")
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+
+    migrated = LMC5Ledger(ledger.path)
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert [
+        chunk.chunk_id for chunk in migrated.list_pending_proposer_chunks()
+    ] == ["chunk-1"]
+    assert migrated.verify_integrity()["chunk_proposer_outcomes"] == 0
+    with sqlite3.connect(migrated.path) as connection:
+        assert connection.execute(
+            """
+            SELECT payload
+            FROM raw_events
+            WHERE session_id = 'session-a' AND source_event_id = 'event-1'
+            """
+        ).fetchone()[0] == b"first"
+
+
+def test_failed_v1_migration_rolls_back_schema_and_version(tmp_path):
+    ledger = _ledger(tmp_path)
+    _seed_chunk(ledger)
+    with sqlite3.connect(ledger.path) as connection:
+        connection.execute("DROP TABLE chunk_proposer_outcome_candidates")
+        connection.execute("DROP TABLE chunk_proposer_outcomes")
+        connection.execute(
+            """
+            CREATE TABLE chunk_proposer_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                chunk_id TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                error_code TEXT,
+                candidate_count INTEGER NOT NULL,
+                candidate_set_digest TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                unexpected_column TEXT
+            )
+            """
+        )
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+
+    with pytest.raises(LedgerCorruptionError):
+        LMC5Ledger(ledger.path)
+
+    with sqlite3.connect(ledger.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(chunk_proposer_outcomes)"
+            ).fetchall()
+        }
+        assert "unexpected_column" in columns
+        assert (
+            connection.execute(
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'chunk_proposer_outcome_candidates'
+                """
+            ).fetchone()
+            is None
+        )
+
+
+def test_exact_column_constraintless_v1_table_is_rejected_and_rolled_back(
+    tmp_path,
+):
+    ledger = _ledger(tmp_path)
+    _seed_chunk(ledger)
+    with sqlite3.connect(ledger.path) as connection:
+        connection.execute("DROP TABLE chunk_proposer_outcome_candidates")
+        connection.execute("DROP TABLE chunk_proposer_outcomes")
+        connection.execute(
+            """
+            CREATE TABLE chunk_proposer_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                idempotency_key TEXT NOT NULL,
+                chunk_id TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                error_code TEXT,
+                candidate_count INTEGER NOT NULL,
+                candidate_set_digest TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+
+    with pytest.raises(LedgerCorruptionError):
+        LMC5Ledger(ledger.path)
+
+    with sqlite3.connect(ledger.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'chunk_proposer_outcome_candidates'
+                """
+            ).fetchone()
+            is None
+        )
+        assert (
+            connection.execute(
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'index'
+                  AND name = 'idx_chunk_proposer_terminal'
+                """
+            ).fetchone()
+            is None
+        )
+        assert connection.execute(
+            """
+            SELECT payload
+            FROM raw_events
+            WHERE session_id = 'session-a' AND source_event_id = 'event-1'
+            """
+        ).fetchone()[0] == b"first"
+
+
+def test_same_name_noop_trigger_is_rejected_and_migration_rolls_back(tmp_path):
+    ledger = _ledger(tmp_path)
+    _seed_chunk(ledger)
+    with sqlite3.connect(ledger.path) as connection:
+        connection.execute("DROP TABLE chunk_proposer_outcome_candidates")
+        connection.execute("DROP TABLE chunk_proposer_outcomes")
+        connection.execute("DROP TRIGGER raw_events_no_update")
+        connection.execute(
+            """
+            CREATE TRIGGER raw_events_no_update
+            BEFORE UPDATE ON raw_events
+            BEGIN
+                SELECT 1;
+            END
+            """
+        )
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+
+    with pytest.raises(LedgerCorruptionError):
+        LMC5Ledger(ledger.path)
+
+    with sqlite3.connect(ledger.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name = 'chunk_proposer_outcome_candidates'
+                """
+            ).fetchone()
+            is None
+        )
+        trigger_sql = connection.execute(
+            """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'trigger' AND name = 'raw_events_no_update'
+            """
+        ).fetchone()[0]
+        assert "SELECT 1" in trigger_sql
+
+
+def test_same_name_wrong_partial_terminal_index_is_rejected(tmp_path):
+    ledger = _ledger(tmp_path)
+    with sqlite3.connect(ledger.path) as connection:
+        connection.execute("DROP INDEX idx_chunk_proposer_terminal")
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX idx_chunk_proposer_terminal
+            ON chunk_proposer_outcomes(chunk_id)
+            WHERE outcome = 'zero_candidates'
+            """
+        )
+        connection.commit()
+
+    with pytest.raises(LedgerCorruptionError):
+        LMC5Ledger(ledger.path)
+
+    with sqlite3.connect(ledger.path) as connection:
+        index_sql = connection.execute(
+            """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'index' AND name = 'idx_chunk_proposer_terminal'
+            """
+        ).fetchone()[0]
+        assert "outcome = 'zero_candidates'" in index_sql
+
+
 def test_uncovered_feed_is_bounded_stable_and_returns_exact_payload(
     tmp_path, monkeypatch
 ):

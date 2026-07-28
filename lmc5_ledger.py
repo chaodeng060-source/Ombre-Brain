@@ -28,17 +28,38 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 from maintenance_barrier import MaintenanceBarrier
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
 MAX_READ_LIMIT = 1_000
 CANDIDATE_STATUSES = frozenset(
     {"pending", "ready", "review", "rejected", "deferred", "error"}
+)
+PROPOSER_OUTCOMES = frozenset(
+    {"zero_candidates", "candidates_persisted", "retryable_error"}
+)
+SUCCESSFUL_PROPOSER_OUTCOMES = frozenset(
+    {"zero_candidates", "candidates_persisted"}
 )
 TERMINAL_NIGHT_STAGES = frozenset({"complete", "rolled_back", "error"})
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MACHINE_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_SCHEMA_TOKEN_RE = re.compile(
+    r"""
+    (?P<space>\s+)
+    |(?P<line_comment>--[^\r\n]*)
+    |(?P<block_comment>/\*.*?\*/)
+    |(?P<string>'(?:''|[^'])*')
+    |(?P<double_quote>"(?:""|[^"])*")
+    |(?P<backtick>`(?:``|[^`])*`)
+    |(?P<bracket>\[(?:\]\]|[^\]])*\])
+    |(?P<word>[A-Za-z_][A-Za-z0-9_$]*)
+    |(?P<number>\d+(?:\.\d*)?(?:[Ee][+-]?\d+)?)
+    |(?P<operator><=|>=|<>|!=|==|\|\||[-+*/%<>=~(),.;])
+    """,
+    re.DOTALL | re.VERBOSE,
+)
 
 _CANDIDATE_TRANSITIONS = {
     "pending": frozenset(
@@ -51,6 +72,171 @@ _CANDIDATE_TRANSITIONS = {
         {"deferred", "pending", "ready", "review", "rejected", "error"}
     ),
     "error": frozenset({"error", "pending", "deferred", "rejected"}),
+}
+
+_PROPOSER_TABLE_SQL_DIGESTS = {
+    "chunk_proposer_outcomes": (
+        "5658e6f85ac2a5ed7b69319ef77e633b5cafbd3c1cc3fea235f5d66d2f086e45"
+    ),
+    "chunk_proposer_outcome_candidates": (
+        "da02b5d0cc16e23a479ca99ecc18a42bae706a4a61c300bd2d617b5927d95e3e"
+    ),
+}
+_PROPOSER_TABLE_COLUMNS = {
+    "chunk_proposer_outcomes": (
+        ("id", "INTEGER", 0, None, 1),
+        ("idempotency_key", "TEXT", 1, None, 0),
+        ("chunk_id", "TEXT", 1, None, 0),
+        ("outcome", "TEXT", 1, None, 0),
+        ("error_code", "TEXT", 0, None, 0),
+        ("candidate_count", "INTEGER", 1, None, 0),
+        ("candidate_set_digest", "TEXT", 1, None, 0),
+        ("created_at", "TEXT", 1, None, 0),
+    ),
+    "chunk_proposer_outcome_candidates": (
+        ("outcome_id", "INTEGER", 1, None, 1),
+        ("candidate_id", "INTEGER", 1, None, 2),
+    ),
+}
+_PROPOSER_FOREIGN_KEYS = {
+    "chunk_proposer_outcomes": {
+        (
+            "event_chunks",
+            "chunk_id",
+            "chunk_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE",
+        ),
+    },
+    "chunk_proposer_outcome_candidates": {
+        (
+            "chunk_proposer_outcomes",
+            "outcome_id",
+            "id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE",
+        ),
+        ("candidates", "candidate_id", "id", "NO ACTION", "RESTRICT", "NONE"),
+    },
+}
+_PROPOSER_INDEXES = {
+    "chunk_proposer_outcomes": {
+        "idx_chunk_proposer_terminal": (
+            1,
+            "c",
+            1,
+            (("chunk_id", 0, "BINARY", 1), (None, 0, "BINARY", 0)),
+        ),
+        "idx_chunk_proposer_outcomes_chunk": (
+            0,
+            "c",
+            0,
+            (
+                ("chunk_id", 0, "BINARY", 1),
+                ("id", 0, "BINARY", 1),
+                (None, 0, "BINARY", 0),
+            ),
+        ),
+        "sqlite_autoindex_chunk_proposer_outcomes_1": (
+            1,
+            "u",
+            0,
+            (("idempotency_key", 0, "BINARY", 1), (None, 0, "BINARY", 0)),
+        ),
+    },
+    "chunk_proposer_outcome_candidates": {
+        "sqlite_autoindex_chunk_proposer_outcome_candidates_1": (
+            1,
+            "pk",
+            0,
+            (
+                ("outcome_id", 0, "BINARY", 1),
+                ("candidate_id", 0, "BINARY", 1),
+                (None, 0, "BINARY", 0),
+            ),
+        ),
+    },
+}
+_NAMED_INDEX_SQL_DIGESTS = {
+    "idx_chunk_proposer_outcomes_chunk": (
+        "01dbc2c81b8dbc52eba3656ba9f24fee313d2614ff5b05f329627d6828cc6aac"
+    ),
+    "idx_chunk_proposer_terminal": (
+        "34cf885d1fbc78398a561247893a29e91566d95f6a4882679f438486c6d4f11c"
+    ),
+}
+_TRIGGER_SQL_DIGESTS = {
+    "candidate_chunks_no_delete": (
+        "2ed387071851009fa8e6f9c023e58f93dc4e7883505718bff67cd2914968eae6"
+    ),
+    "candidate_chunks_no_update": (
+        "f60149d0f57f6493ab8fc00cb94a25afc324f7a5d133a33d2cf77d9d63209c16"
+    ),
+    "candidates_immutable_identity": (
+        "86d0ee8e16ffe1a338dc879a456facffa27bee69105846cbfb33fdd72339ce5f"
+    ),
+    "candidates_no_delete": (
+        "c5ac3e2c341aa655dd93af3bfea49328c7a0f4f64b85fef8a779db634ec8a0f1"
+    ),
+    "chunk_proposer_outcome_candidates_capacity": (
+        "b3ae348c15279e5bd2a57d6cc7bf1f86fa287aa72a19a9f28e2dc4b746bc2d8a"
+    ),
+    "chunk_proposer_outcome_candidates_cover_chunk": (
+        "c24ea16825a7ccdb02cb3bb14cd99741aed42d926dd02c7db6b3e3ee48f2a3e3"
+    ),
+    "chunk_proposer_outcome_candidates_no_delete": (
+        "2e5b5627664ebcf18735d101d68bc1846b943256ecff554902c2de7999e3ce7c"
+    ),
+    "chunk_proposer_outcome_candidates_no_update": (
+        "2e37d0233fa48316577c5e6cd8b35a436fedde4260db48e8b1c477653293e26c"
+    ),
+    "chunk_proposer_outcomes_no_delete": (
+        "61ad4011d6efe82f54b3f80a8243e2d01311ada8aeb8d546d979c2232fed6e4e"
+    ),
+    "chunk_proposer_outcomes_no_update": (
+        "518df9f2044f438407129b99dd5ac38c61bdb723a9fb998bfc2812087e062009"
+    ),
+    "chunk_proposer_outcomes_terminal_guard": (
+        "b3312c974ce946b24cf3360687dfb0dcd3be6a071410749ab62e755c5bfeeff7"
+    ),
+    "chunk_sources_no_delete": (
+        "e05f7a67d3148a5080c68720278efb9dbb433d5c9cef32df57e4b1a7a7489be1"
+    ),
+    "chunk_sources_no_update": (
+        "8b8981adb2423a7ef76af1a3011920bf87624af545bb526d0589bdaeaef61d9e"
+    ),
+    "event_chunks_no_delete": (
+        "e27fdbea4bc95c2377e1d80377acb232dad20261300af9798c6ca2d11bdb13e5"
+    ),
+    "event_chunks_no_update": (
+        "281eeea317fd96c81fb13e856c2a1ccf964941c174d583be5dd364d5b1c62382"
+    ),
+    "night_run_stages_no_delete": (
+        "241631f872f3618b16e0cb96c393ae35165e0464999a48117bfaa543d350f063"
+    ),
+    "night_run_stages_no_update": (
+        "783e564cf62c9ac656ae8c70319282272ee202e6fd3f9bddb9dbc36246870926"
+    ),
+    "night_runs_immutable_identity": (
+        "59f27ee223a4fc92526b53ccc4acd6ff4c1638104beebda9d01a6ccf7467153a"
+    ),
+    "night_runs_no_delete": (
+        "6f28a06dde1d64a1a110ded339500aa57ad7a03c631914762ba8e6cf0f5ff00a"
+    ),
+    "raw_events_no_delete": (
+        "657692ce041a8f24b78e3d285364333896da5d31854ebef4979d282554ed1459"
+    ),
+    "raw_events_no_update": (
+        "9ce02aba2d040c5ec7f49301a0e4019d3cf0e5a1e3fc1b10ceba79e70564b881"
+    ),
+    "write_receipts_no_delete": (
+        "a848ca6202dd419bac7cb24adec585aebd0c314943dc69be8573c8403fd842a7"
+    ),
+    "write_receipts_no_update": (
+        "5b4f1fd6f4f767da75d73b9556d8bc5a2b6f683c9dbb91f02aea20ad6a011dad"
+    ),
 }
 
 
@@ -106,6 +292,27 @@ class ChunkResult:
     chunk_id: str
     content_digest: str
     source_event_ids: tuple[EventIdentity, ...]
+    created: bool
+
+
+@dataclass(frozen=True)
+class PendingProposerChunk:
+    row_id: int
+    chunk_id: str
+    content: bytes
+    content_digest: str
+    source_event_ids: tuple[EventIdentity, ...]
+    created_at: str
+
+
+@dataclass(frozen=True)
+class ChunkProposerOutcomeResult:
+    outcome_id: int
+    idempotency_key: str
+    chunk_id: str
+    outcome: str
+    candidate_keys: tuple[str, ...]
+    error_code: str | None
     created: bool
 
 
@@ -206,6 +413,43 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _normalize_schema_sql(value: str) -> str:
+    """Return a formatting-insensitive token stream for SQLite schema SQL."""
+
+    tokens: list[str] = []
+    position = 0
+    while position < len(value):
+        match = _SCHEMA_TOKEN_RE.match(value, position)
+        if match is None:
+            raise LedgerCorruptionError("ledger schema SQL cannot be parsed")
+        position = match.end()
+        kind = match.lastgroup
+        token = match.group()
+        if kind in {"space", "line_comment", "block_comment"}:
+            continue
+        if kind == "string":
+            tokens.append(token)
+        elif kind == "double_quote":
+            tokens.append(token[1:-1].replace('""', '"').lower())
+        elif kind == "backtick":
+            tokens.append(token[1:-1].replace("``", "`").lower())
+        elif kind == "bracket":
+            tokens.append(token[1:-1].replace("]]", "]").lower())
+        elif kind == "word":
+            tokens.append(token.lower())
+        else:
+            tokens.append(token)
+    for index in range(len(tokens) - 2):
+        if tokens[index : index + 3] == ["if", "not", "exists"]:
+            del tokens[index : index + 3]
+            break
+    return " ".join(tokens)
+
+
+def _schema_sql_digest(value: str) -> str:
+    return _sha256(_normalize_schema_sql(value).encode("utf-8"))
+
+
 def _identifier(value: Any, field: str, *, max_length: int = 512) -> str:
     if not isinstance(value, str):
         raise LedgerValidationError(f"{field} must be a string")
@@ -292,6 +536,15 @@ def _json_counts(counts: Mapping[str, int]) -> str:
 
 def _json_errors(errors: Sequence[str]) -> str:
     return json.dumps(list(errors), separators=(",", ":"))
+
+
+def _candidate_set_digest(candidate_keys: Sequence[str]) -> str:
+    canonical = json.dumps(
+        list(candidate_keys),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _sha256(canonical)
 
 
 class LMC5Ledger:
@@ -400,7 +653,7 @@ class LMC5Ledger:
             if str(journal_mode).lower() != "wal":
                 raise LedgerCorruptionError("ledger could not enable WAL mode")
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in (0, SCHEMA_VERSION):
+            if version not in (0, 1, SCHEMA_VERSION):
                 raise LedgerCorruptionError("unsupported ledger schema version")
             connection.executescript(
                 """
@@ -523,6 +776,131 @@ class LMC5Ledger:
                     SELECT RAISE(ABORT, 'candidate sources are immutable');
                 END;
 
+                CREATE TABLE IF NOT EXISTS chunk_proposer_outcomes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    chunk_id TEXT NOT NULL
+                        REFERENCES event_chunks(chunk_id) ON DELETE RESTRICT,
+                    outcome TEXT NOT NULL CHECK(
+                        outcome IN (
+                            'zero_candidates', 'candidates_persisted',
+                            'retryable_error'
+                        )
+                    ),
+                    error_code TEXT CHECK(
+                        error_code IS NULL OR (
+                            length(error_code) BETWEEN 1 AND 128
+                            AND substr(error_code, 1, 1) GLOB '[A-Za-z0-9]'
+                            AND error_code NOT GLOB '*[^A-Za-z0-9_.:-]*'
+                        )
+                    ),
+                    candidate_count INTEGER NOT NULL
+                        CHECK(candidate_count >= 0),
+                    candidate_set_digest TEXT NOT NULL
+                        CHECK(length(candidate_set_digest) = 64),
+                    created_at TEXT NOT NULL,
+                    CHECK(
+                        (outcome = 'retryable_error' AND error_code IS NOT NULL)
+                        OR
+                        (outcome != 'retryable_error' AND error_code IS NULL)
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS idx_chunk_proposer_outcomes_chunk
+                    ON chunk_proposer_outcomes(chunk_id, id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_chunk_proposer_terminal
+                    ON chunk_proposer_outcomes(chunk_id)
+                    WHERE outcome IN (
+                        'zero_candidates', 'candidates_persisted'
+                    );
+                CREATE TRIGGER IF NOT EXISTS chunk_proposer_outcomes_no_update
+                BEFORE UPDATE ON chunk_proposer_outcomes
+                BEGIN
+                    SELECT RAISE(ABORT, 'chunk proposer outcomes are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS chunk_proposer_outcomes_no_delete
+                BEFORE DELETE ON chunk_proposer_outcomes
+                BEGIN
+                    SELECT RAISE(ABORT, 'chunk proposer outcomes are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS
+                    chunk_proposer_outcomes_terminal_guard
+                BEFORE INSERT ON chunk_proposer_outcomes
+                WHEN EXISTS(
+                    SELECT 1
+                    FROM chunk_proposer_outcomes prior
+                    WHERE prior.chunk_id = NEW.chunk_id
+                      AND prior.outcome IN (
+                          'zero_candidates', 'candidates_persisted'
+                      )
+                )
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'chunk proposer outcome is already terminal'
+                    );
+                END;
+
+                CREATE TABLE IF NOT EXISTS chunk_proposer_outcome_candidates (
+                    outcome_id INTEGER NOT NULL
+                        REFERENCES chunk_proposer_outcomes(id) ON DELETE RESTRICT,
+                    candidate_id INTEGER NOT NULL
+                        REFERENCES candidates(id) ON DELETE RESTRICT,
+                    PRIMARY KEY(outcome_id, candidate_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS
+                    chunk_proposer_outcome_candidates_no_update
+                BEFORE UPDATE ON chunk_proposer_outcome_candidates
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'chunk proposer outcome candidates are append-only'
+                    );
+                END;
+                CREATE TRIGGER IF NOT EXISTS
+                    chunk_proposer_outcome_candidates_capacity
+                BEFORE INSERT ON chunk_proposer_outcome_candidates
+                WHEN (
+                    SELECT COUNT(*)
+                    FROM chunk_proposer_outcome_candidates existing
+                    WHERE existing.outcome_id = NEW.outcome_id
+                ) >= (
+                    SELECT candidate_count
+                    FROM chunk_proposer_outcomes parent
+                    WHERE parent.id = NEW.outcome_id
+                )
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'chunk proposer candidate set is sealed'
+                    );
+                END;
+                CREATE TRIGGER IF NOT EXISTS
+                    chunk_proposer_outcome_candidates_cover_chunk
+                BEFORE INSERT ON chunk_proposer_outcome_candidates
+                WHEN NOT EXISTS(
+                    SELECT 1
+                    FROM chunk_proposer_outcomes parent
+                    JOIN candidate_chunks source
+                      ON source.candidate_id = NEW.candidate_id
+                     AND source.chunk_id = parent.chunk_id
+                    WHERE parent.id = NEW.outcome_id
+                )
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'proposer outcome candidate does not cover chunk'
+                    );
+                END;
+                CREATE TRIGGER IF NOT EXISTS
+                    chunk_proposer_outcome_candidates_no_delete
+                BEFORE DELETE ON chunk_proposer_outcome_candidates
+                BEGIN
+                    SELECT RAISE(
+                        ABORT,
+                        'chunk proposer outcome candidates are append-only'
+                    );
+                END;
+
                 CREATE TABLE IF NOT EXISTS write_receipts (
                     idempotency_key TEXT PRIMARY KEY,
                     request_hash TEXT NOT NULL CHECK(length(request_hash) = 64),
@@ -587,13 +965,15 @@ class LMC5Ledger:
                     SELECT RAISE(ABORT, 'night stage history is append-only');
                 END;
 
-                PRAGMA user_version = 1;
-                COMMIT;
                 """
             )
             self._verify_schema(connection)
             self._quick_check(connection)
+            connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            connection.commit()
         except LedgerError:
+            if connection is not None and connection.in_transaction:
+                connection.rollback()
             raise
         except sqlite3.DatabaseError as exc:
             if connection is not None and connection.in_transaction:
@@ -654,6 +1034,20 @@ class LMC5Ledger:
                 "updated_at",
             },
             "candidate_chunks": {"candidate_id", "chunk_id"},
+            "chunk_proposer_outcomes": {
+                "id",
+                "idempotency_key",
+                "chunk_id",
+                "outcome",
+                "error_code",
+                "candidate_count",
+                "candidate_set_digest",
+                "created_at",
+            },
+            "chunk_proposer_outcome_candidates": {
+                "outcome_id",
+                "candidate_id",
+            },
             "write_receipts": {
                 "idempotency_key",
                 "request_hash",
@@ -684,29 +1078,137 @@ class LMC5Ledger:
             rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
             if {row["name"] for row in rows} != columns:
                 raise LedgerCorruptionError("ledger schema does not match contract")
-        required_triggers = {
-            "raw_events_no_update",
-            "raw_events_no_delete",
-            "event_chunks_no_update",
-            "event_chunks_no_delete",
-            "chunk_sources_no_update",
-            "chunk_sources_no_delete",
-            "candidate_chunks_no_update",
-            "candidate_chunks_no_delete",
-            "candidates_immutable_identity",
-            "candidates_no_delete",
-            "write_receipts_no_update",
-            "write_receipts_no_delete",
-            "night_runs_immutable_identity",
-            "night_runs_no_delete",
-            "night_run_stages_no_update",
-            "night_run_stages_no_delete",
+
+        for table, expected_columns in _PROPOSER_TABLE_COLUMNS.items():
+            rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+            actual_columns = tuple(
+                (
+                    row["name"],
+                    str(row["type"]).upper(),
+                    int(row["notnull"]),
+                    row["dflt_value"],
+                    int(row["pk"]),
+                )
+                for row in rows
+            )
+            if actual_columns != expected_columns:
+                raise LedgerCorruptionError(
+                    "ledger proposer table columns do not match contract"
+                )
+
+            table_row = connection.execute(
+                """
+                SELECT tbl_name, sql
+                FROM sqlite_master
+                WHERE type = 'table' AND name = ?
+                """,
+                (table,),
+            ).fetchone()
+            if (
+                table_row is None
+                or table_row["tbl_name"] != table
+                or not isinstance(table_row["sql"], str)
+                or _schema_sql_digest(table_row["sql"])
+                != _PROPOSER_TABLE_SQL_DIGESTS[table]
+            ):
+                raise LedgerCorruptionError(
+                    "ledger proposer table constraints do not match contract"
+                )
+
+            foreign_keys = {
+                (
+                    row["table"],
+                    row["from"],
+                    row["to"],
+                    row["on_update"],
+                    row["on_delete"],
+                    row["match"],
+                )
+                for row in connection.execute(
+                    f"PRAGMA foreign_key_list({table})"
+                ).fetchall()
+            }
+            if foreign_keys != _PROPOSER_FOREIGN_KEYS[table]:
+                raise LedgerCorruptionError(
+                    "ledger proposer foreign keys do not match contract"
+                )
+
+            index_rows = connection.execute(
+                f"PRAGMA index_list({table})"
+            ).fetchall()
+            expected_indexes = _PROPOSER_INDEXES[table]
+            actual_indexes = {
+                row["name"]: (
+                    int(row["unique"]),
+                    row["origin"],
+                    int(row["partial"]),
+                )
+                for row in index_rows
+            }
+            if set(actual_indexes) != set(expected_indexes):
+                raise LedgerCorruptionError(
+                    "ledger proposer indexes do not match contract"
+                )
+            for index_name, expected_index in expected_indexes.items():
+                if actual_indexes[index_name] != expected_index[:3]:
+                    raise LedgerCorruptionError(
+                        "ledger proposer index semantics do not match contract"
+                    )
+                safe_index_name = index_name.replace('"', '""')
+                index_columns = tuple(
+                    (
+                        row["name"],
+                        int(row["desc"]),
+                        str(row["coll"]).upper(),
+                        int(row["key"]),
+                    )
+                    for row in connection.execute(
+                        f'PRAGMA index_xinfo("{safe_index_name}")'
+                    ).fetchall()
+                )
+                if index_columns != expected_index[3]:
+                    raise LedgerCorruptionError(
+                        "ledger proposer index columns do not match contract"
+                    )
+
+        for index_name, expected_digest in _NAMED_INDEX_SQL_DIGESTS.items():
+            index_row = connection.execute(
+                """
+                SELECT sql
+                FROM sqlite_master
+                WHERE type = 'index' AND name = ?
+                """,
+                (index_name,),
+            ).fetchone()
+            if (
+                index_row is None
+                or not isinstance(index_row["sql"], str)
+                or _schema_sql_digest(index_row["sql"]) != expected_digest
+            ):
+                raise LedgerCorruptionError(
+                    "ledger named index definition does not match contract"
+                )
+
+        trigger_rows = {
+            row["name"]: (row["tbl_name"], row["sql"])
+            for row in connection.execute(
+                """
+                SELECT name, tbl_name, sql
+                FROM sqlite_master
+                WHERE type = 'trigger'
+                """
+            ).fetchall()
         }
-        trigger_rows = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
-        ).fetchall()
-        if not required_triggers.issubset({row["name"] for row in trigger_rows}):
-            raise LedgerCorruptionError("ledger append-only guards are missing")
+        for trigger_name, expected_digest in _TRIGGER_SQL_DIGESTS.items():
+            trigger = trigger_rows.get(trigger_name)
+            if (
+                trigger is None
+                or not isinstance(trigger[1], str)
+                or _schema_sql_digest(trigger[1]) != expected_digest
+            ):
+                raise LedgerCorruptionError(
+                    "ledger trigger definition does not match contract"
+                )
 
     @contextmanager
     def transaction(self) -> Iterator["LedgerTransaction"]:
@@ -795,6 +1297,24 @@ class LMC5Ledger:
                 payload,
                 source_chunk_ids,
                 status=status,
+            )
+
+    def record_chunk_proposer_outcome(
+        self,
+        idempotency_key: str,
+        chunk_id: str,
+        outcome: str,
+        *,
+        candidate_keys: Iterable[str] = (),
+        error_code: str | None = None,
+    ) -> ChunkProposerOutcomeResult:
+        with self.transaction() as transaction:
+            return transaction.record_chunk_proposer_outcome(
+                idempotency_key,
+                chunk_id,
+                outcome,
+                candidate_keys=candidate_keys,
+                error_code=error_code,
             )
 
     def transition_candidate(
@@ -951,6 +1471,96 @@ class LMC5Ledger:
                 connection.rollback()
             raise LedgerCorruptionError(
                 "unable to read uncovered raw events"
+            ) from exc
+        finally:
+            connection.close()
+
+    def list_pending_proposer_chunks(
+        self,
+        *,
+        limit: int = 100,
+        after: int | None = None,
+    ) -> tuple[PendingProposerChunk, ...]:
+        """Return chunks without a successful terminal proposer outcome.
+
+        The absence of an outcome and any number of ``retryable_error``
+        outcomes are both pending. Once either ``zero_candidates`` or
+        ``candidates_persisted`` is durably recorded, the chunk is excluded
+        forever. ``after`` is the stable SQLite row id cursor for the
+        append-only ``event_chunks`` table.
+        """
+
+        safe_limit = _read_limit(limit)
+        safe_after = _after_id(after) if after is not None else 0
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            self._verify_proposer_outcomes(connection)
+            rows = connection.execute(
+                """
+                SELECT ec.rowid AS row_id, ec.chunk_id, ec.content,
+                       ec.content_digest, ec.created_at
+                FROM event_chunks ec
+                WHERE ec.rowid > ?
+                  AND NOT EXISTS(
+                      SELECT 1
+                      FROM chunk_proposer_outcomes cpo
+                      WHERE cpo.chunk_id = ec.chunk_id
+                        AND cpo.outcome IN (
+                            'zero_candidates', 'candidates_persisted'
+                        )
+                  )
+                ORDER BY ec.rowid
+                LIMIT ?
+                """,
+                (safe_after, safe_limit),
+            ).fetchall()
+            results: list[PendingProposerChunk] = []
+            for row in rows:
+                content = bytes(row["content"])
+                if _sha256(content) != row["content_digest"]:
+                    raise LedgerCorruptionError(
+                        "persisted event-chunk digest does not match"
+                    )
+                source_rows = connection.execute(
+                    """
+                    SELECT re.session_id, re.source_event_id
+                    FROM chunk_sources cs
+                    JOIN raw_events re ON re.id = cs.raw_event_id
+                    WHERE cs.chunk_id = ?
+                    ORDER BY re.session_id, re.source_event_id
+                    """,
+                    (row["chunk_id"],),
+                ).fetchall()
+                sources = tuple(
+                    EventIdentity(source["session_id"], source["source_event_id"])
+                    for source in source_rows
+                )
+                if not sources:
+                    raise LedgerCorruptionError(
+                        "event chunk has no persisted source events"
+                    )
+                results.append(
+                    PendingProposerChunk(
+                        row_id=int(row["row_id"]),
+                        chunk_id=row["chunk_id"],
+                        content=content,
+                        content_digest=row["content_digest"],
+                        source_event_ids=sources,
+                        created_at=row["created_at"],
+                    )
+                )
+            connection.commit()
+            return tuple(results)
+        except LedgerError:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.DatabaseError as exc:
+            if connection.in_transaction:
+                connection.rollback()
+            raise LedgerCorruptionError(
+                "unable to read pending proposer chunks"
             ) from exc
         finally:
             connection.close()
@@ -1174,6 +1784,10 @@ class LMC5Ledger:
                     raise LedgerCorruptionError("invalid result digest persisted")
             counts["write_receipts"] = len(receipt_rows)
 
+            counts["chunk_proposer_outcomes"] = (
+                self._verify_proposer_outcomes(connection)
+            )
+
             run_rows = connection.execute("SELECT * FROM night_runs").fetchall()
             for row in run_rows:
                 self._night_run_from_row(row, created=False)
@@ -1185,6 +1799,128 @@ class LMC5Ledger:
             raise LedgerCorruptionError("ledger semantic integrity check failed") from exc
         finally:
             connection.close()
+
+    @staticmethod
+    def _verify_proposer_outcomes(connection: sqlite3.Connection) -> int:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM chunk_proposer_outcomes
+            ORDER BY chunk_id, id
+            """
+        ).fetchall()
+        terminal_chunks: set[str] = set()
+        for row in rows:
+            chunk_id = row["chunk_id"]
+            if chunk_id in terminal_chunks:
+                raise LedgerCorruptionError(
+                    "chunk proposer history continues after terminal outcome"
+                )
+            result = LMC5Ledger._chunk_proposer_outcome_from_row(
+                connection, row, created=False
+            )
+            if result.outcome in SUCCESSFUL_PROPOSER_OUTCOMES:
+                terminal_chunks.add(result.chunk_id)
+        return len(rows)
+
+    @staticmethod
+    def _chunk_proposer_outcome_from_row(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        created: bool,
+    ) -> ChunkProposerOutcomeResult:
+        try:
+            outcome = _machine_code(row["outcome"], "persisted proposer outcome")
+            if outcome not in PROPOSER_OUTCOMES:
+                raise LedgerCorruptionError(
+                    "unknown chunk proposer outcome persisted"
+                )
+            idempotency_key = _identifier(
+                row["idempotency_key"], "persisted proposer idempotency key"
+            )
+            chunk_id = _identifier(row["chunk_id"], "persisted chunk_id")
+            error_code = row["error_code"]
+            if error_code is not None:
+                error_code = _machine_code(
+                    error_code, "persisted proposer error_code"
+                )
+            candidate_rows = connection.execute(
+                """
+                SELECT c.idempotency_key,
+                       EXISTS(
+                           SELECT 1
+                           FROM candidate_chunks cc
+                           WHERE cc.candidate_id = c.id
+                             AND cc.chunk_id = ?
+                       ) AS covers_chunk
+                FROM chunk_proposer_outcome_candidates cpoc
+                JOIN candidates c ON c.id = cpoc.candidate_id
+                WHERE cpoc.outcome_id = ?
+                ORDER BY c.idempotency_key
+                """,
+                (chunk_id, row["id"]),
+            ).fetchall()
+            candidate_keys = tuple(
+                _identifier(
+                    candidate["idempotency_key"],
+                    "persisted candidate idempotency key",
+                )
+                for candidate in candidate_rows
+            )
+            candidate_count = int(row["candidate_count"])
+            if (
+                candidate_count < 0
+                or candidate_count != len(candidate_keys)
+                or _digest(
+                    row["candidate_set_digest"],
+                    "persisted candidate set digest",
+                )
+                != _candidate_set_digest(candidate_keys)
+            ):
+                raise LedgerCorruptionError(
+                    "persisted proposer candidate set is not sealed"
+                )
+            if outcome == "retryable_error":
+                if error_code is None or candidate_keys:
+                    raise LedgerCorruptionError(
+                        "retryable proposer outcome has invalid attachments"
+                    )
+            elif error_code is not None:
+                raise LedgerCorruptionError(
+                    "successful proposer outcome persisted an error"
+                )
+            if outcome == "zero_candidates" and candidate_keys:
+                raise LedgerCorruptionError(
+                    "zero-candidate proposer outcome has candidate attachments"
+                )
+            if outcome == "candidates_persisted":
+                if not candidate_keys or not all(
+                    bool(candidate["covers_chunk"])
+                    for candidate in candidate_rows
+                ):
+                    raise LedgerCorruptionError(
+                        "candidate proposer outcome lacks covered candidates"
+                    )
+        except LedgerCorruptionError:
+            raise
+        except LedgerError as exc:
+            raise LedgerCorruptionError(
+                "invalid chunk proposer outcome persisted"
+            ) from exc
+        except (KeyError, TypeError, ValueError, sqlite3.DatabaseError) as exc:
+            raise LedgerCorruptionError(
+                "invalid chunk proposer outcome persisted"
+            ) from exc
+        return ChunkProposerOutcomeResult(
+            outcome_id=int(row["id"]),
+            idempotency_key=idempotency_key,
+            chunk_id=chunk_id,
+            outcome=outcome,
+            candidate_keys=candidate_keys,
+            error_code=error_code,
+            created=created,
+        )
 
     @staticmethod
     def _night_run_from_row(
@@ -1471,6 +2207,175 @@ class LedgerTransaction:
             error_code=None,
             source_chunk_ids=chunks,
             created=True,
+        )
+
+    def record_chunk_proposer_outcome(
+        self,
+        idempotency_key: str,
+        chunk_id: str,
+        outcome: str,
+        *,
+        candidate_keys: Iterable[str] = (),
+        error_code: str | None = None,
+    ) -> ChunkProposerOutcomeResult:
+        safe_key = _identifier(idempotency_key, "idempotency_key")
+        safe_chunk_id = _identifier(chunk_id, "chunk_id")
+        safe_outcome = _machine_code(outcome, "outcome").lower()
+        if safe_outcome not in PROPOSER_OUTCOMES:
+            raise LedgerValidationError("unknown chunk proposer outcome")
+        if isinstance(candidate_keys, (str, bytes)):
+            raise LedgerValidationError(
+                "candidate_keys must be an iterable of identifiers"
+            )
+        safe_candidates = tuple(
+            sorted(
+                {
+                    _identifier(candidate_key, "candidate idempotency key")
+                    for candidate_key in candidate_keys
+                }
+            )
+        )
+        safe_error = (
+            _machine_code(error_code, "error_code")
+            if error_code is not None
+            else None
+        )
+        if safe_outcome == "zero_candidates":
+            if safe_candidates or safe_error is not None:
+                raise LedgerValidationError(
+                    "zero_candidates cannot attach candidates or an error"
+                )
+        elif safe_outcome == "candidates_persisted":
+            if not safe_candidates or safe_error is not None:
+                raise LedgerValidationError(
+                    "candidates_persisted requires candidates and no error"
+                )
+        elif safe_error is None or safe_candidates:
+            raise LedgerValidationError(
+                "retryable_error requires one machine code and no candidates"
+            )
+
+        existing = self._connection.execute(
+            """
+            SELECT *
+            FROM chunk_proposer_outcomes
+            WHERE idempotency_key = ?
+            """,
+            (safe_key,),
+        ).fetchone()
+        if existing is not None:
+            persisted = self._ledger._chunk_proposer_outcome_from_row(
+                self._connection, existing, created=False
+            )
+            if (
+                persisted.chunk_id != safe_chunk_id
+                or persisted.outcome != safe_outcome
+                or persisted.candidate_keys != safe_candidates
+                or persisted.error_code != safe_error
+            ):
+                raise LedgerConflictError(
+                    "proposer outcome key conflicts with persisted identity"
+                )
+            return persisted
+
+        chunk_row = self._connection.execute(
+            """
+            SELECT content, content_digest
+            FROM event_chunks
+            WHERE chunk_id = ?
+            """,
+            (safe_chunk_id,),
+        ).fetchone()
+        if chunk_row is None:
+            raise LedgerStateError(
+                "proposer outcome references an unknown chunk"
+            )
+        chunk_content = bytes(chunk_row["content"])
+        if _sha256(chunk_content) != chunk_row["content_digest"]:
+            raise LedgerCorruptionError(
+                "persisted event-chunk digest does not match"
+            )
+        if (
+            self._connection.execute(
+                """
+                SELECT 1
+                FROM chunk_proposer_outcomes
+                WHERE chunk_id = ?
+                  AND outcome IN (
+                      'zero_candidates', 'candidates_persisted'
+                  )
+                LIMIT 1
+                """,
+                (safe_chunk_id,),
+            ).fetchone()
+            is not None
+        ):
+            raise LedgerStateError(
+                "chunk proposer outcome is already terminal"
+            )
+
+        candidate_ids: list[int] = []
+        for candidate_key in safe_candidates:
+            candidate = self._connection.execute(
+                """
+                SELECT c.id,
+                       EXISTS(
+                           SELECT 1
+                           FROM candidate_chunks cc
+                           WHERE cc.candidate_id = c.id
+                             AND cc.chunk_id = ?
+                       ) AS covers_chunk
+                FROM candidates c
+                WHERE c.idempotency_key = ?
+                """,
+                (safe_chunk_id, candidate_key),
+            ).fetchone()
+            if candidate is None:
+                raise LedgerStateError(
+                    "proposer outcome references an unknown candidate"
+                )
+            if not bool(candidate["covers_chunk"]):
+                raise LedgerStateError(
+                    "proposer outcome candidate does not cover the chunk"
+                )
+            candidate_ids.append(int(candidate["id"]))
+
+        cursor = self._connection.execute(
+            """
+            INSERT INTO chunk_proposer_outcomes(
+                idempotency_key, chunk_id, outcome, error_code,
+                candidate_count, candidate_set_digest, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                safe_key,
+                safe_chunk_id,
+                safe_outcome,
+                safe_error,
+                len(safe_candidates),
+                _candidate_set_digest(safe_candidates),
+                _utc_now(),
+            ),
+        )
+        outcome_id = int(cursor.lastrowid)
+        if candidate_ids:
+            self._connection.executemany(
+                """
+                INSERT INTO chunk_proposer_outcome_candidates(
+                    outcome_id, candidate_id
+                ) VALUES (?, ?)
+                """,
+                (
+                    (outcome_id, candidate_id)
+                    for candidate_id in candidate_ids
+                ),
+            )
+        row = self._connection.execute(
+            "SELECT * FROM chunk_proposer_outcomes WHERE id = ?",
+            (outcome_id,),
+        ).fetchone()
+        return self._ledger._chunk_proposer_outcome_from_row(
+            self._connection, row, created=True
         )
 
     def transition_candidate(
