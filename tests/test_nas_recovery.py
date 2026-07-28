@@ -32,6 +32,7 @@ def recovery_env(tmp_path: Path) -> dict[str, str]:
     (data / "existing-memory").write_text("present\n", encoding="utf-8")
     (state / "container").write_text("running\n", encoding="utf-8")
     (state / "commands.log").write_text("", encoding="utf-8")
+    (state / "http.log").write_text("", encoding="utf-8")
 
     _write_executable(
         fake_bin / "docker",
@@ -83,10 +84,18 @@ exit 64
         r"""#!/usr/bin/env bash
 set -euo pipefail
 output=""
+headers=""
+method="GET"
 fail_on_http=0
 while (($#)); do
   if [[ "$1" == "-o" ]]; then
     output="$2"
+    shift 2
+  elif [[ "$1" == "-D" ]]; then
+    headers="$2"
+    shift 2
+  elif [[ "$1" == "-X" ]]; then
+    method="$2"
     shift 2
   elif [[ "$1" == "-f" || "$1" == "-fsS" ]]; then
     fail_on_http=1
@@ -95,7 +104,16 @@ while (($#)); do
     shift
   fi
 done
+printf '%s\n' "${method}" >>"${FAKE_STATE}/http.log"
+if [[ "${method}" == "DELETE" ]]; then
+  printf '%s' "${FAKE_MCP_DELETE_CODE:-204}"
+  exit 0
+fi
 if [[ "${FAKE_MCP_HEALTHY:-1}" == "1" ]]; then
+  if [[ -n "${headers}" && -n "${FAKE_MCP_SESSION_ID-fake-session}" ]]; then
+    printf 'HTTP/1.1 200 OK\r\nmcp-session-id: %s\r\n\r\n' \
+      "${FAKE_MCP_SESSION_ID-fake-session}" >"${headers}"
+  fi
   printf '{"result":{"serverInfo":{"name":"Ombre Brain"}}}\n' >"${output}"
   printf '200'
   exit 0
@@ -184,11 +202,41 @@ def _commands(env: dict[str, str]) -> str:
     return (Path(env["FAKE_STATE"]) / "commands.log").read_text(encoding="utf-8")
 
 
+def _http_methods(env: dict[str, str]) -> list[str]:
+    content = (Path(env["FAKE_STATE"]) / "http.log").read_text(encoding="utf-8")
+    return content.splitlines()
+
+
 def test_healthy_container_is_a_noop(recovery_env: dict[str, str]) -> None:
     result = _run(recovery_env)
     assert result.returncode == 0, result.stderr
     assert " up -d" not in _commands(recovery_env)
     assert "no action needed" in result.stdout
+    assert _http_methods(recovery_env) == ["POST", "DELETE"]
+
+
+def test_stateless_mcp_probe_does_not_attempt_session_delete(
+    recovery_env: dict[str, str],
+) -> None:
+    recovery_env["FAKE_MCP_SESSION_ID"] = ""
+
+    result = _run(recovery_env)
+
+    assert result.returncode == 0, result.stderr
+    assert _http_methods(recovery_env) == ["POST"]
+
+
+def test_mcp_session_cleanup_failure_is_not_retried_or_ignored(
+    recovery_env: dict[str, str],
+) -> None:
+    recovery_env["FAKE_MCP_DELETE_CODE"] = "500"
+
+    result = _run(recovery_env)
+
+    assert result.returncode != 0
+    assert "session cleanup returned HTTP 500" in result.stdout
+    assert _http_methods(recovery_env) == ["POST", "DELETE"]
+    assert " up -d" not in _commands(recovery_env)
 
 
 def test_missing_container_is_rebuilt_once(recovery_env: dict[str, str]) -> None:

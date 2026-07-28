@@ -17,6 +17,7 @@ LOCK_FILE="${OMBRE_LOCK_FILE:-${XDG_RUNTIME_DIR:-/tmp}/ombre-brain-recovery-${UI
 CRON_BEGIN="# BEGIN ombre-brain self-recovery"
 CRON_END="# END ombre-brain self-recovery"
 CRON_SAFE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+MCP_PROTOCOL_VERSION="2025-03-26"
 MCP_PAYLOAD='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ombre-nas-recovery","version":"1.0"}}}'
 TEMP_FILES=()
 
@@ -140,14 +141,41 @@ wait_for_docker() {
   done
 }
 
+close_mcp_session() {
+  local session_id="$1" http_code
+  if ! http_code="$(
+    curl -sS \
+      --connect-timeout 3 \
+      --max-time 10 \
+      -o /dev/null \
+      -w '%{http_code}' \
+      -X DELETE "${MCP_URL}" \
+      -H "Mcp-Session-Id: ${session_id}" \
+      -H "MCP-Protocol-Version: ${MCP_PROTOCOL_VERSION}" \
+      -H 'Accept: application/json, text/event-stream' 2>/dev/null
+  )"; then
+    die "MCP initialize succeeded but session cleanup request failed"
+  fi
+  case "${http_code}" in
+    200|202|204|404)
+      return 0
+      ;;
+    *)
+      die "MCP initialize succeeded but session cleanup returned HTTP ${http_code}"
+      ;;
+  esac
+}
+
 probe_mcp() {
-  local body http_code
+  local body headers http_code session_id
   body="$(mktemp)"
-  TEMP_FILES+=("${body}")
+  headers="$(mktemp)"
+  TEMP_FILES+=("${body}" "${headers}")
   if ! http_code="$(
     curl -sS \
       --connect-timeout 3 \
       --max-time 15 \
+      -D "${headers}" \
       -o "${body}" \
       -w '%{http_code}' \
       -X POST "${MCP_URL}" \
@@ -155,16 +183,32 @@ probe_mcp() {
       -H 'Accept: application/json, text/event-stream' \
       --data-binary "${MCP_PAYLOAD}" 2>/dev/null
   )"; then
-    rm -f "${body}"
+    rm -f "${body}" "${headers}"
     return 1
   fi
 
   if [[ "${http_code}" == "200" ]] && grep -q '"serverInfo"' "${body}"; then
-    rm -f "${body}"
+    session_id="$(
+      awk '
+        tolower($0) ~ /^mcp-session-id:/ {
+          line = $0
+          sub(/\r$/, "", line)
+          sub(/^[^:]*:[[:space:]]*/, "", line)
+          print line
+          exit
+        }
+      ' "${headers}"
+    )"
+    rm -f "${body}" "${headers}"
+    if [[ -n "${session_id}" ]]; then
+      [[ "${session_id}" =~ ^[A-Za-z0-9._~-]+$ ]] ||
+        die "MCP returned an unsafe session identifier"
+      close_mcp_session "${session_id}"
+    fi
     return 0
   fi
 
-  rm -f "${body}"
+  rm -f "${body}" "${headers}"
   return 1
 }
 
@@ -313,6 +357,7 @@ recover_service() {
   require_command findmnt
   require_command flock
   require_command grep
+  require_command awk
   require_command mktemp
   require_command python3
   require_command realpath
