@@ -41,6 +41,31 @@ SUCCESSFUL_PROPOSER_OUTCOMES = frozenset(
     {"zero_candidates", "candidates_persisted"}
 )
 TERMINAL_NIGHT_STAGES = frozenset({"complete", "rolled_back", "error"})
+NIGHT_RUN_FORWARD_STAGES = (
+    "started",
+    "snapshotted",
+    "chunked",
+    "proposed",
+    "dispatched",
+    "metabolism_reported",
+    "validated",
+    "complete",
+)
+NIGHT_RUN_STAGES = frozenset(
+    (*NIGHT_RUN_FORWARD_STAGES, "error", "rolled_back")
+)
+_NIGHT_STAGE_TRANSITIONS = {
+    stage: frozenset(
+        {
+            NIGHT_RUN_FORWARD_STAGES[index + 1],
+            "error",
+        }
+    )
+    for index, stage in enumerate(NIGHT_RUN_FORWARD_STAGES[:-1])
+}
+_NIGHT_STAGE_TRANSITIONS["complete"] = frozenset()
+_NIGHT_STAGE_TRANSITIONS["error"] = frozenset()
+_NIGHT_STAGE_TRANSITIONS["rolled_back"] = frozenset()
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MACHINE_CODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -363,6 +388,23 @@ class NightRunResult:
 
 
 @dataclass(frozen=True)
+class InterruptedNightRun:
+    """A nonterminal night run plus its stable pagination cursor."""
+
+    row_id: int
+    run_id: str
+    snapshot_id: str
+    stage: str
+    counts: Mapping[str, int]
+    errors: tuple[str, ...]
+    sequence: int
+
+    @property
+    def cursor(self) -> int:
+        return self.row_id
+
+
+@dataclass(frozen=True)
 class CoverageReport:
     total_raw_events: int
     covered_event_ids: tuple[EventIdentity, ...]
@@ -462,6 +504,20 @@ def _machine_code(value: Any, field: str) -> str:
     if not isinstance(value, str) or not _MACHINE_CODE_RE.fullmatch(value):
         raise LedgerValidationError(f"{field} must be a short machine code")
     return value
+
+
+def _persisted_night_stage(
+    value: Any,
+    *,
+    allow_legacy: bool = False,
+) -> str:
+    try:
+        stage = _machine_code(value, "persisted stage").lower()
+    except LedgerError as exc:
+        raise LedgerCorruptionError("invalid night-run stage persisted") from exc
+    if stage not in NIGHT_RUN_STAGES and not allow_legacy:
+        raise LedgerCorruptionError("unknown night-run stage persisted")
+    return stage
 
 
 def _digest(value: Any, field: str) -> str:
@@ -1386,11 +1442,80 @@ class LMC5Ledger:
             ).fetchone()
             if row is None:
                 raise LedgerStateError("night run does not exist")
-            return self._night_run_from_row(row, created=False)
+            return self._verify_night_run_history(connection, row)
         except sqlite3.DatabaseError as exc:
             raise LedgerCorruptionError("unable to read night run") from exc
         finally:
             connection.close()
+
+    def list_nonterminal_night_runs(
+        self,
+        *,
+        limit: int = 100,
+        after: int | None = None,
+    ) -> tuple[InterruptedNightRun, ...]:
+        """Return a bounded, stable feed of night runs needing recovery.
+
+        This is deliberately read-only: callers decide whether and how to
+        resume a run. ``after`` is the last ``row_id`` (or ``cursor``)
+        observed by the caller.
+        """
+
+        safe_limit = _read_limit(limit)
+        safe_after = _after_id(after) if after is not None else 0
+        terminal = tuple(sorted(TERMINAL_NIGHT_STAGES))
+        placeholders = ", ".join("?" for _ in terminal)
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                f"""
+                SELECT rowid AS recovery_row_id, *
+                FROM night_runs
+                WHERE rowid > ?
+                  AND stage NOT IN ({placeholders})
+                ORDER BY rowid
+                LIMIT ?
+                """,
+                (safe_after, *terminal, safe_limit),
+            ).fetchall()
+            records: list[InterruptedNightRun] = []
+            for row in rows:
+                result = self._verify_night_run_history(connection, row)
+                row_id = int(row["recovery_row_id"])
+                if row_id <= 0 or result.stage in TERMINAL_NIGHT_STAGES:
+                    raise LedgerCorruptionError(
+                        "invalid nonterminal night-run cursor persisted"
+                    )
+                records.append(
+                    InterruptedNightRun(
+                        row_id=row_id,
+                        run_id=result.run_id,
+                        snapshot_id=result.snapshot_id,
+                        stage=result.stage,
+                        counts=result.counts,
+                        errors=result.errors,
+                        sequence=result.sequence,
+                    )
+                )
+            return tuple(records)
+        except LedgerError:
+            raise
+        except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+            raise LedgerCorruptionError(
+                "unable to list nonterminal night runs"
+            ) from exc
+        finally:
+            connection.close()
+
+    def list_interrupted_night_runs(
+        self,
+        *,
+        limit: int = 100,
+        after: int | None = None,
+    ) -> tuple[InterruptedNightRun, ...]:
+        """Compatibility name for :meth:`list_nonterminal_night_runs`."""
+
+        return self.list_nonterminal_night_runs(limit=limit, after=after)
 
     def list_uncovered_raw_events(
         self,
@@ -1788,10 +1913,7 @@ class LMC5Ledger:
                 self._verify_proposer_outcomes(connection)
             )
 
-            run_rows = connection.execute("SELECT * FROM night_runs").fetchall()
-            for row in run_rows:
-                self._night_run_from_row(row, created=False)
-            counts["night_runs"] = len(run_rows)
+            counts["night_runs"] = self._verify_night_runs(connection)
             return counts
         except LedgerError:
             raise
@@ -1822,6 +1944,105 @@ class LMC5Ledger:
             if result.outcome in SUCCESSFUL_PROPOSER_OUTCOMES:
                 terminal_chunks.add(result.chunk_id)
         return len(rows)
+
+    @staticmethod
+    def _verify_night_runs(connection: sqlite3.Connection) -> int:
+        run_rows = connection.execute(
+            "SELECT rowid AS recovery_row_id, * FROM night_runs ORDER BY rowid"
+        ).fetchall()
+        for row in run_rows:
+            LMC5Ledger._verify_night_run_history(connection, row)
+        return len(run_rows)
+
+    @staticmethod
+    def _verify_night_run_history(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> NightRunResult:
+        current = LMC5Ledger._night_run_from_row(row, created=False)
+        stage_rows = connection.execute(
+            """
+            SELECT *
+            FROM night_run_stages
+            WHERE run_id = ?
+            ORDER BY sequence
+            """,
+            (current.run_id,),
+        ).fetchall()
+        if not stage_rows:
+            raise LedgerCorruptionError(
+                "night run lacks append-only stage history"
+            )
+
+        prior_stage: str | None = None
+        final_counts: Mapping[str, int] | None = None
+        final_errors: tuple[str, ...] | None = None
+        legacy_rollback = current.stage == "rolled_back"
+        for expected_sequence, stage_row in enumerate(stage_rows):
+            if int(stage_row["sequence"]) != expected_sequence:
+                raise LedgerCorruptionError(
+                    "night-run stage history is not contiguous"
+                )
+            stage = _persisted_night_stage(
+                stage_row["stage"],
+                allow_legacy=legacy_rollback,
+            )
+            try:
+                stage_counts = _normalize_counts(
+                    json.loads(stage_row["counts_json"])
+                )
+                stage_errors = _normalize_errors(
+                    json.loads(stage_row["errors_json"])
+                )
+            except LedgerError as exc:
+                raise LedgerCorruptionError(
+                    "invalid night-run stage history persisted"
+                ) from exc
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise LedgerCorruptionError(
+                    "invalid night-run stage history persisted"
+                ) from exc
+
+            if expected_sequence == 0:
+                if stage != "started" or stage_errors:
+                    raise LedgerCorruptionError(
+                        "night-run history has an invalid initial stage"
+                    )
+            else:
+                assert prior_stage is not None
+                if legacy_rollback:
+                    is_final = expected_sequence == len(stage_rows) - 1
+                    allowed = (
+                        prior_stage not in TERMINAL_NIGHT_STAGES
+                        and stage != prior_stage
+                        and (
+                            (is_final and stage == "rolled_back")
+                            or (
+                                not is_final
+                                and stage not in TERMINAL_NIGHT_STAGES
+                            )
+                        )
+                    )
+                else:
+                    allowed = stage in _NIGHT_STAGE_TRANSITIONS[prior_stage]
+                if not allowed:
+                    raise LedgerCorruptionError(
+                        "night-run history contains an invalid transition"
+                    )
+            prior_stage = stage
+            final_counts = stage_counts
+            final_errors = stage_errors
+
+        if (
+            len(stage_rows) - 1 != current.sequence
+            or prior_stage != current.stage
+            or dict(final_counts or {}) != dict(current.counts)
+            or (final_errors or ()) != current.errors
+        ):
+            raise LedgerCorruptionError(
+                "night run disagrees with append-only stage history"
+            )
+        return current
 
     @staticmethod
     def _chunk_proposer_outcome_from_row(
@@ -1931,7 +2152,7 @@ class LMC5Ledger:
             raw_errors = json.loads(row["errors_json"])
             counts = _normalize_counts(raw_counts)
             errors = _normalize_errors(raw_errors)
-            stage = _machine_code(row["stage"], "persisted stage")
+            stage = _persisted_night_stage(row["stage"])
             snapshot_id = _identifier(row["snapshot_id"], "persisted snapshot_id")
             sequence = int(row["sequence"])
             if sequence < 0:
@@ -2527,15 +2748,38 @@ class LedgerTransaction:
             "SELECT * FROM night_runs WHERE run_id = ?", (safe_run_id,)
         ).fetchone()
         if row is not None:
-            result = self._ledger._night_run_from_row(row, created=False)
+            result = self._ledger._verify_night_run_history(
+                self._connection, row
+            )
             if result.snapshot_id != safe_snapshot:
                 raise LedgerConflictError(
                     "night run id conflicts with persisted snapshot"
                 )
-            if (
-                result.stage == "started"
-                and dict(result.counts) != safe_counts
-            ):
+            initial_row = self._connection.execute(
+                """
+                SELECT counts_json
+                FROM night_run_stages
+                WHERE run_id = ? AND sequence = 0
+                """,
+                (safe_run_id,),
+            ).fetchone()
+            if initial_row is None:
+                raise LedgerCorruptionError(
+                    "night run lacks its initial stage"
+                )
+            try:
+                initial_counts = _normalize_counts(
+                    json.loads(initial_row["counts_json"])
+                )
+            except LedgerError as exc:
+                raise LedgerCorruptionError(
+                    "invalid initial night-run counts persisted"
+                ) from exc
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                raise LedgerCorruptionError(
+                    "invalid initial night-run counts persisted"
+                ) from exc
+            if initial_counts != safe_counts:
                 raise LedgerConflictError(
                     "night run replay changed its initial counts"
                 )
@@ -2577,11 +2821,15 @@ class LedgerTransaction:
     ) -> NightRunResult:
         safe_run_id = _identifier(run_id, "run_id")
         safe_stage = _machine_code(stage, "stage").lower()
+        if safe_stage not in NIGHT_RUN_STAGES:
+            raise LedgerValidationError("unknown night-run stage")
         safe_expected = (
             _machine_code(expected_stage, "expected_stage").lower()
             if expected_stage is not None
             else None
         )
+        if safe_expected is not None and safe_expected not in NIGHT_RUN_STAGES:
+            raise LedgerValidationError("unknown expected night-run stage")
         safe_counts = _normalize_counts(counts)
         safe_errors = _normalize_errors(errors)
         row = self._connection.execute(
@@ -2589,7 +2837,9 @@ class LedgerTransaction:
         ).fetchone()
         if row is None:
             raise LedgerStateError("night run does not exist")
-        current = self._ledger._night_run_from_row(row, created=False)
+        current = self._ledger._verify_night_run_history(
+            self._connection, row
+        )
         if safe_expected is not None and current.stage != safe_expected:
             raise LedgerStateError("night run compare-and-set failed")
         counts_json = _json_counts(safe_counts)
@@ -2605,6 +2855,8 @@ class LedgerTransaction:
             return current
         if current.stage in TERMINAL_NIGHT_STAGES:
             raise LedgerStateError("night run is already terminal")
+        if safe_stage not in _NIGHT_STAGE_TRANSITIONS[current.stage]:
+            raise LedgerStateError("night run transition is not allowed")
 
         sequence = current.sequence + 1
         now = _utc_now()

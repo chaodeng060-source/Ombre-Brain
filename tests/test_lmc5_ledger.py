@@ -911,49 +911,300 @@ def test_write_receipt_replay_is_exact_and_mismatch_conflicts(tmp_path):
         )
 
 
-def test_night_run_has_snapshot_compare_and_set_and_sanitized_errors(tmp_path):
+def test_night_run_enforces_forward_lifecycle_and_exact_replay(tmp_path):
     ledger = _ledger(tmp_path)
     started = ledger.start_night_run("night-1", "snapshot:sha256:abc", counts={"raw": 3})
     assert started.stage == "started"
     assert started.sequence == 0
 
-    validated = ledger.record_night_stage(
+    snapshotted = ledger.record_night_stage(
         "night-1",
-        "validate",
+        "snapshotted",
         expected_stage="started",
-        counts={"covered": 2, "raw": 3},
-        errors=["coverage.hole"],
+        counts={"raw": 3},
     )
-    assert validated.sequence == 1
-    assert validated.errors == ("coverage.hole",)
+    assert snapshotted.sequence == 1
     replay = ledger.record_night_stage(
         "night-1",
-        "validate",
-        counts={"raw": 3, "covered": 2},
-        errors=["coverage.hole"],
+        "snapshotted",
+        counts={"raw": 3},
     )
     assert replay.sequence == 1
     assert replay.created is False
+    assert ledger.start_night_run(
+        "night-1",
+        "snapshot:sha256:abc",
+        counts={"raw": 3},
+    ).stage == "snapshotted"
+    with pytest.raises(LedgerConflictError):
+        ledger.start_night_run(
+            "night-1",
+            "snapshot:sha256:abc",
+            counts={"raw": 999},
+        )
 
     with pytest.raises(LedgerConflictError):
         ledger.start_night_run("night-1", "other-snapshot")
     with pytest.raises(LedgerStateError):
         ledger.record_night_stage(
-            "night-1", "complete", expected_stage="snapshot", counts={}
+            "night-1", "chunked", expected_stage="started", counts={}
         )
     with pytest.raises(LedgerValidationError):
         ledger.record_night_stage(
             "night-1", "error", errors=["raw text must never enter this log"]
         )
 
-    ledger.record_night_stage(
+    prior = "snapshotted"
+    for sequence, stage in enumerate(
+        (
+            "chunked",
+            "proposed",
+            "dispatched",
+            "metabolism_reported",
+            "validated",
+            "complete",
+        ),
+        start=2,
+    ):
+        completed = ledger.record_night_stage(
+            "night-1",
+            stage,
+            expected_stage=prior,
+            counts={"raw": 3, "sequence": sequence},
+        )
+        assert completed.sequence == sequence
+        prior = stage
+
+    exact_terminal_replay = ledger.record_night_stage(
         "night-1",
         "complete",
-        expected_stage="validate",
-        counts={"covered": 3, "raw": 3},
+        counts={"sequence": 7, "raw": 3},
     )
+    assert exact_terminal_replay.created is False
+    assert exact_terminal_replay.sequence == 7
+    with pytest.raises(LedgerConflictError):
+        ledger.record_night_stage("night-1", "complete", counts={"raw": 3})
     with pytest.raises(LedgerStateError):
-        ledger.record_night_stage("night-1", "post_complete")
+        ledger.record_night_stage("night-1", "error")
+
+
+def test_night_run_rejects_unknown_backward_skipped_and_new_rollback(tmp_path):
+    ledger = _ledger(tmp_path)
+    ledger.start_night_run("night", "snapshot")
+
+    for stage in ("snapshot", "validate", "post_complete"):
+        with pytest.raises(LedgerValidationError):
+            ledger.record_night_stage("night", stage)
+    with pytest.raises(LedgerValidationError):
+        ledger.record_night_stage(
+            "night", "snapshotted", expected_stage="snapshot"
+        )
+
+    for skipped in (
+        "chunked",
+        "proposed",
+        "dispatched",
+        "metabolism_reported",
+        "validated",
+        "complete",
+        "rolled_back",
+    ):
+        with pytest.raises(LedgerStateError):
+            ledger.record_night_stage("night", skipped)
+
+    ledger.record_night_stage("night", "snapshotted")
+    with pytest.raises(LedgerStateError):
+        ledger.record_night_stage("night", "started")
+    with pytest.raises(LedgerStateError):
+        ledger.record_night_stage("night", "validated")
+
+
+@pytest.mark.parametrize(
+    "last_stage",
+    (
+        "started",
+        "snapshotted",
+        "chunked",
+        "proposed",
+        "dispatched",
+        "metabolism_reported",
+        "validated",
+    ),
+)
+def test_any_nonterminal_night_stage_can_fail_closed(tmp_path, last_stage):
+    ledger = _ledger(tmp_path)
+    run_id = f"night-{last_stage}"
+    ledger.start_night_run(run_id, "snapshot")
+    for stage in (
+        "snapshotted",
+        "chunked",
+        "proposed",
+        "dispatched",
+        "metabolism_reported",
+        "validated",
+    ):
+        if last_stage == "started":
+            break
+        ledger.record_night_stage(run_id, stage)
+        if stage == last_stage:
+            break
+    failed = ledger.record_night_stage(
+        run_id,
+        "error",
+        expected_stage=last_stage,
+        errors=["night.test_failure"],
+    )
+    assert failed.stage == "error"
+    assert failed.errors == ("night.test_failure",)
+    assert ledger.record_night_stage(
+        run_id,
+        "error",
+        errors=["night.test_failure"],
+    ).created is False
+    with pytest.raises(LedgerStateError):
+        ledger.record_night_stage(run_id, "complete")
+
+
+def test_nonterminal_night_runs_are_read_only_stably_paginated(tmp_path):
+    ledger = _ledger(tmp_path)
+    ledger.start_night_run("night-1", "snapshot-1", counts={"raw": 1})
+    ledger.start_night_run("night-2", "snapshot-2")
+    ledger.record_night_stage("night-2", "snapshotted", counts={"raw": 2})
+    ledger.start_night_run("night-3", "snapshot-3")
+    ledger.record_night_stage(
+        "night-3", "error", errors=["night.synthetic_failure"]
+    )
+    ledger.start_night_run("night-4", "snapshot-4")
+    for stage in (
+        "snapshotted",
+        "chunked",
+        "proposed",
+        "dispatched",
+        "metabolism_reported",
+        "validated",
+        "complete",
+    ):
+        ledger.record_night_stage("night-4", stage)
+    ledger.start_night_run("night-5", "snapshot-5")
+    ledger.record_night_stage("night-5", "snapshotted")
+
+    with sqlite3.connect(ledger.path) as connection:
+        before = tuple(
+            connection.execute(
+                "SELECT COUNT(*) FROM night_run_stages"
+            ).fetchone()
+        )
+
+    first_page = ledger.list_nonterminal_night_runs(limit=1)
+    assert [run.run_id for run in first_page] == ["night-1"]
+    assert first_page[0].cursor == first_page[0].row_id
+    assert first_page[0].counts == {"raw": 1}
+    second_page = ledger.list_nonterminal_night_runs(
+        limit=1, after=first_page[-1].cursor
+    )
+    assert [run.run_id for run in second_page] == ["night-2"]
+    assert second_page[0].stage == "snapshotted"
+    third_page = ledger.list_nonterminal_night_runs(
+        limit=1, after=second_page[-1].cursor
+    )
+    assert [run.run_id for run in third_page] == ["night-5"]
+    assert ledger.list_nonterminal_night_runs(
+        after=third_page[-1].cursor
+    ) == ()
+    assert ledger.list_interrupted_night_runs() == (
+        first_page + second_page + third_page
+    )
+
+    with sqlite3.connect(ledger.path) as connection:
+        after = tuple(
+            connection.execute(
+                "SELECT COUNT(*) FROM night_run_stages"
+            ).fetchone()
+        )
+    assert after == before
+
+    for bad_limit in (0, 1001, True):
+        with pytest.raises(LedgerValidationError):
+            ledger.list_nonterminal_night_runs(limit=bad_limit)
+    for bad_after in (-1, True):
+        with pytest.raises(LedgerValidationError):
+            ledger.list_nonterminal_night_runs(after=bad_after)
+
+
+def test_legacy_rolled_back_run_is_readable_terminal_but_not_newly_writable(
+    tmp_path,
+):
+    ledger = _ledger(tmp_path)
+    ledger.start_night_run("legacy", "snapshot")
+    with sqlite3.connect(ledger.path) as connection:
+        now = "2026-01-01T00:00:00+00:00"
+        connection.execute(
+            """
+            INSERT INTO night_run_stages(
+                run_id, sequence, stage, counts_json, errors_json, recorded_at
+            ) VALUES ('legacy', 1, 'validate', '{}', '[]', ?)
+            """,
+            (now,),
+        )
+        connection.execute(
+            """
+            INSERT INTO night_run_stages(
+                run_id, sequence, stage, counts_json, errors_json, recorded_at
+            ) VALUES ('legacy', 2, 'rolled_back', '{}', '[]', ?)
+            """,
+            (now,),
+        )
+        connection.execute(
+            """
+            UPDATE night_runs
+            SET stage = 'rolled_back', sequence = 2,
+                counts_json = '{}', errors_json = '[]', updated_at = ?
+            WHERE run_id = 'legacy'
+            """,
+            (now,),
+        )
+        connection.commit()
+
+    run = ledger.get_night_run("legacy")
+    assert run.stage == "rolled_back"
+    assert ledger.list_nonterminal_night_runs() == ()
+    assert ledger.record_night_stage("legacy", "rolled_back").created is False
+    with pytest.raises(LedgerStateError):
+        ledger.record_night_stage("legacy", "error")
+    assert ledger.verify_integrity()["night_runs"] == 1
+
+
+def test_integrity_rejects_skipped_or_divergent_night_history(tmp_path):
+    ledger = _ledger(tmp_path)
+    ledger.start_night_run("night", "snapshot")
+    with sqlite3.connect(ledger.path) as connection:
+        now = "2026-01-01T00:00:00+00:00"
+        connection.execute(
+            """
+            INSERT INTO night_run_stages(
+                run_id, sequence, stage, counts_json, errors_json, recorded_at
+            ) VALUES ('night', 1, 'proposed', '{}', '[]', ?)
+            """,
+            (now,),
+        )
+        connection.execute(
+            """
+            UPDATE night_runs
+            SET stage = 'proposed', sequence = 1, updated_at = ?
+            WHERE run_id = 'night'
+            """,
+            (now,),
+        )
+        connection.commit()
+
+    with pytest.raises(
+        LedgerCorruptionError, match="invalid transition"
+    ):
+        ledger.verify_integrity()
+    with pytest.raises(
+        LedgerCorruptionError, match="invalid transition"
+    ):
+        ledger.list_nonterminal_night_runs()
 
 
 def test_composable_transaction_rolls_back_all_pipeline_rows(tmp_path):
