@@ -10,6 +10,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from maintenance_barrier import MaintenanceBarrier
 from storage_safety import advisory_file_lock
 
 
@@ -314,9 +315,22 @@ def rank_multiplier(_annotation) -> float:
 class EAxisShadowStore:
     """Append-only, fsynced, idempotent JSONL store with corruption fail-close."""
 
-    def __init__(self, path: str | os.PathLike):
+    def __init__(
+        self,
+        path: str | os.PathLike,
+        *,
+        maintenance_root: str | os.PathLike | None = None,
+    ):
         self.path = Path(path)
         self.lock_path = Path(f"{self.path}.lock")
+        parent = self.path.parent
+        root = (
+            Path(maintenance_root)
+            if maintenance_root is not None
+            else parent.parent if parent.name.startswith(".") else parent
+        )
+        root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self._maintenance_barrier = MaintenanceBarrier(root)
 
     @staticmethod
     def _validate_row(row: dict) -> bool:
@@ -409,6 +423,10 @@ class EAxisShadowStore:
                 return self._load_locked(handle)
 
     def append(self, row: dict) -> bool:
+        with self._maintenance_barrier.shared():
+            return self._append_locked(row)
+
+    def _append_locked(self, row: dict) -> bool:
         if not self._validate_row(row):
             raise ValueError("invalid E shadow row")
         key = str(row.get("annotation_key") or "").strip()

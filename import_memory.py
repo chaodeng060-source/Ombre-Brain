@@ -24,6 +24,7 @@ from pathlib import Path
 
 from utils import count_tokens_approx, normalize_event_at, now_iso
 from redact import redact_embedding_input, redact_text  # 只抹 secret，不审查情感内容
+from maintenance_barrier import MaintenanceBarrier
 from storage_safety import advisory_file_lock, atomic_write_text
 
 logger = logging.getLogger("ombre_brain.import")
@@ -570,6 +571,11 @@ class ImportEngine:
         self.dehydrator = dehydrator
         self.embedding_engine = embedding_engine
         self.state = ImportState(config["buckets_dir"])
+        self._maintenance_barrier = getattr(
+            bucket_mgr,
+            "_maintenance_barrier",
+            None,
+        ) or MaintenanceBarrier(config["buckets_dir"])
         self._paused = False
         self._running = False
         self._chunks: list[dict] = []
@@ -607,18 +613,20 @@ class ImportEngine:
             # A single durable ledger is shared by all workers using this
             # buckets_dir.  Serialize the complete import so two processes
             # cannot both observe a missing output marker and create twins.
-            with advisory_file_lock(self.state.lock_file):
-                return await self._start_locked(
-                    raw_content,
-                    filename=filename,
-                    preserve_raw=preserve_raw,
-                    resume=resume,
-                )
+            async with self._maintenance_barrier.shared_async():
+                with advisory_file_lock(self.state.lock_file):
+                    return await self._start_locked(
+                        raw_content,
+                        filename=filename,
+                        preserve_raw=preserve_raw,
+                        resume=resume,
+                    )
         except Exception as e:
-            self.state.data["status"] = "error"
-            self.state.data["errors"] = [str(e)[:200]]
             try:
-                self.state.save()
+                async with self._maintenance_barrier.shared_async():
+                    self.state.data["status"] = "error"
+                    self.state.data["errors"] = [str(e)[:200]]
+                    self.state.save()
             except Exception:
                 logger.exception("Failed to persist terminal import error")
             raise

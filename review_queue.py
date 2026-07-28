@@ -29,6 +29,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from maintenance_barrier import MaintenanceBarrier
 from storage_safety import advisory_file_lock, atomic_write_text
 
 
@@ -50,6 +51,13 @@ REST_SAFE_RESOLVE_STATUSES = {STATUS_REVIEWED, STATUS_REJECTED}
 
 class ReviewQueueCorruptError(RuntimeError):
     """The durable review ledger cannot be trusted and must not be treated as empty."""
+
+
+def _maintenance_root(path: Path) -> Path:
+    parent = path.parent
+    root = parent.parent if parent.name.startswith(".") else parent
+    root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    return root
 
 
 def rest_resolve_status_allowed(status: str) -> bool:
@@ -120,8 +128,18 @@ def make_currentness_overlay_entry(entry: dict, now: Optional[datetime] = None) 
 class CurrentnessOverlay:
     """Append-only reviewed currentness map that never rewrites protected buckets."""
 
-    def __init__(self, path: str | os.PathLike):
+    def __init__(
+        self,
+        path: str | os.PathLike,
+        *,
+        maintenance_root: str | os.PathLike | None = None,
+    ):
         self.path = Path(path)
+        self._maintenance_barrier = MaintenanceBarrier(
+            Path(maintenance_root)
+            if maintenance_root is not None
+            else _maintenance_root(self.path)
+        )
 
     def _load(self) -> list[dict]:
         if not self.path.exists():
@@ -138,6 +156,10 @@ class CurrentnessOverlay:
         return rows
 
     def add(self, entry: dict) -> bool:
+        with self._maintenance_barrier.shared():
+            return self._add_locked(entry)
+
+    def _add_locked(self, entry: dict) -> bool:
         key = str(entry.get("key") or "").strip()
         if not key:
             raise ValueError("overlay entry requires key")
@@ -269,9 +291,19 @@ def make_z_pair_entry(
 class ReviewQueue:
     """append-only 的待审队列；enqueue 幂等去重，resolve 是唯一重写路径。"""
 
-    def __init__(self, path: str | os.PathLike):
+    def __init__(
+        self,
+        path: str | os.PathLike,
+        *,
+        maintenance_root: str | os.PathLike | None = None,
+    ):
         self.path = Path(path)
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        self._maintenance_barrier = MaintenanceBarrier(
+            Path(maintenance_root)
+            if maintenance_root is not None
+            else _maintenance_root(self.path)
+        )
 
     # ---- 读 ----
     def _load_unlocked(self) -> list[dict]:
@@ -316,6 +348,10 @@ class ReviewQueue:
     # ---- 写 ----
     def enqueue(self, entry: dict) -> bool:
         """挂一条 pending 行。已存在同 key 则不重复（幂等）。返回是否新增。"""
+        with self._maintenance_barrier.shared():
+            return self._enqueue_locked(entry)
+
+    def _enqueue_locked(self, entry: dict) -> bool:
         key = entry.get("key")
         if not key:
             raise ValueError("review_queue entry 缺 key")
@@ -338,6 +374,16 @@ class ReviewQueue:
                 now: Optional[datetime] = None) -> bool:
         """人显式裁决一条：把它的 status 改成 reviewed/applied/rejected。
         唯一会重写文件的路径——机器永不调它。返回是否命中。"""
+        with self._maintenance_barrier.shared():
+            return self._resolve_locked(
+                key,
+                status,
+                verdict_note=verdict_note,
+                now=now,
+            )
+
+    def _resolve_locked(self, key: str, status: str, *, verdict_note: str = "",
+                        now: Optional[datetime] = None) -> bool:
         if status not in (STATUS_REVIEWED, STATUS_APPLIED, STATUS_REJECTED):
             raise ValueError(f"非法 resolve 状态: {status}")
         with advisory_file_lock(self.lock_path):

@@ -31,6 +31,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from maintenance_barrier import MaintenanceBarrier
 from storage_safety import advisory_file_lock
 from utils import now_iso
 
@@ -162,11 +163,17 @@ class CuratedWriteCoordinator:
         self.bucket_manager = bucket_manager
         self.embedding_engine = embedding_engine
         base_dir = os.path.abspath(os.fspath(bucket_manager.base_dir))
+        self._maintenance_barrier = getattr(
+            bucket_manager,
+            "_maintenance_barrier",
+            None,
+        ) or MaintenanceBarrier(base_dir)
         self.ledger_path = os.path.abspath(
             os.fspath(ledger_path or os.path.join(base_dir, ".curated_writes.db"))
         )
         self.locks_dir = os.path.join(base_dir, ".curated-write-locks")
-        self._init_ledger()
+        with self._maintenance_barrier.shared():
+            self._init_ledger()
 
     def _init_ledger(self) -> None:
         os.makedirs(os.path.dirname(self.ledger_path), exist_ok=True)
@@ -514,6 +521,24 @@ class CuratedWriteCoordinator:
         return updates
 
     async def write(
+        self,
+        *,
+        idempotency_key: str,
+        content: str,
+        vector_policy: str,
+        bucket_options: dict[str, Any] | None = None,
+        actor: str = "lmc5:curated",
+    ) -> CuratedWriteResult:
+        async with self._maintenance_barrier.shared_async():
+            return await self._write_locked(
+                idempotency_key=idempotency_key,
+                content=content,
+                vector_policy=vector_policy,
+                bucket_options=bucket_options,
+                actor=actor,
+            )
+
+    async def _write_locked(
         self,
         *,
         idempotency_key: str,

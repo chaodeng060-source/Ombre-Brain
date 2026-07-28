@@ -46,6 +46,7 @@ from utils import (
     DATE_PRECISIONS, event_at_from_metadata, normalize_event_at,
 )
 from mutation_audit import MutationAuditLog
+from maintenance_barrier import MaintenanceBarrier
 from storage_safety import advisory_file_lock, atomic_write_post
 from x_provenance import normalize_x_provenance, validate_x_provenance_update
 
@@ -126,11 +127,13 @@ class BucketManager:
         self.w_time = scoring.get("time_proximity", 2.5)
         self.w_importance = scoring.get("importance", 1.0)
         self.content_weight = scoring.get("content_weight", 3.0)
-        self.audit_log = MutationAuditLog(
-            self.base_dir,
-            config.get("audit", {}),
-        )
         self._locks_dir = os.path.join(self.base_dir, ".locks")
+        self._maintenance_barrier = MaintenanceBarrier(self.base_dir)
+        with self._maintenance_barrier.shared():
+            self.audit_log = MutationAuditLog(
+                self.base_dir,
+                config.get("audit", {}),
+            )
         self._bucket_locks: dict[str, asyncio.Lock] = {}
 
     def _lock_for(self, bucket_id: str) -> asyncio.Lock:
@@ -143,11 +146,12 @@ class BucketManager:
     @asynccontextmanager
     async def _write_guard(self, bucket_id: str):
         """Serialize writes in this process and across maintenance processes."""
-        async with self._lock_for(bucket_id):
-            lock_name = re.sub(r"[^A-Za-z0-9_.-]", "_", bucket_id)
-            lock_path = os.path.join(self._locks_dir, f"{lock_name}.lock")
-            with advisory_file_lock(lock_path):
-                yield
+        async with self._maintenance_barrier.shared_async():
+            async with self._lock_for(bucket_id):
+                lock_name = re.sub(r"[^A-Za-z0-9_.-]", "_", bucket_id)
+                lock_path = os.path.join(self._locks_dir, f"{lock_name}.lock")
+                with advisory_file_lock(lock_path):
+                    yield
 
     @staticmethod
     def _post_snapshot(post, file_path: str = "") -> dict:
@@ -333,7 +337,6 @@ class BucketManager:
             primary_domain = sanitize_name(domain[0]) if domain else "未分类"
             
         target_dir = os.path.join(type_dir, primary_domain)
-        os.makedirs(target_dir, exist_ok=True)
 
         if bucket_name and bucket_name != bucket_id:
             filename = f"{bucket_name}_{bucket_id}.md"
@@ -343,6 +346,7 @@ class BucketManager:
 
         post = frontmatter.Post(linked_content, **metadata)
         async with self._write_guard(bucket_id):
+            os.makedirs(target_dir, exist_ok=True)
             event_id = self.audit_log.begin(
                 actor=actor,
                 action="create",
@@ -680,37 +684,48 @@ class BucketManager:
     # Touch bucket
     # ---------------------------------------------------------
     async def touch(self, bucket_id: str, actor: str = "system:touch") -> None:
-        current_time = None
-        async with self._write_guard(bucket_id):
-            file_path = self._find_bucket_file(bucket_id)
-            if not file_path:
-                return
+        # One touch includes its bounded time ripple.  Keep the maintenance
+        # lease across both phases so an exclusive night snapshot cannot land
+        # between the primary mutation and its derived mutations.
+        async with self._maintenance_barrier.shared_async():
+            current_time = None
+            async with self._write_guard(bucket_id):
+                file_path = self._find_bucket_file(bucket_id)
+                if not file_path:
+                    return
 
-            event_id = None
-            try:
-                post = self._safe_load_post(file_path)
-                before = self._post_snapshot(post, file_path)
-                post["last_active"] = now_iso()
-                post["activation_count"] = post.get("activation_count", 0) + 1
-                event_id = self.audit_log.begin(
-                    actor=actor,
-                    action="touch",
-                    bucket_id=bucket_id,
-                    before=before,
-                    after=self._post_snapshot(post, file_path),
-                    details={"activation_increment": 1},
-                )
-                self._atomic_write_post(file_path, post)
-                self.audit_log.commit(event_id)
-                current_time = datetime.fromisoformat(
-                    str(event_at_from_metadata(post.metadata, fallback_last_active=True))
-                )
-            except Exception as e:
-                self.audit_log.fail(event_id, e)
-                logger.warning(f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}")
-                return
-        if current_time is not None:
-            await self._time_ripple(bucket_id, current_time)
+                event_id = None
+                try:
+                    post = self._safe_load_post(file_path)
+                    before = self._post_snapshot(post, file_path)
+                    post["last_active"] = now_iso()
+                    post["activation_count"] = post.get("activation_count", 0) + 1
+                    event_id = self.audit_log.begin(
+                        actor=actor,
+                        action="touch",
+                        bucket_id=bucket_id,
+                        before=before,
+                        after=self._post_snapshot(post, file_path),
+                        details={"activation_increment": 1},
+                    )
+                    self._atomic_write_post(file_path, post)
+                    self.audit_log.commit(event_id)
+                    current_time = datetime.fromisoformat(
+                        str(
+                            event_at_from_metadata(
+                                post.metadata,
+                                fallback_last_active=True,
+                            )
+                        )
+                    )
+                except Exception as e:
+                    self.audit_log.fail(event_id, e)
+                    logger.warning(
+                        f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}"
+                    )
+                    return
+            if current_time is not None:
+                await self._time_ripple(bucket_id, current_time)
 
     async def _time_ripple(self, source_id: str, reference_time: datetime, hours: float = 48.0) -> None:
         try:

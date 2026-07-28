@@ -20,6 +20,8 @@ from pathlib import Path
 
 import httpx
 from openai import AsyncOpenAI
+
+from maintenance_barrier import MaintenanceBarrier
 from redact import redact_embedding_input
 
 logger = logging.getLogger("ombre_brain.embedding")
@@ -68,6 +70,7 @@ class EmbeddingEngine:
         # SQLite path
         db_path = os.path.join(config["buckets_dir"], "embeddings.db")
         self.db_path = db_path
+        self._maintenance_barrier = MaintenanceBarrier(config["buckets_dir"])
 
         # --- Optional dedicated proxy ONLY for embedding traffic ---
         # --- 仅给 embedding 流量挂的专用代理（不碰 DeepSeek/R2 直连）---
@@ -98,17 +101,18 @@ class EmbeddingEngine:
         self._init_db()
 
     def _init_db(self):
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
-        # 扫盘 #4：全文件 SQLite 一律 closing() 包住——中途抛异常也不漏连接（长跑进程会累积）
-        with closing(sqlite3.connect(self.db_path)) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS embeddings (
-                    bucket_id TEXT PRIMARY KEY,
-                    embedding TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-            """)
-            conn.commit()
+        with self._maintenance_barrier.shared():
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+            # 扫盘 #4：全文件 SQLite 一律 closing() 包住——中途抛异常也不漏连接（长跑进程会累积）
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS embeddings (
+                        bucket_id TEXT PRIMARY KEY,
+                        embedding TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                """)
+                conn.commit()
 
     # --- Multi-vector chunking (2026-06-09) ---
     # 旧版：整桶取前 2000 字、生成单一向量。大杂烩桶（多条 core_facts）里的子主题
@@ -223,17 +227,22 @@ class EmbeddingEngine:
 
     def _store_embedding(self, bucket_id: str, embedding: list[float]):
         from utils import now_iso
-        with closing(sqlite3.connect(self.db_path)) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO embeddings (bucket_id, embedding, updated_at) VALUES (?, ?, ?)",
-                (bucket_id, json.dumps(embedding), now_iso()),
-            )
-            conn.commit()
+        with self._maintenance_barrier.shared():
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO embeddings (bucket_id, embedding, updated_at) VALUES (?, ?, ?)",
+                    (bucket_id, json.dumps(embedding), now_iso()),
+                )
+                conn.commit()
 
     def delete_embedding(self, bucket_id: str):
-        with closing(sqlite3.connect(self.db_path)) as conn:
-            conn.execute("DELETE FROM embeddings WHERE bucket_id = ?", (bucket_id,))
-            conn.commit()
+        with self._maintenance_barrier.shared():
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                conn.execute(
+                    "DELETE FROM embeddings WHERE bucket_id = ?",
+                    (bucket_id,),
+                )
+                conn.commit()
 
     async def get_embedding(self, bucket_id: str) -> list[float] | None:
         with closing(sqlite3.connect(self.db_path)) as conn:

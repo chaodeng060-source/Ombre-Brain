@@ -25,6 +25,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
+from maintenance_barrier import MaintenanceBarrier
+
 
 SCHEMA_VERSION = 1
 MAX_PAYLOAD_BYTES = 16 * 1024 * 1024
@@ -301,6 +303,7 @@ class LMC5Ledger:
         *,
         busy_timeout_ms: int = 30_000,
         secure_permissions: bool = True,
+        maintenance_root: str | os.PathLike[str] | None = None,
     ) -> None:
         self.path = Path(path)
         if not self.path.is_absolute():
@@ -309,8 +312,19 @@ class LMC5Ledger:
             raise LedgerValidationError("busy_timeout_ms must be positive")
         self.busy_timeout_ms = int(busy_timeout_ms)
         self.secure_permissions = bool(secure_permissions)
-        self._prepare_path()
-        self._initialize()
+        if maintenance_root is not None:
+            barrier_root = Path(maintenance_root)
+        else:
+            parent = self.path.parent
+            barrier_root = parent.parent if parent.name.startswith(".") else parent
+        if not barrier_root.is_absolute():
+            barrier_root = barrier_root.resolve()
+        if not barrier_root.exists():
+            barrier_root.mkdir(parents=True, mode=0o700)
+        self._maintenance_barrier = MaintenanceBarrier(barrier_root)
+        with self._maintenance_barrier.shared():
+            self._prepare_path()
+            self._initialize()
 
     def _prepare_path(self) -> None:
         parent = self.path.parent
@@ -702,18 +716,19 @@ class LMC5Ledger:
         yielded transaction facade.
         """
 
-        connection = self._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            yield LedgerTransaction(self, connection)
-            connection.commit()
-        except Exception:
-            if connection.in_transaction:
-                connection.rollback()
-            raise
-        finally:
-            connection.close()
-            self._secure_sidecars()
+        with self._maintenance_barrier.shared():
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                yield LedgerTransaction(self, connection)
+                connection.commit()
+            except Exception:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+            finally:
+                connection.close()
+                self._secure_sidecars()
 
     def append_raw_event(
         self,

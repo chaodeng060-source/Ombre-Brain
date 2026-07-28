@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 import pytest
 
 import server
@@ -27,6 +29,7 @@ class FakeBucketMgr:
         self.keyword_matches = keyword_matches or []
         self.updates = []
         self.created = []
+        self._maintenance_barrier = _NoopMaintenanceBarrier()
 
     async def search(self, *args, **kwargs):
         return list(self.keyword_matches)
@@ -47,6 +50,12 @@ class FakeBucketMgr:
     async def create(self, **kwargs):
         self.created.append(kwargs)
         return "new-bucket"
+
+
+class _NoopMaintenanceBarrier:
+    @asynccontextmanager
+    async def shared_async(self):
+        yield
 
 
 class FakeEmbedding:

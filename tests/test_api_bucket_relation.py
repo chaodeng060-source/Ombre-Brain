@@ -3,6 +3,8 @@
 # （原 api_bucket_update 注释吹"镜像 trace"却漏了 relation；这里补齐并回归）
 # ============================================================
 import json
+from contextlib import asynccontextmanager
+
 import pytest
 
 import server
@@ -23,6 +25,7 @@ class _RelMgr:
         self.edges = []
         self.removed = []
         self.updated = None
+        self._maintenance_barrier = _NoopMaintenanceBarrier()
 
     async def get(self, bid):
         if bid in self._ids:
@@ -42,6 +45,12 @@ class _RelMgr:
     async def update(self, bid, **kw):
         self.updated = kw
         return True
+
+
+class _NoopMaintenanceBarrier:
+    @asynccontextmanager
+    async def shared_async(self):
+        yield
 
 
 async def _call(monkeypatch, mgr, bucket_id, body):

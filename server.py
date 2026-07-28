@@ -164,7 +164,10 @@ def _get_review_queue() -> ReviewQueue:
     path = os.path.join(config["buckets_dir"], "review_queue.jsonl")
     if _review_queue is None or str(_review_queue.path) != os.path.abspath(path) \
             and str(_review_queue.path) != path:
-        _review_queue = ReviewQueue(path)
+        _review_queue = ReviewQueue(
+            path,
+            maintenance_root=config["buckets_dir"],
+        )
     return _review_queue
 
 
@@ -172,7 +175,10 @@ def _get_e_axis_shadow_store() -> EAxisShadowStore:
     global _e_axis_shadow_store
     path = os.path.join(config["buckets_dir"], ".axis", "e-shadow.jsonl")
     if _e_axis_shadow_store is None or str(_e_axis_shadow_store.path) != path:
-        _e_axis_shadow_store = EAxisShadowStore(path)
+        _e_axis_shadow_store = EAxisShadowStore(
+            path,
+            maintenance_root=config["buckets_dir"],
+        )
     return _e_axis_shadow_store
 
 
@@ -191,7 +197,10 @@ def _get_lmc5_ledger() -> LMC5Ledger:
                 _lmc5_ledger is None
                 or os.fspath(_lmc5_ledger.path) != expected_path
             ):
-                _lmc5_ledger = LMC5Ledger(path)
+                _lmc5_ledger = LMC5Ledger(
+                    path,
+                    maintenance_root=config["buckets_dir"],
+                )
     return _lmc5_ledger
 
 
@@ -1520,35 +1529,37 @@ async def _merge_or_create(
                 merged_senses = union_senses(bmeta.get("sense"), detected_senses, structured_senses)
                 if merged_senses:
                     update_kwargs["sense"] = merged_senses
-                await bucket_mgr.update(bucket["id"], **update_kwargs)
-                # --- Update embedding after merge ---
-                # 扫盘 #10：embedding 失败不再静默——语义检索会悄悄陈旧，至少留 warning
-                try:
-                    await embedding_engine.generate_and_store(bucket["id"], merged)
-                except Exception as e:
-                    logger.warning(f"Embedding update after merge failed / 合并后向量更新失败: {bucket['id']}: {e}")
+                async with bucket_mgr._maintenance_barrier.shared_async():
+                    await bucket_mgr.update(bucket["id"], **update_kwargs)
+                    # --- Update embedding after merge ---
+                    # 扫盘 #10：embedding 失败不再静默——语义检索会悄悄陈旧，至少留 warning
+                    try:
+                        await embedding_engine.generate_and_store(bucket["id"], merged)
+                    except Exception as e:
+                        logger.warning(f"Embedding update after merge failed / 合并后向量更新失败: {bucket['id']}: {e}")
                 return bucket["id"], bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
 
-    bucket_id = await bucket_mgr.create(
-        content=content,
-        tags=tags,
-        importance=importance,
-        domain=domain,
-        valence=valence,
-        arousal=arousal,
-        name=name or None,
-        world=world,
-        chord_tag=chord_tag,
-        sense=detected_senses or None,
-    )
-    # --- Generate embedding for new bucket ---
-    # 扫盘 #10：失败留痕，否则新桶语义检索召不回且无任何日志线索
-    try:
-        await embedding_engine.generate_and_store(bucket_id, content)
-    except Exception as e:
-        logger.warning(f"Embedding for new bucket failed / 新桶向量生成失败: {bucket_id}: {e}")
+    async with bucket_mgr._maintenance_barrier.shared_async():
+        bucket_id = await bucket_mgr.create(
+            content=content,
+            tags=tags,
+            importance=importance,
+            domain=domain,
+            valence=valence,
+            arousal=arousal,
+            name=name or None,
+            world=world,
+            chord_tag=chord_tag,
+            sense=detected_senses or None,
+        )
+        # --- Generate embedding for new bucket ---
+        # 扫盘 #10：失败留痕，否则新桶语义检索召不回且无任何日志线索
+        try:
+            await embedding_engine.generate_and_store(bucket_id, content)
+        except Exception as e:
+            logger.warning(f"Embedding for new bucket failed / 新桶向量生成失败: {bucket_id}: {e}")
     display = name if name else bucket_id
     return bucket_id, display, False
 
@@ -2454,30 +2465,31 @@ async def hold(
         # 2026-07-12 修：原先硬编码空 tags/domain，调用方传的字段全丢，
         # imprint 写进来的记忆全变'未分类'。改用调用方实际传入的值。
         feel_domain = [d.strip() for d in (domain or "").split(",") if d.strip()]
-        bucket_id = await bucket_mgr.create(
-            content=content,
-            tags=extra_tags,
-            importance=5,
-            domain=feel_domain,
-            valence=feel_valence,
-            arousal=feel_arousal,
-            name=None,
-            bucket_type="feel",
-        )
-        try:
-            await embedding_engine.generate_and_store(bucket_id, content)
-        except Exception:
-            pass
-        # --- Mark source memory as digested + store model's valence perspective ---
-        # --- 标记源记忆为已消化 + 存储模型视角的 valence ---
-        if source_bucket and source_bucket.strip():
+        async with bucket_mgr._maintenance_barrier.shared_async():
+            bucket_id = await bucket_mgr.create(
+                content=content,
+                tags=extra_tags,
+                importance=5,
+                domain=feel_domain,
+                valence=feel_valence,
+                arousal=feel_arousal,
+                name=None,
+                bucket_type="feel",
+            )
             try:
-                update_kwargs = {"digested": True}
-                if 0 <= valence <= 1:
-                    update_kwargs["model_valence"] = feel_valence
-                await bucket_mgr.update(source_bucket.strip(), **update_kwargs)
-            except Exception as e:
-                logger.warning(f"Failed to mark source as digested / 标记已消化失败: {e}")
+                await embedding_engine.generate_and_store(bucket_id, content)
+            except Exception:
+                pass
+            # --- Mark source memory as digested + store model's valence perspective ---
+            # --- 标记源记忆为已消化 + 存储模型视角的 valence ---
+            if source_bucket and source_bucket.strip():
+                try:
+                    update_kwargs = {"digested": True}
+                    if 0 <= valence <= 1:
+                        update_kwargs["model_valence"] = feel_valence
+                    await bucket_mgr.update(source_bucket.strip(), **update_kwargs)
+                except Exception as e:
+                    logger.warning(f"Failed to mark source as digested / 标记已消化失败: {e}")
         return f"🫧feel→{bucket_id}"
 
     # --- Step 1: auto-tagging / 自动打标 ---
@@ -2504,23 +2516,24 @@ async def hold(
     # --- Pinned buckets bypass merge and are created directly in permanent dir ---
     # --- 钉选桶跳过合并，直接新建到 permanent 目录 ---
     if pinned:
-        bucket_id = await bucket_mgr.create(
-            content=content,
-            tags=all_tags,
-            importance=10,
-            domain=domain,
-            valence=valence,
-            arousal=arousal,
-            name=suggested_name or None,
-            bucket_type="permanent",
-            pinned=True,
-            world=effective_world,
-            chord_tag=chord_tag,
-        )
-        try:
-            await embedding_engine.generate_and_store(bucket_id, content)
-        except Exception:
-            pass
+        async with bucket_mgr._maintenance_barrier.shared_async():
+            bucket_id = await bucket_mgr.create(
+                content=content,
+                tags=all_tags,
+                importance=10,
+                domain=domain,
+                valence=valence,
+                arousal=arousal,
+                name=suggested_name or None,
+                bucket_type="permanent",
+                pinned=True,
+                world=effective_world,
+                chord_tag=chord_tag,
+            )
+            try:
+                await embedding_engine.generate_and_store(bucket_id, content)
+            except Exception:
+                pass
         return f"📌钉选→{bucket_id} {','.join(domain)}"
 
     # --- Step 2: merge or create / 合并或新建 ---
@@ -2719,9 +2732,10 @@ async def trace(
 
     # --- Delete mode / 删除模式 ---
     if delete:
-        success = await bucket_mgr.delete(bucket_id)
-        if success:
-            embedding_engine.delete_embedding(bucket_id)
+        async with bucket_mgr._maintenance_barrier.shared_async():
+            success = await bucket_mgr.delete(bucket_id)
+            if success:
+                embedding_engine.delete_embedding(bucket_id)
         return f"已遗忘记忆桶: {bucket_id}" if success else f"未找到记忆桶: {bucket_id}"
 
     bucket = await bucket_mgr.get(bucket_id)
@@ -2789,21 +2803,22 @@ async def trace(
 
     if updates:
         try:
-            success = await bucket_mgr.update(bucket_id, **updates)
+            async with bucket_mgr._maintenance_barrier.shared_async():
+                success = await bucket_mgr.update(bucket_id, **updates)
+                if success and "content" in updates:
+                    try:
+                        await embedding_engine.generate_and_store(
+                            bucket_id,
+                            updates["content"],
+                        )
+                    except Exception as e:
+                        logger.warning(f"Embedding refresh after update failed / 改内容后向量刷新失败: {bucket_id}: {e}")
         except ResolvedGuardError as e:
             return f"❌ 守卫拦截: {e}。这条铁律是 5.10 黑洞修复后落代码的兜底——保护域桶=持续状态，不该有'完结'。"
         if not success:
             return f"修改失败: {bucket_id}"
     else:
         success = True
-
-    # Re-generate embedding if content changed
-    # 扫盘 #10：失败留痕（改内容后旧向量还指着旧文本，检索结果会对不上）
-    if "content" in updates:
-        try:
-            await embedding_engine.generate_and_store(bucket_id, updates["content"])
-        except Exception as e:
-            logger.warning(f"Embedding refresh after update failed / 改内容后向量刷新失败: {bucket_id}: {e}")
 
     changed = ", ".join(f"{k}={v}" for k, v in updates.items() if k != "content")
     if "content" in updates:
@@ -4143,15 +4158,16 @@ async def api_bucket_update(request):
         return JSONResponse({"error": "no fields to update"}, status_code=400)
 
     if updates:
-        success = await bucket_mgr.update(bucket_id, **updates)
-        if not success:
-            return JSONResponse({"error": "update failed"}, status_code=500)
+        async with bucket_mgr._maintenance_barrier.shared_async():
+            success = await bucket_mgr.update(bucket_id, **updates)
+            if not success:
+                return JSONResponse({"error": "update failed"}, status_code=500)
 
-        if "content" in updates:
-            try:
-                await embedding_engine.generate_and_store(bucket_id, updates["content"])
-            except Exception:
-                pass
+            if "content" in updates:
+                try:
+                    await embedding_engine.generate_and_store(bucket_id, updates["content"])
+                except Exception:
+                    pass
 
     return JSONResponse({
         "ok": True,
