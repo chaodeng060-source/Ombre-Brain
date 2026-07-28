@@ -188,6 +188,10 @@ class BucketManager:
         date_confidence: float = None,
         actor: str = "system",
         x_provenance: dict = None,
+        curated_write_key: str = None,
+        curated_payload_sha256: str = None,
+        vector_policy: str = None,
+        lmc5_recall_state: str = None,
     ) -> str:
         bucket_id = generate_bucket_id()
         domain = domain or ["未分类"]
@@ -249,6 +253,34 @@ class BucketManager:
             # must never be patched in after create, because a failed second
             # write would leave a derived memory with no evidence chain.
             metadata.update(normalize_x_provenance(x_provenance))
+        curated_fields = (
+            curated_write_key,
+            curated_payload_sha256,
+            vector_policy,
+            lmc5_recall_state,
+        )
+        if any(value is not None for value in curated_fields):
+            if not all(isinstance(value, str) and value for value in curated_fields):
+                raise ValueError(
+                    "curated write metadata must be supplied as one complete set"
+                )
+            if not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}",
+                curated_write_key,
+            ):
+                raise ValueError("invalid curated_write_key")
+            if not re.fullmatch(r"[0-9a-f]{64}", curated_payload_sha256):
+                raise ValueError("invalid curated_payload_sha256")
+            if vector_policy not in {"required", "fts_only"}:
+                raise ValueError("invalid vector_policy")
+            if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", lmc5_recall_state):
+                raise ValueError("invalid lmc5_recall_state")
+            metadata.update({
+                "curated_write_key": curated_write_key,
+                "curated_payload_sha256": curated_payload_sha256,
+                "vector_policy": vector_policy,
+                "lmc5_recall_state": lmc5_recall_state,
+            })
         if pinned:
             metadata["pinned"] = True
         if protected:
@@ -286,6 +318,12 @@ class BucketManager:
                 metadata["type"] = "permanent"
         elif bucket_type == "feel":
             type_dir = self.feel_dir
+        elif bucket_type == "archived":
+            # A strict writer may stage a body in the cold store while an
+            # external index is being prepared.  Keeping both the metadata
+            # type and the physical path archived makes that intermediate
+            # body invisible to ordinary ``list_all``/``search`` callers.
+            type_dir = self.archive_dir
         else:
             type_dir = self.dynamic_dir
             
@@ -439,13 +477,20 @@ class BucketManager:
                     target_type_dir = self.permanent_dir
                     need_move = True
                 elif not new_pinned and old_pinned:
-                    target_type_dir = self.dynamic_dir if new_type != "feel" else self.feel_dir
+                    if new_type == "feel":
+                        target_type_dir = self.feel_dir
+                    elif new_type == "archived":
+                        target_type_dir = self.archive_dir
+                    else:
+                        target_type_dir = self.dynamic_dir
                     need_move = True
                 elif new_type != old_type:
                     if new_type == "permanent":
                         target_type_dir = self.permanent_dir
                     elif new_type == "feel":
                         target_type_dir = self.feel_dir
+                    elif new_type == "archived":
+                        target_type_dir = self.archive_dir
                     else:
                         target_type_dir = self.dynamic_dir
                     need_move = True
@@ -454,6 +499,8 @@ class BucketManager:
                         target_type_dir = self.permanent_dir
                     elif new_type == "feel":
                         target_type_dir = self.feel_dir
+                    elif new_type == "archived":
+                        target_type_dir = self.archive_dir
                     else:
                         target_type_dir = self.dynamic_dir
                     need_move = True
