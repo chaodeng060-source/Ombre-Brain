@@ -9,6 +9,7 @@ import pytest
 
 from e_axis_shadow import (
     CONTRACT_VERSION,
+    EAxisShadowConflictError,
     EAxisShadowStore,
     build_failure_record,
     build_shadow_annotation,
@@ -111,6 +112,86 @@ def test_shadow_store_is_fsynced_idempotent_and_private(tmp_path):
     assert store.lock_path.exists()
 
 
+def test_shadow_store_reordered_object_keys_are_the_same_normalized_row(
+    tmp_path,
+):
+    annotation, _ = _annotation()
+    path = tmp_path / "e-shadow.jsonl"
+    store = EAxisShadowStore(path)
+    assert store.append(annotation) is True
+    before = path.read_bytes()
+
+    reordered = dict(reversed(list(annotation.items())))
+    reordered["score"] = dict(reversed(list(annotation["score"].items())))
+    assert store.append(reordered) is False
+    assert path.read_bytes() == before
+    assert store.load() == [annotation]
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda row: row["score"].update(valence=-0.75),
+        lambda row: row.update(scored_at="2026-07-28T00:00:01+00:00"),
+        lambda row: row.update(status="failed", category="provider.error"),
+        lambda row: row.update(category="provider.error"),
+        lambda row: row.update(bucket_id="bucket-2"),
+        lambda row: row.update(source_digest="b" * 64),
+        lambda row: row.update(scorer="e-shadow-v2"),
+        lambda row: row.update(model="model-b"),
+        lambda row: row.update(rubric_version="rubric-2"),
+        lambda row: row.update(contract_version=2),
+        lambda row: row.update(shadow_only=False),
+        lambda row: row.update(affects_ranking=True),
+        lambda row: row.update(extra="not-allowed"),
+    ],
+)
+def test_shadow_store_rejects_any_changed_row_for_existing_key(tmp_path, mutate):
+    annotation, _ = _annotation()
+    path = tmp_path / "e-shadow.jsonl"
+    store = EAxisShadowStore(path)
+    assert store.append(annotation) is True
+    before = path.read_bytes()
+
+    changed = copy.deepcopy(annotation)
+    mutate(changed)
+    with pytest.raises(
+        EAxisShadowConflictError,
+        match="annotation_key conflict",
+    ):
+        store.append(changed)
+    assert path.read_bytes() == before
+    assert store.load() == [annotation]
+
+
+def test_shadow_store_failure_key_replay_must_match_category_and_time(tmp_path):
+    row = build_failure_record(
+        bucket_id="bucket-1",
+        source_digest="a" * 64,
+        scorer="scorer",
+        model="model",
+        rubric_version="v1",
+        category="schema.missing",
+    )
+    path = tmp_path / "e-shadow.jsonl"
+    store = EAxisShadowStore(path)
+    assert store.append(row) is True
+    assert store.append(dict(reversed(list(row.items())))) is False
+
+    for field, changed_value in (
+        ("category", "schema.unexpected"),
+        ("scored_at", "1900-01-01T00:00:00+00:00"),
+    ):
+        changed = copy.deepcopy(row)
+        changed[field] = changed_value
+        with pytest.raises(
+            EAxisShadowConflictError,
+            match="annotation_key conflict",
+        ):
+            store.append(changed)
+    assert store.load() == [row]
+
+
 def test_shadow_store_corruption_fails_closed(tmp_path):
     path = tmp_path / "e-shadow.jsonl"
     annotation, _ = _annotation()
@@ -125,6 +206,46 @@ def test_shadow_store_corruption_fails_closed(tmp_path):
     with pytest.raises(ValueError, match="corrupt E shadow ledger"):
         store.append(annotation)
     assert path.read_text(encoding="utf-8").endswith("not-json\n")
+
+
+def test_shadow_store_conflicting_duplicate_key_is_corruption(tmp_path):
+    annotation, _ = _annotation()
+    changed = copy.deepcopy(annotation)
+    changed["score"]["tension"] = 0.9
+    path = tmp_path / "e-shadow.jsonl"
+    original = (
+        json.dumps(annotation, ensure_ascii=False)
+        + "\n"
+        + json.dumps(changed, ensure_ascii=False)
+        + "\n"
+    )
+    path.write_text(original, encoding="utf-8")
+    store = EAxisShadowStore(path)
+
+    with pytest.raises(
+        ValueError,
+        match="corrupt E shadow ledger: conflicting annotation_key",
+    ):
+        store.load()
+    with pytest.raises(
+        ValueError,
+        match="corrupt E shadow ledger: conflicting annotation_key",
+    ):
+        store.append(annotation)
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_shadow_store_identical_duplicate_key_is_corruption(tmp_path):
+    annotation, _ = _annotation()
+    path = tmp_path / "e-shadow.jsonl"
+    raw = json.dumps(annotation, ensure_ascii=False) + "\n"
+    path.write_text(raw + raw, encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="corrupt E shadow ledger: duplicate annotation_key",
+    ):
+        EAxisShadowStore(path).load()
 
 
 @pytest.mark.parametrize(

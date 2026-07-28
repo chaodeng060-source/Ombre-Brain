@@ -56,6 +56,10 @@ _FAILURE_ROW_FIELDS = frozenset({
 })
 
 
+class EAxisShadowConflictError(ValueError):
+    """An annotation identity was reused with different immutable data."""
+
+
 def _plain_finite_number(value) -> bool:
     if type(value) not in (int, float):
         return False
@@ -333,9 +337,9 @@ class EAxisShadowStore:
         self._maintenance_barrier = MaintenanceBarrier(root)
 
     @staticmethod
-    def _validate_row(row: dict) -> bool:
+    def _normalize_row(row: dict) -> dict:
         if type(row) is not dict:
-            return False
+            raise ValueError("row must be an object")
         status = row.get("status")
         expected_fields = (
             _SUCCESS_ROW_FIELDS if status == "success"
@@ -343,30 +347,27 @@ class EAxisShadowStore:
             else None
         )
         if expected_fields is None or set(row) != expected_fields:
-            return False
+            raise ValueError("row fields do not match its status")
         if type(row.get("contract_version")) is not int \
                 or row["contract_version"] != CONTRACT_VERSION:
-            return False
+            raise ValueError("unsupported contract version")
         if row.get("shadow_only") is not True \
                 or row.get("affects_ranking") is not False:
-            return False
+            raise ValueError("row is not permanently shadow-only")
         annotation_key = row.get("annotation_key")
         source_digest = row.get("source_digest")
         if type(annotation_key) is not str or not _SHA256_RE.fullmatch(annotation_key):
-            return False
+            raise ValueError("invalid annotation key")
         if type(source_digest) is not str or not _SHA256_RE.fullmatch(source_digest):
-            return False
-        try:
-            bucket_id = _required_text(row.get("bucket_id"), "bucket_id")
-            scorer = _required_text(row.get("scorer"), "scorer")
-            model = _required_text(row.get("model"), "model")
-            rubric_version = _required_text(
-                row.get("rubric_version"),
-                "rubric_version",
-            )
-            _normalized_timestamp(row.get("scored_at"))
-        except ValueError:
-            return False
+            raise ValueError("invalid source digest")
+        bucket_id = _required_text(row.get("bucket_id"), "bucket_id")
+        scorer = _required_text(row.get("scorer"), "scorer")
+        model = _required_text(row.get("model"), "model")
+        rubric_version = _required_text(
+            row.get("rubric_version"),
+            "rubric_version",
+        )
+        scored_at = _normalized_timestamp(row.get("scored_at"))
 
         if status == "success":
             normalized_score, error = validate_shadow_score(
@@ -374,7 +375,7 @@ class EAxisShadowStore:
                 min_confidence=0.0,
             )
             if error or normalized_score is None:
-                return False
+                raise ValueError("invalid shadow score")
             expected_key = _success_key(
                 bucket_id,
                 source_digest,
@@ -383,10 +384,7 @@ class EAxisShadowStore:
                 rubric_version,
             )
         else:
-            try:
-                category = _required_text(row.get("category"), "category")
-            except ValueError:
-                return False
+            category = _required_text(row.get("category"), "category")
             expected_key = _failure_key(
                 bucket_id,
                 source_digest,
@@ -395,12 +393,41 @@ class EAxisShadowStore:
                 rubric_version,
                 category,
             )
-        return annotation_key == expected_key
+        if annotation_key != expected_key:
+            raise ValueError("annotation key does not match row identity")
+
+        normalized = {
+            "contract_version": CONTRACT_VERSION,
+            "annotation_key": annotation_key,
+            "status": status,
+            "bucket_id": bucket_id,
+            "source_digest": source_digest,
+            "scorer": scorer,
+            "model": model,
+            "rubric_version": rubric_version,
+            "scored_at": scored_at,
+            "shadow_only": True,
+            "affects_ranking": False,
+        }
+        if status == "success":
+            normalized["score"] = normalized_score
+        else:
+            normalized["category"] = category
+        return normalized
+
+    @staticmethod
+    def _validate_row(row: dict) -> bool:
+        try:
+            EAxisShadowStore._normalize_row(row)
+        except (TypeError, ValueError):
+            return False
+        return True
 
     @staticmethod
     def _load_locked(handle) -> list[dict]:
         handle.seek(0)
         rows = []
+        rows_by_key: dict[str, dict] = {}
         for line_number, raw in enumerate(handle, start=1):
             if not raw.strip():
                 continue
@@ -410,9 +437,24 @@ class EAxisShadowStore:
                 raise ValueError(
                     f"corrupt E shadow ledger at line {line_number}"
                 ) from exc
-            if not EAxisShadowStore._validate_row(row):
-                raise ValueError(f"invalid E shadow ledger row at line {line_number}")
-            rows.append(row)
+            try:
+                normalized = EAxisShadowStore._normalize_row(row)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"invalid E shadow ledger row at line {line_number}"
+                ) from exc
+            annotation_key = normalized["annotation_key"]
+            existing = rows_by_key.get(annotation_key)
+            if existing is not None:
+                detail = (
+                    "duplicate" if existing == normalized else "conflicting"
+                )
+                raise ValueError(
+                    "corrupt E shadow ledger: "
+                    f"{detail} annotation_key at line {line_number}"
+                )
+            rows_by_key[annotation_key] = normalized
+            rows.append(normalized)
         return rows
 
     def load(self) -> list[dict]:
@@ -427,9 +469,11 @@ class EAxisShadowStore:
             return self._append_locked(row)
 
     def _append_locked(self, row: dict) -> bool:
-        if not self._validate_row(row):
+        if type(row) is not dict:
             raise ValueError("invalid E shadow row")
-        key = str(row.get("annotation_key") or "").strip()
+        key = row.get("annotation_key")
+        if type(key) is not str or not _SHA256_RE.fullmatch(key):
+            raise ValueError("invalid E shadow row")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with advisory_file_lock(self.lock_path):
             fd = None
@@ -439,11 +483,38 @@ class EAxisShadowStore:
                 fd = None  # os.fdopen owns and closes it from this point.
                 with handle:
                     rows = self._load_locked(handle)
-                    if any(existing.get("annotation_key") == key for existing in rows):
-                        return False
+                    existing = next(
+                        (
+                            item
+                            for item in rows
+                            if item.get("annotation_key") == key
+                        ),
+                        None,
+                    )
+                    if existing is not None:
+                        try:
+                            normalized = self._normalize_row(row)
+                        except (TypeError, ValueError) as exc:
+                            raise EAxisShadowConflictError(
+                                "E shadow annotation_key conflict"
+                            ) from exc
+                        if existing == normalized:
+                            return False
+                        raise EAxisShadowConflictError(
+                            "E shadow annotation_key conflict"
+                        )
+                    try:
+                        normalized = self._normalize_row(row)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("invalid E shadow row") from exc
                     handle.seek(0, os.SEEK_END)
                     handle.write(
-                        json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                        json.dumps(
+                            normalized,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                        + "\n"
                     )
                     handle.flush()
                     os.fsync(handle.fileno())
