@@ -158,11 +158,22 @@ class EmbeddingEngine:
             embeddings = []
             for ch in chunks:
                 emb = await self._generate_embedding(ch)
-                if emb:
-                    embeddings.append(emb)
-                # circuit open / 全失败时 embeddings 为空，下面会返回 False，不写脏数据
-            if not embeddings:
-                return False
+                if not emb:
+                    # A bucket embedding is one logical index record even when
+                    # the body is split into several API requests.  Persisting
+                    # only the successful chunks makes a partially indexed
+                    # bucket look healthy and lets callers acknowledge a write
+                    # that cannot be recalled consistently.  Keep the previous
+                    # vector untouched until every chunk succeeds.
+                    logger.warning(
+                        "Embedding incomplete for %s: generated %d/%d chunks; "
+                        "existing vector left unchanged",
+                        bucket_id,
+                        len(embeddings),
+                        len(chunks),
+                    )
+                    return False
+                embeddings.append(emb)
             self._store_embedding(bucket_id, embeddings)   # 存「多向量数组」
             return True
         except Exception as e:
