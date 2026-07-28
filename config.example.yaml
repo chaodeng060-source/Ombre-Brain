@@ -224,7 +224,8 @@ query_expansion:
   max_query_chars: 500
 
 # --- Recall evidence roles / 召回证据角色 ---
-# 默认关闭；开启后 breath 输出会标明 main / association 等角色，让 agent 区分主证据和旁证。
+# 主结果角色标记默认关闭以兼容旧客户端；Y 轴 association 无论此开关如何都会显式标成
+# supporting_only，避免关系旁证看起来像主事实依据。
 recall_evidence_roles:
   enabled: false
 

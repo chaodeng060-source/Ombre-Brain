@@ -5,6 +5,7 @@ import pytest
 from intent_recall import (
     INTENT_DEFAULT,
     INTENT_FACT,
+    INTENT_RECALL,
     INTENT_RELATION,
     INTENT_TEMPORAL,
     bucket_intent_score_multiplier,
@@ -17,6 +18,40 @@ def test_period_date_query_is_fact_intent():
     classified = classify_query_intent("她生理期哪天")
     assert classified["intent"] == INTENT_FACT
     assert classified["confidence"] >= 0.55
+
+
+def test_registered_slot_natural_question_is_fact_intent():
+    registry = {
+        "preference.ui.primary_color": {
+            "aliases": ["主色"],
+        },
+    }
+    classified = classify_query_intent("现在主色是什么", registry)
+
+    assert classified["intent"] == INTENT_FACT
+    assert classified["confidence"] >= 0.55
+    assert "fact_slot:preference.ui.primary_color" in classified["matched_terms"]
+
+
+def test_registered_slot_narrative_mention_does_not_force_fact_intent():
+    registry = {
+        "preference.ui.primary_color": {
+            "aliases": ["主色"],
+        },
+    }
+    classified = classify_query_intent("回顾主色设计的变化时间线", registry)
+
+    assert classified["intent"] in {INTENT_RECALL, INTENT_TEMPORAL}
+
+
+def test_unregistered_slot_word_remains_fail_open_default():
+    registry = {
+        "preference.ui.primary_color": {
+            "aliases": ["主色"],
+        },
+    }
+
+    assert classify_query_intent("现在辅色是什么", registry)["intent"] == INTENT_DEFAULT
 
 
 def test_relationship_state_query_is_relation_intent():

@@ -78,6 +78,104 @@ def test_history_and_non_fact_queries_keep_historical(monkeypatch):
     assert [bucket["id"] for bucket in relation] == ["current", "historical"]
 
 
+def test_natural_registered_slot_question_activates_currentness(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            **server.config,
+            "fact_slots": {
+                "enabled": True,
+                "registry": {
+                    "preference.ui.primary_color": {"aliases": ["主色"]},
+                    "preference.ui.font_style": {"aliases": ["字体倾向"]},
+                },
+            },
+        },
+    )
+    buckets = [
+        _bucket(
+            "color-current",
+            key="preference.ui.primary_color",
+            status="current",
+        ),
+        _bucket(
+            "color-old",
+            key="preference.ui.primary_color",
+            status="historical",
+        ),
+        _bucket(
+            "font-old",
+            key="preference.ui.font_style",
+            status="historical",
+        ),
+        _bucket(
+            "protected-old",
+            key="preference.ui.primary_color",
+            status="historical",
+            protected=True,
+        ),
+    ]
+
+    policy = server._resolve_recall_policy(
+        "现在主色是什么",
+        base_recall_limit=20,
+        requested_relation_depth=1,
+    )
+    kept = server._filter_z_fact_candidates(
+        buckets,
+        query="现在主色是什么",
+        intent=policy["intent"],
+    )
+
+    assert policy["intent"] == "fact"
+    assert [bucket["id"] for bucket in kept] == [
+        "color-current",
+        "font-old",
+        "protected-old",
+    ]
+
+
+def test_registered_slot_history_question_keeps_history(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            **server.config,
+            "fact_slots": {
+                "enabled": True,
+                "registry": {
+                    "preference.ui.primary_color": {"aliases": ["主色"]},
+                },
+            },
+        },
+    )
+    buckets = [
+        _bucket(
+            "color-current",
+            key="preference.ui.primary_color",
+            status="current",
+        ),
+        _bucket(
+            "color-old",
+            key="preference.ui.primary_color",
+            status="historical",
+        ),
+    ]
+    policy = server._resolve_recall_policy(
+        "以前的主色是什么",
+        base_recall_limit=20,
+        requested_relation_depth=1,
+    )
+
+    assert policy["intent"] == "fact"
+    assert server._filter_z_fact_candidates(
+        buckets,
+        query="以前的主色是什么",
+        intent=policy["intent"],
+    ) == buckets
+
+
 def test_disabled_or_empty_registry_is_fail_open(monkeypatch):
     buckets = [_bucket("historical", key="profile.city", status="historical")]
     monkeypatch.setattr(

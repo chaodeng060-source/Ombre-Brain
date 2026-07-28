@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import math
 from datetime import datetime
-from typing import Any
+from typing import Any, Mapping
+
+from fact_slots import registered_fact_query_matches
 
 INTENT_DEFAULT = "default"
 INTENT_FACT = "fact"
@@ -119,7 +121,10 @@ _RELATION_META_TERMS = {
 }
 
 
-def classify_query_intent(query: str) -> dict[str, Any]:
+def classify_query_intent(
+    query: str,
+    fact_slot_registry: Mapping | None = None,
+) -> dict[str, Any]:
     """Classify a query into the small intent set used by recall policies."""
     q = str(query or "").strip().lower()
     if not q:
@@ -143,6 +148,17 @@ def classify_query_intent(query: str) -> dict[str, Any]:
         if hits:
             matched[intent] = hits
             scores[intent] = float(len(hits))
+
+    # A configured slot alias is authoritative enough to recognize natural
+    # exact-current questions ("现在主色是什么") without adding every household
+    # fact label to the global keyword list.  The matcher itself is deliberately
+    # conservative and fails open for narrative mentions or ambiguous aliases.
+    registered_slots = registered_fact_query_matches(q, fact_slot_registry)
+    if registered_slots:
+        scores[INTENT_FACT] = scores.get(INTENT_FACT, 0.0) + 3.0
+        matched.setdefault(INTENT_FACT, []).extend(
+            f"fact_slot:{key}" for key in sorted(registered_slots)
+        )
 
     # A few compound signals are stronger than isolated words.
     if ("我俩" in q or "我们俩" in q or "我们之间" in q) and ("怎么样" in q or "最近" in q):
@@ -188,6 +204,7 @@ def resolve_intent_recall_policy(
     config: dict[str, Any] | None,
     base_recall_limit: int,
     requested_relation_depth: int,
+    fact_slot_registry: Mapping | None = None,
 ) -> dict[str, Any]:
     """Return the effective recall policy for a query."""
     config = config or {}
@@ -196,7 +213,7 @@ def resolve_intent_recall_policy(
         config.get("intent_recall", {}) or {},
     )
     rrf_cfg = config.get("rrf", {}) or {}
-    classification = classify_query_intent(query)
+    classification = classify_query_intent(query, fact_slot_registry)
 
     policies = recall_cfg.get("policies", {}) or {}
     default_policy = dict(DEFAULT_INTENT_RECALL_CONFIG["policies"][INTENT_DEFAULT])

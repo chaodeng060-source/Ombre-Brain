@@ -31,6 +31,18 @@ _FACT_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
 _STRUCTURED_FACT_RE = re.compile(
     r"(?im)^\s*(?:[-*]\s*)?([A-Za-z0-9_.\-\u4e00-\u9fff]{1,80})\s*[:：=]\s*([^\n#;；]+?)\s*$"
 )
+_FACT_QUERY_CUES = (
+    "现在", "当前", "目前", "如今", "最新", "现用", "现行",
+    "以前", "过去", "上次", "历史", "当时", "之前", "曾经", "那次",
+    "是什么", "是多少", "哪个", "哪一个", "哪种", "什么", "多少",
+    "哪里", "哪儿", "是谁", "吗", "呢", "?", "？",
+    "old", "previous", "historical", "before", "back then",
+    "current", "currently", "latest", "what", "which",
+)
+_NARRATIVE_QUERY_CUES = (
+    "回顾", "复盘", "时间线", "过程", "故事", "怎么变化", "如何变化",
+    "recap", "summary", "timeline",
+)
 
 
 def _metadata(bucket: dict) -> dict:
@@ -72,6 +84,63 @@ def normalize_fact_slot_registry(registry: Mapping | None) -> dict[str, frozense
         )
         normalized[key] = frozenset(labels)
     return normalized
+
+
+def registered_fact_query_matches(
+    query: str,
+    registry: Mapping | None,
+) -> frozenset[str]:
+    """Return registered slots explicitly targeted by a natural fact query.
+
+    Merely mentioning an alias inside a narrative/recap request is not enough
+    to turn the whole request into an exact-current fact lookup.  This keeps
+    the Z gate conservative while still recognizing ordinary questions such
+    as ``现在主色是什么``.  Ambiguous aliases fail open.
+    """
+    normalized_query = " ".join(str(query or "").strip().lower().split())
+    if not normalized_query:
+        return frozenset()
+
+    slots = normalize_fact_slot_registry(registry)
+    if not slots:
+        return frozenset()
+
+    label_to_keys: defaultdict[str, set[str]] = defaultdict(set)
+    for key, labels in slots.items():
+        for label in labels:
+            normalized_label = " ".join(str(label or "").strip().lower().split())
+            if normalized_label:
+                label_to_keys[normalized_label].add(key)
+
+    matched_keys: set[str] = set()
+    matched_labels: set[str] = set()
+    for label, keys in label_to_keys.items():
+        if len(keys) != 1 or not _query_contains_label(normalized_query, label):
+            continue
+        matched_labels.add(label)
+        matched_keys.update(keys)
+
+    if not matched_keys:
+        return frozenset()
+
+    exact_alias_query = normalized_query in matched_labels
+    has_fact_cue = any(cue in normalized_query for cue in _FACT_QUERY_CUES)
+    has_narrative_cue = any(cue in normalized_query for cue in _NARRATIVE_QUERY_CUES)
+    if not exact_alias_query and (not has_fact_cue or has_narrative_cue):
+        return frozenset()
+    return frozenset(matched_keys)
+
+
+def _query_contains_label(query: str, label: str) -> bool:
+    """Match CJK aliases by substring and ASCII aliases on token boundaries."""
+    if not label:
+        return False
+    if re.search(r"[\u4e00-\u9fff]", label):
+        return label in query
+    return re.search(
+        rf"(?<![a-z0-9_]){re.escape(label)}(?![a-z0-9_])",
+        query,
+    ) is not None
 
 
 def is_fact_slot_exempt(bucket: dict) -> bool:
@@ -244,6 +313,7 @@ def filter_fact_slot_candidates(
     *,
     intent: str,
     registry: Mapping | None,
+    fact_keys: Iterable[str] | None = None,
 ) -> list[dict]:
     """Hide registered historical facts only for exact-fact recall.
 
@@ -255,15 +325,22 @@ def filter_fact_slot_candidates(
     if intent != "fact" or not normalize_fact_slot_registry(registry):
         return candidates
 
+    requested_keys = {
+        key
+        for raw_key in (fact_keys or [])
+        if (key := registered_fact_key(raw_key, registry)) is not None
+    }
     kept: list[dict] = []
     for bucket in candidates:
         if is_fact_slot_exempt(bucket):
             kept.append(bucket)
             continue
         meta = _metadata(bucket)
-        applies = fact_slot_applies_to_bucket(meta.get("fact_key"), bucket, registry)
+        canonical = registered_fact_key(meta.get("fact_key"), registry)
+        applies = fact_slot_applies_to_bucket(canonical, bucket, registry)
         status = str(meta.get("fact_status") or FACT_STATUS_CURRENT).strip().lower()
-        if applies and status == FACT_STATUS_HISTORICAL:
+        slot_is_requested = not requested_keys or canonical in requested_keys
+        if applies and slot_is_requested and status == FACT_STATUS_HISTORICAL:
             continue
         kept.append(bucket)
     return kept

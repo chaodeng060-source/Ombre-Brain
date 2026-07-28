@@ -84,6 +84,7 @@ from fact_conflicts import build_supersedes_audit
 from fact_slots import (
     fact_slot_applies_to_bucket,
     filter_fact_slot_candidates,
+    registered_fact_query_matches,
     registered_fact_key,
 )
 from query_expand import expand_query
@@ -169,11 +170,52 @@ def _filter_z_fact_candidates(buckets, *, query: str, intent: str):
     candidates = list(buckets)
     if query_requests_history(query):
         return candidates
+    requested_keys = registered_fact_query_matches(query, _fact_slot_registry())
     return filter_fact_slot_candidates(
         candidates,
         intent=intent,
         registry=_fact_slot_registry(),
+        fact_keys=requested_keys,
     )
+
+
+def _resolve_recall_policy(
+    query: str,
+    *,
+    base_recall_limit: int,
+    requested_relation_depth: int,
+) -> dict:
+    """Resolve intent with the configured fact-slot vocabulary in both paths."""
+    return resolve_intent_recall_policy(
+        query,
+        config,
+        base_recall_limit=base_recall_limit,
+        requested_relation_depth=requested_relation_depth,
+        fact_slot_registry=_fact_slot_registry(),
+    )
+
+
+def _is_main_recall_bucket(bucket: dict) -> bool:
+    """Reject archive/cold material even when a stale index returns its id."""
+    if not isinstance(bucket, dict):
+        return False
+    metadata = bucket.get("metadata", {}) or {}
+    if str(metadata.get("type") or "").strip().lower() == "archived":
+        return False
+
+    raw_path = str(bucket.get("path") or "").strip()
+    archive_dir = str(getattr(bucket_mgr, "archive_dir", "") or "").strip()
+    if raw_path and archive_dir:
+        try:
+            path = os.path.realpath(raw_path)
+            archive_root = os.path.realpath(archive_dir)
+            if os.path.commonpath([path, archive_root]) == archive_root:
+                return False
+        except (OSError, ValueError):
+            # A malformed/unrelated path is not evidence that an otherwise
+            # ordinary in-memory candidate belongs to the cold store.
+            pass
+    return True
 
 
 def _z_pair_validation_error(current: dict, historical: dict, fact_key: str) -> str:
@@ -206,7 +248,11 @@ def _relation_recall_neighbors(
     excluded_ids=None,
 ):
     """Build a bounded, typed Y-axis expansion from already-loaded buckets."""
-    candidates = [bucket for bucket in buckets if isinstance(bucket, dict)]
+    candidates = [
+        bucket
+        for bucket in buckets
+        if isinstance(bucket, dict) and _is_main_recall_bucket(bucket)
+    ]
     wf_set = {str(value).strip() for value in world_filter} if world_filter is not None else None
     domain_set = {str(value).strip().lower() for value in (domain_filter or [])}
 
@@ -286,9 +332,12 @@ def _recall_prefix(
     marker: str = "",
     relation: str = "",
 ) -> str:
-    """Prefix recall snippets with evidence roles when explicitly enabled."""
-    if (config.get("recall_evidence_roles", {}) or {}).get("enabled", False):
+    """Prefix recall snippets; association is always explicit supporting evidence."""
+    roles_enabled = (config.get("recall_evidence_roles", {}) or {}).get("enabled", False)
+    if roles_enabled or role != "main":
         parts = [f"[role:{role}]", f"[layer:{layer}]"]
+        if role != "main":
+            parts.append("[authority:supporting_only]")
         if relation:
             parts.append(f"[relation:{relation}]")
         parts.append(f"[bucket_id:{bucket_id}]")
@@ -1481,6 +1530,7 @@ async def breath(
         except Exception as e:
             logger.error(f"Failed to list buckets for surfacing / 浮现列桶失败: {e}")
             return "记忆系统暂时无法访问。"
+        all_buckets = [bucket for bucket in all_buckets if _is_main_recall_bucket(bucket)]
 
         # --- Pinned/protected buckets: always surface as core principles ---
         # --- 钉选桶：作为核心准则，始终浮现（不受 world 过滤影响）---
@@ -1636,7 +1686,11 @@ async def breath(
     if domain.strip().lower() == "feel":
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
-            feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
+            feels = [
+                b
+                for b in all_buckets
+                if _is_main_recall_bucket(b) and b["metadata"].get("type") == "feel"
+            ]
             if created_after is not None or created_before is not None:
                 from bucket_manager import _bucket_in_time_range
                 feels = [f for f in feels if _bucket_in_time_range(f, created_after, created_before)]
@@ -1679,9 +1733,8 @@ async def breath(
     domain_filter = [d.strip() for d in domain.split(",") if d.strip()] or None
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
-    intent_policy = resolve_intent_recall_policy(
+    intent_policy = _resolve_recall_policy(
         query,
-        config,
         base_recall_limit=recall_limit,
         requested_relation_depth=relation_depth,
     )
@@ -1729,7 +1782,11 @@ async def breath(
                 if existing is None or bucket.get("score", 0) > existing.get("score", 0):
                     keyword_by_id[bucket["id"]] = bucket
         keyword_matches = _filter_z_fact_candidates(
-            keyword_by_id.values(),
+            (
+                bucket
+                for bucket in keyword_by_id.values()
+                if _is_main_recall_bucket(bucket)
+            ),
             query=query,
             intent=intent_policy["intent"],
         )
@@ -1775,7 +1832,7 @@ async def breath(
         else:
             # Vector-only bucket — fetch and re-apply filters that bucket_mgr.search applied
             b = await bucket_mgr.get(bid)
-            if not b:
+            if not b or not _is_main_recall_bucket(b):
                 continue
             meta = b["metadata"]
             if meta.get("pinned") or meta.get("protected"):
@@ -1890,6 +1947,11 @@ async def breath(
         neighbor_msgs = []
         try:
             graph_buckets = await bucket_mgr.list_all(include_archive=False)
+            graph_buckets = [
+                bucket
+                for bucket in graph_buckets
+                if _is_main_recall_bucket(bucket)
+            ]
             bucket_by_id = {
                 str(bucket.get("id")): bucket
                 for bucket in graph_buckets
@@ -1954,7 +2016,10 @@ async def breath(
                 )
                 continue
         if neighbor_msgs:
-            results.append("--- 关系网邻居 ---\n" + "\n---\n".join(neighbor_msgs))
+            results.append(
+                "--- 关系网关联旁证（supporting only，不可替代主证据） ---\n"
+                + "\n---\n".join(neighbor_msgs)
+            )
 
     # --- Random surfacing is opt-in after PR-1 noise reduction.
     # --- 减噪后随机漂浮改为显式配置，默认关闭，避免检索不足时硬塞旧噪音。
@@ -1966,6 +2031,11 @@ async def breath(
     if len(matches) < 3 and random_chance > 0 and random.random() < random_chance:
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
+            all_buckets = [
+                bucket
+                for bucket in all_buckets
+                if _is_main_recall_bucket(bucket)
+            ]
             matched_ids = set(result_ids)
             seen_ids = _load_session_seen_ids(session_id)
             low_weight = [
@@ -3992,9 +4062,8 @@ async def _probe_anchor_status(query: str) -> dict:
     """Run the read-only recall candidate path without touching bucket access time."""
     started = time.monotonic()
     recall_limit = BREATH_RECALL_POOL_SIZE
-    intent_policy = resolve_intent_recall_policy(
+    intent_policy = _resolve_recall_policy(
         query,
-        config,
         base_recall_limit=recall_limit,
         requested_relation_depth=0,
     )
@@ -4019,9 +4088,19 @@ async def _probe_anchor_status(query: str) -> dict:
         ))
         for batch in keyword_batches:
             for bucket in batch:
+                if not _is_main_recall_bucket(bucket):
+                    continue
                 existing = keyword_by_id.get(bucket["id"])
                 if existing is None or bucket.get("score", 0) > existing.get("score", 0):
                     keyword_by_id[bucket["id"]] = bucket
+        keyword_by_id = {
+            bucket["id"]: bucket
+            for bucket in _filter_z_fact_candidates(
+                keyword_by_id.values(),
+                query=query,
+                intent=intent_policy["intent"],
+            )
+        }
     except Exception as exc:
         logger.warning("anchor status keyword search failed: %s", type(exc).__name__)
         keyword_error = True
@@ -4054,12 +4133,18 @@ async def _probe_anchor_status(query: str) -> dict:
         )
         for bucket_id, fused_score in fused_pairs[:recall_limit]:
             bucket = keyword_by_id.get(bucket_id) or await bucket_mgr.get(bucket_id)
-            if not bucket:
+            if not bucket or not _is_main_recall_bucket(bucket):
                 continue
             meta = bucket.get("metadata", {})
             if meta.get("pinned") or meta.get("protected"):
                 continue
             if wf_set is not None and not world_matches(meta.get("world", ""), wf_set):
+                continue
+            if not _filter_z_fact_candidates(
+                [bucket],
+                query=query,
+                intent=intent_policy["intent"],
+            ):
                 continue
             bucket["score"] = round(fused_score * 1000, 2)
             matches.append(bucket)
