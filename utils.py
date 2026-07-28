@@ -86,6 +86,12 @@ def load_config(config_path: str = None) -> dict:
             # Empty means <buckets_dir>/.audit/mutations.sqlite3.
             "path": "",
         },
+        "maintenance": {
+            # The legacy relation sweep performs a full vector search per
+            # eligible bucket.  It is intentionally opt-in so the first
+            # breath/hold request cannot starve the HTTP event loop.
+            "startup_relation_backfill": False,
+        },
         "dehydration": {
             "model": "deepseek-chat",
             "base_url": "https://api.deepseek.com/v1",
@@ -237,6 +243,13 @@ def load_config(config_path: str = None) -> dict:
     env_embed_model = os.environ.get("OMBRE_EMBED_MODEL", "")
     if env_embed_model:
         config.setdefault("embedding", {})["model"] = env_embed_model
+
+    # --- Maintenance env overrides ---
+    env_startup_backfill = os.environ.get("OMBRE_STARTUP_RELATION_BACKFILL", "")
+    if env_startup_backfill:
+        config.setdefault("maintenance", {})["startup_relation_backfill"] = (
+            env_startup_backfill.lower() in ("1", "true", "yes", "on")
+        )
 
     # --- Matching env overrides ---
     env_fuzzy = os.environ.get("OMBRE_FUZZY_THRESHOLD", "")

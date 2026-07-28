@@ -1348,9 +1348,27 @@ async def _startup_backfill_loop() -> None:
         pass
 
 
+def _startup_relation_backfill_enabled() -> bool:
+    """Return whether the expensive legacy relation sweep was explicitly enabled.
+
+    A production library can contain thousands of multi-vector embeddings.  The
+    legacy sweep performs a full similarity search for every eligible bucket, so
+    starting it implicitly from a user-facing request can starve the HTTP event
+    loop for minutes.  Keep the manual ``backfill_relations`` tool available,
+    but require an explicit maintenance opt-in for the unbounded background pass.
+    """
+    maintenance = config.get("maintenance", {})
+    return (
+        isinstance(maintenance, dict)
+        and maintenance.get("startup_relation_backfill") is True
+    )
+
+
 def _maybe_start_backfill() -> None:
-    """Lazy start of the backfill loop on first MCP tool call."""
+    """Lazy start the legacy backfill only after an explicit maintenance opt-in."""
     global _backfill_started
+    if not _startup_relation_backfill_enabled():
+        return
     if _backfill_started:
         return
     try:
