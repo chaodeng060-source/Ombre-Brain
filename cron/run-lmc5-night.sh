@@ -10,5 +10,13 @@ if ! /usr/bin/flock -n 9; then
     exit 0
 fi
 
+if "$DOCKER_BIN" exec "$CONTAINER" \
+    python /app/night_run_trigger.py; then
+    :
+else
+    night_status=$?
+    exit "$night_status"
+fi
+
 exec "$DOCKER_BIN" exec "$CONTAINER" \
-    python /app/night_run_trigger.py
+    python /app/e_axis_night.py

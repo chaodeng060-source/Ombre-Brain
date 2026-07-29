@@ -92,6 +92,9 @@ metabolism:
 e_axis_shadow:
   enabled: true
   min_confidence: 0.3
+  max_per_run: 20               # bounded daily backlog; only LMC-5 X buckets
+  max_tokens: 512               # strict JSON score, plain integer 512..1024
+  temperature: 0.0
 
 # --- Decay parameters / 记忆衰减参数 ---
 # 计算艾宾浩斯衰减候选；是否自动归档由 metabolism.mode 控制。
