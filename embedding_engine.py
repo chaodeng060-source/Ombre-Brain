@@ -298,16 +298,63 @@ class EmbeddingEngine:
         """对一个桶的 stored 向量取与 query 的最高余弦相似度。
         兼容两种格式：旧=单向量 list[float]；新=多向量 list[list[float]]（分段）。
         迁移期 DB 里两种并存，这里统一处理，无需先刷全库即可上线读路径。"""
-        if not stored:
-            return 0.0
-        if isinstance(stored[0], (int, float)):          # 旧格式：单向量
-            return self._cosine_similarity(query_emb, stored)
-        best = 0.0                                        # 新格式：多段取 max
-        for emb in stored:
-            s = self._cosine_similarity(query_emb, emb)
-            if s > best:
-                best = s
+        return self._max_stored_similarity(query_emb, stored)
+
+    def _max_stored_similarity(self, left, right) -> float:
+        """Return the best cosine across two stored embedding records.
+
+        Both sides accept the historical ``list[float]`` shape and the current
+        ``list[list[float]]`` multi-segment shape.  Shape validation stays
+        strict so a corrupt row cannot silently become a zero-similarity
+        result.
+        """
+
+        left_segments = self._embedding_segments(left)
+        right_segments = self._embedding_segments(right)
+        if len(left_segments[0]) != len(right_segments[0]):
+            raise TypeError("embedding dimensions do not match")
+        best = 0.0
+        for left_segment in left_segments:
+            for right_segment in right_segments:
+                similarity = self._cosine_similarity(
+                    left_segment,
+                    right_segment,
+                )
+                if (
+                    isinstance(similarity, bool)
+                    or not isinstance(similarity, (int, float))
+                    or not math.isfinite(float(similarity))
+                ):
+                    raise TypeError("cosine similarity must be finite")
+                best = max(best, float(similarity))
         return best
+
+    @staticmethod
+    def _embedding_segments(value) -> tuple[list[float], ...]:
+        if not isinstance(value, list) or not value:
+            raise TypeError("embedding must be a non-empty list")
+        if all(
+            not isinstance(item, bool)
+            and isinstance(item, (int, float))
+            and math.isfinite(float(item))
+            for item in value
+        ):
+            return (value,)
+        if all(
+            isinstance(segment, list)
+            and bool(segment)
+            and all(
+                not isinstance(item, bool)
+                and isinstance(item, (int, float))
+                and math.isfinite(float(item))
+                for item in segment
+            )
+            for segment in value
+        ):
+            if len({len(segment) for segment in value}) != 1:
+                raise TypeError("embedding segment dimensions do not match")
+            return tuple(value)
+        raise TypeError("embedding has an unsupported shape")
 
     @staticmethod
     def _cosine_similarity(a: list[float], b: list[float]) -> float:

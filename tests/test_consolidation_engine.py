@@ -53,6 +53,12 @@ class FakeEmbedding:
         nb = math.sqrt(sum(x * x for x in b))
         return dot / (na * nb) if na and nb else 0.0
 
+    def _max_stored_similarity(self, left, right):
+        from embedding_engine import EmbeddingEngine
+
+        engine = EmbeddingEngine.__new__(EmbeddingEngine)
+        return engine._max_stored_similarity(left, right)
+
 
 class FakeBucketMgr:
     def __init__(self, buckets):
@@ -116,6 +122,112 @@ def test_find_duplicates_pairs_above_threshold():
     ids = {pairs[0]["a_id"], pairs[0]["b_id"]}
     assert ids == {"A", "B"}
     assert pairs[0]["similarity"] >= 0.99
+
+
+def test_find_duplicates_supports_single_and_multi_segment_vectors():
+    buckets = [_bucket("SINGLE"), _bucket("MULTI"), _bucket("OTHER")]
+    vecs = {
+        "SINGLE": [1.0, 0.0, 0.0],
+        "MULTI": [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]],
+        "OTHER": [[0.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+    }
+    eng, _, _ = _engine(buckets, vecs)
+
+    pairs = asyncio.run(eng.find_duplicates(0.85))
+
+    pair_ids = [{pair["a_id"], pair["b_id"]} for pair in pairs]
+    assert {"SINGLE", "MULTI"} in pair_ids
+    assert {"MULTI", "OTHER"} in pair_ids
+    assert {"SINGLE", "OTHER"} not in pair_ids
+    assert eng._read_errors == []
+
+
+def test_find_duplicates_rejects_malformed_segment_shape_as_read_error():
+    buckets = [_bucket("GOOD"), _bucket("BAD")]
+    vecs = {
+        "GOOD": [1.0, 0.0],
+        "BAD": [[1.0, 0.0], ["not-a-number", 0.0]],
+    }
+    eng, bm, _ = _engine(
+        buckets,
+        vecs,
+        metabolism_mode="report_only",
+    )
+
+    result = asyncio.run(eng.run_consolidation_cycle())
+
+    assert result["ok"] is False
+    assert result["errors"] == [
+        "find_duplicates.cosine:GOOD:BAD:TypeError",
+    ]
+    assert bm.updates == [] and bm.created == []
+
+
+def test_find_duplicates_rejects_mixed_segment_dimensions_as_read_error():
+    buckets = [_bucket("GOOD"), _bucket("BAD")]
+    vecs = {
+        "GOOD": [1.0, 0.0],
+        "BAD": [[1.0, 0.0], [1.0, 0.0, 0.0]],
+    }
+    eng, bm, _ = _engine(
+        buckets,
+        vecs,
+        metabolism_mode="report_only",
+    )
+
+    result = asyncio.run(eng.run_consolidation_cycle())
+
+    assert result["ok"] is False
+    assert result["errors"] == [
+        "find_duplicates.cosine:GOOD:BAD:TypeError",
+    ]
+    assert bm.updates == [] and bm.created == []
+
+
+def test_find_duplicates_rejects_cross_record_dimension_mismatch():
+    buckets = [_bucket("LEFT"), _bucket("RIGHT")]
+    vecs = {
+        "LEFT": [1.0, 0.0],
+        "RIGHT": [[1.0, 0.0, 0.0]],
+    }
+    eng, _, _ = _engine(
+        buckets,
+        vecs,
+        metabolism_mode="report_only",
+    )
+
+    result = asyncio.run(eng.run_consolidation_cycle())
+
+    assert result["ok"] is False
+    assert result["errors"] == [
+        "find_duplicates.cosine:LEFT:RIGHT:TypeError",
+    ]
+
+
+def test_report_only_cycle_accepts_multi_segment_embeddings_without_writes():
+    buckets = [
+        _bucket("LONG", content="x" * 100),
+        _bucket("SHORT", content="x"),
+    ]
+    vecs = {
+        "LONG": [[0.0, 1.0], [1.0, 0.0]],
+        "SHORT": [[1.0, 0.0]],
+    }
+    eng, bm, _ = _engine(
+        buckets,
+        vecs,
+        cfg={"auto_digest_near_identical": True},
+        metabolism_mode="report_only",
+    )
+
+    result = asyncio.run(eng.run_consolidation_cycle())
+
+    assert result["ok"] is True
+    assert result["errors"] == []
+    assert result["dup_pairs"] == 1
+    assert result["would_digest"] == ["SHORT"]
+    assert result["report_bucket_id"] is None
+    assert bm.updates == [] and bm.created == []
 
 
 def test_find_duplicates_skips_exempt():

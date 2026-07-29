@@ -142,7 +142,10 @@ class ConsolidationEngine:
         for i, a in enumerate(ids):
             for b in ids[i + 1:]:
                 try:
-                    sim = self.embedding_engine._cosine_similarity(embs[a], embs[b])
+                    sim = self.embedding_engine._max_stored_similarity(
+                        embs[a],
+                        embs[b],
+                    )
                 except Exception as exc:
                     self._read_errors.append(
                         f"find_duplicates.cosine:{a}:{b}:{type(exc).__name__}"
