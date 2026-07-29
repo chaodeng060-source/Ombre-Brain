@@ -108,6 +108,12 @@ from utils import (
     event_at_from_metadata, now_iso,
 )
 from redact import redact_embedding_input, redact_text  # 只抹 secret，不审查情感内容
+from mcp_auth import (
+    APIBearerAuthMiddleware,
+    MCPBearerAuthMiddleware,
+    require_api_token,
+    require_mcp_token,
+)
 from review_queue import (
     ReviewQueue, make_relation_entry, make_z_conflict_entry, make_z_pair_entry,
     render_md as _render_review_md,
@@ -5410,28 +5416,18 @@ if __name__ == "__main__":
         else:
             _app = mcp.sse_app()
 
-        # --- /api/* Bearer 鉴权（扫盘 #1）：dashboard 端点（读 + 改 bucket / 换 key / 导记忆）
-        #     裸暴露在隧道上，拿到 URL 即可读全部记忆原文。要求 Authorization: Bearer <OMBRE_API_TOKEN>。
-        #     前端不直连 Ombre（走 claude-twin 代理服务端注入 token），所以加锁不影响面板。
-        #     OMBRE_API_TOKEN 未配 → fail-open（只告警），两边都配才真正生效，避免半配置锁死。
-        #     MCP 传输路径（/mcp、/sse、/messages）和 /health 放行：Claude 经 MCP 客户端访问、另算。
-        from starlette.middleware.base import BaseHTTPMiddleware as _BaseHTTPMiddleware
-        from starlette.responses import JSONResponse  # 本库 JSONResponse 在各端点内 import，模块级无
+        # --- Network authentication boundary ---
+        # /api/* uses OMBRE_API_TOKEN; MCP transports use OMBRE_MCP_TOKEN.
+        # Both are mandatory for network mode.  /health remains anonymous so
+        # container and tunnel health checks never need a secret.
+        #
+        # MCP uses a pure ASGI middleware: BaseHTTPMiddleware may buffer or
+        # cancel streaming/SSE bodies and is therefore unsuitable here.
+        _OMBRE_API_TOKEN = require_api_token()
+        _OMBRE_MCP_TOKEN = require_mcp_token()
 
-        _OMBRE_API_TOKEN = os.environ.get("OMBRE_API_TOKEN", "").strip()
-        if not _OMBRE_API_TOKEN:
-            logger.warning("OMBRE_API_TOKEN 未配置 → /api/* 鉴权 fail-open（暂不拦截）；配上后即强制")
-
-        async def _api_auth_dispatch(request, call_next):
-            path = request.url.path or ""
-            if path.startswith("/api/") and _OMBRE_API_TOKEN:
-                auth = request.headers.get("authorization") or ""
-                if auth.strip() != f"Bearer {_OMBRE_API_TOKEN}":
-                    logger.warning(f"/api 鉴权拒绝：{request.method} {path}")
-                    return JSONResponse({"error": "unauthorized"}, status_code=401)
-            return await call_next(request)
-
-        _app.add_middleware(_BaseHTTPMiddleware, dispatch=_api_auth_dispatch)
+        _app.add_middleware(APIBearerAuthMiddleware, token=_OMBRE_API_TOKEN)
+        _app.add_middleware(MCPBearerAuthMiddleware, token=_OMBRE_MCP_TOKEN)
 
         # CORS：前端不直连 Ombre（经 claude-twin 代理），故收紧到本机回环 —— 杀掉
         # 「任意网站用浏览器跨域读你记忆」的攻击面。MCP 是服务端到服务端、不吃浏览器 CORS。
@@ -5442,7 +5438,9 @@ if __name__ == "__main__":
             allow_headers=["*"],
             expose_headers=["*"],
         )
-        logger.info("CORS + /api Bearer 鉴权中间件已启用 / auth middleware enabled")
+        logger.info(
+            "CORS + /api + MCP Bearer 鉴权已启用 / network auth middleware enabled"
+        )
         uvicorn.run(_app, host="0.0.0.0", port=8000)
     else:
         mcp.run(transport=transport)

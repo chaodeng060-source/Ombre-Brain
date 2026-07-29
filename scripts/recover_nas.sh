@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 COMPOSE_DIR="${OMBRE_COMPOSE_DIR:-/vol1/ombre-deploy}"
 COMPOSE_FILE="${OMBRE_COMPOSE_FILE:-${COMPOSE_DIR}/docker-compose.yml}"
+ENV_FILE="${OMBRE_ENV_FILE:-${COMPOSE_DIR}/.env}"
 DATA_DIR="${OMBRE_DATA_DIR:-/vol1/ombre-data}"
 DATA_TARGET="${OMBRE_DATA_TARGET:-/data}"
 EXPECTED_VOLUME_ROOT="${OMBRE_EXPECTED_VOLUME_ROOT:-/vol1}"
@@ -13,12 +14,13 @@ MCP_URL="${OMBRE_MCP_URL:-http://127.0.0.1:8000/mcp}"
 DOCKER_WAIT_SECONDS="${OMBRE_DOCKER_WAIT_SECONDS:-300}"
 MCP_WAIT_SECONDS="${OMBRE_MCP_WAIT_SECONDS:-90}"
 POLL_SECONDS="${OMBRE_POLL_SECONDS:-5}"
-LOCK_FILE="${OMBRE_LOCK_FILE:-${XDG_RUNTIME_DIR:-/tmp}/ombre-brain-recovery-${UID}.lock}"
+LOCK_FILE="${OMBRE_LOCK_FILE:-/tmp/ombre-brain-recovery-${UID}.lock}"
 CRON_BEGIN="# BEGIN ombre-brain self-recovery"
 CRON_END="# END ombre-brain self-recovery"
 CRON_SAFE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 MCP_PROTOCOL_VERSION="2025-03-26"
 MCP_PAYLOAD='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"ombre-nas-recovery","version":"1.0"}}}'
+MCP_AUTH_HEADER_FILE=""
 TEMP_FILES=()
 
 cleanup() {
@@ -50,6 +52,38 @@ require_command() {
 
 canonical_path() {
   realpath "$1" 2>/dev/null || die "cannot resolve path: $1"
+}
+
+prepare_mcp_auth() {
+  local token="${OMBRE_MCP_TOKEN:-}" line candidate count=0
+  if [[ -z "${token}" ]]; then
+    [[ -r "${ENV_FILE}" ]] ||
+      die "MCP token is unavailable and env file is unreadable"
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+      line="${line%$'\r'}"
+      if [[ "${line}" == OMBRE_MCP_TOKEN=* ]]; then
+        candidate="${line#OMBRE_MCP_TOKEN=}"
+        count=$((count + 1))
+        token="${candidate}"
+      fi
+    done <"${ENV_FILE}"
+    [[ "${count}" == "1" ]] ||
+      die "MCP token is missing or duplicated in the env file"
+  fi
+
+  if [[ "${token}" == \"*\" && "${token}" == *\" ]]; then
+    token="${token:1:${#token}-2}"
+  elif [[ "${token}" == \'*\' && "${token}" == *\' ]]; then
+    token="${token:1:${#token}-2}"
+  fi
+  [[ "${token}" =~ ^[A-Za-z0-9._~-]{32,}$ ]] ||
+    die "MCP token has an unsafe format"
+
+  MCP_AUTH_HEADER_FILE="$(mktemp)"
+  chmod 600 "${MCP_AUTH_HEADER_FILE}"
+  printf 'Authorization: Bearer %s\n' "${token}" >"${MCP_AUTH_HEADER_FILE}"
+  TEMP_FILES+=("${MCP_AUTH_HEADER_FILE}")
+  unset token candidate line
 }
 
 install_cron() {
@@ -150,6 +184,7 @@ close_mcp_session() {
       -o /dev/null \
       -w '%{http_code}' \
       -X DELETE "${MCP_URL}" \
+      -H "@${MCP_AUTH_HEADER_FILE}" \
       -H "Mcp-Session-Id: ${session_id}" \
       -H "MCP-Protocol-Version: ${MCP_PROTOCOL_VERSION}" \
       -H 'Accept: application/json, text/event-stream' 2>/dev/null
@@ -179,6 +214,7 @@ probe_mcp() {
       -o "${body}" \
       -w '%{http_code}' \
       -X POST "${MCP_URL}" \
+      -H "@${MCP_AUTH_HEADER_FILE}" \
       -H 'Content-Type: application/json' \
       -H 'Accept: application/json, text/event-stream' \
       --data-binary "${MCP_PAYLOAD}" 2>/dev/null
@@ -369,6 +405,7 @@ recover_service() {
   fi
 
   guard_storage
+  prepare_mcp_auth
   wait_for_docker
   guard_docker_root
 

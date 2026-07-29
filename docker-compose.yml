@@ -3,8 +3,8 @@
 # Docker Compose 配置
 #
 # Usage / 使用：
-#   1. Create .env: echo "OMBRE_API_KEY=your-key" > .env
-#      创建 .env 文件
+#   1. Create .env with provider and network access tokens.
+#      OMBRE_API_TOKEN and OMBRE_MCP_TOKEN are mandatory in network mode.
 #   2. docker-compose up -d
 #   3. docker compose logs tunnel (for public URL / 查看公网地址)
 # ============================================================
@@ -15,14 +15,17 @@ services:
     container_name: ombre-brain
     restart: unless-stopped
     ports:
-      - "8000:8000"                        # Local debug port (optional) / 本地调试端口
+      # Publish on host loopback only. Host cloudflared reaches 127.0.0.1;
+      # LAN clients must not bypass the authenticated public endpoint.
+      - "${OMBRE_BIND_ADDRESS:-127.0.0.1}:${OMBRE_HOST_PORT:-8000}:8000"
     env_file:
       - .env                               # Pass provider/R2/filter env without hard-coding secrets
     environment:
       - OMBRE_API_KEY=${OMBRE_API_KEY}      # From .env file / 从 .env 文件读取
       - OMBRE_TRANSPORT=streamable-http     # Claude.ai requires streamable-http
       - OMBRE_BUCKETS_DIR=/data             # Container-internal bucket path / 容器内路径
-      - OMBRE_API_TOKEN=${OMBRE_API_TOKEN:-} # /api/* Bearer 鉴权（扫盘 #1）；空=fail-open 不拦截
+      - OMBRE_API_TOKEN=${OMBRE_API_TOKEN:?required} # /api/* Bearer token
+      - OMBRE_MCP_TOKEN=${OMBRE_MCP_TOKEN:?required} # /mcp,/sse,/messages Bearer token
     volumes:
       # Mount your Obsidian vault (or any host directory) for persistent storage
       # 挂载你的 Obsidian 仓库（或任意宿主机目录）做持久化存储

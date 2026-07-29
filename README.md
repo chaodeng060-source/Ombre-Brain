@@ -165,6 +165,23 @@ OMBRE_API_KEY=你的API密钥
 OMBRE_API_KEY=
 ```
 
+网络传输还必须在 `.env` 中配置两个高强度访问令牌；缺失时服务会拒绝启动，
+不会匿名开放记忆接口：
+
+```dotenv
+OMBRE_API_TOKEN=<random-token-for-dashboard-api>
+OMBRE_MCP_TOKEN=<random-token-for-mcp-clients>
+```
+
+Token 必须至少 32 位，只能使用 `A-Z a-z 0-9 . _ ~ -`；推荐
+`openssl rand -hex 32`。服务端、Compose 自愈探针和客户端共用这一份格式合同，
+弱口令或含空白、`=` 的值会让网络模式拒绝启动。
+
+访问 `/api/*` 的客户端使用对应 API Token；访问 `/mcp`、`/sse` 或
+`/messages` 的客户端必须发送 `Authorization: Bearer <OMBRE_MCP_TOKEN>`。
+生产 Compose 默认只把容器端口发布到宿主机 `127.0.0.1`，供本机反向代理或
+Cloudflare Tunnel 使用，局域网设备不能绕过鉴权直连。
+
 **第三步：配置 `docker-compose.yml`（指向你的 Obsidian Vault）**
 
 用文本编辑器打开 `docker-compose.yml`，找到这一行：

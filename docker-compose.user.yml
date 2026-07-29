@@ -1,24 +1,29 @@
 # ============================================================
-# Ombre Brain — 用户快速部署版
-# User Quick Deploy (pre-built image, no local build needed)
+# Ombre Brain — 用户部署版（从当前安全源码构建）
+# User deployment (build the current authenticated source)
 #
 # 使用方法 / Usage:
-#   1. 创建 .env: echo "OMBRE_API_KEY=your-key" > .env
+#   1. 创建 .env，至少配置 OMBRE_API_KEY、OMBRE_API_TOKEN、OMBRE_MCP_TOKEN
 #   2. 按需修改下面的 volumes 路径
 #   3. docker compose -f docker-compose.user.yml up -d
 # ============================================================
 
 services:
   ombre-brain:
-    image: p0luz/ombre-brain:latest
+    build: .
+    image: ombre-brain:local
     container_name: ombre-brain
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "${OMBRE_BIND_ADDRESS:-127.0.0.1}:${OMBRE_HOST_PORT:-8000}:8000"
+    env_file:
+      - .env
     environment:
       - OMBRE_API_KEY=${OMBRE_API_KEY}
       - OMBRE_TRANSPORT=streamable-http
       - OMBRE_BUCKETS_DIR=/data
+      - OMBRE_API_TOKEN=${OMBRE_API_TOKEN:?required}
+      - OMBRE_MCP_TOKEN=${OMBRE_MCP_TOKEN:?required}
     volumes:
       # 改成你的 Obsidian Vault 路径，或保持 ./buckets 用本地目录
       # Change to your Obsidian Vault path, or keep ./buckets for local storage

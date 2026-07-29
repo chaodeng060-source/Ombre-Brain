@@ -28,7 +28,12 @@ def recovery_env(tmp_path: Path) -> dict[str, str]:
         directory.mkdir(parents=True, exist_ok=True)
     (deploy / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
     (deploy / "config.yaml").write_text("runtime: preserved\n", encoding="utf-8")
-    (deploy / ".env").write_text("RUNTIME_SETTING=preserved\n", encoding="utf-8")
+    (deploy / ".env").write_text(
+        "RUNTIME_SETTING=preserved\n"
+        "OMBRE_API_TOKEN=test-recovery-token-0123456789abcdef\n"
+        "OMBRE_MCP_TOKEN=test-recovery-token-0123456789abcdef\n",
+        encoding="utf-8",
+    )
     (data / "existing-memory").write_text("present\n", encoding="utf-8")
     (state / "container").write_text("running\n", encoding="utf-8")
     (state / "commands.log").write_text("", encoding="utf-8")
@@ -87,6 +92,7 @@ output=""
 headers=""
 method="GET"
 fail_on_http=0
+auth_header_file=""
 while (($#)); do
   if [[ "$1" == "-o" ]]; then
     output="$2"
@@ -97,6 +103,11 @@ while (($#)); do
   elif [[ "$1" == "-X" ]]; then
     method="$2"
     shift 2
+  elif [[ "$1" == "-H" ]]; then
+    if [[ "$2" == @* ]]; then
+      auth_header_file="${2#@}"
+    fi
+    shift 2
   elif [[ "$1" == "-f" || "$1" == "-fsS" ]]; then
     fail_on_http=1
     shift
@@ -105,6 +116,12 @@ while (($#)); do
   fi
 done
 printf '%s\n' "${method}" >>"${FAKE_STATE}/http.log"
+if [[ -z "${auth_header_file}" ]] ||
+   ! grep -Fxq "Authorization: Bearer ${FAKE_EXPECTED_MCP_TOKEN}" "${auth_header_file}"; then
+  [[ -z "${output}" ]] || printf '{"error":"unauthorized"}\n' >"${output}"
+  printf '401'
+  exit 0
+fi
 if [[ "${method}" == "DELETE" ]]; then
   printf '%s' "${FAKE_MCP_DELETE_CODE:-204}"
   exit 0
@@ -172,6 +189,7 @@ fi
             "FAKE_CONTAINER_DATA_TARGET": "/data",
             "FAKE_CONTAINER_DATA_RW": "true",
             "FAKE_CRONTAB": str(state / "crontab"),
+            "FAKE_EXPECTED_MCP_TOKEN": "test-recovery-token-0123456789abcdef",
             "OMBRE_COMPOSE_DIR": str(deploy),
             "OMBRE_COMPOSE_FILE": str(deploy / "docker-compose.yml"),
             "OMBRE_DATA_DIR": str(data),
@@ -213,6 +231,31 @@ def test_healthy_container_is_a_noop(recovery_env: dict[str, str]) -> None:
     assert " up -d" not in _commands(recovery_env)
     assert "no action needed" in result.stdout
     assert _http_methods(recovery_env) == ["POST", "DELETE"]
+    secret = recovery_env["FAKE_EXPECTED_MCP_TOKEN"]
+    assert secret not in result.stdout
+    assert secret not in result.stderr
+    assert secret not in _commands(recovery_env)
+
+
+def test_missing_mcp_token_fails_closed_before_probe(
+    recovery_env: dict[str, str],
+) -> None:
+    env_file = Path(recovery_env["OMBRE_COMPOSE_DIR"]) / ".env"
+    env_file.write_text("RUNTIME_SETTING=preserved\n", encoding="utf-8")
+
+    result = _run(recovery_env)
+
+    assert result.returncode != 0
+    assert "MCP token" in result.stdout
+    assert _http_methods(recovery_env) == []
+    assert _commands(recovery_env) == ""
+
+
+def test_recovery_lock_does_not_depend_on_xdg_runtime_dir() -> None:
+    source = RECOVERY_SCRIPT.read_text(encoding="utf-8")
+
+    assert 'LOCK_FILE="${OMBRE_LOCK_FILE:-/tmp/ombre-brain-recovery-${UID}.lock}"' in source
+    assert "${XDG_RUNTIME_DIR:-/tmp}/ombre-brain-recovery" not in source
 
 
 def test_stateless_mcp_probe_does_not_attempt_session_delete(
