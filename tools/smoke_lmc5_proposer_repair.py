@@ -114,6 +114,9 @@ async def _schema_candidate_is_repaired_once() -> None:
 
 async def _source_id_is_repaired_once() -> None:
     prompts: list[str] = []
+    chunks = CHUNKS + (
+        ProposerChunk("chunk-2", "第二段证据：部署前必须先验收。"),
+    )
     invalid = _candidate(evidence="喜欢雨声")
     invalid["source_chunk_ids"] = ["altered-chunk-id"]
     responses = iter(
@@ -127,7 +130,7 @@ async def _source_id_is_repaired_once() -> None:
         prompts.append(prompt)
         return _envelope(next(responses))
 
-    batch = await StrictOmbreProposer(provider).propose(CHUNKS)
+    batch = await StrictOmbreProposer(provider).propose(chunks)
     assert batch.candidates[0].source_chunk_ids == ("chunk-1",)
     assert len(prompts) == 2
     assert "provenance_source" in prompts[1]
@@ -149,12 +152,26 @@ async def _parse_errors_do_not_retry() -> None:
     assert len(prompts) == 1
 
 
+async def _single_chunk_controls_are_local() -> None:
+    candidate = _candidate(evidence="喜欢雨声")
+    candidate["source_chunk_ids"] = ["model-typo"]
+    candidate["thread_hint"] = ""
+
+    async def provider(_prompt: str) -> dict:
+        return _envelope(_document(candidate))
+
+    batch = await StrictOmbreProposer(provider).propose(CHUNKS)
+    assert batch.candidates[0].source_chunk_ids == ("chunk-1",)
+    assert batch.candidates[0].thread_hint == ""
+
+
 async def main() -> None:
     await _repair_succeeds_once()
     await _repair_stops_after_second_failure()
     await _schema_candidate_is_repaired_once()
     await _source_id_is_repaired_once()
     await _parse_errors_do_not_retry()
+    await _single_chunk_controls_are_local()
 
 
 if __name__ == "__main__":

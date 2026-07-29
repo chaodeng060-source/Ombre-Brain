@@ -465,7 +465,6 @@ async def test_candidate_schema_is_exact_and_has_no_model_control_fields(candida
         ("content", " "),
         ("content", " 朝灯喜欢雨声。"),
         ("content", "朝灯喜欢雨声。\t"),
-        ("thread_hint", ""),
         ("thread_hint", " "),
         ("thread_hint", "声音偏好 "),
         ("thread_hint", "声音\x00偏好"),
@@ -476,6 +475,15 @@ async def test_candidate_text_is_exact_nonblank_bounded_utf8_without_controls(
 ):
     proposer = _proposer(json.dumps(_document(_candidate(**{field: value}))))
     assert await _error_code(proposer) == "schema_candidate"
+
+
+@pytest.mark.asyncio
+async def test_empty_thread_hint_is_a_valid_optional_hint():
+    batch = await _proposer(
+        json.dumps(_document(_candidate(thread_hint="")))
+    ).propose(CHUNKS)
+
+    assert batch.candidates[0].thread_hint == ""
 
 
 @pytest.mark.asyncio
@@ -527,6 +535,34 @@ async def test_source_ids_are_unique_nonempty_input_subset(source_ids):
         json.dumps(_document(_candidate(source_chunk_ids=source_ids)))
     )
     assert await _error_code(proposer) == "provenance_source"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_ids", ([], ["model-typo"]))
+async def test_single_chunk_source_is_bound_locally(source_ids):
+    proposer = _proposer(
+        json.dumps(_document(_candidate(source_chunk_ids=source_ids)))
+    )
+
+    batch = await proposer.propose((CHUNKS[0],))
+
+    assert batch.candidates[0].source_chunk_ids == ("chunk-1",)
+
+
+@pytest.mark.asyncio
+async def test_single_chunk_source_hint_stays_structurally_bounded():
+    proposer = _proposer(
+        json.dumps(
+            _document(
+                _candidate(source_chunk_ids=["model-typo", "second"])
+            )
+        )
+    )
+
+    with pytest.raises(ProposerContractError) as caught:
+        await proposer.propose((CHUNKS[0],))
+
+    assert caught.value.code == "provenance_source"
 
 
 @pytest.mark.asyncio

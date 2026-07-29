@@ -238,6 +238,10 @@ def _is_utf8_bounded(value: Any, max_bytes: int) -> bool:
         return False
 
 
+def _is_optional_bounded_text(value: Any, max_bytes: int) -> bool:
+    return value == "" or _is_bounded_text(value, max_bytes)
+
+
 def _expect_exact_mapping(
     value: Any, fields: frozenset[str], code: str, detail: str
 ) -> Mapping[str, Any]:
@@ -702,7 +706,7 @@ class StrictOmbreProposer:
         if (
             not _is_bounded_text(candidate["title"], _MAX_TITLE_BYTES)
             or not _is_bounded_text(candidate["content"], _MAX_CONTENT_BYTES)
-            or not _is_bounded_text(
+            or not _is_optional_bounded_text(
                 candidate["thread_hint"], _MAX_THREAD_HINT_BYTES
             )
             or candidate["risk"] not in _RISKS
@@ -721,7 +725,24 @@ class StrictOmbreProposer:
             )
 
         source_ids = candidate["source_chunk_ids"]
-        if (
+        if len(chunk_by_id) == 1:
+            # The production coordinator proposes one chunk at a time. Bind
+            # that sole source locally so a model typo cannot corrupt or block
+            # provenance. The persisted draft always receives the real input
+            # id, while the model hint remains structurally bounded.
+            if (
+                len(source_ids) > 1
+                or any(
+                    not _is_bounded_text(source_id, _MAX_ID_BYTES)
+                    for source_id in source_ids
+                )
+            ):
+                raise ProposerContractError(
+                    "provenance_source",
+                    "single-chunk source hint is not structurally bounded",
+                )
+            bound_source_ids = tuple(chunk_by_id)
+        elif (
             not source_ids
             or any(
                 not _is_bounded_text(source_id, _MAX_ID_BYTES)
@@ -734,9 +755,12 @@ class StrictOmbreProposer:
                 "provenance_source",
                 "candidate sources must be a unique non-empty input subset",
             )
+        else:
+            bound_source_ids = tuple(source_ids)
         evidence = candidate["evidence"]
         if not _is_bounded_text(evidence, _MAX_EVIDENCE_BYTES) or not any(
-            evidence in chunk_by_id[source_id] for source_id in source_ids
+            evidence in chunk_by_id[source_id]
+            for source_id in bound_source_ids
         ):
             raise ProposerContractError(
                 "provenance_evidence",
@@ -754,7 +778,7 @@ class StrictOmbreProposer:
             importance=candidate["importance"],
             thread_hint=candidate["thread_hint"],
             relation_hints=relations,
-            source_chunk_ids=tuple(source_ids),
+            source_chunk_ids=bound_source_ids,
             evidence=evidence,
             risk=candidate["risk"],
         )
