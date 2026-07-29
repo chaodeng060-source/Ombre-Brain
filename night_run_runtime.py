@@ -40,6 +40,9 @@ from snapshot_manager import SnapshotManager
 DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_MAX_ATTEMPTS = 8
 DEFAULT_SCHEDULE_TIME = time(hour=4, minute=30)
+DEFAULT_PROPOSER_MAX_TOKENS = 4096
+MIN_PROPOSER_MAX_TOKENS = 512
+MAX_PROPOSER_MAX_TOKENS = 8192
 
 
 class NightRunRuntimeError(RuntimeError):
@@ -48,6 +51,26 @@ class NightRunRuntimeError(RuntimeError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+def _proposer_max_tokens(config: dict[str, Any]) -> int:
+    section = config.get("lmc5_night", {})
+    if section is None:
+        section = {}
+    if type(section) is not dict:
+        raise NightRunRuntimeError("provider.max_tokens_invalid")
+    value = section.get(
+        "proposer_max_tokens",
+        DEFAULT_PROPOSER_MAX_TOKENS,
+    )
+    if (
+        type(value) is not int
+        or not MIN_PROPOSER_MAX_TOKENS
+        <= value
+        <= MAX_PROPOSER_MAX_TOKENS
+    ):
+        raise NightRunRuntimeError("provider.max_tokens_invalid")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +104,12 @@ class OpenAIChatProvider:
             raise NightRunRuntimeError("provider.base_url_invalid")
         if not isinstance(model, str) or not model.strip():
             raise NightRunRuntimeError("provider.model_invalid")
-        if type(max_tokens) is not int or max_tokens <= 0:
+        if (
+            type(max_tokens) is not int
+            or not MIN_PROPOSER_MAX_TOKENS
+            <= max_tokens
+            <= MAX_PROPOSER_MAX_TOKENS
+        ):
             raise NightRunRuntimeError("provider.max_tokens_invalid")
         if isinstance(temperature, bool) or not isinstance(
             temperature, (int, float)
@@ -291,7 +319,7 @@ def build_night_run_runtime(
         dehydration.get("base_url") or "https://api.deepseek.com/v1"
     )
     model = str(dehydration.get("model") or "deepseek-chat")
-    max_tokens = dehydration.get("max_tokens", 1024)
+    max_tokens = _proposer_max_tokens(config)
     temperature = dehydration.get("temperature", 0.1)
     provider_timeout = 75.0
     provider = OpenAIChatProvider(

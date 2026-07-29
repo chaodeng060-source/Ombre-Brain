@@ -74,6 +74,12 @@ dehydration:
   max_tokens: 1024
   temperature: 0.1
 
+# --- LMC-5 conservative night runtime / LMC-5 保守夜班 ---
+# Proposer 的结构化 JSON 预算与普通脱水任务分离；输出被截断时仍 fail closed，
+# 下次必须用新 run_id 重试，绝不把 partial JSON 当成空候选。
+lmc5_night:
+  proposer_max_tokens: 4096       # plain integer, 512..8192
+
 # --- XYZME metabolism / M 轴代谢 ---
 # report_only 是安全默认：只计算候选，不 resolve/archive/digest，也不把报告写回记忆库。
 # 只有人工明确改成 apply 才保留旧的自动变更行为；不接受 yes/true 等模糊别名。

@@ -9,13 +9,20 @@ from typing import Any
 
 import pytest
 
+import night_run_runtime as night_runtime_module
 import night_run_trigger
 from lmc5_ledger import LMC5Ledger, NIGHT_RUN_FORWARD_STAGES
 from night_run_coordinator import (
     NightRunCoordinatorError,
     NightRunOutcome,
 )
-from night_run_runtime import NightRunRuntime, OpenAIChatProvider
+from night_run_runtime import (
+    NightRunRuntime,
+    NightRunRuntimeError,
+    OpenAIChatProvider,
+    _proposer_max_tokens,
+    build_night_run_runtime,
+)
 from night_run_trigger import (
     NightTriggerHTTPError,
     _safe_summary,
@@ -394,7 +401,7 @@ def test_openai_provider_returns_plain_json_envelope() -> None:
         api_key="test-key",
         base_url="https://example.invalid/v1",
         model="test-model",
-        max_tokens=128,
+        max_tokens=4096,
         temperature=0.1,
         timeout_seconds=5,
         client=client,
@@ -407,6 +414,152 @@ def test_openai_provider_returns_plain_json_envelope() -> None:
         {"role": "user", "content": "strict prompt"}
     ]
     assert captured["model"] == "test-model"
+    assert captured["max_tokens"] == 4096
+    assert captured["temperature"] == 0.1
+
+
+def test_proposer_budget_is_independent_from_dehydration_budget() -> None:
+    assert _proposer_max_tokens(
+        {"dehydration": {"max_tokens": 128}}
+    ) == 4096
+    assert _proposer_max_tokens(
+        {
+            "dehydration": {"max_tokens": 128},
+            "lmc5_night": {"proposer_max_tokens": 6144},
+        }
+    ) == 6144
+
+
+@pytest.mark.parametrize("value", (512, 2048, 4096, 8192))
+def test_proposer_budget_accepts_plain_integer_boundaries(value: int) -> None:
+    assert _proposer_max_tokens(
+        {"lmc5_night": {"proposer_max_tokens": value}}
+    ) == value
+
+
+def test_null_night_section_uses_safe_default() -> None:
+    assert _proposer_max_tokens({"lmc5_night": None}) == 4096
+
+
+@pytest.mark.parametrize(
+    "section",
+    (
+        [],
+        {"proposer_max_tokens": None},
+        {"proposer_max_tokens": True},
+        {"proposer_max_tokens": False},
+        {"proposer_max_tokens": 0},
+        {"proposer_max_tokens": -1},
+        {"proposer_max_tokens": 512.0},
+        {"proposer_max_tokens": "4096"},
+        {"proposer_max_tokens": 511},
+        {"proposer_max_tokens": 8193},
+    ),
+)
+def test_proposer_budget_rejects_unsafe_config(section: object) -> None:
+    with pytest.raises(
+        NightRunRuntimeError,
+        match="^provider\\.max_tokens_invalid$",
+    ):
+        _proposer_max_tokens({"lmc5_night": section})
+
+
+@pytest.mark.parametrize("value", (None, True, False, 0, -1, 511, 8193, 512.0, "512"))
+def test_openai_provider_rejects_budget_outside_contract(value: object) -> None:
+    with pytest.raises(
+        NightRunRuntimeError,
+        match="^provider\\.max_tokens_invalid$",
+    ):
+        OpenAIChatProvider(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            max_tokens=value,  # type: ignore[arg-type]
+            temperature=0.1,
+            timeout_seconds=5,
+            client=object(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("night_section", "expected"),
+    (
+        (None, 4096),
+        ({"proposer_max_tokens": 2048}, 2048),
+    ),
+)
+def test_runtime_builder_wires_dedicated_proposer_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    night_section: dict[str, int] | None,
+    expected: int,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class ProviderSpy:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.update(kwargs)
+
+        def __call__(self, prompt: str) -> dict[str, Any]:
+            return {}
+
+    class CoordinatorStub:
+        def __init__(self, **kwargs: Any) -> None:
+            self.maintenance_barrier = object()
+            self.policy = SimpleNamespace(barrier_timeout_seconds=1.0)
+
+    monkeypatch.setenv(
+        "OMBRE_LMC5_SNAPSHOT_DIR",
+        str(tmp_path / "snapshots"),
+    )
+    monkeypatch.setattr(
+        night_runtime_module,
+        "OpenAIChatProvider",
+        ProviderSpy,
+    )
+    monkeypatch.setattr(
+        night_runtime_module,
+        "StrictOmbreProposer",
+        lambda provider, **_: provider,
+    )
+    monkeypatch.setattr(
+        night_runtime_module,
+        "SnapshotManager",
+        lambda *_: object(),
+    )
+    monkeypatch.setattr(
+        night_runtime_module,
+        "CuratedWriteCoordinator",
+        lambda *_: object(),
+    )
+    monkeypatch.setattr(
+        night_runtime_module,
+        "NightRunCoordinator",
+        CoordinatorStub,
+    )
+
+    config: dict[str, Any] = {
+        "buckets_dir": str(tmp_path / "vault"),
+        "dehydration": {
+            "api_key": "test-key",
+            "model": "test-model",
+            "max_tokens": 777,
+        },
+    }
+    if night_section is not None:
+        config["lmc5_night"] = night_section
+
+    runtime = build_night_run_runtime(
+        config=config,
+        ledger=_ledger(tmp_path),
+        bucket_manager=object(),
+        embedding_engine=object(),
+        decay_engine=object(),
+        consolidation_engine=object(),
+    )
+
+    assert isinstance(runtime, NightRunRuntime)
+    assert captured["max_tokens"] == expected
 
 
 def test_trigger_summary_strips_snapshot_and_internal_fields() -> None:
