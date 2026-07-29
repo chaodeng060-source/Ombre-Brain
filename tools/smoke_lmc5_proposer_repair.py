@@ -69,8 +69,11 @@ async def _repair_succeeds_once() -> None:
     batch = await StrictOmbreProposer(provider).propose(CHUNKS)
     assert batch.candidates[0].evidence == "喜欢雨声"
     assert len(prompts) == 2
-    assert "REPAIR ONE PROVENANCE ERROR" not in prompts[0]
-    assert "REPAIR ONE PROVENANCE ERROR" in prompts[1]
+    assert "REPAIR ONE MODEL CONTRACT ERROR" not in prompts[0]
+    assert (
+        "REPAIR ONE MODEL CONTRACT ERROR (provenance_evidence)"
+        in prompts[1]
+    )
 
 
 async def _repair_stops_after_second_failure() -> None:
@@ -90,27 +93,68 @@ async def _repair_stops_after_second_failure() -> None:
     assert len(prompts) == 2
 
 
-async def _other_errors_do_not_retry() -> None:
+async def _schema_candidate_is_repaired_once() -> None:
     prompts: list[str] = []
-    content = _document(_candidate(evidence="喜欢雨声", importance=11))
+    responses = iter(
+        (
+            _document(_candidate(evidence="喜欢雨声", importance=11)),
+            _document(_candidate(evidence="喜欢雨声")),
+        )
+    )
 
     async def provider(prompt: str) -> dict:
         prompts.append(prompt)
-        return _envelope(content)
+        return _envelope(next(responses))
+
+    batch = await StrictOmbreProposer(provider).propose(CHUNKS)
+    assert batch.candidates[0].importance == 7
+    assert len(prompts) == 2
+    assert "schema_candidate" in prompts[1]
+
+
+async def _source_id_is_repaired_once() -> None:
+    prompts: list[str] = []
+    invalid = _candidate(evidence="喜欢雨声")
+    invalid["source_chunk_ids"] = ["altered-chunk-id"]
+    responses = iter(
+        (
+            _document(invalid),
+            _document(_candidate(evidence="喜欢雨声")),
+        )
+    )
+
+    async def provider(prompt: str) -> dict:
+        prompts.append(prompt)
+        return _envelope(next(responses))
+
+    batch = await StrictOmbreProposer(provider).propose(CHUNKS)
+    assert batch.candidates[0].source_chunk_ids == ("chunk-1",)
+    assert len(prompts) == 2
+    assert "provenance_source" in prompts[1]
+
+
+async def _parse_errors_do_not_retry() -> None:
+    prompts: list[str] = []
+
+    async def provider(prompt: str) -> dict:
+        prompts.append(prompt)
+        return _envelope('{"schema_version":')
 
     try:
         await StrictOmbreProposer(provider).propose(CHUNKS)
     except ProposerContractError as exc:
-        assert exc.code == "schema_candidate"
+        assert exc.code == "parse_json"
     else:
-        raise AssertionError("invalid candidate schema was accepted")
+        raise AssertionError("malformed JSON was accepted")
     assert len(prompts) == 1
 
 
 async def main() -> None:
     await _repair_succeeds_once()
     await _repair_stops_after_second_failure()
-    await _other_errors_do_not_retry()
+    await _schema_candidate_is_repaired_once()
+    await _source_id_is_repaired_once()
+    await _parse_errors_do_not_retry()
 
 
 if __name__ == "__main__":

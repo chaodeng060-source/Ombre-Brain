@@ -699,8 +699,8 @@ async def test_evidence_error_gets_one_full_batch_repair():
 
     assert batch.candidates[0].evidence == "喜欢雨声"
     assert len(prompts) == 2
-    assert "REPAIR ONE PROVENANCE ERROR" not in prompts[0]
-    assert "REPAIR ONE PROVENANCE ERROR" in prompts[1]
+    assert "REPAIR ONE MODEL CONTRACT ERROR" not in prompts[0]
+    assert "REPAIR ONE MODEL CONTRACT ERROR (provenance_evidence)" in prompts[1]
     assert "Regenerate the whole JSON object" in prompts[1]
     assert batch.prompt_digest == hashlib.sha256(
         prompts[1].encode("utf-8")
@@ -726,18 +726,69 @@ async def test_evidence_repair_is_attempted_only_once():
 
 
 @pytest.mark.asyncio
-async def test_non_evidence_contract_error_does_not_retry():
+async def test_schema_candidate_error_gets_one_full_batch_repair():
     prompts = []
-    content = json.dumps(_document(_candidate(importance=11)))
+    responses = iter(
+        (
+            json.dumps(_document(_candidate(importance=11))),
+            json.dumps(_document(_candidate())),
+        )
+    )
 
     async def provider(prompt):
         prompts.append(prompt)
-        return {"choices": [{"message": {"content": content}}]}
+        return {
+            "choices": [{"message": {"content": next(responses)}}]
+        }
+
+    batch = await StrictOmbreProposer(provider).propose(CHUNKS)
+
+    assert batch.candidates[0].importance == 7
+    assert len(prompts) == 2
+    assert "schema_candidate" in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_provenance_source_error_gets_one_full_batch_repair():
+    prompts = []
+    responses = iter(
+        (
+            json.dumps(
+                _document(
+                    _candidate(source_chunk_ids=["altered-chunk-id"])
+                )
+            ),
+            json.dumps(_document(_candidate())),
+        )
+    )
+
+    async def provider(prompt):
+        prompts.append(prompt)
+        return {
+            "choices": [{"message": {"content": next(responses)}}]
+        }
+
+    batch = await StrictOmbreProposer(provider).propose(CHUNKS)
+
+    assert batch.candidates[0].source_chunk_ids == ("chunk-1",)
+    assert len(prompts) == 2
+    assert "provenance_source" in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_nonrepairable_parse_error_does_not_retry():
+    prompts = []
+
+    async def provider(prompt):
+        prompts.append(prompt)
+        return {
+            "choices": [{"message": {"content": '{"schema_version":'}}]
+        }
 
     with pytest.raises(ProposerContractError) as caught:
         await StrictOmbreProposer(provider).propose(CHUNKS)
 
-    assert caught.value.code == "schema_candidate"
+    assert caught.value.code == "parse_json"
     assert len(prompts) == 1
 
 

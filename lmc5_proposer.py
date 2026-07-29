@@ -57,14 +57,26 @@ _MAX_CONTENT_BYTES = 16 * 1024
 _MAX_THREAD_HINT_BYTES = 512
 _MAX_EVIDENCE_BYTES = 4 * 1024
 _MAX_RELATION_REASON_BYTES = 2 * 1024
-_EVIDENCE_REPAIR_INSTRUCTION = (
-    "REPAIR ONE PROVENANCE ERROR: The prior response failed because at least "
-    "one candidate's evidence was not an exact literal substring of a cited "
-    "chunk. Regenerate the whole JSON object. For every candidate, copy "
-    "evidence verbatim as one exact contiguous substring from the text of one "
-    "source_chunk_id, with identical punctuation and whitespace. Never "
-    "paraphrase, summarize, translate, normalize, splice, or invent evidence. "
-    "All other schema and contract rules remain unchanged."
+_REPAIRABLE_MODEL_CODES = frozenset(
+    {
+        "provenance_evidence",
+        "provenance_source",
+        "relation_target",
+        "schema_candidate",
+        "schema_relation",
+        "schema_root",
+    }
+)
+_CONTRACT_REPAIR_INSTRUCTION = (
+    "REPAIR ONE MODEL CONTRACT ERROR ({code}): Regenerate the whole JSON "
+    "object; do not patch or discuss the prior output. Match every root, "
+    "candidate, and relation key and value type in output_schema exactly. "
+    "Copy every source_chunk_id verbatim from INPUT.chunks[].id and use only "
+    "those ids. For every candidate, copy evidence verbatim as one exact "
+    "contiguous substring from the text of one cited source_chunk_id, with "
+    "identical punctuation and whitespace. Never paraphrase, summarize, "
+    "translate, normalize, splice, or invent evidence. All other schema and "
+    "contract rules remain unchanged."
 )
 _TYPE_AXES = {
     "event": frozenset({"X", "M"}),
@@ -323,9 +335,11 @@ class StrictOmbreProposer:
                 prompt, chunk_tuple, targets
             )
         except ProposerContractError as exc:
-            if exc.code != "provenance_evidence":
+            if exc.code not in _REPAIRABLE_MODEL_CODES:
                 raise
-            effective_prompt = self._build_evidence_repair_prompt(prompt)
+            effective_prompt = self._build_contract_repair_prompt(
+                prompt, exc.code
+            )
             self._validate_prompt_size(effective_prompt)
             candidates = await self._call_and_validate(
                 effective_prompt, chunk_tuple, targets
@@ -533,18 +547,20 @@ class StrictOmbreProposer:
             "protected, archive, or delete controls. If no candidate is "
             "supported, return the exact schema with candidates:[]. Every "
             "candidate needs non-empty unique source_chunk_ids and non-empty "
-            "evidence copied verbatim as one exact contiguous substring from "
-            "the text of one cited chunk, with identical punctuation and "
-            "whitespace; never paraphrase, summarize, translate, normalize, "
-            "splice, or invent evidence. relation_hints must be empty when "
-            "allowed_relation_targets is empty. risk must be exactly normal "
-            "or review."
+            "source_chunk_ids must be copied exactly from INPUT.chunks[].id "
+            "without alteration. evidence must be copied verbatim as one exact "
+            "contiguous substring from the text of one cited chunk, with "
+            "identical punctuation and whitespace; never paraphrase, "
+            "summarize, translate, normalize, splice, or invent evidence. "
+            "relation_hints must be empty when allowed_relation_targets is "
+            "empty. risk must be exactly normal or review."
         )
         return f"{rules}\nINPUT={_canonical_json(payload)}"
 
     @staticmethod
-    def _build_evidence_repair_prompt(prompt: str) -> str:
-        return f"{_EVIDENCE_REPAIR_INSTRUCTION}\n{prompt}"
+    def _build_contract_repair_prompt(prompt: str, code: str) -> str:
+        instruction = _CONTRACT_REPAIR_INSTRUCTION.format(code=code)
+        return f"{instruction}\n{prompt}"
 
     @staticmethod
     def _extract_message(envelope: Any) -> str:
