@@ -57,6 +57,15 @@ _MAX_CONTENT_BYTES = 16 * 1024
 _MAX_THREAD_HINT_BYTES = 512
 _MAX_EVIDENCE_BYTES = 4 * 1024
 _MAX_RELATION_REASON_BYTES = 2 * 1024
+_EVIDENCE_REPAIR_INSTRUCTION = (
+    "REPAIR ONE PROVENANCE ERROR: The prior response failed because at least "
+    "one candidate's evidence was not an exact literal substring of a cited "
+    "chunk. Regenerate the whole JSON object. For every candidate, copy "
+    "evidence verbatim as one exact contiguous substring from the text of one "
+    "source_chunk_id, with identical punctuation and whitespace. Never "
+    "paraphrase, summarize, translate, normalize, splice, or invent evidence. "
+    "All other schema and contract rules remain unchanged."
+)
 _TYPE_AXES = {
     "event": frozenset({"X", "M"}),
     "fact": frozenset({"X", "Z", "M"}),
@@ -248,7 +257,7 @@ def _candidate_as_json(candidate: CandidateDraft) -> dict[str, Any]:
 
 
 class StrictOmbreProposer:
-    """Call one injected provider and validate its response atomically."""
+    """Call an injected provider and validate each whole response atomically."""
 
     def __init__(
         self,
@@ -306,6 +315,38 @@ class StrictOmbreProposer:
             chunks, allowed_relation_targets
         )
         prompt = self._build_prompt(chunk_tuple, targets)
+        self._validate_prompt_size(prompt)
+
+        effective_prompt = prompt
+        try:
+            candidates = await self._call_and_validate(
+                prompt, chunk_tuple, targets
+            )
+        except ProposerContractError as exc:
+            if exc.code != "provenance_evidence":
+                raise
+            effective_prompt = self._build_evidence_repair_prompt(prompt)
+            self._validate_prompt_size(effective_prompt)
+            candidates = await self._call_and_validate(
+                effective_prompt, chunk_tuple, targets
+            )
+
+        normalized = {
+            "schema_version": SCHEMA_VERSION,
+            "candidates": [
+                _candidate_as_json(candidate) for candidate in candidates
+            ],
+        }
+        return ProposerBatch(
+            schema_version=SCHEMA_VERSION,
+            candidates=candidates,
+            prompt_digest=_digest_text(effective_prompt),
+            output_digest=_digest_text(_canonical_json(normalized)),
+            model=self.model,
+            provider=self.provider_name,
+        )
+
+    def _validate_prompt_size(self, prompt: str) -> None:
         try:
             prompt_size = len(prompt.encode("utf-8", errors="strict"))
         except UnicodeError as exc:
@@ -317,8 +358,13 @@ class StrictOmbreProposer:
                 "prompt_too_large", "canonical proposer prompt exceeds limit"
             )
 
+    async def _call_and_validate(
+        self,
+        prompt: str,
+        chunks: tuple[ProposerChunk, ...],
+        targets: frozenset[str],
+    ) -> tuple[CandidateDraft, ...]:
         envelope = await self._call_provider(prompt)
-
         response = self._extract_message(envelope)
         try:
             encoded = response.encode("utf-8", errors="strict")
@@ -334,23 +380,8 @@ class StrictOmbreProposer:
             raise ProposerContractError(
                 "provider.empty_response", "provider message was blank"
             )
-
         parsed = self._parse_json(response)
-        candidates = self._validate_root(parsed, chunk_tuple, targets)
-        normalized = {
-            "schema_version": SCHEMA_VERSION,
-            "candidates": [
-                _candidate_as_json(candidate) for candidate in candidates
-            ],
-        }
-        return ProposerBatch(
-            schema_version=SCHEMA_VERSION,
-            candidates=candidates,
-            prompt_digest=_digest_text(prompt),
-            output_digest=_digest_text(_canonical_json(normalized)),
-            model=self.model,
-            provider=self.provider_name,
-        )
+        return self._validate_root(parsed, chunks, targets)
 
     async def _call_provider(self, prompt: str) -> Any:
         caller_loop = asyncio.get_running_loop()
@@ -502,11 +533,18 @@ class StrictOmbreProposer:
             "protected, archive, or delete controls. If no candidate is "
             "supported, return the exact schema with candidates:[]. Every "
             "candidate needs non-empty unique source_chunk_ids and non-empty "
-            "evidence copied literally from a cited chunk. relation_hints must "
-            "be empty when allowed_relation_targets is empty. risk must be "
-            "exactly normal or review."
+            "evidence copied verbatim as one exact contiguous substring from "
+            "the text of one cited chunk, with identical punctuation and "
+            "whitespace; never paraphrase, summarize, translate, normalize, "
+            "splice, or invent evidence. relation_hints must be empty when "
+            "allowed_relation_targets is empty. risk must be exactly normal "
+            "or review."
         )
         return f"{rules}\nINPUT={_canonical_json(payload)}"
+
+    @staticmethod
+    def _build_evidence_repair_prompt(prompt: str) -> str:
+        return f"{_EVIDENCE_REPAIR_INSTRUCTION}\n{prompt}"
 
     @staticmethod
     def _extract_message(envelope: Any) -> str:

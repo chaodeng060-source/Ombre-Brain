@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from collections.abc import Mapping
@@ -674,6 +675,70 @@ async def test_one_invalid_candidate_fails_whole_batch():
     invalid = _candidate(title="invalid", evidence="not present")
     proposer = _proposer(json.dumps(_document(valid, invalid)))
     assert await _error_code(proposer) == "provenance_evidence"
+
+
+@pytest.mark.asyncio
+async def test_evidence_error_gets_one_full_batch_repair():
+    prompts = []
+    responses = iter(
+        (
+            json.dumps(
+                _document(_candidate(evidence="模型改写的雨声证据"))
+            ),
+            json.dumps(_document(_candidate(evidence="喜欢雨声"))),
+        )
+    )
+
+    async def provider(prompt):
+        prompts.append(prompt)
+        return {
+            "choices": [{"message": {"content": next(responses)}}]
+        }
+
+    batch = await StrictOmbreProposer(provider).propose(CHUNKS)
+
+    assert batch.candidates[0].evidence == "喜欢雨声"
+    assert len(prompts) == 2
+    assert "REPAIR ONE PROVENANCE ERROR" not in prompts[0]
+    assert "REPAIR ONE PROVENANCE ERROR" in prompts[1]
+    assert "Regenerate the whole JSON object" in prompts[1]
+    assert batch.prompt_digest == hashlib.sha256(
+        prompts[1].encode("utf-8")
+    ).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_evidence_repair_is_attempted_only_once():
+    prompts = []
+    content = json.dumps(
+        _document(_candidate(evidence="模型改写的雨声证据"))
+    )
+
+    async def provider(prompt):
+        prompts.append(prompt)
+        return {"choices": [{"message": {"content": content}}]}
+
+    with pytest.raises(ProposerContractError) as caught:
+        await StrictOmbreProposer(provider).propose(CHUNKS)
+
+    assert caught.value.code == "provenance_evidence"
+    assert len(prompts) == 2
+
+
+@pytest.mark.asyncio
+async def test_non_evidence_contract_error_does_not_retry():
+    prompts = []
+    content = json.dumps(_document(_candidate(importance=11)))
+
+    async def provider(prompt):
+        prompts.append(prompt)
+        return {"choices": [{"message": {"content": content}}]}
+
+    with pytest.raises(ProposerContractError) as caught:
+        await StrictOmbreProposer(provider).propose(CHUNKS)
+
+    assert caught.value.code == "schema_candidate"
+    assert len(prompts) == 1
 
 
 def _draft(candidate_type, with_relation=False):
