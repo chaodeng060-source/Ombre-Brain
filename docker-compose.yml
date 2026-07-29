@@ -26,12 +26,15 @@ services:
       - OMBRE_BUCKETS_DIR=/data             # Container-internal bucket path / 容器内路径
       - OMBRE_API_TOKEN=${OMBRE_API_TOKEN:?required} # /api/* Bearer token
       - OMBRE_MCP_TOKEN=${OMBRE_MCP_TOKEN:?required} # /mcp,/sse,/messages Bearer token
+      - OMBRE_LMC5_NIGHT_ENABLED=1       # Disable drifting 24h loops; cron owns the run
+      - OMBRE_LMC5_SNAPSHOT_DIR=/snapshots
     volumes:
       # Mount your Obsidian vault (or any host directory) for persistent storage
       # 挂载你的 Obsidian 仓库（或任意宿主机目录）做持久化存储
       # Example / 示例:
       #   - /path/to/your/Obsidian Vault/Ombre Brain:/data
       - /vol1/ombre-data:/data
+      - /vol1/ombre-night-snapshots:/snapshots
       - ./config.yaml:/app/config.yaml
 
   # Cloudflare Tunnel — 在朝灯 NAS 上已由 host 上的 cloudflared systemd/手起进程承担

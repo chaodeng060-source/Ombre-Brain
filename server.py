@@ -127,6 +127,11 @@ from lmc5_ledger import (
     LedgerError,
     LedgerValidationError,
 )
+from night_run_coordinator import NightRunCoordinatorError
+from night_run_runtime import (
+    NightRunRuntimeError,
+    build_night_run_runtime,
+)
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -154,6 +159,8 @@ _review_queue = None
 _e_axis_shadow_store = None
 _lmc5_ledger = None
 _lmc5_ledger_lock = threading.Lock()
+_lmc5_night_runtime = None
+_lmc5_night_runtime_lock = threading.Lock()
 _strict_recall_errors = contextvars.ContextVar(
     "ombre_strict_recall_errors",
     default=False,
@@ -208,6 +215,48 @@ def _get_lmc5_ledger() -> LMC5Ledger:
                     maintenance_root=config["buckets_dir"],
                 )
     return _lmc5_ledger
+
+
+def _lmc5_night_enabled() -> bool:
+    return os.environ.get("OMBRE_LMC5_NIGHT_ENABLED", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _get_lmc5_night_runtime():
+    global _lmc5_night_runtime
+    ledger = _get_lmc5_ledger()
+    if (
+        _lmc5_night_runtime is None
+        or _lmc5_night_runtime.ledger is not ledger
+    ):
+        with _lmc5_night_runtime_lock:
+            if (
+                _lmc5_night_runtime is None
+                or _lmc5_night_runtime.ledger is not ledger
+            ):
+                _lmc5_night_runtime = build_night_run_runtime(
+                    config=config,
+                    ledger=ledger,
+                    bucket_manager=bucket_mgr,
+                    embedding_engine=embedding_engine,
+                    decay_engine=decay_engine,
+                    consolidation_engine=consolidation_engine,
+                )
+    return _lmc5_night_runtime
+
+
+async def _ensure_decay_background() -> None:
+    if not _lmc5_night_enabled():
+        await decay_engine.ensure_started()
+
+
+async def _ensure_consolidation_background() -> None:
+    if not _lmc5_night_enabled():
+        await consolidation_engine.ensure_started()
 
 
 def _hook_auth_state(request) -> str:
@@ -1188,6 +1237,111 @@ async def lmc5_raw_events_hook(request):
     )
 
 
+async def _read_lmc5_night_request(
+    request,
+    *,
+    max_bytes: int = 1024,
+) -> bytes:
+    """Read the tiny scheduler contract without accepting an unbounded body."""
+    stream = getattr(request, "stream", None)
+    if callable(stream):
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in stream():
+            if not isinstance(chunk, bytes):
+                raise ValueError("night request body is not bytes")
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError("night request body is too large")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    raw = await request.body()
+    if not isinstance(raw, bytes) or len(raw) > max_bytes:
+        raise ValueError("night request body is invalid")
+    return raw
+
+
+@mcp.custom_route("/api/maintenance/lmc5-night", methods=["POST"])
+async def lmc5_night_maintenance(request):
+    """Run one authenticated, single-flight conservative LMC-5 night job."""
+    from starlette.responses import JSONResponse
+
+    if not _lmc5_night_enabled():
+        return JSONResponse(
+            {"ok": False, "code": "night.disabled"},
+            status_code=503,
+        )
+    try:
+        raw = await _read_lmc5_night_request(request)
+        if raw.strip():
+            body = json.loads(raw)
+            if body != {"schema_version": 1}:
+                raise ValueError("night request contract fields do not match")
+    except (
+        UnicodeError,
+        json.JSONDecodeError,
+        OverflowError,
+        RecursionError,
+        ValueError,
+        TypeError,
+    ):
+        return JSONResponse(
+            {"ok": False, "code": "request.invalid"},
+            status_code=400,
+        )
+
+    try:
+        result = await _get_lmc5_night_runtime().run_once()
+    except NightRunRuntimeError as exc:
+        status_code = 409 if exc.code in {"run.busy", "run.raced"} else 503
+        logger.warning("LMC-5 night runtime stopped: %s", exc.code)
+        return JSONResponse(
+            {"ok": False, "code": exc.code},
+            status_code=status_code,
+        )
+    except NightRunCoordinatorError as exc:
+        logger.error("LMC-5 night run failed closed: %s", exc.code)
+        return JSONResponse(
+            {"ok": False, "code": exc.code},
+            status_code=503,
+        )
+    except (LedgerError, OSError, ValueError):
+        logger.error("LMC-5 night runtime unavailable")
+        return JSONResponse(
+            {"ok": False, "code": "night.unavailable"},
+            status_code=503,
+        )
+    except Exception:
+        logger.error("LMC-5 night runtime stopped unexpectedly")
+        return JSONResponse(
+            {"ok": False, "code": "night.unavailable"},
+            status_code=503,
+        )
+
+    logger.info(
+        "LMC-5 conservative night run complete: run_id=%s stage=%s "
+        "already_complete=%s counts=%s",
+        result.run_id,
+        result.stage,
+        result.already_complete,
+        dict(result.counts),
+    )
+    return JSONResponse(
+        {
+            "ok": True,
+            "contract": "lmc5-conservative-stage1",
+            "run_id": result.run_id,
+            "local_date": result.local_date,
+            "stage": result.stage,
+            "already_complete": result.already_complete,
+            "cutoff_utc": result.cutoff_utc,
+            "snapshot_manifest_sha256": result.snapshot_manifest_sha256,
+            "counts": result.counts,
+            "deferred_axes": ["Y", "Z", "E"],
+        }
+    )
+
+
 @mcp.custom_route("/lmc5/recall-hook", methods=["POST"])
 async def lmc5_recall_hook(request):
     """Run the normal authoritative recall pipeline for one user prompt."""
@@ -1816,8 +1970,8 @@ async def breath(
     reset_body_state: bool = False,
 ) -> str | list[TextContent | ImageContent]:
     """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认6000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制注入数量上限(默认8,最大50; 内部仍先召回20条给过滤器)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿安全关系边双向召回邻居的跳数(默认1,0=关闭,最大2)，关联证据单独列出且不改变主排序。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。session_id=同一会话内对已浮现动态桶去重。include_images=True时,白名单图桶会随文本返回 MCP image content。include_body_state=False时只关闭外部身体状态块,不改变记忆检索。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。"""
-    await decay_engine.ensure_started()
-    await consolidation_engine.ensure_started()
+    await _ensure_decay_background()
+    await _ensure_consolidation_background()
     await episode_engine.ensure_started()
     _maybe_start_backfill()
     max_results = max(1, min(max_results, 50))
@@ -2423,7 +2577,7 @@ async def hold(
     domain: str = "",
 ) -> str:
     """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。image_base64=可选,base64编码的图片数据,会上传到R2并把URL插入正文(允许此条记忆带图)。image_filename=图片名称提示(默认image)。world=显式指定世界归属,留空时走全局current_world(日常聊天=空,角色扮演=具体世界名),"通用"表示跨世界设定。feel桶不归属世界。chord_tag=可选和弦记号串(如"Em(maj7) → A13#11 · 92bpm · f"),作为情绪色调索引,只用于跨窗口标记,不参与表达。紧张系和弦(m(maj7)/♭9/dim等)加动作词disambiguator(盯/压/憋/狂),一行最多4个和弦,段落切换用"; "分隔,详见 INTERNALS.md 5.12。feel桶不打chord_tag。merge时若新带chord_tag会覆盖旧桶。domain=显式指定主题域(csv),非空时override dehydrator 自动推断,用于跨 Agent 工程日志隔离(如 hajimi-工程)。feel/pinned 路径同样适用。"""
-    await decay_engine.ensure_started()
+    await _ensure_decay_background()
     _maybe_start_backfill()
 
     # --- Input validation / 输入校验 ---
@@ -2588,7 +2742,7 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
     """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。world留空走全局current_world。chord_tag=可选和弦记号串作为整段日记的色调,会打到所有子桶上(子桶共用同一色调)。"""
     _grow_t0 = time.perf_counter()
     _content_len = len(content.strip()) if content else 0
-    await decay_engine.ensure_started()
+    await _ensure_decay_background()
 
     if not content or not content.strip():
         return "内容为空，无法整理。"
@@ -3182,7 +3336,7 @@ async def pulse(include_archive: bool = False, full: bool = False, limit: int = 
 @mcp.tool()
 async def dream() -> str:
     """做梦——读取最近新增的记忆桶,供你自省。读完后可以trace(resolved=1)放下,或hold(feel=True)写感受。"""
-    await decay_engine.ensure_started()
+    await _ensure_decay_background()
 
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
@@ -3662,7 +3816,7 @@ async def briefing(
     format: str = "text",
 ) -> str:
     """开窗简报。聚合钉选+高权重未解决+最近活跃桶,LLM压缩为≤max_chars字简报,默认1000字。输出顺序:朝灯当前氛围/走向→最近因果链故事→活着的欠账→工程线→铁律。domain逗号分隔可过滤主题域。pinned_only=True只用钉选桶。session_id=同一会话内对感官刺激去重。include_body_state=False时只关闭外部身体状态块,不改变简报素材。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。format=text(默认)返回拼接好的简报字符串(向后兼容);format=json时把 tier==0 的桶单独剥出来作为 slots[] 返回原文、剩余桶继续走 LLM 压缩为 briefing 字段——治简报≠原文(#4 核心画像分离, 2026-05-30)。开窗调一次,省80%token。"""
-    await decay_engine.ensure_started()
+    await _ensure_decay_background()
     max_chars = max(300, min(max_chars, 4000))
 
     try:

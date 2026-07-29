@@ -34,6 +34,7 @@ def _hook_environment(monkeypatch, test_config):
     monkeypatch.setenv("OMBRE_HOOK_TOKEN", "hook-secret")
     monkeypatch.setitem(server.config, "buckets_dir", test_config["buckets_dir"])
     monkeypatch.setattr(server, "_lmc5_ledger", None)
+    monkeypatch.setattr(server, "_lmc5_night_runtime", None)
 
 
 @pytest.mark.asyncio
@@ -260,3 +261,152 @@ async def test_recall_hook_never_turns_vector_outage_into_empty_success(
 
     assert response.status_code == 500
     assert _json(response) == {"error": "recall failed"}
+
+
+@pytest.mark.asyncio
+async def test_night_route_returns_conservative_stage1_contract(
+    monkeypatch,
+):
+    monkeypatch.setenv("OMBRE_LMC5_NIGHT_ENABLED", "1")
+
+    class Runtime:
+        async def run_once(self):
+            return SimpleNamespace(
+                run_id="lmc5-night-20260729",
+                local_date="2026-07-29",
+                stage="complete",
+                already_complete=False,
+                cutoff_utc="2026-07-29T20:30:00+00:00",
+                snapshot_manifest_sha256="a" * 64,
+                counts={"x_ready": 1, "m_computed": 1},
+            )
+
+    monkeypatch.setattr(
+        server,
+        "_get_lmc5_night_runtime",
+        lambda: Runtime(),
+    )
+
+    response = await server.lmc5_night_maintenance(
+        _Request({"schema_version": 1})
+    )
+
+    assert response.status_code == 200
+    payload = _json(response)
+    assert payload["contract"] == "lmc5-conservative-stage1"
+    assert payload["stage"] == "complete"
+    assert payload["deferred_axes"] == ["Y", "Z", "E"]
+    assert payload["counts"] == {"x_ready": 1, "m_computed": 1}
+
+
+@pytest.mark.asyncio
+async def test_night_route_is_disabled_without_explicit_switch(
+    monkeypatch,
+):
+    monkeypatch.delenv("OMBRE_LMC5_NIGHT_ENABLED", raising=False)
+
+    response = await server.lmc5_night_maintenance(
+        _Request({"schema_version": 1})
+    )
+
+    assert response.status_code == 503
+    assert _json(response) == {"ok": False, "code": "night.disabled"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b"{" + b'"padding":"' + b"x" * 2048 + b'"}',
+        ("[" * 2000 + "0" + "]" * 2000).encode("ascii"),
+    ],
+)
+async def test_night_route_rejects_large_or_deep_body(
+    monkeypatch,
+    raw: bytes,
+):
+    monkeypatch.setenv("OMBRE_LMC5_NIGHT_ENABLED", "1")
+
+    response = await server.lmc5_night_maintenance(_Request(raw))
+
+    assert response.status_code == 400
+    assert _json(response) == {"ok": False, "code": "request.invalid"}
+
+
+@pytest.mark.asyncio
+async def test_night_route_sanitizes_unexpected_failure(monkeypatch):
+    monkeypatch.setenv("OMBRE_LMC5_NIGHT_ENABLED", "1")
+
+    class Runtime:
+        async def run_once(self):
+            raise RuntimeError("secret provider detail")
+
+    monkeypatch.setattr(
+        server,
+        "_get_lmc5_night_runtime",
+        lambda: Runtime(),
+    )
+
+    response = await server.lmc5_night_maintenance(
+        _Request({"schema_version": 1})
+    )
+
+    assert response.status_code == 503
+    assert _json(response) == {
+        "ok": False,
+        "code": "night.unavailable",
+    }
+
+
+@pytest.mark.asyncio
+async def test_night_route_maps_busy_to_conflict(monkeypatch):
+    from night_run_runtime import NightRunRuntimeError
+
+    monkeypatch.setenv("OMBRE_LMC5_NIGHT_ENABLED", "1")
+
+    class Runtime:
+        async def run_once(self):
+            raise NightRunRuntimeError("run.busy")
+
+    monkeypatch.setattr(
+        server,
+        "_get_lmc5_night_runtime",
+        lambda: Runtime(),
+    )
+
+    response = await server.lmc5_night_maintenance(
+        _Request({"schema_version": 1})
+    )
+
+    assert response.status_code == 409
+    assert _json(response) == {"ok": False, "code": "run.busy"}
+
+
+@pytest.mark.asyncio
+async def test_scheduled_night_disables_legacy_drifting_metabolism(
+    monkeypatch,
+):
+    calls = {"decay": 0, "consolidation": 0}
+
+    async def start_decay():
+        calls["decay"] += 1
+
+    async def start_consolidation():
+        calls["consolidation"] += 1
+
+    monkeypatch.setattr(server.decay_engine, "ensure_started", start_decay)
+    monkeypatch.setattr(
+        server.consolidation_engine,
+        "ensure_started",
+        start_consolidation,
+    )
+    monkeypatch.setenv("OMBRE_LMC5_NIGHT_ENABLED", "1")
+
+    await server._ensure_decay_background()
+    await server._ensure_consolidation_background()
+    assert calls == {"decay": 0, "consolidation": 0}
+
+    monkeypatch.delenv("OMBRE_LMC5_NIGHT_ENABLED")
+    await server._ensure_decay_background()
+    await server._ensure_consolidation_background()
+    assert calls == {"decay": 1, "consolidation": 1}

@@ -219,7 +219,10 @@ class ConsolidationEngine:
                 "report_bucket_id": None,
                 "errors": list(self._read_errors),
             }
-            logger.error("Consolidation read failed / 整理读取失败: %s", result)
+            logger.error(
+                "Consolidation read failed / 整理读取失败: errors=%d",
+                len(result["errors"]),
+            )
             return result
 
         # --- Optional, OFF by default: digest (hide, reversible) the shorter of
@@ -270,7 +273,17 @@ class ConsolidationEngine:
             "report_bucket_id": report_id,
             "errors": operation_errors,
         }
-        logger.info(f"Consolidation cycle complete / 整理周期完成: {result}")
+        logger.info(
+            "Consolidation cycle complete / 整理周期完成: "
+            "ok=%s mode=%s dup_pairs=%d stale_count=%d "
+            "would_digest=%d errors=%d",
+            result["ok"],
+            result["mode"],
+            result["dup_pairs"],
+            result["stale_count"],
+            len(result["would_digest"]),
+            len(result["errors"]),
+        )
         return result
 
     async def _write_report(self, dups: list[dict], stale: list[dict], auto_digested: int) -> str | None:

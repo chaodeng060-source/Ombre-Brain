@@ -303,9 +303,9 @@ class DecayEngine:
                 if imp <= 4 and days_since > 30:
                     would_auto_resolve.append(str(bucket["id"]))
                     if self.metabolism_mode == "report_only":
-                        logger.info(
-                            "M report-only would resolve / 只读代谢候选结案: %s",
-                            bucket["id"],
+                        logger.debug(
+                            "M report-only found a resolve candidate / "
+                            "只读代谢发现候选结案"
                         )
                     else:
                         try:
@@ -341,9 +341,9 @@ class DecayEngine:
             if score < self.threshold:
                 would_archive.append(str(bucket["id"]))
                 if self.metabolism_mode == "report_only":
-                    logger.info(
-                        "M report-only would archive / 只读代谢候选归档: %s",
-                        bucket["id"],
+                    logger.debug(
+                        "M report-only found an archive candidate / "
+                        "只读代谢发现候选归档"
                     )
                 else:
                     try:
@@ -375,7 +375,17 @@ class DecayEngine:
             "lowest_score": lowest_score if checked > 0 else 0,
             "errors": errors,
         }
-        logger.info(f"Decay cycle complete / 衰减周期完成: {result}")
+        logger.info(
+            "Decay cycle complete / 衰减周期完成: "
+            "ok=%s mode=%s checked=%d would_archive=%d "
+            "would_auto_resolve=%d errors=%d",
+            result["ok"],
+            result["mode"],
+            result["checked"],
+            len(result["would_archive"]),
+            len(result["would_auto_resolve"]),
+            len(result["errors"]),
+        )
         return result
 
     # ---------------------------------------------------------

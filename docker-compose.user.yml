@@ -24,7 +24,10 @@ services:
       - OMBRE_BUCKETS_DIR=/data
       - OMBRE_API_TOKEN=${OMBRE_API_TOKEN:?required}
       - OMBRE_MCP_TOKEN=${OMBRE_MCP_TOKEN:?required}
+      - OMBRE_LMC5_NIGHT_ENABLED=${OMBRE_LMC5_NIGHT_ENABLED:-0}
+      - OMBRE_LMC5_SNAPSHOT_DIR=/snapshots
     volumes:
       # 改成你的 Obsidian Vault 路径，或保持 ./buckets 用本地目录
       # Change to your Obsidian Vault path, or keep ./buckets for local storage
       - ./buckets:/data
+      - ./snapshots:/snapshots

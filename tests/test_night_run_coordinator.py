@@ -1,0 +1,558 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from curated_writer import CuratedWriteCoordinator, CuratedWriteResult
+from lmc5_ledger import LMC5Ledger
+from lmc5_proposer import StrictOmbreProposer
+from maintenance_barrier import MaintenanceBarrier
+from night_run_coordinator import (
+    NightRunCoordinator,
+    NightRunCoordinatorError,
+)
+from snapshot_manager import SnapshotManager
+
+
+class _Provider:
+    def __init__(
+        self,
+        *,
+        candidate_type: str = "event",
+        risk: str = "normal",
+        invalid: bool = False,
+        empty: bool = False,
+    ) -> None:
+        self.candidate_type = candidate_type
+        self.risk = risk
+        self.invalid = invalid
+        self.empty = empty
+        self.prompts: list[str] = []
+
+    def __call__(self, prompt: str) -> dict[str, Any]:
+        self.prompts.append(prompt)
+        if self.invalid:
+            return {"choices": []}
+        raw_input = prompt.split("INPUT=", 1)[1]
+        proposer_input = json.loads(raw_input)
+        chunk = proposer_input["chunks"][0]
+        candidates: list[dict[str, Any]] = []
+        if not self.empty:
+            candidates.append(
+                {
+                    "type": self.candidate_type,
+                    "title": "夜间候选",
+                    "content": "朝灯今晚想看星星",
+                    "importance": 7,
+                    "thread_hint": "night",
+                    "relation_hints": [],
+                    "source_chunk_ids": [chunk["id"]],
+                    "evidence": chunk["text"][:12],
+                    "risk": self.risk,
+                }
+            )
+        content = json.dumps(
+            {"schema_version": 1, "candidates": candidates},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": content},
+                }
+            ]
+        }
+
+
+class _FakeCurated:
+    def __init__(self, barrier: MaintenanceBarrier) -> None:
+        self._maintenance_barrier = barrier
+        self.calls: list[dict[str, Any]] = []
+
+    async def write(self, **kwargs: Any) -> CuratedWriteResult:
+        self.calls.append(kwargs)
+        return CuratedWriteResult(
+            success=True,
+            status="completed",
+            bucket_id=f"bucket-{len(self.calls)}",
+            vector_policy="required",
+            recall_state="ready_vector",
+        )
+
+
+class _RetryEmbedding:
+    def __init__(self) -> None:
+        self.enabled = True
+        self.calls = 0
+        self.stored: set[str] = set()
+
+    async def generate_and_store(
+        self,
+        bucket_id: str,
+        content: str,
+    ) -> bool:
+        self.calls += 1
+        if self.calls == 1:
+            return False
+        self.stored.add(bucket_id)
+        return True
+
+    async def get_embedding(self, bucket_id: str):
+        return [1.0] if bucket_id in self.stored else None
+
+    def delete_embedding(self, bucket_id: str) -> None:
+        self.stored.discard(bucket_id)
+
+    @staticmethod
+    def _cosine_similarity(a, b) -> float:
+        return 1.0 if a == b else 0.0
+
+
+class _ReportEngine:
+    def __init__(
+        self,
+        barrier: MaintenanceBarrier,
+        *,
+        kind: str,
+        unsafe: bool = False,
+    ) -> None:
+        self.bucket_mgr = SimpleNamespace(_maintenance_barrier=barrier)
+        self.metabolism_mode = "report_only"
+        self.kind = kind
+        self.unsafe = unsafe
+        self.calls = 0
+
+    async def run_decay_cycle(self) -> dict[str, Any]:
+        assert self.kind == "decay"
+        self.calls += 1
+        return {
+            "ok": True,
+            "mode": "report_only",
+            "checked": 1,
+            "archived": 1 if self.unsafe else 0,
+            "auto_resolved": 0,
+            "would_archive": ["candidate"],
+            "would_auto_resolve": [],
+            "lowest_score": 0.2,
+            "errors": [],
+        }
+
+    async def run_consolidation_cycle(self) -> dict[str, Any]:
+        assert self.kind == "consolidation"
+        self.calls += 1
+        return {
+            "ok": True,
+            "mode": "report_only",
+            "dup_pairs": 1,
+            "stale_count": 0,
+            "auto_digested": 1 if self.unsafe else 0,
+            "would_digest": ["candidate"],
+            "would_create_report": True,
+            "duplicate_candidates": [],
+            "stale_candidates": [],
+            "report_bucket_id": None,
+            "errors": [],
+        }
+
+
+@dataclass
+class _Harness:
+    source: Path
+    backups: Path
+    ledger: LMC5Ledger
+    snapshots: SnapshotManager
+    provider: _Provider
+    curated: _FakeCurated
+    decay: _ReportEngine
+    consolidation: _ReportEngine
+    coordinator: NightRunCoordinator
+
+
+def _harness(
+    tmp_path: Path,
+    *,
+    candidate_type: str = "event",
+    risk: str = "normal",
+    invalid_provider: bool = False,
+    empty_provider: bool = False,
+    unsafe_decay: bool = False,
+) -> _Harness:
+    source = tmp_path / "vault"
+    backups = tmp_path / "snapshots"
+    source.mkdir()
+    (source / "dynamic").mkdir()
+    ledger = LMC5Ledger(
+        source / ".lmc5" / "ledger.db",
+        maintenance_root=source,
+    )
+    snapshots = SnapshotManager(source, backups)
+    barrier = MaintenanceBarrier(source)
+    provider = _Provider(
+        candidate_type=candidate_type,
+        risk=risk,
+        invalid=invalid_provider,
+        empty=empty_provider,
+    )
+    proposer = StrictOmbreProposer(
+        provider,
+        timeout_seconds=1,
+        model="test-model",
+        provider_name="test-provider",
+    )
+    curated = _FakeCurated(barrier)
+    decay = _ReportEngine(
+        barrier, kind="decay", unsafe=unsafe_decay
+    )
+    consolidation = _ReportEngine(barrier, kind="consolidation")
+    coordinator = NightRunCoordinator(
+        ledger=ledger,
+        snapshots=snapshots,
+        proposer=proposer,
+        curated=curated,
+        decay_engine=decay,
+        consolidation_engine=consolidation,
+    )
+    return _Harness(
+        source=source,
+        backups=backups,
+        ledger=ledger,
+        snapshots=snapshots,
+        provider=provider,
+        curated=curated,
+        decay=decay,
+        consolidation=consolidation,
+        coordinator=coordinator,
+    )
+
+
+@pytest.mark.asyncio
+async def test_event_run_completes_snapshot_chunk_x_and_report_only_m(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.ledger.append_raw_event(
+        "room-main",
+        "message-1",
+        json.dumps(
+            {
+                "message": "朝灯今晚想看星星",
+                "api_key": "must-not-leave-local",
+            },
+            ensure_ascii=False,
+        ),
+    )
+    cutoff = datetime.now(timezone.utc)
+
+    outcome = await harness.coordinator.run(
+        run_id="night-success-1",
+        cutoff=cutoff,
+    )
+
+    assert outcome.run.stage == "complete"
+    assert outcome.counts == {
+        "raw_events": 1,
+        "chunks": 1,
+        "proposer_chunks": 1,
+        "candidates": 2,
+        "x_ready": 1,
+        "m_computed": 1,
+    }
+    assert len(harness.curated.calls) == 1
+    assert harness.curated.calls[0]["vector_policy"] == "required"
+    assert (
+        harness.curated.calls[0]["bucket_options"]["x_provenance"][
+            "source_event_ids"
+        ]
+        == ["message-1"]
+    )
+    assert "must-not-leave-local" not in harness.provider.prompts[0]
+    assert "[REDACTED]" in harness.provider.prompts[0]
+    assert len(harness.ledger.list_candidates("ready")) == 2
+    assert harness.ledger.list_candidates("pending") == ()
+    assert harness.ledger.get_night_run("night-success-1").sequence == 7
+    verified = harness.snapshots.verify_snapshot(
+        "night-success-1",
+        expected_manifest_sha256=outcome.snapshot_manifest_sha256,
+    )
+    assert verified.snapshot_id == "night-success-1"
+
+
+@pytest.mark.asyncio
+async def test_cutoff_is_exclusive_and_newer_event_remains_uncovered(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path, empty_provider=True)
+    harness.ledger.append_raw_event(
+        "room-main", "before", '{"message":"before cutoff"}'
+    )
+    cutoff = datetime.now(timezone.utc)
+    harness.ledger.append_raw_event(
+        "room-main", "after", '{"message":"after cutoff"}'
+    )
+
+    outcome = await harness.coordinator.run(
+        run_id="night-cutoff-1",
+        cutoff=cutoff,
+    )
+
+    assert outcome.run.stage == "complete"
+    uncovered = harness.ledger.list_uncovered_raw_events(limit=10)
+    assert [row.identity.source_event_id for row in uncovered] == ["after"]
+    assert outcome.counts["raw_events"] == 1
+    assert outcome.counts["candidates"] == 0
+    assert harness.curated.calls == []
+
+
+@pytest.mark.asyncio
+async def test_preference_axes_are_explicitly_deferred_without_x_write(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path, candidate_type="preference")
+    harness.ledger.append_raw_event(
+        "room-main", "preference-1", '{"message":"我更喜欢墨绿色"}'
+    )
+
+    outcome = await harness.coordinator.run(
+        run_id="night-defer-1",
+        cutoff=datetime.now(timezone.utc),
+    )
+
+    assert outcome.run.stage == "complete"
+    assert harness.curated.calls == []
+    deferred = harness.ledger.list_candidates("deferred")
+    assert {(row.axis, row.error_code) for row in deferred} == {
+        ("X", "x.type_requires_axis_decision"),
+        ("Z", "z.fact_pair_unavailable"),
+        ("E", "e.scorer_unavailable"),
+    }
+    ready = harness.ledger.list_candidates("ready")
+    assert [(row.axis, row.error_code) for row in ready] == [("M", None)]
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_is_retryable_and_run_is_error(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path, invalid_provider=True)
+    harness.ledger.append_raw_event(
+        "room-main", "message-1", '{"message":"provider failure"}'
+    )
+
+    with pytest.raises(NightRunCoordinatorError) as raised:
+        await harness.coordinator.run(
+            run_id="night-provider-error",
+            cutoff=datetime.now(timezone.utc),
+        )
+
+    assert raised.value.code == "proposer.failed"
+    run = harness.ledger.get_night_run("night-provider-error")
+    assert run.stage == "error"
+    assert run.errors == ("proposer.failed",)
+    assert len(harness.ledger.list_pending_proposer_chunks(limit=10)) == 1
+    with sqlite3.connect(harness.ledger.path) as connection:
+        assert connection.execute(
+            "SELECT outcome, error_code FROM chunk_proposer_outcomes"
+        ).fetchall() == [("retryable_error", "provider.no_choices")]
+
+
+@pytest.mark.asyncio
+async def test_invalid_raw_json_stays_uncovered_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.ledger.append_raw_event(
+        "room-main", "message-1", '{"duplicate":1,"duplicate":2}'
+    )
+
+    with pytest.raises(NightRunCoordinatorError) as raised:
+        await harness.coordinator.run(
+            run_id="night-invalid-raw",
+            cutoff=datetime.now(timezone.utc),
+        )
+
+    assert raised.value.code == "raw.invalid_json"
+    assert harness.ledger.get_night_run("night-invalid-raw").stage == "error"
+    assert len(harness.ledger.list_uncovered_raw_events(limit=10)) == 1
+    assert harness.ledger.list_pending_proposer_chunks(limit=10) == ()
+
+
+@pytest.mark.asyncio
+async def test_report_only_engine_cannot_claim_success_after_mutation(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path, unsafe_decay=True)
+    harness.ledger.append_raw_event(
+        "room-main", "message-1", '{"message":"unsafe metabolism"}'
+    )
+
+    with pytest.raises(NightRunCoordinatorError) as raised:
+        await harness.coordinator.run(
+            run_id="night-unsafe-m",
+            cutoff=datetime.now(timezone.utc),
+        )
+
+    assert raised.value.code == "metabolism.decay_unsafe"
+    run = harness.ledger.get_night_run("night-unsafe-m")
+    assert run.stage == "error"
+    assert [row.axis for row in harness.ledger.list_candidates("pending")] == [
+        "M"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_completed_run_id_is_never_resumed_or_resnapshotted(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path, empty_provider=True)
+    cutoff = datetime.now(timezone.utc)
+    first = await harness.coordinator.run(
+        run_id="night-no-resume",
+        cutoff=cutoff,
+    )
+
+    with pytest.raises(NightRunCoordinatorError) as raised:
+        await harness.coordinator.run(
+            run_id="night-no-resume",
+            cutoff=datetime.now(timezone.utc),
+        )
+
+    assert raised.value.code == "run.reused"
+    current = harness.ledger.get_night_run("night-no-resume")
+    assert current.stage == "complete"
+    assert current.sequence == first.run.sequence
+
+
+def test_components_with_different_maintenance_roots_are_rejected(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "vault"
+    source.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    snapshots = SnapshotManager(source, tmp_path / "snapshots")
+    ledger = LMC5Ledger(
+        source / ".lmc5" / "ledger.db",
+        maintenance_root=source,
+    )
+    provider = _Provider(empty=True)
+    proposer = StrictOmbreProposer(provider)
+    wrong_barrier = MaintenanceBarrier(other)
+    curated = _FakeCurated(wrong_barrier)
+    decay = _ReportEngine(wrong_barrier, kind="decay")
+    consolidation = _ReportEngine(wrong_barrier, kind="consolidation")
+
+    with pytest.raises(ValueError, match="share one maintenance barrier"):
+        NightRunCoordinator(
+            ledger=ledger,
+            snapshots=snapshots,
+            proposer=proposer,
+            curated=curated,
+            decay_engine=decay,
+            consolidation_engine=consolidation,
+        )
+
+
+@pytest.mark.asyncio
+async def test_real_x_write_retries_without_duplicate_bucket(
+    tmp_path: Path,
+    test_config: dict[str, Any],
+    bucket_mgr,
+) -> None:
+    from consolidation_engine import ConsolidationEngine
+    from decay_engine import DecayEngine
+
+    seed_id = await bucket_mgr.create(
+        content="夜班前已经存在的记忆",
+        name="night-seed",
+        bucket_type="dynamic",
+    )
+    seed_before = await bucket_mgr.get(seed_id)
+    assert seed_before is not None
+
+    root = Path(test_config["buckets_dir"])
+    ledger = LMC5Ledger(
+        root / ".lmc5" / "pipeline.sqlite3",
+        maintenance_root=root,
+    )
+    snapshots = SnapshotManager(root, tmp_path / "night-snapshots")
+    provider = _Provider()
+    proposer = StrictOmbreProposer(
+        provider,
+        timeout_seconds=1,
+        model="test-model",
+        provider_name="test-provider",
+    )
+    embedding = _RetryEmbedding()
+    curated = CuratedWriteCoordinator(bucket_mgr, embedding)
+    decay = DecayEngine(test_config, bucket_mgr)
+    consolidation = ConsolidationEngine(
+        test_config,
+        bucket_mgr,
+        embedding,
+    )
+    coordinator = NightRunCoordinator(
+        ledger=ledger,
+        snapshots=snapshots,
+        proposer=proposer,
+        curated=curated,
+        decay_engine=decay,
+        consolidation_engine=consolidation,
+    )
+    ledger.append_raw_event(
+        "room-main",
+        "night-real-write",
+        '{"message":"朝灯今晚想看星星"}',
+    )
+
+    with pytest.raises(NightRunCoordinatorError) as raised:
+        await coordinator.run(
+            run_id="night-real-write-r1",
+            cutoff=datetime.now(timezone.utc),
+        )
+
+    assert raised.value.code == "x.write_retryable"
+    assert ledger.get_night_run("night-real-write-r1").stage == "error"
+    assert len(ledger.list_candidates("pending")) == 2
+
+    second = await coordinator.run(
+        run_id="night-real-write-r2",
+        cutoff=datetime.now(timezone.utc),
+    )
+
+    assert second.run.stage == "complete"
+    assert embedding.calls == 2
+    assert len(provider.prompts) == 1
+    assert ledger.list_candidates("pending") == ()
+    visible = await bucket_mgr.list_all(include_archive=False)
+    curated_buckets = [
+        bucket
+        for bucket in visible
+        if (bucket.get("metadata") or {}).get("curated_write_key")
+    ]
+    assert len(curated_buckets) == 1
+    assert (
+        curated_buckets[0]["metadata"]["lmc5_recall_state"]
+        == "ready_vector"
+    )
+    all_curated_buckets = [
+        bucket
+        for bucket in await bucket_mgr.list_all(include_archive=True)
+        if (bucket.get("metadata") or {}).get("curated_write_key")
+    ]
+    assert [bucket["id"] for bucket in all_curated_buckets] == [
+        curated_buckets[0]["id"]
+    ]
+    seed_after = await bucket_mgr.get(seed_id)
+    assert seed_after is not None
+    assert seed_after["content"] == seed_before["content"]
+    assert seed_after["metadata"] == seed_before["metadata"]
