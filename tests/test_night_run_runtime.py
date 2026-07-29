@@ -21,6 +21,7 @@ from night_run_runtime import (
     NightRunRuntimeError,
     OpenAIChatProvider,
     _proposer_max_tokens,
+    _proposer_temperature,
     build_night_run_runtime,
 )
 from night_run_trigger import (
@@ -441,6 +442,43 @@ def test_null_night_section_uses_safe_default() -> None:
     assert _proposer_max_tokens({"lmc5_night": None}) == 4096
 
 
+def test_proposer_temperature_is_deterministic_and_independent() -> None:
+    assert _proposer_temperature(
+        {"dehydration": {"temperature": 0.8}}
+    ) == 0.0
+    assert _proposer_temperature(
+        {
+            "dehydration": {"temperature": 0.8},
+            "lmc5_night": {"proposer_temperature": 0.25},
+        }
+    ) == 0.25
+    assert _proposer_temperature({"lmc5_night": None}) == 0.0
+
+
+@pytest.mark.parametrize(
+    "section",
+    (
+        [],
+        {"proposer_temperature": None},
+        {"proposer_temperature": True},
+        {"proposer_temperature": False},
+        {"proposer_temperature": -0.01},
+        {"proposer_temperature": 1.01},
+        {"proposer_temperature": float("nan")},
+        {"proposer_temperature": float("inf")},
+        {"proposer_temperature": "0"},
+    ),
+)
+def test_proposer_temperature_rejects_unsafe_config(
+    section: object,
+) -> None:
+    with pytest.raises(
+        NightRunRuntimeError,
+        match="^provider\\.temperature_invalid$",
+    ):
+        _proposer_temperature({"lmc5_night": section})
+
+
 @pytest.mark.parametrize(
     "section",
     (
@@ -482,17 +520,25 @@ def test_openai_provider_rejects_budget_outside_contract(value: object) -> None:
 
 
 @pytest.mark.parametrize(
-    ("night_section", "expected"),
+    ("night_section", "expected_tokens", "expected_temperature"),
     (
-        (None, 4096),
-        ({"proposer_max_tokens": 2048}, 2048),
+        (None, 4096, 0.0),
+        (
+            {
+                "proposer_max_tokens": 2048,
+                "proposer_temperature": 0.2,
+            },
+            2048,
+            0.2,
+        ),
     ),
 )
-def test_runtime_builder_wires_dedicated_proposer_budget(
+def test_runtime_builder_wires_dedicated_proposer_controls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    night_section: dict[str, int] | None,
-    expected: int,
+    night_section: dict[str, int | float] | None,
+    expected_tokens: int,
+    expected_temperature: float,
 ) -> None:
     captured: dict[str, Any] = {}
 
@@ -559,7 +605,8 @@ def test_runtime_builder_wires_dedicated_proposer_budget(
     )
 
     assert isinstance(runtime, NightRunRuntime)
-    assert captured["max_tokens"] == expected
+    assert captured["max_tokens"] == expected_tokens
+    assert captured["temperature"] == expected_temperature
 
 
 def test_trigger_summary_strips_snapshot_and_internal_fields() -> None:

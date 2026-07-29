@@ -41,6 +41,7 @@ DEFAULT_TIMEZONE = "Asia/Shanghai"
 DEFAULT_MAX_ATTEMPTS = 8
 DEFAULT_SCHEDULE_TIME = time(hour=4, minute=30)
 DEFAULT_PROPOSER_MAX_TOKENS = 4096
+DEFAULT_PROPOSER_TEMPERATURE = 0.0
 MIN_PROPOSER_MAX_TOKENS = 512
 MAX_PROPOSER_MAX_TOKENS = 8192
 
@@ -71,6 +72,26 @@ def _proposer_max_tokens(config: dict[str, Any]) -> int:
     ):
         raise NightRunRuntimeError("provider.max_tokens_invalid")
     return value
+
+
+def _proposer_temperature(config: dict[str, Any]) -> float:
+    section = config.get("lmc5_night", {})
+    if section is None:
+        section = {}
+    if type(section) is not dict:
+        raise NightRunRuntimeError("provider.temperature_invalid")
+    value = section.get(
+        "proposer_temperature",
+        DEFAULT_PROPOSER_TEMPERATURE,
+    )
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or not 0 <= float(value) <= 1
+    ):
+        raise NightRunRuntimeError("provider.temperature_invalid")
+    return float(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,7 +341,7 @@ def build_night_run_runtime(
     )
     model = str(dehydration.get("model") or "deepseek-chat")
     max_tokens = _proposer_max_tokens(config)
-    temperature = dehydration.get("temperature", 0.1)
+    temperature = _proposer_temperature(config)
     provider_timeout = 75.0
     provider = OpenAIChatProvider(
         api_key=api_key,
