@@ -14,6 +14,7 @@ WORKDIR /app
 # 先装依赖（利用 Docker 缓存）
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN python -c "from mcp.server.fastmcp import FastMCP"
 
 # Copy project files / 复制项目文件
 COPY *.py .

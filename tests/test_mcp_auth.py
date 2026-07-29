@@ -313,3 +313,11 @@ def test_docker_build_context_excludes_secrets_and_runtime_data() -> None:
     assert "*.sqlite" in patterns
     assert "*.key" in patterns
     assert "*.pem" in patterns
+
+
+def test_container_pins_and_smokes_the_fastmcp_contract() -> None:
+    requirements = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    assert "mcp==1.28.1" in requirements.splitlines()
+    assert 'RUN python -c "from mcp.server.fastmcp import FastMCP"' in dockerfile
