@@ -104,7 +104,7 @@ from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
     world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
     rrf_fuse, parse_relative_time, PROTECTED_RESOLVE_DOMAINS,
-    SAFE_RELATION_TYPES, REVIEW_RELATION_TYPES,
+    RELATION_TYPES, SAFE_RELATION_TYPES, PROPAGATION_RELATION_TYPES,
     event_at_from_metadata, now_iso,
 )
 from redact import redact_embedding_input, redact_text  # 只抹 secret，不审查情感内容
@@ -437,7 +437,27 @@ def _relation_recall_neighbors(
     })
 
     relation_cfg = config.get("relation_recall", {}) or {}
-    raw_allowed_types = relation_cfg.get("allowed_types", SAFE_RELATION_TYPES)
+    raw_propagation_only = relation_cfg.get("propagation_only", False)
+    if isinstance(raw_propagation_only, str):
+        propagation_only = raw_propagation_only.strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+    else:
+        propagation_only = bool(raw_propagation_only)
+
+    if propagation_only:
+        classification = PROPAGATION_RELATION_TYPES
+        raw_allowed_types = relation_cfg.get(
+            "propagation_types", PROPAGATION_RELATION_TYPES
+        )
+    else:
+        # Exact rollback to the pre-classification behavior.  Keep this branch
+        # separate so a legacy allowed_types=[kin, explains] config cannot
+        # suppress hard-edge types after propagation mode is enabled.
+        classification = SAFE_RELATION_TYPES
+        raw_allowed_types = relation_cfg.get(
+            "allowed_types", SAFE_RELATION_TYPES
+        )
     if isinstance(raw_allowed_types, str):
         raw_allowed_types = [raw_allowed_types]
     elif not isinstance(raw_allowed_types, (list, tuple, set, frozenset)):
@@ -446,7 +466,8 @@ def _relation_recall_neighbors(
         str(value).strip()
         for value in raw_allowed_types
     }
-    allowed_types = configured_types.intersection(SAFE_RELATION_TYPES)
+    # Unknown/storage-only edge types degrade to non-propagating semantics.
+    allowed_types = configured_types.intersection(classification)
 
     def threshold(name: str, default: float) -> float:
         try:
@@ -1770,7 +1791,7 @@ async def _startup_backfill_loop() -> None:
 
         for i, b in enumerate(candidates):
             try:
-                n = await _auto_infer_edges(
+                proposals = await _auto_infer_edges(
                     source_id=b["id"],
                     content=b["content"],
                     world=b["metadata"].get("world", ""),
@@ -1778,7 +1799,7 @@ async def _startup_backfill_loop() -> None:
                 if i % 5 == 0:
                     logger.info(
                         f"Backfill {i + 1}/{len(candidates)} | "
-                        f"{b['id'][:6]} +{n}边"
+                        f"{b['id'][:6]} +{len(proposals)}提议"
                     )
             except asyncio.CancelledError:
                 raise
@@ -1835,15 +1856,15 @@ def _maybe_start_backfill() -> None:
 # Helper: auto-edge inference for newly created bucket
 # 工具：新桶自动建边
 # Wraps embedding-similar + keyword-search candidate gathering, LLM relation
-# inference via dehydrator, and add_relation calls. All failures swallowed —
-# never blocks hold.
-# 包装 embedding 邻居 + 关键词搜索拿候选，dehydrator LLM 判边，bucket_mgr 加边。
-# 所有失败吞掉——绝不阻塞 hold 主流程。
+# inference via dehydrator, then queue proposals for explicit agent review.
+# All failures are swallowed so this never blocks hold.
+# 包装 embedding 邻居 + 关键词搜索拿候选，dehydrator LLM 判边，只挂待审提议。
+# 所有失败吞掉——绝不阻塞 hold 主流程，也绝不由自动任务直接写边。
 # =============================================================
 async def _auto_infer_edges(
     source_id: str, content: str, world: str = ""
 ) -> list[dict]:
-    """Returns list of edge dicts actually added: [{type, target, target_name, note}]."""
+    """Queue machine-inferred edge proposals; never commit them to the graph."""
     if not content or not content.strip():
         return []
 
@@ -1906,41 +1927,40 @@ async def _auto_infer_edges(
         return []
 
     cand_name_by_id = {c["id"]: c["name"] for c in candidates}
-    # #3 关系闸：只闸**机器自动推断**的边。开关默认关 → 行为不变（全部直接写）。
-    # 开了之后：safe 类（kin/explains）照写；危险类（因果/取代）改挂 pending 等人审，不写库。
-    gate_on = _review_gate("relation_review")
-    added: list[dict] = []
+    proposed: list[dict] = []
     queued = 0
     for edge in edges:
-        etype = edge.get("type", "")
-        if gate_on and etype in REVIEW_RELATION_TYPES:
-            try:
-                if _get_review_queue().enqueue(make_relation_entry(
-                    source_id, edge["target"], etype, edge.get("note", ""),
-                    target_name=cand_name_by_id.get(edge["target"], edge["target"]),
-                )):
-                    queued += 1
-            except Exception as e:
-                logger.warning(f"关系闸入队失败（不阻塞）/ relation review enqueue failed: {e}")
-            continue  # 危险边不直接写库
-        ok = await bucket_mgr.add_relation(
-            source_id, edge["target"], etype, edge.get("note", "")
-        )
-        if ok:
-            added.append({
+        etype = str(edge.get("type") or "").strip()
+        target = str(edge.get("target") or "").strip()
+        if etype not in RELATION_TYPES or target not in cand_name_by_id:
+            continue
+        try:
+            entry = make_relation_entry(
+                source_id,
+                target,
+                etype,
+                edge.get("note", ""),
+                target_name=cand_name_by_id.get(target, target),
+            )
+            if _get_review_queue().enqueue(entry):
+                queued += 1
+            proposed.append({
                 "type": etype,
-                "target": edge["target"],
-                "target_name": cand_name_by_id.get(edge["target"], edge["target"]),
+                "target": target,
+                "target_name": cand_name_by_id.get(target, target),
                 "note": edge.get("note", ""),
             })
+        except Exception as e:
+            logger.warning(
+                "关系提议入队失败（不阻塞）/ relation proposal enqueue failed: %s",
+                type(e).__name__,
+            )
     if queued:
-        logger.info(f"关系闸：{queued} 条危险边挂 pending 待审（未写库）from {source_id}")
-    if added:
         logger.info(
-            f"Auto-edge inference added {len(added)} edge(s) / 自动建边 {len(added)} 条 "
-            f"from {source_id}"
+            "Machine relation inference queued %d proposal(s); graph unchanged",
+            queued,
         )
-    return added
+    return proposed
 
 
 # =============================================================
@@ -2709,12 +2729,12 @@ async def hold(
         chord_tag=chord_tag,
     )
 
-    # --- Step 3: auto-edge inference (only on new buckets, never on merges) ---
-    # --- 自动建边：仅对新建桶，合并桶已经融进了相关性，不再加边避免冗余 ---
-    added_edges: list[dict] = []
+    # --- Step 3: machine relation proposals (new buckets only) ---
+    # --- 机器只提关系候选；只有 agent 显式 add_relation 才写入关系图 ---
+    relation_proposals: list[dict] = []
     if not is_merged:
         try:
-            added_edges = await _auto_infer_edges(
+            relation_proposals = await _auto_infer_edges(
                 source_id=bucket_id, content=content, world=effective_world
             )
         except Exception as e:
@@ -2722,15 +2742,18 @@ async def hold(
 
     action = "合并→" if is_merged else "新建→"
     base = f"{action}{result_name} {','.join(domain)}"
-    if not added_edges:
+    if not relation_proposals:
         return base
-    # 写=读：hold 同时返回相关桶（让用户感知这条记忆和什么连着）
+    # 提议不等于图事实：明确标待审，避免调用方误以为已经落边。
     related_lines = [
         f"  • [{e['type']}] {e['target_name']} ({e['target']})"
         + (f" — {e['note']}" if e.get("note") else "")
-        for e in added_edges
+        for e in relation_proposals
     ]
-    return f"{base} +{len(added_edges)}边\n关联：\n" + "\n".join(related_lines)
+    return (
+        f"{base} +{len(relation_proposals)}条关系提议（待审，未落图）\n"
+        "候选关联：\n" + "\n".join(related_lines)
+    )
 
 
 # =============================================================
@@ -3123,8 +3146,8 @@ async def delete_bucket(bucket_id: str, confirm: bool = False) -> str:
 
 
 # =============================================================
-# Tool: backfill_relations — run auto-edge inference on existing buckets
-# 工具：backfill_relations — 给老桶批量自动建边
+# Tool: backfill_relations — propose relations for existing buckets
+# 工具：backfill_relations — 给老桶批量生成待审关系提议
 # Hold-time auto-edge only fires on new buckets; this tool fills in the
 # graph for memories that existed before the feature shipped. Batched to
 # avoid MCP timeout and to let the caller resume between calls.
@@ -3135,10 +3158,10 @@ async def backfill_relations(
     limit: int = 5,
     offset: int = 0,
 ) -> str:
-    """对已有桶批量跑自动建边。
+    """对已有桶批量生成待审关系提议，不直接写入关系图。
     bucket_id=指定单桶处理（最快验证用）。
     bucket_id 为空时按 limit/offset 批量遍历 dynamic 桶（跳过 pinned/permanent/feel/resolved），每次最多 10 个，多次调用滚动跑完。
-    返回每桶加了几条边和下一批 offset。"""
+    返回每桶生成了几条提议和下一批 offset。"""
     if bucket_id and bucket_id.strip():
         bucket = await bucket_mgr.get(bucket_id.strip())
         if not bucket:
@@ -3150,7 +3173,7 @@ async def backfill_relations(
                 world=bucket["metadata"].get("world", ""),
             )
             n = len(edges)
-            return f"{bucket['id']}: +{n}边"
+            return f"{bucket['id']}: +{n}条提议（未落图）"
         except Exception as e:
             logger.warning(f"backfill single failed {bucket_id}: {e}")
             return f"{bucket_id}: 失败 {e}"
@@ -3197,7 +3220,7 @@ async def backfill_relations(
     remaining = len(eligible) - next_offset
     return (
         f"批 {offset}-{next_offset - 1}/{len(eligible)} | "
-        f"+{total}边 | {' '.join(results)} | "
+        f"+{total}条提议（未落图） | {' '.join(results)} | "
         f"剩 {remaining}, next offset={next_offset}"
     )
 

@@ -48,10 +48,31 @@ REVIEW_RELATION_TYPES = frozenset({
 assert SAFE_RELATION_TYPES | REVIEW_RELATION_TYPES == RELATION_TYPES
 assert not (SAFE_RELATION_TYPES & REVIEW_RELATION_TYPES)
 
+# Recall propagation is independent from write-risk classification.  Hard
+# causal/explanatory edges may carry context into recall; topic/update edges
+# remain graph facts but must not drag a neighboring bucket into the result.
+PROPAGATION_RELATION_TYPES = frozenset({
+    "causes",
+    "contributes",
+    "improves",
+    "explains",
+})
+SEMANTIC_RELATION_TYPES = frozenset({
+    "updates",
+    "kin",
+})
+assert PROPAGATION_RELATION_TYPES | SEMANTIC_RELATION_TYPES == RELATION_TYPES
+assert not (PROPAGATION_RELATION_TYPES & SEMANTIC_RELATION_TYPES)
+
 
 def default_graph_relation_allowed(value) -> bool:
-    """Return whether an edge type may participate in default recall expansion."""
+    """Backward-compatible write-safety classifier for existing callers."""
     return str(value or "").strip() in SAFE_RELATION_TYPES
+
+
+def default_recall_relation_allowed(value) -> bool:
+    """Return whether an edge type may participate in recall propagation."""
+    return str(value or "").strip() in PROPAGATION_RELATION_TYPES
 
 # Domains where a bucket must never be marked resolved=True.
 # Not "problem-and-solution" structures — persistent states (relationships,
@@ -154,7 +175,12 @@ def load_config(config_path: str = None) -> dict:
             "enabled": False,
         },
         "relation_recall": {
+            # False is the exact pre-classification behavior and therefore the
+            # emergency rollback.  When enabled, propagation_types replaces
+            # the legacy allowed_types list for graph expansion.
+            "propagation_only": False,
             "allowed_types": sorted(SAFE_RELATION_TYPES),
+            "propagation_types": sorted(PROPAGATION_RELATION_TYPES),
             "hop1_min_strength": 0.4,
             "hop2_min_strength": 0.7,
         },
