@@ -7,15 +7,92 @@ full service runtime.
 """
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence, TypeVar
 
 
 DEFAULT_RELATION_TYPE_WEIGHTS = {
     "kin": 1.0,
     "explains": 0.85,
 }
+
+T = TypeVar("T")
+
+
+def _finite_score(value: object, *, fallback: float = float("-inf")) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return score if math.isfinite(score) else fallback
+
+
+def rank_within_relevance_bands(
+    items: Iterable[T],
+    *,
+    relevance_score: Callable[[T], float],
+    tie_break_score: Callable[[T], object],
+    band_width: float,
+) -> list[T]:
+    """Keep relevance as the first ordering key and rerank only close scores.
+
+    Items are first sorted by relevance.  A band starts at the best remaining
+    relevance score and extends down by at most ``band_width``; only members of
+    that band may be reordered by ``tie_break_score``.  Using the band leader
+    rather than chaining adjacent gaps prevents a long sequence of tiny gaps
+    from letting a weak result leapfrog a clearly stronger one.
+    """
+    decorated = [
+        (item, _finite_score(relevance_score(item)), index)
+        for index, item in enumerate(items)
+    ]
+    decorated.sort(key=lambda row: (-row[1], row[2]))
+    width = max(0.0, _finite_score(band_width, fallback=0.0))
+
+    ranked: list[T] = []
+    cursor = 0
+    while cursor < len(decorated):
+        leader_score = decorated[cursor][1]
+        end = cursor + 1
+        while (
+            end < len(decorated)
+            and leader_score - decorated[end][1] <= width
+        ):
+            end += 1
+        band = decorated[cursor:end]
+        # Python's sort is stable, so equal tie-break scores retain the
+        # relevance-first order established above.
+        band.sort(key=lambda row: tie_break_score(row[0]), reverse=True)
+        ranked.extend(row[0] for row in band)
+        cursor = end
+    return ranked
+
+
+def retain_original_query_supported_candidates(
+    items: Iterable[T],
+    *,
+    literal_score: Callable[[T], float],
+    original_vector_score: Callable[[T], float],
+    literal_floor: float,
+) -> list[T]:
+    """Drop candidates supported only by generated query expansions.
+
+    A candidate remains eligible when the original user wording gives it a
+    useful literal score, or when the original-query embedding channel finds
+    it. Expanded keyword/vector angles may improve ranking among those
+    candidates, but cannot introduce an otherwise unsupported result.
+    """
+    floor = max(0.0, _finite_score(literal_floor, fallback=0.0))
+    return [
+        item
+        for item in items
+        if (
+            _finite_score(literal_score(item), fallback=0.0) >= floor
+            or _finite_score(original_vector_score(item), fallback=0.0) > 0.0
+        )
+    ]
 
 
 @dataclass(frozen=True)

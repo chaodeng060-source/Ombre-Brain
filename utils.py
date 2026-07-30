@@ -154,6 +154,9 @@ def load_config(config_path: str = None) -> dict:
         "matching": {
             "fuzzy_threshold": 50,
             "max_results": 5,
+            "literal_candidate_floor": 40.0,
+            "keyword_relevance_tie_band": 3.0,
+            "fused_relevance_tie_band": 0.35,
         },
         "rrf": {
             "k": 60,

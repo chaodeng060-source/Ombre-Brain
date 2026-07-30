@@ -157,6 +157,9 @@ scoring_weights:
 matching:
   fuzzy_threshold: 50             # Minimum match score (0-100) / 最低匹配分数
   max_results: 5                  # Max results per search / 单次搜索最多返回条数
+  literal_candidate_floor: 40.0   # Original-query topic floor for recall candidates
+  keyword_relevance_tie_band: 3.0 # Emotion/time/importance may rerank only within this topic-score gap
+  fused_relevance_tie_band: 0.35  # Decay/sense/intent may rerank only within this RRF×1000 gap
 
 # --- RRF fusion / RRF 融合检索 ---
 # breath 双通道融合参数：keyword (jieba+rapidfuzz) + vector (embedding)

@@ -90,7 +90,11 @@ from fact_slots import (
     registered_fact_key,
 )
 from query_expand import expand_query
-from recall_support import expand_relation_graph
+from recall_support import (
+    expand_relation_graph,
+    rank_within_relevance_bands,
+    retain_original_query_supported_candidates,
+)
 from e_axis_shadow import (
     EAxisShadowStore,
     build_failure_record,
@@ -2279,6 +2283,7 @@ async def breath(
                 query_arousal=q_arousal,
                 created_after=created_after,
                 created_before=created_before,
+                relevance_first=True,
             ):
                 existing = keyword_by_id.get(bucket["id"])
                 if existing is None or bucket.get("score", 0) > existing.get("score", 0):
@@ -2300,14 +2305,19 @@ async def breath(
 
     # Vector channel — sim>0.5 floor blocks high-cosine noise
     vector_scores: dict[str, float] = {}
+    original_vector_scores: dict[str, float] = {}
     try:
-        for angle in query_angles:
+        for angle_index, angle in enumerate(query_angles):
             for bid, sim in await embedding_engine.search_similar(
                 angle,
                 top_k=intent_policy["vector_top_k"],
             ):
-                if sim > 0.5 and sim > vector_scores.get(bid, 0.0):
+                if sim <= 0.5:
+                    continue
+                if sim > vector_scores.get(bid, 0.0):
                     vector_scores[bid] = sim
+                if angle_index == 0 and sim > original_vector_scores.get(bid, 0.0):
+                    original_vector_scores[bid] = sim
         vector_ranked = list(vector_scores.items())
     except Exception as e:
         logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
@@ -2317,7 +2327,11 @@ async def breath(
 
     # RRF fusion of two ranked channels
     rrf_cfg = config.get("rrf", {})
-    keyword_ranked = [(b["id"], b.get("score", 0)) for b in keyword_matches]
+    keyword_scores = {
+        b["id"]: float(b.get("score", 0) or 0)
+        for b in keyword_matches
+    }
+    keyword_ranked = list(keyword_scores.items())
     fused_pairs = rrf_fuse(
         keyword_ranked,
         vector_ranked,
@@ -2328,13 +2342,24 @@ async def breath(
 
     # Materialize fused list: reuse keyword-channel buckets, fetch vector-only ones
     bucket_cache = {b["id"]: b for b in keyword_matches}
+    literal_candidate_floor = max(
+        0.0,
+        float(
+            getattr(
+                bucket_mgr,
+                "literal_candidate_floor",
+                (config.get("matching", {}) or {}).get(
+                    "literal_candidate_floor",
+                    40.0,
+                ),
+            )
+        ),
+    )
+    topic_score_calculator = getattr(bucket_mgr, "_calc_topic_score", None)
     matches = []
     for bid, fused_score in fused_pairs:
-        if len(matches) >= recall_limit:
-            break
         if bid in bucket_cache:
             b = bucket_cache[bid]
-            b["score"] = round(fused_score * 1000, 2)
         else:
             # Vector-only bucket — fetch and re-apply filters that bucket_mgr.search applied
             b = await bucket_mgr.get(bid)
@@ -2358,7 +2383,6 @@ async def breath(
                 domain_lower = {str(d).lower() for d in domain_filter}
                 if not ({str(d).lower() for d in b_domain} & domain_lower):
                     continue
-            b["score"] = round(fused_score * 1000, 2)
             b["vector_match"] = True
         if not _filter_z_fact_candidates(
             [b],
@@ -2366,11 +2390,45 @@ async def breath(
             intent=intent_policy["intent"],
         ):
             continue
+        fused_relevance = round(fused_score * 1000, 6)
+        b["score"] = round(fused_relevance, 2)
+        b["_fused_relevance_score"] = fused_relevance
+        # Always evaluate literal relevance against the original user query,
+        # not an expanded angle.  Expansion and vectors remain available when
+        # there is no confident literal hit.
+        b["_literal_relevance_score"] = (
+            round(topic_score_calculator(query, b) * 100.0, 4)
+            if callable(topic_score_calculator)
+            else literal_candidate_floor
+        )
+        b["_vector_relevance_score"] = round(
+            float(vector_scores.get(bid, 0.0)),
+            6,
+        )
+        b["_original_vector_relevance_score"] = round(
+            float(original_vector_scores.get(bid, 0.0)),
+            6,
+        )
         matches.append(b)
 
-    # --- Forgetting curve on fused ranking (ebbingflow 偷师) ---
-    # --- 检索排序权重掺遗忘曲线：老桶/resolved 桶自然下沉，pinned/feel 豁免 ---
-    # --- 五感入口层 v1：query 带感官线索时，同感官的 sense 桶轻微上浮（普鲁斯特钩子）---
+    # Generated expansion angles may improve ranking, but cannot introduce a
+    # candidate that neither the original words nor original embedding support.
+    matches = retain_original_query_supported_candidates(
+        matches,
+        literal_score=lambda bucket: bucket.get(
+            "_literal_relevance_score",
+            0,
+        ),
+        original_vector_score=lambda bucket: bucket.get(
+            "_original_vector_relevance_score",
+            0,
+        ),
+        literal_floor=literal_candidate_floor,
+    )[:recall_limit]
+
+    # Relevance is the first ordering key.  Forgetting curve, sense and intent
+    # remain useful, but may only adjust candidates inside one narrow fused
+    # relevance band.
     sense_cfg = config.get("sense", {})
     sense_boost = (
         float(sense_cfg.get("recall_boost", 1.25))
@@ -2378,17 +2436,42 @@ async def breath(
     )
     query_senses = set(detect_senses(query)) if sense_boost != 1.0 else set()
     for b in matches:
-        b["score"] = round(decay_engine.apply_retrieval_decay(b["score"], b["metadata"]), 2)
+        tie_break_score = decay_engine.apply_retrieval_decay(
+            b["_fused_relevance_score"],
+            b["metadata"],
+        )
         if query_senses:
             b_sense = b["metadata"].get("sense")
             if isinstance(b_sense, str):
                 b_sense = [b_sense]
             if b_sense and set(b_sense) & query_senses:
-                b["score"] = round(b["score"] * sense_boost, 2)
+                tie_break_score *= sense_boost
         intent_multiplier = bucket_intent_score_multiplier(b, intent_policy)
         if intent_multiplier != 1.0:
-            b["score"] = round(b["score"] * intent_multiplier, 2)
-    matches.sort(key=lambda b: b["score"], reverse=True)
+            tie_break_score *= intent_multiplier
+        b["_non_relevance_tie_break_score"] = round(tie_break_score, 6)
+
+    fused_band = max(
+        0.0,
+        float(
+            (config.get("matching", {}) or {}).get(
+                "fused_relevance_tie_band",
+                0.35,
+            )
+        ),
+    )
+    matches = rank_within_relevance_bands(
+        matches,
+        relevance_score=lambda bucket: bucket.get(
+            "_fused_relevance_score",
+            0,
+        ),
+        tie_break_score=lambda bucket: bucket.get(
+            "_non_relevance_tie_break_score",
+            0,
+        ),
+        band_width=fused_band,
+    )
 
     matches = _filter_session_seen(matches, session_id)
     matches = await _ds_filter_candidates(
@@ -4386,7 +4469,11 @@ async def api_search(request):
     if not query:
         return JSONResponse({"error": "missing q parameter"}, status_code=400)
     try:
-        matches = await bucket_mgr.search(query, limit=10)
+        matches = await bucket_mgr.search(
+            query,
+            limit=10,
+            relevance_first=True,
+        )
         result = []
         for b in matches:
             meta = b.get("metadata", {})
@@ -4495,7 +4582,7 @@ async def api_breath_debug(request):
             "time": bucket_mgr.w_time,
             "importance": bucket_mgr.w_importance,
         }
-        w_sum = sum(w.values())
+        secondary_weight = w["emotion"] + w["time"] + w["importance"]
 
         for bucket in all_buckets:
             meta = bucket.get("metadata", {})
@@ -4506,16 +4593,19 @@ async def api_breath_debug(request):
                 time_s = bucket_mgr._calc_time_score(meta)
                 imp = max(1, min(10, int(meta.get("importance", 5)))) / 10.0
 
-                raw_total = (
-                    topic * w["topic"]
-                    + emotion * w["emotion"]
+                secondary_total = (
+                    emotion * w["emotion"]
                     + time_s * w["time"]
                     + imp * w["importance"]
                 )
-                normalized = (raw_total / w_sum) * 100 if w_sum > 0 else 0
+                normalized = topic * 100.0
+                tie_break_score = (
+                    secondary_total / secondary_weight * 100.0
+                    if secondary_weight > 0 else 0.0
+                )
                 resolved = meta.get("resolved", False)
                 if resolved:
-                    normalized *= 0.3
+                    tie_break_score *= 0.3
 
                 results.append({
                     "id": bid,
@@ -4531,21 +4621,28 @@ async def api_breath_debug(request):
                         "importance": round(imp, 4),
                     },
                     "weights": w,
-                    "raw_total": round(raw_total, 4),
+                    "secondary_tie_break": round(tie_break_score, 4),
                     "normalized": round(normalized, 2),
-                    "passed_threshold": normalized >= bucket_mgr.fuzzy_threshold,
+                    "passed_threshold": (
+                        normalized >= bucket_mgr.literal_candidate_floor
+                    ),
                 })
             except Exception:
                 continue
 
-        results.sort(key=lambda x: x["normalized"], reverse=True)
+        results = rank_within_relevance_bands(
+            results,
+            relevance_score=lambda row: row["normalized"],
+            tie_break_score=lambda row: row["secondary_tie_break"],
+            band_width=bucket_mgr.keyword_relevance_tie_band,
+        )
         passed = [r for r in results if r["passed_threshold"]]
         return JSONResponse({
             "query": query,
             "valence": q_valence,
             "arousal": q_arousal,
             "weights": w,
-            "threshold": bucket_mgr.fuzzy_threshold,
+            "threshold": bucket_mgr.literal_candidate_floor,
             "total_candidates": len(results),
             "passed_count": len(passed),
             "results": results[:50],  # top 50 for debug
@@ -4602,6 +4699,7 @@ async def _probe_anchor_status(query: str) -> dict:
                 angle,
                 limit=intent_policy["keyword_top_k"],
                 world_filter=world_filter,
+                relevance_first=True,
             )
             for angle in query_angles
         ))
