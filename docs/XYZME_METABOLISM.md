@@ -20,9 +20,9 @@ M 轴不读取或修改 Z 轴事实状态，也不会根据 E 轴分值自动销
 
 ```bash
 python patrol.py \
-  --buckets /app/buckets \
+  --buckets /data \
   --config /app/config.yaml \
-  --review-queue /app/buckets/review_queue.jsonl
+  --review-queue /data/review_queue.jsonl
 ```
 
 巡检把每类发现转换为带 `action`、`severity`、`reason`、`bucket_ids` 的

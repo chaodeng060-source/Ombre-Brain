@@ -11,7 +11,7 @@
     python patrol.py --buckets /c/Users/HP/Ombre-Brain-backups/2026-06-15_0111/buckets
 
     # NAS 活库上看（只读，cron-able）
-    OMBRE_BUCKETS_DIR=/vol1/ombre-data/buckets python patrol.py
+    python patrol.py --config /app/config.yaml
 
     # 把报告落到文件
     python patrol.py --buckets <dir> --out notes/patrol_2026-06-15.md
@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 import frontmatter
+import yaml
 
 from fact_slots import audit_fact_slots
 from fact_conflicts import scan_cross_bucket_z_conflicts
@@ -34,7 +35,7 @@ from review_queue import (
     ReviewQueue,
     make_metabolism_entry,
 )
-from utils import RELATION_TYPES, load_config
+from utils import RELATION_TYPES
 
 # 与 utils.PROTECTED_RESOLVE_DOMAINS 保持一致（resolve=遗忘的禁区）。
 # 这里硬编一份副本，让 patrol 不依赖 server 运行时即可独立巡检。
@@ -44,6 +45,14 @@ PROTECTED_RESOLVE_DOMAINS = frozenset({"恋爱", "纪念日", "约定", "家庭"
 OVERSIZED_CHARS = 1500          # content 超此长度 → 拆线候选（只提示）
 STALE_DAYS = 90                 # 高重要度桶超此天数没激活 → 提示（绝不自动忘）
 STALE_IMPORTANCE = 7            # 仅对 importance>=此值的桶报陈旧（重要的才值得提醒）
+
+
+def _load_patrol_config(path: str | os.PathLike) -> dict:
+    """Read only the patrol config; unlike server load_config, create nothing."""
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        raise ValueError("patrol config must be a YAML mapping")
+    return raw
 
 
 def _sample_ids(items: list[dict], *keys: str, limit: int = 30) -> list[str]:
@@ -580,8 +589,11 @@ def render_md(report: dict, buckets_dir: Path, now: datetime) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description="海马体只读巡检（永不改库）")
-    ap.add_argument("--buckets", default=os.environ.get("OMBRE_BUCKETS_DIR", "/data/buckets"),
-                    help="桶目录（默认 $OMBRE_BUCKETS_DIR 或 /data/buckets）")
+    ap.add_argument(
+        "--buckets",
+        default=None,
+        help="桶目录（优先级：显式参数 > config.buckets_dir > $OMBRE_BUCKETS_DIR > /data）",
+    )
     ap.add_argument("--out", default=None, help="报告落点（默认打印到 stdout）")
     ap.add_argument("--now", default=None, help="覆盖当前时间（ISO，便于测试）")
     ap.add_argument("--config", default=os.environ.get("OMBRE_CONFIG"),
@@ -594,15 +606,21 @@ def main():
     if args.apply:
         raise SystemExit("M 巡检严格只读：不支持 --apply")
 
-    buckets_dir = Path(args.buckets)
+    cfg = {}
+    registry = {}
+    if args.config:
+        cfg = _load_patrol_config(args.config)
+        registry = ((cfg.get("fact_slots", {}) or {}).get("registry", {}) or {})
+    buckets_dir = Path(
+        args.buckets
+        or cfg.get("buckets_dir")
+        or os.environ.get("OMBRE_BUCKETS_DIR")
+        or "/data"
+    )
     if not buckets_dir.is_dir():
         raise SystemExit(f"桶目录不存在：{buckets_dir}")
     now = _parse_dt(args.now) or datetime.now()
 
-    registry = {}
-    if args.config:
-        cfg = load_config(args.config)
-        registry = ((cfg.get("fact_slots", {}) or {}).get("registry", {}) or {})
     report = patrol(buckets_dir, now, fact_slot_registry=registry)
     md = render_md(report, buckets_dir, now)
     queued = 0

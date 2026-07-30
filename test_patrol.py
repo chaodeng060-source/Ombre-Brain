@@ -200,3 +200,37 @@ def test_patrol_cli_rejects_apply_before_reading_target(monkeypatch):
     )
     with pytest.raises(SystemExit, match="严格只读"):
         patrol.main()
+
+
+def test_patrol_cli_prefers_configured_vault_over_stale_environment(
+    monkeypatch,
+    tmp_path,
+):
+    vault = tmp_path / "vault"
+    _write(
+        vault,
+        "dynamic/one.md",
+        "---\nid: one\nname: One\ntype: dynamic\n---\nbody",
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"buckets_dir: {vault}\nfact_slots:\n  registry: {{}}\n",
+        encoding="utf-8",
+    )
+    report_path = tmp_path / "report.md"
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", "/stale/empty/mount")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "patrol.py",
+            "--config",
+            str(config_path),
+            "--out",
+            str(report_path),
+        ],
+    )
+
+    patrol.main()
+
+    assert "桶总数：**1**" in report_path.read_text(encoding="utf-8")
