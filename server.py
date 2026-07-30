@@ -2560,6 +2560,61 @@ async def breath(
 # Tool 2: hold — Hold on to this
 # 工具 2：hold — 握住，留下来
 # =============================================================
+def _find_exact_feel_bucket(buckets: list[dict], content: str) -> dict | None:
+    """Return an active feel bucket whose body is byte-for-byte identical."""
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            continue
+        metadata = bucket.get("metadata", {}) or {}
+        if metadata.get("type") != "feel":
+            continue
+        if str(bucket.get("content") or "") == content:
+            return bucket
+    return None
+
+
+async def _create_or_reuse_feel_bucket(
+    content: str,
+    *,
+    tags: list[str],
+    domain: list[str],
+    valence: float,
+    arousal: float,
+) -> tuple[str, bool]:
+    """Create one exact feel body, serializing concurrent replays by content."""
+    content_digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    lock_id = f"feel-content-{content_digest}"
+    async with bucket_mgr._write_guard(lock_id):
+        existing = _find_exact_feel_bucket(
+            await bucket_mgr.list_all(include_archive=False),
+            content,
+        )
+        if existing is not None:
+            bucket_id = str(existing.get("id") or "")
+            if bucket_id:
+                logger.info(
+                    "Reused exact feel bucket / 复用逐字相同 feel: %s",
+                    bucket_id,
+                )
+                return bucket_id, False
+
+        bucket_id = await bucket_mgr.create(
+            content=content,
+            tags=tags,
+            importance=5,
+            domain=domain,
+            valence=valence,
+            arousal=arousal,
+            name=None,
+            bucket_type="feel",
+        )
+        try:
+            await embedding_engine.generate_and_store(bucket_id, content)
+        except Exception:
+            pass
+        return bucket_id, True
+
+
 @mcp.tool()
 async def hold(
     content: str,
@@ -2626,20 +2681,13 @@ async def hold(
         # imprint 写进来的记忆全变'未分类'。改用调用方实际传入的值。
         feel_domain = [d.strip() for d in (domain or "").split(",") if d.strip()]
         async with bucket_mgr._maintenance_barrier.shared_async():
-            bucket_id = await bucket_mgr.create(
-                content=content,
+            bucket_id, _created = await _create_or_reuse_feel_bucket(
+                content,
                 tags=extra_tags,
-                importance=5,
                 domain=feel_domain,
                 valence=feel_valence,
                 arousal=feel_arousal,
-                name=None,
-                bucket_type="feel",
             )
-            try:
-                await embedding_engine.generate_and_store(bucket_id, content)
-            except Exception:
-                pass
             # --- Mark source memory as digested + store model's valence perspective ---
             # --- 标记源记忆为已消化 + 存储模型视角的 valence ---
             if source_bucket and source_bucket.strip():
