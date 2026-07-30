@@ -8,17 +8,18 @@
      （"keep fact changes reviewable instead of silently rewriting truth"）。
   2. **append-only + 入队去重。** 同一 (来源, 类型, 目标/字段值) 只挂一次，
      不刷屏；幂等，重复 enqueue 返回 False。
-  3. **lifecycle 显式。** pending → reviewed/applied/rejected 只能由人显式 resolve，
-     没有自动流转；resolve 是唯一会重写文件的写入路径。
+  3. **lifecycle 显式。** pending → reviewed/rejected 由人显式 resolve；
+     applied 只能由带崩溃恢复日志的 Z 双桶事务落成。
   4. 队列本身不删任何桶、不动任何边——它只是一张「待人看」的清单。
 
 存储：一行一个 JSON 对象的 .jsonl，落在 <buckets_dir>/review_queue.jsonl。
 
 A pending-review queue shared by Z-axis fact evolution (#2) and relation safety
 gating (#3). Machines only enqueue candidates here; the queue is append-only with
-enqueue-dedup, and resolve() is the only path that changes a row's pending status.
-(Note: #2 is an audit trail — ordinary merges still proceed; the queue records them
-for review rather than blocking the truth store.  Safety gates default enabled.)
+enqueue-dedup. Generic resolve() can acknowledge/reject; applied is reserved for
+the paired lifecycle transaction.
+(Z conflicts stay as separate facts until explicit approval.  Discovery defaults
+to dry-run; apply only creates a pending row.)
 """
 from __future__ import annotations
 
@@ -53,9 +54,9 @@ STATUS_REVIEWED = "reviewed"   # 人看过、判定保留候选（不应用）
 STATUS_APPLIED = "applied"     # 人确认应用（真去建边 / 真去 supersede）
 STATUS_REJECTED = "rejected"   # 人否决候选
 
-# REST/UI may only acknowledge or reject a candidate.  ``applied`` is kept in
-# the storage state machine for a future explicit memory-write transaction, but
-# marking a queue row applied is not itself such a transaction.
+# Generic REST/UI resolve may only acknowledge or reject a candidate.
+# ``applied`` is reserved for the crash-recoverable paired lifecycle transaction;
+# marking a queue row applied by itself is never sufficient.
 REST_SAFE_RESOLVE_STATUSES = {STATUS_REVIEWED, STATUS_REJECTED}
 
 
@@ -87,10 +88,12 @@ def lifecycle_updates(entry: dict) -> tuple[dict, dict]:
         {
             "fact_status": "current",
             "fact_key": fact_key,
+            "supersedes_bucket_ids": [historical_id],
         },
         {
             "fact_status": "historical",
             "fact_key": fact_key,
+            "superseded_by_bucket_id": current_id,
         },
     )
 
@@ -398,6 +401,13 @@ class ReviewQueue:
     def all(self) -> list[dict]:
         return self._load()
 
+    def get(self, key: str) -> Optional[dict]:
+        """Return one durable row by key without treating absence as pending."""
+        key = str(key or "").strip()
+        if not key:
+            return None
+        return next((entry for entry in self._load() if entry.get("key") == key), None)
+
     # ---- 写 ----
     def enqueue(self, entry: dict) -> bool:
         """挂一条 pending 行。已存在同 key 则不重复（幂等）。返回是否新增。"""
@@ -424,18 +434,41 @@ class ReviewQueue:
             return True
 
     def resolve(self, key: str, status: str, *, verdict_note: str = "",
-                now: Optional[datetime] = None) -> bool:
-        """人显式裁决一条：把它的 status 改成 reviewed/applied/rejected。
-        唯一会重写文件的路径——机器永不调它。返回是否命中。"""
+                reviewer: str = "", now: Optional[datetime] = None) -> bool:
+        """Acknowledge or reject one row without applying memory changes."""
+        if status == STATUS_APPLIED:
+            raise ValueError(
+                "applied is reserved for the paired Z lifecycle transaction"
+            )
         with self._maintenance_barrier.shared():
             return self._resolve_locked(
                 key,
                 status,
                 verdict_note=verdict_note,
+                reviewer=reviewer,
+                require_lifecycle=False,
+                now=now,
+            )
+
+    def apply_lifecycle(self, key: str, *, reviewer: str,
+                        verdict_note: str = "",
+                        now: Optional[datetime] = None) -> bool:
+        """Mark a row applied from inside the paired Z transaction only."""
+        reviewer = str(reviewer or "").strip()
+        if not reviewer:
+            raise ValueError("reviewer is required")
+        with self._maintenance_barrier.shared():
+            return self._resolve_locked(
+                key,
+                STATUS_APPLIED,
+                verdict_note=verdict_note,
+                reviewer=reviewer,
+                require_lifecycle=True,
                 now=now,
             )
 
     def _resolve_locked(self, key: str, status: str, *, verdict_note: str = "",
+                        reviewer: str = "", require_lifecycle: bool = False,
                         now: Optional[datetime] = None) -> bool:
         if status not in (STATUS_REVIEWED, STATUS_APPLIED, STATUS_REJECTED):
             raise ValueError(f"非法 resolve 状态: {status}")
@@ -444,10 +477,19 @@ class ReviewQueue:
             hit = False
             for r in rows:
                 if r.get("key") == key and r.get("status") == STATUS_PENDING:
+                    if (
+                        require_lifecycle
+                        and r.get("candidate_type") != "cross_bucket_lifecycle"
+                    ):
+                        raise ValueError(
+                            "applied requires a cross-bucket lifecycle candidate"
+                        )
                     r["status"] = status
                     r["resolved_at"] = _now_iso(now)
                     if verdict_note:
                         r["verdict_note"] = verdict_note
+                    if reviewer:
+                        r["reviewer"] = str(reviewer).strip()[:120]
                     hit = True
             if hit:
                 atomic_write_text(
@@ -492,7 +534,7 @@ def render_md(items: list[dict], now: Optional[datetime] = None) -> str:
     L.append("")
 
     L.append(f"## ⚠️ Z轴 · 待审事实演化（{len(zs)}）")
-    L.append("> 合并时检出的事实冲突（数字/日期/否定翻转），旧值已留 historical，挂此待人核。")
+    L.append("> 待审事实冲突尚未改变真值；只有人明确批准后，旧事实才会标 historical。")
     if not zs:
         L.append("- ✅ 无")
     else:

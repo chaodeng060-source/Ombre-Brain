@@ -74,13 +74,18 @@ def test_list_pending_by_kind():
 
 def test_resolve_removes_from_pending():
     q = _q()
-    e = make_z_conflict_entry("buk1", "negation", "affirmed", "negated")
+    e = make_z_pair_entry("new", "old", fact_key="profile.city")
     q.enqueue(e)
     assert len(q.list_pending()) == 1
-    assert q.resolve(e["key"], STATUS_APPLIED, verdict_note="确认翻转") is True
+    assert q.apply_lifecycle(
+        e["key"],
+        reviewer="哥哥",
+        verdict_note="确认翻转",
+    ) is True
     assert q.list_pending() == []               # 不再 pending
     rows = q.all()
     assert rows[0]["status"] == STATUS_APPLIED
+    assert rows[0]["reviewer"] == "哥哥"
     assert rows[0]["verdict_note"] == "确认翻转"
     assert "resolved_at" in rows[0]
     # 已裁决的再 resolve 不命中（只动 pending 行）
@@ -94,6 +99,11 @@ def test_resolve_rejects_bad_status():
     try:
         q.resolve(e["key"], "garbage")
         assert False, "应拒非法状态"
+    except ValueError:
+        pass
+    try:
+        q.resolve(e["key"], STATUS_APPLIED)
+        assert False, "applied must go through the paired lifecycle transaction"
     except ValueError:
         pass
 
@@ -121,10 +131,12 @@ def test_z_pair_uses_canonical_fact_contract():
     assert current == {
         "fact_status": "current",
         "fact_key": "profile.city",
+        "supersedes_bucket_ids": ["old"],
     }
     assert historical == {
         "fact_status": "historical",
         "fact_key": "profile.city",
+        "superseded_by_bucket_id": "new",
     }
     assert "active_fact" not in current and "lifecycle" not in historical
 

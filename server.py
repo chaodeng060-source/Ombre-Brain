@@ -115,10 +115,15 @@ from mcp_auth import (
     require_mcp_token,
 )
 from review_queue import (
-    ReviewQueue, make_relation_entry, make_z_conflict_entry, make_z_pair_entry,
+    ReviewQueue, make_relation_entry, make_z_pair_entry,
     render_md as _render_review_md,
     KIND_RELATION, KIND_Z_CONFLICT, KIND_METABOLISM,
     query_requests_history, rest_resolve_status_allowed,
+)
+from z_lifecycle import (
+    ZLifecycleNotFound,
+    ZLifecycleStateError,
+    ZLifecycleTransaction,
 )
 from lmc5_ledger import (
     LMC5Ledger,
@@ -153,9 +158,10 @@ import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  
 sensory_engine = SensoryEngine(config["buckets_dir"])  # External body-state sidecar / 外部身体状态层
 
 # --- 待审队列（#2 Z轴事实演化 + #3 关系闸的共用 pending 存储）---
-# 落在 <buckets_dir>/review_queue.jsonl。两个闸默认**关**（gated），开了只是把
-# 机器自动推断的危险边 / 合并检出的事实冲突改挂 pending 给人审，不动现有部署路。
+# 落在 <buckets_dir>/review_queue.jsonl。机器提议只进 pending；Z 冲突默认
+# dry-run，只有显式 apply 才入队，只有显式人审事务才改事实 lifecycle。
 _review_queue = None
+_z_lifecycle_transaction = None
 _e_axis_shadow_store = None
 _lmc5_ledger = None
 _lmc5_ledger_lock = threading.Lock()
@@ -182,6 +188,25 @@ def _get_review_queue() -> ReviewQueue:
             maintenance_root=config["buckets_dir"],
         )
     return _review_queue
+
+
+def _get_z_lifecycle_transaction() -> ZLifecycleTransaction:
+    """Lazily bind the Z approval transaction to the active test/prod vault."""
+    global _z_lifecycle_transaction
+    queue = _get_review_queue()
+    root = os.path.abspath(config["buckets_dir"])
+    if (
+        _z_lifecycle_transaction is None
+        or os.fspath(_z_lifecycle_transaction.root) != root
+        or _z_lifecycle_transaction.bucket_manager is not bucket_mgr
+        or _z_lifecycle_transaction.review_queue is not queue
+    ):
+        _z_lifecycle_transaction = ZLifecycleTransaction(
+            root,
+            bucket_mgr,
+            queue,
+        )
+    return _z_lifecycle_transaction
 
 
 def _get_e_axis_shadow_store() -> EAxisShadowStore:
@@ -1597,19 +1622,6 @@ async def _find_merge_candidates(
 _ARBITRATION_CONTEXT_BLOCK_RE = re.compile(r"\n?\[ARBITRATION_CONTEXT\].*?\[/ARBITRATION_CONTEXT\]\n?", re.DOTALL)
 
 
-def _with_arbitration_context(content: str, audit_entries: list[dict]) -> str:
-    if not audit_entries:
-        return content
-    lines = [
-        "[ARBITRATION_CONTEXT]",
-        "Use these newer values as authoritative for this merge. Keep the old values only in historical/audit wording if needed. Do not copy this block into the final memory.",
-    ]
-    for entry in audit_entries:
-        lines.append(f"- {entry['field']}: old={entry['old']} -> new={entry['new']}")
-    lines.append("[/ARBITRATION_CONTEXT]")
-    return f"{content}\n\n" + "\n".join(lines)
-
-
 def _strip_arbitration_context(content: str) -> str:
     if not content:
         return content
@@ -1668,57 +1680,61 @@ async def _merge_or_create(
         if not _is_merge_protected_bucket(bucket, domain, chord_tag):
             try:
                 audit_entries = build_supersedes_audit(bucket, content)
-                merge_content = _with_arbitration_context(content, audit_entries)
-                merged = await dehydrator.merge(bucket["content"], merge_content)
-                merged = _strip_arbitration_context(merged) or merged
-                old_v = bucket["metadata"].get("valence", 0.5)
-                old_a = bucket["metadata"].get("arousal", 0.3)
-                merged_valence = round((old_v + valence) / 2, 2)
-                merged_arousal = round((old_a + arousal) / 2, 2)
-                update_kwargs = dict(
-                    content=merged,
-                    tags=list(set(bucket["metadata"].get("tags", []) + tags)),
-                    importance=max(bucket["metadata"].get("importance", 5), importance),
-                    domain=list(set(bucket["metadata"].get("domain", []) + domain)),
-                    valence=merged_valence,
-                    arousal=merged_arousal,
-                )
                 if audit_entries:
-                    prior = bmeta.get("supersedes", [])
-                    if not isinstance(prior, list):
-                        prior = []
-                    update_kwargs["supersedes"] = prior + audit_entries
-                    # #2 Z轴：除了把新值标权威 / 旧值留 historical，再额外挂一条 pending
-                    # 审计行，让人/patrol 能回看「这次合并把哪个事实值悄悄改了」。
-                    # 开关默认关；保护域桶在 _is_merge_protected_bucket 已被排除出本块，
-                    # 这里只会是普通桶（感情记忆绝不走到这）。合并照常进行，仅多一条可审清单。
-                    if _review_gate("fact_evolution_audit"):
+                    # A factual flip must remain two independently reviewable
+                    # buckets.  Do not merge content, write supersedes metadata,
+                    # or enqueue a candidate implicitly; the explicit Z
+                    # dry-run/apply flow owns all three lifecycle transitions.
+                    logger.info(
+                        "Z conflict kept separate pending explicit review / "
+                        "Z轴冲突保留为独立事实待显式审查: %s",
+                        bucket["id"],
+                    )
+                else:
+                    merged = await dehydrator.merge(bucket["content"], content)
+                    merged = _strip_arbitration_context(merged) or merged
+                    old_v = bucket["metadata"].get("valence", 0.5)
+                    old_a = bucket["metadata"].get("arousal", 0.3)
+                    merged_valence = round((old_v + valence) / 2, 2)
+                    merged_arousal = round((old_a + arousal) / 2, 2)
+                    update_kwargs = dict(
+                        content=merged,
+                        tags=list(set(bucket["metadata"].get("tags", []) + tags)),
+                        importance=max(bucket["metadata"].get("importance", 5), importance),
+                        domain=list(set(bucket["metadata"].get("domain", []) + domain)),
+                        valence=merged_valence,
+                        arousal=merged_arousal,
+                    )
+                    # 感官标签并入（合并不丢已有 sense、补上新内容触到的感官）
+                    # 结构化 sensory.spicy/touch 也映射成 sense 通道：闭环另一半——带 sensory.* 的桶
+                    # 既能被读到点燃身体，也能被「味觉/触觉」类 query 上浮（普鲁斯特钩子，小卷 #1）。
+                    structured_senses = senses_from_sensory({"metadata": bmeta})
+                    merged_senses = union_senses(
+                        bmeta.get("sense"),
+                        detected_senses,
+                        structured_senses,
+                    )
+                    if merged_senses:
+                        update_kwargs["sense"] = merged_senses
+                    async with bucket_mgr._maintenance_barrier.shared_async():
+                        await bucket_mgr.update(bucket["id"], **update_kwargs)
+                        # --- Update embedding after merge ---
+                        # 扫盘 #10：embedding 失败不再静默——语义检索会悄悄陈旧，至少留 warning
                         try:
-                            q = _get_review_queue()
-                            bname = bmeta.get("name", bucket["id"])
-                            for a in audit_entries:
-                                q.enqueue(make_z_conflict_entry(
-                                    bucket["id"], a["field"], a["old"], a["new"],
-                                    bucket_name=bname, reason="merge_supersede",
-                                ))
+                            await embedding_engine.generate_and_store(
+                                bucket["id"],
+                                merged,
+                            )
                         except Exception as e:
-                            logger.warning(f"Z轴审计入队失败（不阻塞）/ z-audit enqueue failed: {e}")
-                # 感官标签并入（合并不丢已有 sense、补上新内容触到的感官）
-                # 结构化 sensory.spicy/touch 也映射成 sense 通道：闭环另一半——带 sensory.* 的桶
-                # 既能被读到点燃身体，也能被「味觉/触觉」类 query 上浮（普鲁斯特钩子，小卷 #1）。
-                structured_senses = senses_from_sensory({"metadata": bmeta})
-                merged_senses = union_senses(bmeta.get("sense"), detected_senses, structured_senses)
-                if merged_senses:
-                    update_kwargs["sense"] = merged_senses
-                async with bucket_mgr._maintenance_barrier.shared_async():
-                    await bucket_mgr.update(bucket["id"], **update_kwargs)
-                    # --- Update embedding after merge ---
-                    # 扫盘 #10：embedding 失败不再静默——语义检索会悄悄陈旧，至少留 warning
-                    try:
-                        await embedding_engine.generate_and_store(bucket["id"], merged)
-                    except Exception as e:
-                        logger.warning(f"Embedding update after merge failed / 合并后向量更新失败: {bucket['id']}: {e}")
-                return bucket["id"], bucket["metadata"].get("name", bucket["id"]), True
+                            logger.warning(
+                                "Embedding update after merge failed / "
+                                f"合并后向量更新失败: {bucket['id']}: {e}"
+                            )
+                    return (
+                        bucket["id"],
+                        bucket["metadata"].get("name", bucket["id"]),
+                        True,
+                    )
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
 
@@ -4756,7 +4772,7 @@ async def api_review_queue_resolve(request):
 
 @mcp.custom_route("/api/review_queue/candidate", methods=["POST"])
 async def api_review_queue_candidate(request):
-    """Enqueue a cross-bucket Z candidate without changing either bucket."""
+    """Preview a Z pair by default; explicit mode=apply only queues pending."""
     from starlette.responses import JSONResponse
     if not _review_write_api_enabled():
         return JSONResponse({"error": "OMBRE_API_TOKEN required for review queue writes"}, status_code=503)
@@ -4766,6 +4782,18 @@ async def api_review_queue_candidate(request):
         return JSONResponse({"error": "invalid JSON"}, status_code=400)
     if not isinstance(body, dict):
         return JSONResponse({"error": "JSON object required"}, status_code=400)
+    return await _submit_review_queue_candidate(body)
+
+
+async def _submit_review_queue_candidate(body: dict):
+    """Validate one pair and either preview it or enqueue a pending decision."""
+    from starlette.responses import JSONResponse
+    mode = str(body.get("mode") or "dry-run").strip().lower()
+    if mode not in {"dry-run", "apply"}:
+        return JSONResponse(
+            {"error": "mode must be dry-run or apply"},
+            status_code=400,
+        )
     current_id = str(body.get("current_bucket_id") or "").strip()
     historical_id = str(body.get("historical_bucket_id") or "").strip()
     fact_key = registered_fact_key(body.get("fact_key"), _fact_slot_registry())
@@ -4798,38 +4826,119 @@ async def api_review_queue_candidate(request):
         current_name=_name(current),
         historical_name=_name(historical),
         reason=str(body.get("reason") or "cross_bucket_currentness")[:160],
-        source=str(body.get("source") or "quality_benchmark")[:80],
+        source=str(body.get("source") or "z_conflict_review")[:80],
     )
+    if mode == "dry-run":
+        existing = await _await_daemon_thread(
+            lambda: _get_review_queue().get(entry["key"])
+        )
+        return JSONResponse({
+            "ok": True,
+            "mode": mode,
+            "key": entry["key"],
+            "status": "preview",
+            "candidate": entry,
+            "existing_status": existing.get("status") if existing else None,
+            "queue_mutated": False,
+            "memory_mutated": False,
+        })
+
     try:
-        added = await asyncio.to_thread(_get_review_queue().enqueue, entry)
+        added = await _await_daemon_thread(
+            lambda: _get_review_queue().enqueue(entry)
+        )
+        durable = await _await_daemon_thread(
+            lambda: _get_review_queue().get(entry["key"])
+        )
     except Exception as exc:
         logger.warning("review queue candidate enqueue failed: %s", type(exc).__name__)
         return JSONResponse({"error": "review queue unavailable"}, status_code=503)
+    if not durable or durable.get("status") != "pending":
+        return JSONResponse({
+            "error": (
+                "the same Z candidate was already resolved; "
+                "create a new pair instead of reviving it"
+            ),
+            "key": entry["key"],
+            "existing_status": durable.get("status") if durable else None,
+            "queue_mutated": False,
+            "memory_mutated": False,
+        }, status_code=409)
     return JSONResponse({
         "ok": True,
+        "mode": mode,
         "key": entry["key"],
         "status": "pending",
         "added": added,
+        "queue_mutated": added,
         "memory_mutated": False,
     })
 
 
 @mcp.custom_route("/api/review_queue/apply-lifecycle", methods=["POST"])
 async def api_review_queue_apply_lifecycle(request):
-    """Retired until paired Markdown writes have a durable transaction."""
+    """Apply one pending pair after an explicit named human approval."""
     from starlette.responses import JSONResponse
     if not _review_write_api_enabled():
         return JSONResponse({"error": "OMBRE_API_TOKEN required for review queue writes"}, status_code=503)
-    return await _apply_review_queue_lifecycle({})
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON object required"}, status_code=400)
+    return await _apply_review_queue_lifecycle(body)
 
 
 async def _apply_review_queue_lifecycle(body):
     from starlette.responses import JSONResponse
+    key = str(body.get("key") or "").strip()
+    reviewer = str(body.get("reviewer") or "").strip()
+    verdict_note = str(body.get("verdict_note") or "").strip()[:500]
+    if not key:
+        return JSONResponse({"error": "key required"}, status_code=400)
+    if not reviewer:
+        return JSONResponse(
+            {"error": "reviewer required for explicit Z approval"},
+            status_code=400,
+        )
+    try:
+        result = await _await_daemon_thread(
+            lambda: _get_z_lifecycle_transaction().apply(
+                key,
+                reviewer=reviewer,
+                verdict_note=verdict_note,
+                validate_pair=_z_pair_validation_error,
+            )
+        )
+    except ZLifecycleNotFound as exc:
+        return JSONResponse({
+            "error": str(exc),
+            "memory_mutated": False,
+            "queue_mutated": False,
+        }, status_code=404)
+    except (ValueError, ZLifecycleStateError) as exc:
+        return JSONResponse({
+            "error": str(exc),
+            "memory_mutated": False,
+            "queue_mutated": False,
+        }, status_code=409)
+    except Exception as exc:
+        logger.exception(
+            "Z lifecycle transaction failed: %s",
+            type(exc).__name__,
+        )
+        return JSONResponse({
+            "error": "Z lifecycle transaction failed closed",
+            "memory_mutated": False,
+            "queue_mutated": False,
+        }, status_code=503)
     return JSONResponse({
-        "error": "Z apply is disabled until a durable paired-write transaction is available",
-        "memory_mutated": False,
-        "queue_mutated": False,
-    }, status_code=409)
+        "ok": True,
+        **result,
+        "memory_mutated": result["changed"],
+        "queue_mutated": result["changed"],
+    })
 
 
 @mcp.custom_route("/api/review_queue/apply-protected-overlay", methods=["POST"])
@@ -5563,6 +5672,17 @@ async def api_outbox_get(request):
 
 # --- Entry point / 启动入口 ---
 if __name__ == "__main__":
+    try:
+        recovered_z = _get_z_lifecycle_transaction().recover()
+        if recovered_z:
+            logger.warning(
+                "Recovered %d interrupted Z lifecycle transaction(s)",
+                len(recovered_z),
+            )
+    except Exception:
+        logger.exception("Z lifecycle recovery failed; refusing to start")
+        raise
+
     transport = config.get("transport", "stdio")
     logger.info(f"Ombre Brain starting | transport: {transport}")
 
