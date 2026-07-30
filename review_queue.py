@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""pending 审计队列 review_queue —— #2 Z轴事实演化 + #3 关系闸的共用「待审」存储
+"""pending 审计队列 review_queue —— M 轴巡检、Z轴事实演化与关系闸共用的「待审」存储
 （对位 lmc-5 的 z_conflict_audits + relation review-plan）。
 
 设计铁律（直接抄 lmc-5，也守咱家 5.10/5.14 教训）：
@@ -33,9 +33,19 @@ from maintenance_barrier import MaintenanceBarrier
 from storage_safety import advisory_file_lock, atomic_write_text
 
 
-# 队列里两类条目（kind）：
+# 队列里的条目类型（kind）：
 KIND_RELATION = "relation"    # #3：机器自动推断的「危险」关系边（因果/取代类）
 KIND_Z_CONFLICT = "z_conflict"  # #2：合并时检出的事实冲突（数字/日期/否定翻转）
+KIND_METABOLISM = "metabolism"  # M：只读巡检建议，永不自动执行
+
+METABOLISM_ACTIONS = frozenset({
+    "promote",
+    "demote",
+    "split_thread",
+    "mark_review",
+    "archive",
+})
+METABOLISM_SEVERITIES = frozenset({"info", "warning", "critical"})
 
 # 状态机：机器只写 pending，其余只能人显式 resolve。
 STATUS_PENDING = "pending"
@@ -216,6 +226,49 @@ def make_relation_entry(
         "target_name": target_name,
         "rel_type": rel_type,
         "note": note or "",
+        "created": _now_iso(now),
+    }
+
+
+def make_metabolism_entry(
+    check: str,
+    action: str,
+    reason: str,
+    *,
+    severity: str = "info",
+    bucket_ids: Optional[list[str]] = None,
+    details: Optional[dict] = None,
+    now: Optional[datetime] = None,
+) -> dict:
+    """Build one idempotent M-axis suggestion; it never applies the action."""
+    check = str(check or "").strip()
+    action = str(action or "").strip()
+    severity = str(severity or "").strip()
+    reason = str(reason or "").strip()
+    if not check:
+        raise ValueError("metabolism check is required")
+    if action not in METABOLISM_ACTIONS:
+        raise ValueError(f"invalid metabolism action: {action}")
+    if severity not in METABOLISM_SEVERITIES:
+        raise ValueError(f"invalid metabolism severity: {severity}")
+    if not reason:
+        raise ValueError("metabolism reason is required")
+    normalized_ids = sorted({
+        str(value).strip()
+        for value in (bucket_ids or [])
+        if str(value).strip()
+    })
+    return {
+        "key": "m|" + _short_hash(check, action, ",".join(normalized_ids)),
+        "kind": KIND_METABOLISM,
+        "status": STATUS_PENDING,
+        "check": check,
+        "action": action,
+        "severity": severity,
+        "reason": reason,
+        "bucket_ids": normalized_ids,
+        "details": dict(details or {}),
+        "source": "patrol_read_only",
         "created": _now_iso(now),
     }
 
@@ -411,6 +464,20 @@ def render_md(items: list[dict], now: Optional[datetime] = None) -> str:
     L = [f"# 海马体待审队列 · {now:%Y-%m-%d %H:%M}", ""]
     rels = [e for e in items if e.get("kind") == KIND_RELATION]
     zs = [e for e in items if e.get("kind") == KIND_Z_CONFLICT]
+    metabolism = [e for e in items if e.get("kind") == KIND_METABOLISM]
+
+    L.append(f"## 🩺 M轴 · 待审代谢建议（{len(metabolism)}）")
+    L.append("> 巡检只提出建议，不改桶；晋升、降级、拆分或归档均需人显式执行。")
+    if not metabolism:
+        L.append("- ✅ 无")
+    else:
+        for entry in metabolism:
+            bucket_ids = ", ".join(entry.get("bucket_ids") or []) or "全局"
+            L.append(
+                f"- `{entry['key']}` [{entry['severity']}] "
+                f"`{entry['action']}` · {bucket_ids} —— {entry['reason']}"
+            )
+    L.append("")
 
     L.append(f"## 🔶 关系闸 · 待审危险边（{len(rels)}）")
     L.append("> 机器自动推断的因果/取代类边，未写库，等人确认。")

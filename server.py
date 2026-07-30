@@ -117,7 +117,7 @@ from mcp_auth import (
 from review_queue import (
     ReviewQueue, make_relation_entry, make_z_conflict_entry, make_z_pair_entry,
     render_md as _render_review_md,
-    KIND_RELATION, KIND_Z_CONFLICT,
+    KIND_RELATION, KIND_Z_CONFLICT, KIND_METABOLISM,
     query_requests_history, rest_resolve_status_allowed,
 )
 from lmc5_ledger import (
@@ -3263,15 +3263,20 @@ async def switch_world(world: str = "") -> str:
 # =============================================================
 @mcp.tool()
 async def review_pending(kind: str = "") -> str:
-    """只读列出「待审队列」里的 pending 候选——机器自动推断的危险关系边（#3 关系闸）
-    和合并时检出的事实演化冲突（#2 Z轴），都先挂这等人显式裁决。
+    """只读列出「待审队列」里的 pending 候选——M 轴巡检建议、机器自动推断的危险
+    关系边（#3 关系闸）和事实演化冲突（#2 Z轴），都先挂这等人显式裁决。
 
     永不改库：本工具只把清单念出来，建边/supersede/resolve 都需人另外显式操作。
-    kind 可选过滤：'relation'（只看关系边）/ 'z_conflict'（只看事实冲突）/ 留空看全部。
+    kind 可选过滤：'metabolism' / 'relation' / 'z_conflict' / 留空看全部。
     """
     k = (kind or "").strip().lower()
-    if k and k not in (KIND_RELATION, KIND_Z_CONFLICT):
-        return f"kind 只能是 '{KIND_RELATION}' / '{KIND_Z_CONFLICT}' 或留空。"
+    allowed_kinds = (KIND_METABOLISM, KIND_RELATION, KIND_Z_CONFLICT)
+    if k and k not in allowed_kinds:
+        return (
+            "kind 只能是 "
+            f"'{KIND_METABOLISM}' / '{KIND_RELATION}' / "
+            f"'{KIND_Z_CONFLICT}' 或留空。"
+        )
     try:
         # The queue is a small local JSONL ledger.  Reading it inline avoids
         # depending on the process-wide default executor, which can be
@@ -4694,7 +4699,7 @@ async def api_review_queue(request):
     """Return the real pending review queue; never substitute demo rows."""
     from starlette.responses import JSONResponse
     kind = (request.query_params.get("kind") or "").strip().lower()
-    if kind and kind not in (KIND_RELATION, KIND_Z_CONFLICT):
+    if kind and kind not in (KIND_RELATION, KIND_Z_CONFLICT, KIND_METABOLISM):
         return JSONResponse({"error": "invalid kind"}, status_code=400)
     try:
         items = await asyncio.to_thread(_get_review_queue().list_pending, kind or None)

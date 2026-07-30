@@ -8,10 +8,14 @@
 """
 import tempfile
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 
+import pytest
+
 import patrol
+from review_queue import ReviewQueue
 
 
 def _write(dir_path, rel, text):
@@ -95,6 +99,8 @@ def test_patrol_end_to_end_flags():
     assert rep["total"] == 2
     assert any(x["id"] == "love" for x in rep["protected_resolved"])
     assert any(x["id"] == "old" for x in rep["stale_important"])
+    assert rep["suggestions"]
+    assert all(item["reason"] for item in rep["suggestions"])
     assert "巡检" in patrol.render_md(rep, Path(d), now)   # render 不炸
 
 
@@ -157,3 +163,40 @@ def test_patrol_reads_json_backup_snapshots_and_ignores_sidecars():
     assert rep["migration_candidates"] == [
         {"id": "abcdef123456", "fact_key": "profile.city", "values": ["杭州"]}
     ]
+
+
+def test_patrol_is_read_only_and_queues_reasoned_suggestions_idempotently():
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as qd:
+        bucket = _write(
+            d,
+            "dynamic/long.md",
+            "---\nid: long\nname: 长桶\ntype: dynamic\n---\n" + ("内容" * 900),
+        )
+        before = bucket.read_bytes()
+        report = patrol.patrol(Path(d), datetime(2026, 7, 30, 12, 0, 0))
+        after = bucket.read_bytes()
+
+        assert before == after
+        assert report["suggestions"]
+        assert all(
+            entry["action"] and entry["severity"] and entry["reason"]
+            for entry in report["suggestions"]
+        )
+        queue = ReviewQueue(Path(qd) / "review_queue.jsonl")
+        first = patrol.enqueue_metabolism_suggestions(report, queue)
+        second = patrol.enqueue_metabolism_suggestions(report, queue)
+        assert first >= 1
+        assert second == 0
+        pending = queue.list_pending("metabolism")
+        assert len(pending) == first
+        assert all(entry["reason"] for entry in pending)
+
+
+def test_patrol_cli_rejects_apply_before_reading_target(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["patrol.py", "--apply", "--buckets", "/definitely/not/a/vault"],
+    )
+    with pytest.raises(SystemExit, match="严格只读"):
+        patrol.main()

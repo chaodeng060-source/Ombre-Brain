@@ -30,6 +30,10 @@ import frontmatter
 
 from fact_slots import audit_fact_slots
 from fact_conflicts import scan_cross_bucket_z_conflicts
+from review_queue import (
+    ReviewQueue,
+    make_metabolism_entry,
+)
 from utils import RELATION_TYPES, load_config
 
 # 与 utils.PROTECTED_RESOLVE_DOMAINS 保持一致（resolve=遗忘的禁区）。
@@ -40,6 +44,210 @@ PROTECTED_RESOLVE_DOMAINS = frozenset({"恋爱", "纪念日", "约定", "家庭"
 OVERSIZED_CHARS = 1500          # content 超此长度 → 拆线候选（只提示）
 STALE_DAYS = 90                 # 高重要度桶超此天数没激活 → 提示（绝不自动忘）
 STALE_IMPORTANCE = 7            # 仅对 importance>=此值的桶报陈旧（重要的才值得提醒）
+
+
+def _sample_ids(items: list[dict], *keys: str, limit: int = 30) -> list[str]:
+    values: list[str] = []
+    for item in items:
+        for key in keys:
+            value = str(item.get(key) or "").strip()
+            if value and value not in values:
+                values.append(value)
+                if len(values) >= limit:
+                    return values
+    return values
+
+
+def build_metabolism_suggestions(report: dict, now: datetime) -> list[dict]:
+    """Convert read-only patrol findings into reviewable, reasoned M entries."""
+    suggestions: list[dict] = []
+
+    def add(
+        check: str,
+        action: str,
+        severity: str,
+        items: list[dict],
+        reason: str,
+        *id_keys: str,
+    ) -> None:
+        if not items:
+            return
+        suggestions.append(make_metabolism_entry(
+            check,
+            action,
+            reason,
+            severity=severity,
+            bucket_ids=_sample_ids(items, *id_keys),
+            details={"count": len(items)},
+            now=now,
+        ))
+
+    add(
+        "broken_bucket_files",
+        "mark_review",
+        "critical",
+        report["broken"],
+        f"{len(report['broken'])} 个桶文件无法解析，需人工修复后再参与代谢。",
+        "__broken__",
+    )
+    add(
+        "protected_resolved",
+        "mark_review",
+        "critical",
+        report["protected_resolved"],
+        f"{len(report['protected_resolved'])} 个保护域桶被标记 resolved；禁止自动降级或归档。",
+        "id",
+    )
+    add(
+        "dangling_relations",
+        "mark_review",
+        "critical",
+        report["dangling"],
+        f"{len(report['dangling'])} 条关系指向不存在的桶，需人工核对来源与目标。",
+        "from",
+        "target",
+    )
+    add(
+        "relation_self_loops",
+        "mark_review",
+        "critical",
+        report["self_loops"],
+        f"{len(report['self_loops'])} 条关系自环无有效语义，需人工确认后清理。",
+        "from",
+    )
+    add(
+        "duplicate_relation_edges",
+        "mark_review",
+        "warning",
+        report["duplicate_edges"],
+        f"{len(report['duplicate_edges'])} 条关系边重复，需人工确认保留项。",
+        "from",
+        "target",
+    )
+    add(
+        "reciprocal_kin_edges",
+        "mark_review",
+        "warning",
+        report["reciprocal_kin"],
+        f"{len(report['reciprocal_kin'])} 组 kin 双向重复存储，需人工确认保留一条。",
+        "from",
+        "target",
+    )
+    add(
+        "invalid_relation_types",
+        "mark_review",
+        "warning",
+        report["invalid_relation_types"],
+        f"{len(report['invalid_relation_types'])} 条关系使用未知类型，不能自动迁移。",
+        "from",
+        "target",
+    )
+    add(
+        "invalid_relation_strengths",
+        "mark_review",
+        "warning",
+        report["invalid_relation_strengths"],
+        f"{len(report['invalid_relation_strengths'])} 条关系强度不在 0..1，需人工校正。",
+        "from",
+        "target",
+    )
+    add(
+        "oversized_buckets",
+        "split_thread",
+        "info",
+        report["oversized"],
+        f"{len(report['oversized'])} 个桶正文超过 {OVERSIZED_CHARS} 字，仅建议人工拆分。",
+        "id",
+    )
+
+    duplicate_rows = [
+        {"name": name, "id": bucket_id}
+        for name, bucket_ids in report["duplicates"].items()
+        for bucket_id in bucket_ids
+    ]
+    add(
+        "duplicate_bucket_names",
+        "mark_review",
+        "warning",
+        duplicate_rows,
+        f"{len(report['duplicates'])} 组桶重名，需人工判断是否同一事件。",
+        "id",
+    )
+
+    fact_rows = [
+        {"fact_key": fact_key, "id": bucket_id}
+        for fact_key, bucket_ids in report["fact_conflicts"].items()
+        for bucket_id in bucket_ids
+    ]
+    add(
+        "duplicate_current_fact_slots",
+        "mark_review",
+        "critical",
+        fact_rows,
+        f"{len(report['fact_conflicts'])} 个 fact_key 同时存在多个 current 值，需人工裁决。",
+        "id",
+    )
+    add(
+        "fact_slot_migration_candidates",
+        "mark_review",
+        "info",
+        report["migration_candidates"],
+        f"{len(report['migration_candidates'])} 个桶可迁移到明确 fact_key，未自动写入。",
+        "id",
+    )
+    add(
+        "ambiguous_fact_slot_candidates",
+        "mark_review",
+        "warning",
+        report["ambiguous_candidates"],
+        f"{len(report['ambiguous_candidates'])} 个桶同时命中多个 fact_key，需人工拆分。",
+        "id",
+    )
+    add(
+        "invalid_fact_keys",
+        "mark_review",
+        "warning",
+        report["invalid_fact_keys"],
+        f"{len(report['invalid_fact_keys'])} 个 fact_key 未登记，禁止自动晋升为当前事实。",
+        "id",
+    )
+    add(
+        "invalid_fact_statuses",
+        "mark_review",
+        "warning",
+        report["invalid_fact_statuses"],
+        f"{len(report['invalid_fact_statuses'])} 个 fact_status 非法，需人工修正。",
+        "id",
+    )
+    add(
+        "legacy_active_fact",
+        "mark_review",
+        "warning",
+        report["legacy_active_fact"],
+        f"{len(report['legacy_active_fact'])} 个桶仍使用遗留 active_fact 字段，未自动迁移。",
+        "id",
+    )
+    add(
+        "stale_important",
+        "mark_review",
+        "info",
+        report["stale_important"],
+        (
+            f"{len(report['stale_important'])} 个高重要度桶超过 {STALE_DAYS} 天未激活；"
+            "只建议复核，绝不自动归档。"
+        ),
+        "id",
+    )
+    return suggestions
+
+
+def enqueue_metabolism_suggestions(report: dict, queue: ReviewQueue) -> int:
+    """Append new pending M suggestions; bucket contents remain untouched."""
+    added = 0
+    for entry in report.get("suggestions", []):
+        if queue.enqueue(entry):
+            added += 1
+    return added
 
 
 def _safe_frontmatter(path: Path):
@@ -244,7 +452,7 @@ def patrol(buckets_dir: Path, now: datetime, fact_slot_registry: dict | None = N
         if rel_type == "kin" and (target_id, source_id, rel_type) in typed_edges and source_id < target_id:
             reciprocal_kin.append({"from": source_id, "target": target_id, "type": rel_type})
 
-    return {
+    report = {
         "total": len(buckets),
         "broken": broken,
         "by_type": dict(by_type.most_common()),
@@ -263,6 +471,8 @@ def patrol(buckets_dir: Path, now: datetime, fact_slot_registry: dict | None = N
         "protected_resolved": protected_resolved,
         "stale_important": sorted(stale_important, key=lambda x: -x["days"])[:20],
     }
+    report["suggestions"] = build_metabolism_suggestions(report, now)
+    return report
 
 
 def render_md(report: dict, buckets_dir: Path, now: datetime) -> str:
@@ -276,6 +486,18 @@ def render_md(report: dict, buckets_dir: Path, now: datetime) -> str:
         L.append(f"- ⚠️ 坏文件：**{len(report['broken'])}** 个 —— {[b['__broken__'] for b in report['broken']]}")
     L.append(f"- 按类型：{report['by_type']}")
     L.append(f"- 按 domain（Top12）：{report['by_domain']}")
+    L.append("")
+
+    L.append(f"## 📋 M轴待审建议（{len(report['suggestions'])}）")
+    if not report["suggestions"]:
+        L.append("- ✅ 无")
+    else:
+        for entry in report["suggestions"]:
+            bucket_ids = ", ".join(entry["bucket_ids"]) or "全局"
+            L.append(
+                f"- [{entry['severity']}] `{entry['action']}` · {bucket_ids}"
+                f" —— {entry['reason']}"
+            )
     L.append("")
 
     def section(title, items, fmt, empty="无"):
@@ -364,7 +586,13 @@ def main():
     ap.add_argument("--now", default=None, help="覆盖当前时间（ISO，便于测试）")
     ap.add_argument("--config", default=os.environ.get("OMBRE_CONFIG"),
                     help="可选 config.yaml，用于读取 fact_slots.registry")
+    ap.add_argument("--review-queue", default=None,
+                    help="可选待审队列路径；只入 pending 建议，不修改任何桶")
+    ap.add_argument("--apply", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args.apply:
+        raise SystemExit("M 巡检严格只读：不支持 --apply")
 
     buckets_dir = Path(args.buckets)
     if not buckets_dir.is_dir():
@@ -377,6 +605,12 @@ def main():
         registry = ((cfg.get("fact_slots", {}) or {}).get("registry", {}) or {})
     report = patrol(buckets_dir, now, fact_slot_registry=registry)
     md = render_md(report, buckets_dir, now)
+    queued = 0
+    if args.review_queue:
+        queued = enqueue_metabolism_suggestions(
+            report,
+            ReviewQueue(args.review_queue),
+        )
 
     if args.out:
         outp = Path(args.out)
@@ -385,6 +619,8 @@ def main():
         print(f"报告已写 → {outp}")
     else:
         print(md)
+    if args.review_queue:
+        print(f"待审建议新增 {queued} 条；记忆桶未改。")
 
 
 if __name__ == "__main__":
