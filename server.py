@@ -2284,6 +2284,10 @@ async def breath(
                 created_after=created_after,
                 created_before=created_before,
                 relevance_first=True,
+                # Keep a broad relevance-ranked keyword pool for RRF. The
+                # original-query literal/vector evidence gate below decides
+                # eligibility after both channels are available.
+                relevance_candidate_floor=0.0,
             ):
                 existing = keyword_by_id.get(bucket["id"])
                 if existing is None or bucket.get("score", 0) > existing.get("score", 0):

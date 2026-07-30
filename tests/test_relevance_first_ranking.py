@@ -159,3 +159,53 @@ async def test_relevance_mode_keeps_useful_literal_candidate_below_legacy_floor(
     )
 
     assert [row["id"] for row in results] == ["6a881e94365f"]
+
+
+@pytest.mark.asyncio
+async def test_relevance_pool_can_include_vector_backed_low_literal_candidate(
+    bucket_mgr,
+    monkeypatch,
+):
+    rows = [
+        {
+            "id": "literal_leader",
+            "metadata": {"importance": 5},
+            "content": "姐姐",
+        },
+        {
+            "id": "vector_backed_target",
+            "metadata": {"importance": 5},
+            "content": "朝灯有一个姐姐",
+        },
+    ]
+
+    async def fake_list_all(*, include_archive=False):
+        assert include_archive is False
+        return rows
+
+    monkeypatch.setattr(bucket_mgr, "list_all", fake_list_all)
+    monkeypatch.setattr(
+        bucket_mgr,
+        "_calc_topic_score",
+        lambda _query, bucket: (
+            0.42 if bucket["id"] == "literal_leader" else 0.3333
+        ),
+    )
+
+    default_results = await bucket_mgr.search(
+        "我还没下班…你记不记得我有一个姐姐",
+        limit=10,
+        relevance_first=True,
+    )
+    broad_pool = await bucket_mgr.search(
+        "我还没下班…你记不记得我有一个姐姐",
+        limit=10,
+        relevance_first=True,
+        relevance_candidate_floor=0.0,
+    )
+
+    assert [row["id"] for row in default_results] == ["literal_leader"]
+    assert [row["id"] for row in broad_pool] == [
+        "literal_leader",
+        "vector_backed_target",
+    ]

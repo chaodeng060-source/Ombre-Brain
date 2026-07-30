@@ -804,6 +804,7 @@ class BucketManager:
         created_after: datetime = None,
         created_before: datetime = None,
         relevance_first: bool = False,
+        relevance_candidate_floor: float = None,
     ) -> list[dict]:
         if not query or not query.strip():
             return []
@@ -895,9 +896,15 @@ class BucketManager:
                 # remain reachable by keyword (penalty applied only to ranking).
                 # 阈值用原始分数判定，确保 resolved 桶在关键词命中时仍可被搜出
                 candidate_floor = (
-                    self.literal_candidate_floor
-                    if relevance_first
-                    else self.fuzzy_threshold
+                    (
+                        self.literal_candidate_floor
+                        if relevance_candidate_floor is None
+                        else max(
+                            0.0,
+                            min(100.0, float(relevance_candidate_floor)),
+                        )
+                    )
+                    if relevance_first else self.fuzzy_threshold
                 )
                 if normalized >= candidate_floor:
                     # Resolved buckets get ranking penalty (but still reachable by keyword)
