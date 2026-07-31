@@ -69,6 +69,7 @@ async def test_touch_keeps_shared_lease_through_time_ripple(
     monkeypatch,
 ):
     bucket_id = await bucket_mgr.create("touch maintenance barrier regression")
+    before_touch = await bucket_mgr.get(bucket_id)
     ripple_started = asyncio.Event()
     release_ripple = asyncio.Event()
     exclusive_attempted = asyncio.Event()
@@ -108,6 +109,10 @@ async def test_touch_keeps_shared_lease_through_time_ripple(
         "ripple_finished",
         "exclusive_entered",
     ]
+    after_touch = await bucket_mgr.get(bucket_id)
+    assert after_touch["metadata"]["activation_count"] == (
+        before_touch["metadata"]["activation_count"] + 1
+    )
 
 
 @pytest.mark.asyncio

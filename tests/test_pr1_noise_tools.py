@@ -92,6 +92,14 @@ class FakeBucketMgr:
         self.touched.append(bucket_id)
 
 
+class _JsonRequest:
+    def __init__(self, body):
+        self._body = body
+
+    async def json(self):
+        return self._body
+
+
 @pytest.mark.asyncio
 async def test_pulse_defaults_to_navigator_and_full_preserves_old_listing(monkeypatch):
     content = json.dumps(
@@ -166,6 +174,33 @@ async def test_breath_uses_recall_pool_caps_output_and_dedups_session(tmp_path, 
     assert "[bucket_id:a]" not in second
     assert "[bucket_id:b]" not in second
     assert "[bucket_id:c]" in second
+    assert fake_mgr.touched == []
+
+
+@pytest.mark.asyncio
+async def test_api_breath_search_does_not_touch_returned_buckets(tmp_path, monkeypatch):
+    fake_mgr = FakeBucketMgr([_bucket("a", "alpha")])
+    monkeypatch.setitem(server.config, "buckets_dir", str(tmp_path))
+    monkeypatch.setitem(server.config, "random_surfacing", {})
+    monkeypatch.setattr(server, "bucket_mgr", fake_mgr)
+    monkeypatch.setattr(server, "decay_engine", FakeDecay())
+    monkeypatch.setattr(server, "dehydrator", FakeDehydrator())
+    monkeypatch.setattr(server, "embedding_engine", FakeEmbedding())
+    monkeypatch.setattr(server, "_backfill_started", True)
+
+    response = await server.api_breath(
+        _JsonRequest(
+            {
+                "query": "工程",
+                "max_results": 1,
+                "relation_depth": 0,
+            }
+        )
+    )
+
+    assert response.status_code == 200
+    assert "[bucket_id:a]" in json.loads(response.body)["raw"]
+    assert fake_mgr.touched == []
 
 
 @pytest.mark.asyncio
