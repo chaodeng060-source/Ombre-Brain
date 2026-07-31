@@ -2392,7 +2392,9 @@ async def breath(
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
                 break
-            await bucket_mgr.touch(bucket["id"])
+            # Recall is read-only with respect to memory buckets.  Rendering a
+            # search hit must not refresh last_active / activation_count or
+            # trigger touch()'s bounded time ripple into neighboring buckets.
             if bucket.get("vector_match"):
                 prefix = _recall_prefix(
                     bucket["id"],
@@ -5244,8 +5246,8 @@ async def api_breath(request):
     The bridge deliberately exposes only the search arguments needed by thin
     frontends.  Images and the external body-state block are always disabled,
     so the JSON response is text-only and cannot carry image payloads or mutate
-    body state.  Search-mode access metadata has the same touch semantics as a
-    direct MCP ``breath`` call.
+    body state.  Search-mode retrieval is bucket-read-only, just like a direct
+    MCP ``breath`` call: neither path touches bucket activity metadata.
     """
     from starlette.responses import JSONResponse
 
