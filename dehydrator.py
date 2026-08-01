@@ -37,6 +37,207 @@ from redact import redact_embedding_input  # 出本地去外部 LLM 前脱敏
 logger = logging.getLogger("ombre_brain.dehydrator")
 
 
+class SelfContainmentError(RuntimeError):
+    """Refuse a grow write whose references cannot be resolved faithfully."""
+
+
+_QUOTED_SPAN_RE = re.compile(
+    r"「[^」]*」|“[^”]*”|”[^”]*”|‘[^’]*’|’[^’]*’|"
+    r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'"
+)
+# Mask lexical compounds before looking for one-character pronouns.  These are
+# ordinary words, not anaphora (for example, “排他性” must not be treated as “他”).
+_NON_REFERENCE_SPAN_RE = re.compile(
+    r"其他|其次|其余|尤其|其实|其中|其间|其一|其二|极其|与其|何其|卡其|土耳其|"
+    r"吉他|排他(?:性)?|利他(?:主义|行为)?|"
+    r"他妈的|他乡|他人|自我|忘我|无我|迷你"
+)
+_PERSON_REFERENCE_RE = re.compile(
+    r"我们|咱们|你们|他们|她们|它们|本人|对方|双方|彼此|"
+    r"前者|后者|自己|我|咱|你|他|她|它|其"
+)
+_DEICTIC_REFERENCE_RE = re.compile(
+    r"这里|那里|这儿|那儿|这边|那边|此处|当时|此前|此后|之前|之后|随后|后来|刚才|现在|"
+    r"昨天|今天|明天|前天|后天|上周|本周|这周|下周|"
+    r"去年|今年|明年|上个月|本月|这个月|下个月|上次|本次|这次|那次|"
+    r"上述(?:项目|任务|问题|方案|文件|功能|需求|版本|事项|内容)?|"
+    r"前述(?:项目|任务|问题|方案|文件|功能|需求|版本|事项|内容)?|"
+    r"(?:这|那|该|此|本)(?:个|些|项|家)?(?:人|地方|公司|组织|团队|系统|项目|计划|问题|事|方案|文件|"
+    r"应用|程序|模块|仓库|功能|任务|需求|版本|产品|内容|地点)|"
+    r"这个|那个|这些|那些|这份|那份|该项|本项|此事|某人|某地|某处|某项目"
+)
+_PREDICATE_RE = re.compile(
+    r"完成|完成了|去|前往|来|离开|说|表示|告诉|认为|觉得|"
+    r"参加|继续|推进|修复|部署|上线|发布|创建|更新|删除|"
+    r"重启|开始|停止|喜欢|讨厌|希望|计划|准备|需要|是|有|没有"
+)
+_NON_SUBJECT_ANCHOR_RE = re.compile(
+    r"^(?:早上|上午|中午|下午|晚上|傍晚|凌晨|深夜|当天|当日|当周|当月)$"
+)
+_RELATIVE_TIME_REFERENCE_RE = re.compile(
+    r"^(?:当时|此前|此后|之前|之后|随后|后来|刚才|现在|昨天|今天|明天|前天|后天|"
+    r"上周|本周|这周|下周|去年|今年|明年|上个月|本月|这个月|下个月|上次|本次|这次|那次)$"
+)
+_LOCATION_REFERENCE_RE = re.compile(
+    r"^(?:这里|那里|这儿|那儿|这边|那边|此处|"
+    r"(?:这|那|该|此|本)(?:个)?(?:地方|地点)|某地|某处)$"
+)
+_PLACEHOLDER_REFERENCE_RE = re.compile(
+    r"某人|某地|某处|某项目|某件事|原文未指明|不详"
+)
+_PERSON_COORDINATION_RE = re.compile(
+    r"(?:\[\[[^\]\n]{1,40}\]\]|[A-Za-z][A-Za-z0-9_.-]{1,31}|[一-鿿]{2,8})"
+    r"\s*(?:和|与|及|、|跟|以及|还有)\s*"
+    r"(?:\[\[[^\]\n]{1,40}\]\]|[A-Za-z][A-Za-z0-9_.-]{1,31}|[一-鿿]{2,8})"
+)
+_ENTITY_TOKEN_RE = re.compile(r"[A-Za-z0-9_.\-一-鿿]{1,40}(?: [A-Za-z0-9_.\-]{1,30}){0,3}")
+_SUBJECT_LABEL_RE = re.compile(
+    r"(?:人物|主体|姓名|说话人)【?[:：]】?\s*"
+    r"(\[\[[^\]\n]{1,40}\]\]|[A-Za-z0-9_.\-一-鿿]{1,40})"
+)
+_WIKILINK_RE = re.compile(r"\[\[([^\[\]\n]{1,80})\]\]")
+
+_SELF_CONTAINMENT_RULE_VERSION = "mapping-v2"
+
+
+def _mask_non_reference_words(content: str) -> str:
+    text = str(content or "")
+    # A valid wikilink is already an explicit entity.  Mask its payload so a
+    # lexical suffix such as the “其” in [[土耳其]] is never rewritten.
+    chars = list(text)
+    for match in _WIKILINK_RE.finditer(text):
+        inner = match.group(1).strip()
+        if (
+            not _PERSON_REFERENCE_RE.fullmatch(inner)
+            and not _DEICTIC_REFERENCE_RE.fullmatch(inner)
+        ):
+            for index in range(match.start(), match.end()):
+                chars[index] = " "
+    masked_links = "".join(chars)
+    return _NON_REFERENCE_SPAN_RE.sub(
+        lambda match: " " * len(match.group(0)),
+        masked_links,
+    )
+
+
+def _reference_occurrences(content: str) -> list[dict]:
+    """Return every risky reference with stable offsets for local replacement."""
+    text = str(content or "")
+    scan = _mask_non_reference_words(text)
+    quoted_spans = [(m.start(), m.end()) for m in _QUOTED_SPAN_RE.finditer(text)]
+    matches: list[tuple[int, int, str, str]] = []
+    for kind, pattern in (("person", _PERSON_REFERENCE_RE), ("context", _DEICTIC_REFERENCE_RE)):
+        matches.extend(
+            (match.start(), match.end(), match.group(0), kind)
+            for match in pattern.finditer(scan)
+        )
+    # Prefer the longest match when patterns ever overlap, then restore source order.
+    selected: list[tuple[int, int, str, str]] = []
+    for item in sorted(matches, key=lambda x: (x[0], -(x[1] - x[0]))):
+        if any(item[0] < prior[1] and prior[0] < item[1] for prior in selected):
+            continue
+        selected.append(item)
+    selected.sort(key=lambda x: x[0])
+    return [
+        {
+            "id": f"r{index}",
+            "start": start,
+            "end": end,
+            "text": token,
+            "kind": kind,
+            "inside_quote": any(q_start <= start < q_end for q_start, q_end in quoted_spans),
+        }
+        for index, (start, end, token, kind) in enumerate(selected)
+    ]
+
+
+def find_unresolved_references(content: str) -> list[str]:
+    """Return ordered unique references that make a fact context-bound."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in _reference_occurrences(content):
+        token = item["text"]
+        if token not in seen:
+            seen.add(token)
+            ordered.append(token)
+    return ordered
+
+
+def _explicit_subject_anchor(content: str) -> bool:
+    """A wikilink before the first predicate is a deterministic subject anchor."""
+    text = str(content or "")
+    links = list(_WIKILINK_RE.finditer(text))
+    if not links:
+        return False
+    predicate = _PREDICATE_RE.search(text)
+    if predicate is None:
+        return True
+    return any(link.end() <= predicate.start() for link in links)
+
+
+def _source_subject_candidates(content: str) -> set[str]:
+    """Extract only high-confidence, model-independent sentence subjects."""
+    text = str(content or "")
+    candidates = {
+        match.group(1).removeprefix("[[").removesuffix("]]").strip()
+        for match in _SUBJECT_LABEL_RE.finditer(text)
+    }
+    for segment in re.split(r"[。！？；;\n]+", text):
+        segment = segment.strip()
+        if not segment:
+            continue
+        predicate = _PREDICATE_RE.search(segment)
+        if predicate is None:
+            continue
+        prefix = segment[:predicate.start()].strip("　 \t，,：:-")
+        prefix = re.sub(
+            r"^(?:\d{4}年)?\d{1,2}月\d{1,2}日[ 　]*",
+            "",
+            prefix,
+        )
+        prefix = re.sub(r"(?:(?:也|都|已经|已|正在|曾经|将|不会|可能|会))+$", "", prefix).strip()
+        leading = re.match(
+            r"^(?:\[\[([^\]\n]{1,40})\]\]|([A-Za-z0-9_.\-一-鿿]{1,40}?))"
+            r"(?:也|都|已经|已|正在|曾经|将|不会|可能|会|在|于|向|对|从|把)",
+            prefix,
+        )
+        if leading:
+            candidate = (leading.group(1) or leading.group(2) or "").strip()
+        else:
+            direct = re.fullmatch(
+                r"\[\[([^\]\n]{1,40})\]\]|([A-Za-z0-9_.\-一-鿿]{1,40})",
+                prefix,
+            )
+            candidate = ((direct.group(1) or direct.group(2)) if direct else "").strip()
+        if candidate and not find_unresolved_references(candidate):
+            candidates.add(candidate)
+    return candidates
+
+
+def _replacement_is_atomic(replacement: str, role: str) -> bool:
+    """Allow only a source entity/date token, never an arbitrary source clause."""
+    value = str(replacement or "").strip()
+    if not value or not _ENTITY_TOKEN_RE.fullmatch(value):
+        return False
+    if role == "time":
+        return bool(re.search(r"\d", value)) and len(value) <= 40
+    return not _PREDICATE_RE.search(value)
+
+
+def _has_unbalanced_verbatim_quote(content: str) -> bool:
+    text = str(content or "")
+    if text.count("「") != text.count("」"):
+        return True
+    # The legacy digest JSON salvage turns both broken ASCII quote marks into
+    # a closing curly quote.  Treat an even pair as closed while still
+    # rejecting any odd/unclosed curly-quote count.
+    if (text.count("“") + text.count("”")) % 2:
+        return True
+    if (text.count("‘") + text.count("’")) % 2:
+        return True
+    return len(re.findall(r'(?<!\\)"', text)) % 2 == 1
+
+
 # --- Dehydration prompt: instructs cheap LLM to compress information ---
 # --- 脱水提示词：指导廉价 LLM 压缩信息 ---
 DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水为紧凑摘要。
@@ -83,6 +284,10 @@ DIGEST_PROMPT = """你是一个日记整理专家。用户会发送一段包含�
 6. 单个条目内容不少于50字，过短的零碎信息合并到最相关的条目中
 7. 总条目数控制在 2~6 个，避免过度碎片化
 8. 在 content 中对人名、地名、专有名词用 [[双链]] 标记（如 [[婷易]]、[[Obsidian]]），普通词汇不要加
+9. 每个 content 必须脱离原日记也能独立理解：不得留下“我/你/他/她/它/那里/上述项目/当时/对方/前者/后者”等指代或省略主语；逐句写出具体的人、地点、项目、日期或对象
+10. 只能把指代还原为本次原文中逐字出现、且能唯一确认的实体；任一事实无法唯一确认时，整批输出 entries=[] 并把指代写入 unresolved_references，绝不猜实体、悄悄丢掉坏条后只返回部分结果
+11. 每个条目保持单一主题和原子事实，不要为了补上下文把其他主题整段复制进来
+12. 改写只做保真消歧：日期、数字、否定、可能性、待办状态和逐字引语不得改变，不得把建议/假设写成已发生事实。若逐字引语内部仍含无法独立理解的指代，因引语不能改字，整批必须 unresolved，不得强改引语
 
 【JSON 合法性铁律】字符串值（尤其 content）内部如果要引用某句话或词，一律用中文引号「」或""，绝对禁止使用英文双引号 " ——英文双引号会破坏 JSON 结构导致整批解析失败。
 
@@ -97,7 +302,7 @@ DIGEST_PROMPT = """你是一个日记整理专家。用户会发送一段包含�
     "tags": ["核心词1", "核心词2", "扩展词1", "扩展词2"],
     "importance": 5
   }
-]}
+], "unresolved_references": []}
 
 tags 生成规则：先从原文精准提取 3~5 个核心词，再引申扩展 5~8 个语义相关词（近义词、上位词、关联场景词），合并为一个数组。
 
@@ -109,6 +314,29 @@ tags 生成规则：先从原文精准提取 3~5 个核心词，再引申扩展 
 importance: 1-10，根据内容重要程度判断
 valence: 0~1（0=消极, 0.5=中性, 1=积极）
 arousal: 0~1（0=平静, 0.5=普通, 1=激动）"""
+
+
+# --- Grow write preprocessor: make each stored fact self-contained ---
+# --- grow 写入预处理：把待写事实改成可脱离上下文理解的自包含文本 ---
+SELF_CONTAIN_PROMPT = """你是长期记忆写入前的“指代映射审计器”。你不改写句子，只返回结构化映射和主体锚点，实际替换由代码完成。
+
+输入包含【完整来源】、【待写入事实】和【待解决位置】。每个位置有 id/text/start/end/kind/inside_quote。
+
+硬规则：
+1. 每个位置都必须唯一映射；任何一个不唯一，整体 status=ambiguous。
+2. replacement 必须是【完整来源】中逐字出现的原词，不得改写动词、否定、日期或句子其他部分。
+3. candidates 列出该位置在来源中所有合理先行词；只有列表恰好一项时才能 resolved。不得从多个人名/地点中猜一个。
+4. 引语内的原词不允许改；inside_quote=true 时整体 ambiguous。
+5. 输入中【必须有主体】=true 时，事实必须有明写主体。subject_anchors 只列【待写入事实】中逐字出现、且真正执行动作/承载状态的人、组织、项目、系统或对象。“明天去深圳”和“完成了测试”没有主体，必须 ambiguous；不能把时间、地点或宾语当主体。若该值=false，这是拆分前的完整来源，只做指代映射，subject_anchors 可为空。
+6. 不得用“某人/某地/原文未指明”假装已解决。
+
+只输出 JSON，无其他文字。
+可确认：
+{"status":"resolved","mappings":[{"id":"r0","replacement":"朝灯","candidates":["朝灯"],"role":"subject"}],"subject_anchors":["朝灯"],"unresolved":[]}
+无待解决位置但事实本身已自包含时，mappings=[]，仍须给出 subject_anchors。
+不可确认：
+{"status":"ambiguous","mappings":[],"subject_anchors":[],"unresolved":["无法唯一确认的位置或缺失主体"]}
+"""
 
 
 # --- Merge prompt: instruct LLM to blend old and new memories ---
@@ -456,6 +684,273 @@ class Dehydrator:
         except Exception:
             return
 
+    @staticmethod
+    def _parse_self_contained_payload(raw: str) -> dict:
+        cleaned = str(raw or "").strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
+        try:
+            payload = json.loads(cleaned)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _apply_self_containment_mapping(
+        *,
+        draft: str,
+        source: str,
+        occurrences: list[dict],
+        payload: dict,
+        require_subject: bool = True,
+    ) -> tuple[str, str]:
+        """Validate a model mapping and apply only the named source substrings."""
+        if payload.get("status") != "resolved":
+            return "", "bad_status"
+        mappings = payload.get("mappings", [])
+        anchors = payload.get("subject_anchors", [])
+        if not isinstance(mappings, list) or not isinstance(anchors, list):
+            return "", "bad_shape"
+
+        expected = {item["id"]: item for item in occurrences}
+        by_id: dict[str, dict] = {}
+        for mapping in mappings:
+            if not isinstance(mapping, dict):
+                return "", "bad_mapping"
+            mapping_id = str(mapping.get("id") or "")
+            if mapping_id not in expected or mapping_id in by_id:
+                return "", "unknown_or_duplicate_id"
+            replacement = str(mapping.get("replacement") or "").strip()
+            candidates = mapping.get("candidates", [])
+            if (
+                not replacement
+                or len(replacement) > 80
+                or "\n" in replacement
+                or re.search(r"[。！？;；]", replacement)
+                or not isinstance(candidates, list)
+                or len(candidates) != 1
+                or str(candidates[0]).strip() != replacement
+            ):
+                return "", "non_unique_mapping"
+            if replacement not in source:
+                return "", "replacement_not_in_source"
+            if find_unresolved_references(replacement):
+                return "", "replacement_is_reference"
+            if re.search(r"某人|某地|原文未指明|不详", replacement):
+                return "", "placeholder_replacement"
+            if mapping.get("role") not in {"subject", "object", "place", "time", "other"}:
+                return "", "bad_role"
+            occurrence = expected[mapping_id]
+            if not _replacement_is_atomic(replacement, str(mapping.get("role"))):
+                return "", "replacement_not_atomic"
+            if occurrence["kind"] == "person" and mapping.get("role") not in {"subject", "object"}:
+                return "", "person_role_mismatch"
+            if occurrence["kind"] == "person" and len(replacement) > 40:
+                return "", "person_replacement_too_long"
+            if occurrence["kind"] == "person":
+                source_subjects = _source_subject_candidates(source)
+                if len(source_subjects) > 1:
+                    return "", "multiple_source_subjects"
+                if source_subjects and replacement not in source_subjects:
+                    return "", "replacement_not_source_subject"
+            if (
+                mapping.get("role") == "subject"
+                and _RELATIVE_TIME_REFERENCE_RE.fullmatch(occurrence["text"])
+            ):
+                return "", "time_is_not_subject"
+            if (
+                _RELATIVE_TIME_REFERENCE_RE.fullmatch(occurrence["text"])
+                and mapping.get("role") != "time"
+            ):
+                return "", "time_role_mismatch"
+            if (
+                _LOCATION_REFERENCE_RE.fullmatch(occurrence["text"])
+                and mapping.get("role") != "place"
+            ):
+                return "", "place_role_mismatch"
+            by_id[mapping_id] = mapping
+        if set(by_id) != set(expected):
+            return "", "incomplete_mapping"
+
+        predicate = _PREDICATE_RE.search(draft)
+        has_subject = False
+        for item in occurrences:
+            mapping = by_id[item["id"]]
+            if mapping.get("role") == "subject" and (
+                predicate is None or item["start"] <= predicate.start()
+            ):
+                has_subject = True
+
+        for raw_anchor in anchors:
+            anchor = str(raw_anchor or "").strip()
+            if (
+                not anchor
+                or len(anchor) < 2
+                or anchor not in draft
+                or find_unresolved_references(anchor)
+                or _NON_SUBJECT_ANCHOR_RE.fullmatch(anchor)
+                or re.search(r"某人|某地|原文未指明|不详", anchor)
+            ):
+                continue
+            starts = [m.start() for m in re.finditer(re.escape(anchor), draft)]
+            if predicate is None or any(start + len(anchor) <= predicate.start() for start in starts):
+                has_subject = True
+                break
+
+        if require_subject and not has_subject:
+            return "", "missing_subject"
+
+        candidate = draft
+        for item in sorted(occurrences, key=lambda value: value["start"], reverse=True):
+            replacement = str(by_id[item["id"]]["replacement"]).strip()
+            candidate = candidate[:item["start"]] + replacement + candidate[item["end"]:]
+        if find_unresolved_references(candidate):
+            return "", "still_ambiguous"
+        if redact_embedding_input(candidate) != candidate:
+            return "", "generated_sensitive_content"
+        return candidate, ""
+
+    async def ensure_self_contained(
+        self,
+        content: str,
+        source_context: str = "",
+        *,
+        require_subject: bool = True,
+    ) -> str:
+        """Resolve references by local substitution, or fail closed."""
+        draft = str(content or "").strip()
+        if not draft:
+            raise SelfContainmentError("待写入事实为空")
+        if _PLACEHOLDER_REFERENCE_RE.search(draft):
+            raise SelfContainmentError("待写入事实含某人/某地等占位指代")
+        if _has_unbalanced_verbatim_quote(draft):
+            raise SelfContainmentError("待写入事实含未闭合的逐字引语")
+        occurrences = _reference_occurrences(draft)
+        risks = list(dict.fromkeys(item["text"] for item in occurrences))
+        if any(item["inside_quote"] for item in occurrences):
+            raise SelfContainmentError("逐字引语内含无法安全改写的指代")
+        if not occurrences and (not require_subject or _explicit_subject_anchor(draft)):
+            return draft
+
+        source = str(source_context or draft).strip()
+        redacted_source = redact_embedding_input(source)
+        redacted_draft = redact_embedding_input(draft)
+        if redacted_source != source or redacted_draft != draft:
+            raise SelfContainmentError(
+                "待消解内容含敏感凭据，拒绝把外部模型的脱敏结果写回记忆"
+            )
+        if not self.api_available or self.client is None:
+            raise SelfContainmentError("自包含审计 API 不可用，已拒绝写入")
+        if (
+            any(item["kind"] == "person" for item in occurrences)
+            and (
+                _PERSON_COORDINATION_RE.search(source)
+                or len(_source_subject_candidates(source)) > 1
+            )
+        ):
+            raise SelfContainmentError("来源中存在并列候选主体，已拒绝猜测指代")
+
+        source_for_api = redacted_source[:5000]
+        draft_for_api = redacted_draft[:3000]
+        if len(source) > len(source_for_api) or len(draft) > len(draft_for_api):
+            raise SelfContainmentError("内容超出指代消解安全上限，已拒绝写入")
+        occurrence_payload = [
+            {
+                "id": item["id"],
+                "text": item["text"],
+                "start": item["start"],
+                "end": item["end"],
+                "kind": item["kind"],
+                "inside_quote": item["inside_quote"],
+            }
+            for item in occurrences
+        ]
+        cache_key = json.dumps(
+            {
+                "rule": _SELF_CONTAINMENT_RULE_VERSION,
+                "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+                "draft_sha256": hashlib.sha256(draft.encode()).hexdigest(),
+                "occurrences": occurrence_payload,
+                "require_subject": require_subject,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        cached = self._get_cached_json("self_contain", cache_key)
+        if isinstance(cached, dict) and cached.get("status") == "resolved":
+            candidate, cache_error = self._apply_self_containment_mapping(
+                draft=draft,
+                source=source,
+                occurrences=occurrences,
+                payload=cached,
+                require_subject=require_subject,
+            )
+            if not cache_error:
+                return candidate
+
+        user_message = (
+            f"【完整来源】\n{source_for_api}\n\n"
+            f"【待写入事实】\n{draft_for_api}\n\n"
+            f"【必须有主体】\n{str(require_subject).lower()}\n\n"
+            f"【待解决位置】\n"
+            f"{json.dumps(occurrence_payload, ensure_ascii=False)}"
+        )
+        last_error = "invalid_response"
+        for attempt in range(2):
+            messages = [
+                {"role": "system", "content": SELF_CONTAIN_PROMPT},
+                {"role": "user", "content": user_message},
+            ]
+            if attempt:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "上次映射未通过代码校验。只返回每个 id 的唯一来源原词，"
+                        "不改写句子；无法唯一确认或没有明写主体就返回 ambiguous。"
+                    ),
+                })
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=min(max(int(self.max_tokens), 512), 2048),
+                    temperature=0.0,
+                    response_format={"type": "json_object"},
+                )
+            except Exception as exc:
+                last_error = f"api_{type(exc).__name__}"
+                continue
+            if not response.choices:
+                last_error = "empty_choices"
+                continue
+            payload = self._parse_self_contained_payload(
+                response.choices[0].message.content or ""
+            )
+            if payload.get("status") == "ambiguous":
+                raise SelfContainmentError(
+                    f"无法唯一确认指代或事实缺少主体：{', '.join(risks) or '无主体'}"
+                )
+            candidate, last_error = self._apply_self_containment_mapping(
+                draft=draft,
+                source=source,
+                occurrences=occurrences,
+                payload=payload,
+                require_subject=require_subject,
+            )
+            if last_error:
+                continue
+            self._set_cached_json("self_contain", cache_key, payload)
+            return candidate
+
+        logger.warning(
+            "Self-containment mapping failed closed: risks=%s reason=%s",
+            risks,
+            last_error,
+        )
+        raise SelfContainmentError(
+            f"自包含映射未通过校验：{', '.join(risks) or '无主体'}"
+        )
+
     # ---------------------------------------------------------
     # Dehydrate: compress raw content into concise summary
     # 脱水：将原始内容压缩为精简摘要
@@ -767,13 +1262,20 @@ class Dehydrator:
         if not content or not content.strip():
             return []
 
-        content = redact_embedding_input(content)
-
         # --- API digest (no local fallback) ---
         if not self.api_available:
             raise RuntimeError("脱水 API 不可用，请检查 config.yaml 中的 dehydration 配置")
 
         try:
+            # Resolve the raw source before the digest model sees it.  Without
+            # this mapping-only pass a digest model could silently pick one of
+            # several antecedents and return a clean-looking but false atom.
+            content = await self.ensure_self_contained(
+                content.strip(),
+                source_context=content.strip(),
+                require_subject=False,
+            )
+            content = redact_embedding_input(content)
             result = await self._api_digest(content)
             if result:
                 return result
@@ -801,6 +1303,7 @@ class Dehydrator:
         """
         content = redact_embedding_input(content)
         last_raw = ""
+        last_self_containment_error: SelfContainmentError | None = None
         for attempt in range(3):
             # 扫盘 #12：重试加指数退避（0/2/4s）；API 网络异常也算一次重试而不是
             # 直接炸穿整个 digest 流程（原来一次网络抖动就 3 次机会全没）。
@@ -829,13 +1332,47 @@ class Dehydrator:
                 continue
             last_raw = raw
 
-            items = self._parse_digest(raw)
+            try:
+                items = self._parse_digest(raw)
+            except SelfContainmentError as exc:
+                last_self_containment_error = exc
+                logger.warning(
+                    "Diary digest declared unresolved references, retrying "
+                    "(attempt %d/3): %s",
+                    attempt + 1,
+                    exc,
+                )
+                continue
             if items:
+                try:
+                    validated: list[dict] = []
+                    # Validate the whole batch before grow writes its first
+                    # bucket. One bad item retries the entire digest batch;
+                    # partial writes would make the caller think nothing was
+                    # lost while silently dropping a fact.
+                    for item in items:
+                        checked = dict(item)
+                        checked["content"] = await self.ensure_self_contained(
+                            checked.get("content", ""),
+                            source_context=content,
+                        )
+                        validated.append(checked)
+                except SelfContainmentError as exc:
+                    last_self_containment_error = exc
+                    logger.warning(
+                        "Diary digest self-containment rejected, retrying "
+                        "(attempt %d/3): %s",
+                        attempt + 1,
+                        exc,
+                    )
+                    continue
                 if attempt > 0:
                     logger.info(f"Diary digest succeeded on attempt {attempt + 1} / 日记整理第 {attempt + 1} 次尝试成功")
-                return items
+                return validated
             logger.warning(f"Diary digest parse empty, retrying / 解析返空，重试 (attempt {attempt + 1}/3)")
 
+        if last_self_containment_error is not None:
+            raise last_self_containment_error
         logger.error(f"Diary digest failed after 3 attempts / 三次尝试均失败: {last_raw[:200]}")
         return []
 
@@ -868,6 +1405,15 @@ class Dehydrator:
 
         # 兼容两种结构：新版 {"entries": [...]} 对象包裹，或旧版裸数组
         if isinstance(parsed, dict):
+            unresolved = parsed.get("unresolved_references", [])
+            if isinstance(unresolved, list):
+                unresolved = [str(item).strip() for item in unresolved if str(item).strip()]
+            else:
+                unresolved = []
+            if unresolved:
+                raise SelfContainmentError(
+                    f"日记来源仍有无法唯一确认的指代：{', '.join(unresolved[:5])}"
+                )
             items = parsed.get("entries")
         else:
             items = parsed

@@ -73,7 +73,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 
 from bucket_manager import BucketManager
-from dehydrator import Dehydrator
+from dehydrator import Dehydrator, SelfContainmentError
 from decay_engine import DecayEngine
 from consolidation_engine import ConsolidationEngine
 from episode_engine import EpisodeEngine
@@ -1611,6 +1611,7 @@ async def _merge_or_create(
     name: str = "",
     world: str = "",
     chord_tag: str = "",
+    require_self_contained: bool = False,
 ) -> tuple[str, str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -1618,6 +1619,11 @@ async def _merge_or_create(
     检查是否有相似桶可合并，有则合并，无则新建。
     返回 (桶ID, 显示名, 是否合并)。
     """
+    # grow validates every incoming item before this helper is called.  Do not
+    # audit it a second time here: a mapping-only resolution deliberately
+    # changes the text and no longer carries the original antecedent context.
+    # The flag below guards only the LLM-produced merge result.
+
     # 五感入口层 v1：从内容识别感官标签（嗅/味/触/听），合并与新建两路都带上。
     detected_senses = detect_senses(content)
 
@@ -1650,6 +1656,11 @@ async def _merge_or_create(
                 merge_content = _with_arbitration_context(content, audit_entries)
                 merged = await dehydrator.merge(bucket["content"], merge_content)
                 merged = _strip_arbitration_context(merged) or merged
+                if require_self_contained:
+                    merged = await dehydrator.ensure_self_contained(
+                        merged,
+                        source_context=f"{bucket['content']}\n\n{content}",
+                    )
                 old_v = bucket["metadata"].get("valence", 0.5)
                 old_a = bucket["metadata"].get("arousal", 0.3)
                 merged_valence = round((old_v + valence) / 2, 2)
@@ -2758,8 +2769,16 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
     if len(content.strip()) < 30:
         logger.info(f"grow short-content fast path: {len(content.strip())} chars")
         try:
+            prepared_content = await dehydrator.ensure_self_contained(
+                content.strip(),
+                source_context=content.strip(),
+            )
+        except SelfContainmentError as exc:
+            logger.warning("grow short-content rejected: %s", exc)
+            return "内容含无法唯一确认的指代，未写入记忆。请补充具体人名、地点或项目后重试。"
+        try:
             _t_a = time.perf_counter()
-            analysis = await dehydrator.analyze(content)
+            analysis = await dehydrator.analyze(prepared_content)
             _ela_a = time.perf_counter() - _t_a
         except Exception as e:
             logger.warning(f"Fast-path analyze failed / 快速路径打标失败: {e}")
@@ -2770,7 +2789,7 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
             _ela_a = time.perf_counter() - _t_a
         _t_m = time.perf_counter()
         _bid, result_name, is_merged = await _merge_or_create(
-            content=content.strip(),
+            content=prepared_content,
             tags=analysis.get("tags", []),
             importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
             domain=analysis.get("domain", ["未分类"]),
@@ -2779,6 +2798,7 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
             name=analysis.get("suggested_name", ""),
             world=effective_world,
             chord_tag=chord_tag,
+            require_self_contained=True,
         )
         _ela_m = time.perf_counter() - _t_m
         _ela_total = time.perf_counter() - _grow_t0
@@ -2795,6 +2815,13 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
         _t_d = time.perf_counter()
         items = await dehydrator.digest(content)
         _ela_d = time.perf_counter() - _t_d
+    except SelfContainmentError as e:
+        logger.warning(f"Diary digest self-containment failed / 指代消解失败: {e}")
+        logger.info(
+            f"grow.timing path=long chars={_content_len} self_containment_failed=1 "
+            f"total={time.perf_counter() - _grow_t0:.2f}s"
+        )
+        return "内容含无法唯一确认的指代，整批未写入。请补充具体人名、地点或项目后重试。"
     except Exception as e:
         logger.error(f"Diary digest failed / 日记整理失败: {e}")
         logger.info(
@@ -2830,6 +2857,7 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
                 name=item.get("name", ""),
                 world=effective_world,
                 chord_tag=chord_tag,
+                require_self_contained=True,
             )
 
             if is_merged:

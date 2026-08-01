@@ -2,9 +2,9 @@ import pytest
 
 
 SECRET_TEXT = (
-    "api_key=sk-leaksecret123456789 然后她说好想我\n"
-    "postgresql://u:p@10.0.0.9:5432/ombre 她亲了我一下\n"
-    "Authorization: Bearer abc123XYZ._-token 但这里是她的真实情绪"
+    "api_key=sk-leaksecret123456789 然后朝灯说好想哥哥\n"
+    "postgresql://u:p@10.0.0.9:5432/ombre 朝灯亲了哥哥一下\n"
+    "Authorization: Bearer abc123XYZ._-token 但这是朝灯的真实情绪"
 )
 
 
@@ -15,8 +15,8 @@ def _assert_secret_redacted(text: str):
 
 
 def _assert_emotion_kept(text: str):
-    assert "好想我" in text
-    assert "她亲了我一下" in text
+    assert "好想哥哥" in text
+    assert "朝灯亲了哥哥一下" in text
     assert "真实情绪" in text
 
 
@@ -107,7 +107,7 @@ async def test_analyze_redacts_external_payload_keeps_emotion(test_config):
 async def test_digest_redacts_external_payload_keeps_emotion(test_config):
     dh = _dehydrator(
         test_config,
-        '{"entries":[{"name":"亲密记忆","content":"她亲了我一下",'
+        '{"entries":[{"name":"亲密记忆","content":"[[朝灯]]亲了[[哥哥]]一下",'
         '"domain":["feel"],"valence":0.8,"arousal":0.4,'
         '"tags":["真实情绪"],"importance":5}]}',
     )

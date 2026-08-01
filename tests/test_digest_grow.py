@@ -87,15 +87,15 @@ async def test_empty_content_returns_empty_without_api(digest_dehy):
 async def test_clean_entries_object_parses(digest_dehy):
     """标准 {"entries": [...]} 对象包裹 → 正常解析 + 字段落位。"""
     raw = (
-        '{"entries": [{"name": "通勤", "content": "早上挤地铁去上班",'
+        '{"entries": [{"name": "通勤", "content": "[[朝灯]]早上挤地铁去上班",'
         ' "domain": ["日常"], "valence": 0.5, "arousal": 0.3,'
         ' "tags": ["通勤", "地铁"], "importance": 4}]}'
     )
     _install(digest_dehy, _create_returning(raw))
-    items = await digest_dehy.digest("早上挤地铁去上班")
+    items = await digest_dehy.digest("朝灯早上挤地铁去上班")
     assert len(items) == 1
     assert items[0]["name"] == "通勤"
-    assert items[0]["content"] == "早上挤地铁去上班"
+    assert items[0]["content"] == "[[朝灯]]早上挤地铁去上班"
     assert items[0]["importance"] == 4
     assert items[0]["domain"] == ["日常"]
 
@@ -104,12 +104,12 @@ async def test_clean_entries_object_parses(digest_dehy):
 async def test_legacy_bare_array_still_parses(digest_dehy):
     """旧版裸数组（无 entries 包裹）向后兼容。"""
     raw = (
-        '[{"name": "散步", "content": "傍晚去河边走了走",'
+        '[{"name": "散步", "content": "[[朝灯]]傍晚去河边走了走",'
         ' "domain": ["日常"], "valence": 0.7, "arousal": 0.2,'
         ' "tags": ["散步"], "importance": 3}]'
     )
     _install(digest_dehy, _create_returning(raw))
-    items = await digest_dehy.digest("傍晚去河边走了走")
+    items = await digest_dehy.digest("朝灯傍晚去河边走了走")
     assert len(items) == 1
     assert items[0]["name"] == "散步"
 
@@ -118,14 +118,14 @@ async def test_legacy_bare_array_still_parses(digest_dehy):
 async def test_markdown_fence_stripped(digest_dehy):
     """LLM 偶发包 ```json 代码围栏 → 剥掉后解析。"""
     raw = (
-        '```json\n{"entries": [{"name": "读书", "content": "看完一本书",'
+        '```json\n{"entries": [{"name": "读书", "content": "[[朝灯]]看完一本书",'
         ' "domain": ["日常"], "valence": 0.6, "arousal": 0.3,'
         ' "tags": ["读书"], "importance": 5}]}\n```'
     )
     _install(digest_dehy, _create_returning(raw))
-    items = await digest_dehy.digest("看完一本书")
+    items = await digest_dehy.digest("朝灯看完一本书")
     assert len(items) == 1
-    assert items[0]["content"] == "看完一本书"
+    assert items[0]["content"] == "[[朝灯]]看完一本书"
 
 
 @pytest.mark.asyncio
@@ -136,28 +136,28 @@ async def test_unescaped_english_quotes_salvaged(digest_dehy):
     """
     # 内层 "在的" 是未转义英文引号，标准 json.loads 会炸。
     raw = (
-        '{"entries": [{"name": "对话", "content": "他说"在的"然后笑了",'
+        '{"entries": [{"name": "对话", "content": "[[朝灯]]说"在的"然后笑了",'
         ' "domain": ["日常"], "valence": 0.6, "arousal": 0.4,'
         ' "tags": ["对话"], "importance": 5}]}'
     )
     _install(digest_dehy, _create_returning(raw))
-    items = await digest_dehy.digest("他说在的然后笑了")
+    items = await digest_dehy.digest("朝灯说在的然后笑了")
     assert len(items) == 1
     # 内层引号被换成中文引号，正文挽救成功（不返空）。
     assert "在的" in items[0]["content"]
-    assert items[0]["content"].startswith("他说")
+    assert items[0]["content"].startswith("[[朝灯]]说")
 
 
 @pytest.mark.asyncio
 async def test_retry_recovers_after_bad_first_attempt(digest_dehy):
     """第一次吐不可解析垃圾、第二次正常 → 重试层兜住返出条目。"""
     good = (
-        '{"entries": [{"name": "工作", "content": "改完一个 bug",'
+        '{"entries": [{"name": "工作", "content": "[[小卷]]改完一个 bug",'
         ' "domain": ["工程"], "valence": 0.5, "arousal": 0.3,'
         ' "tags": ["bug"], "importance": 5}]}'
     )
     create = _install(digest_dehy, _create_returning("彻底不是 JSON 的一坨 {", good))
-    items = await digest_dehy.digest("改完一个 bug")
+    items = await digest_dehy.digest("小卷改完一个 bug")
     assert len(items) == 1
     assert items[0]["name"] == "工作"
     assert create.calls["i"] == 2  # 第一次失败、第二次成功，恰好调两次
@@ -181,11 +181,11 @@ async def test_validation_clamps_out_of_range_fields(digest_dehy):
     """越界的 importance/valence/arousal 被夹紧，超长 name 被截断。"""
     raw = (
         '{"entries": [{"name": "这个标题故意写得非常非常长超过二十个字符上限了真的很长",'
-        ' "content": "正文", "domain": ["a", "b", "c", "d", "e"],'
+        ' "content": "[[小卷]]完成正文校验", "domain": ["a", "b", "c", "d", "e"],'
         ' "valence": 9.9, "arousal": -5, "tags": ["x"], "importance": 99}]}'
     )
     _install(digest_dehy, _create_returning(raw))
-    items = await digest_dehy.digest("正文")
+    items = await digest_dehy.digest("小卷完成正文校验")
     assert len(items) == 1
     it = items[0]
     assert len(it["name"]) <= 20            # name 截断
