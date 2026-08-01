@@ -1,29 +1,101 @@
-# XYZME · E 轴 Shadow 合同
+# XYZME E axis: E0 shadow collection
 
-E 轴第一阶段只保存体验标注，不影响事实与召回顺序。
+E0 is an observation pipeline, not a recall feature. Its automatic source
+universe is the union of:
 
-写入端点：`POST /api/e-axis/shadow`。请求必须精确包含：
+- validated, already-redacted X-axis candidate payloads from the LMC-5 ledger;
+- Markdown memories recursively read from exactly the five authoritative
+  curated roots: `permanent`, `dynamic`, `archive`, `feel`, and `涩涩`.
 
-- `bucket_id`
-- `source_digest`：当前桶正文的 SHA-256
-- `scorer`
-- `model`
-- `rubric_version`
-- `score`：精确字段 `valence`、`arousal`、`tension`、`confidence`、
-  `response_tendency`、`growth_delta`
+Both source kinds pass the official type, keyword, and emotional-link gate.
+The curated reader is strictly read-only: it rejects unsafe ancestors,
+symlinks, hardlinks, malformed frontmatter, naive timestamps, and duplicate
+IDs. It never creates, touches, or rewrites a memory file, never reads raw
+events, and never traverses outside those five roots. Both curated Markdown and
+the LMC-5 SQLite source are opened through held directory descriptors with
+`O_NOFOLLOW|O_NOATIME`; unsupported filesystems or permissions fail closed
+instead of falling back to metadata-touching reads. The SQLite main file is
+copied into a private in-memory database, so reading never creates source
+`-wal`/`-shm`; a non-empty WAL or rollback journal is an explicit failure.
 
-数值必须是有限 JSON number；布尔不是数字。缺字段、额外字段、NaN/Infinity、
-浮点溢出、重复 JSON key、越界、非法枚举和低置信度均拒绝，不补默认值。
-`e_axis_shadow.min_confidence` 也必须是有限的 `[0, 1]` number，配置错误时端点
-fail-closed。正文哈希不匹配时拒绝旧分数。
+It writes three private sidecars under <buckets_dir>/.axis/:
 
-成功与失败记录都写在 `<buckets_dir>/.axis/e-shadow.jsonl`，不写 Markdown 桶；
-失败记录不保存模型原文或记忆正文。账本 append-only、文件锁、fsync、同一
-`bucket + source_digest + scorer + model + rubric` 幂等；账本损坏时停止写入。
-锁复用跨平台 `storage_safety.advisory_file_lock`。每行都必须精确符合
-`contract_version=1` 的 success/failure 模式；重复 key、非有限数、缺字段、
-多字段或错误版本都会把账本判为损坏并停止追加。
+- e-shadow.jsonl: immutable success or failure rows;
+- e-shadow-attempts.jsonl: one outcome per run and source, with source IDs
+  hashed and no memory text or provider output;
+- e-shadow-coverage.jsonl: aggregate coverage, failure, distribution, enum,
+  and distinct-natural-day reports for the formal automatic cohort. Reports
+  break down source kind, memory type, trigger reason, skip reason, and failure
+  code, including retryable, terminal, and unresolved failures. Coverage
+  includes scored, terminal, unresolved, score-rate, and resolved-rate fields;
+  a zero denominator is explicit and the CLI exits non-zero with
+  `source.no_eligible`.
 
-硬约束：每行都带 `shadow_only=true`、`affects_ranking=false`。现有顶层
-`valence/arousal` 仍是旧的在线情绪坐标，E shadow 不读取、不覆盖，也没有
-“满 30 天自动开排序”的路径。
+Every score row carries provider, model, scorer, rubric, source digest, E run
+ID, trigger reason, and timestamp. Valence is [-1, 1]; arousal, tension, and
+confidence are [0, 1]; response tendency and growth delta are strict enums.
+Before curated title/content leaves Ombre for the configured scorer, it passes
+the existing secret/credential redactor; emotional wording is preserved.
+Timeout, empty output, incomplete output, malformed JSON, schema errors, range
+errors, and low confidence are separate failures. Retryable failures remain in
+the next run's backlog. A terminal failure remains non-green on later runs even
+when no new provider call is made; it cannot disappear behind a zero-new-error
+exit code.
+
+`provider_name` is required and must name the real provider; there is no
+generic `openai-compatible` default. The scorer identity includes a digest of
+provider endpoint, model, rubric, prompt contract, token/content limits,
+confidence threshold, temperature, and timeout. Changing any of those starts a
+new calibration cohort instead of silently mixing distributions.
+
+The producer reads no raw events and no memory directory outside the five
+curated roots. It never updates candidate status, memory body/frontmatter,
+facts, relations, decay, RRF, or any recall score. Every annotation permanently
+sets shadow_only=true and affects_ranking=false.
+
+The authoritative score ledger is contract_version=2. It intentionally fails
+closed on v1 rows; an existing v1 ledger must be archived or migrated in a
+reviewed maintenance window before this producer starts. Deployment must first
+inspect the exact production ledger state; it must not assume that the ledger
+is empty.
+
+The authenticated manual `/api/e-axis/shadow` route uses the same v2 contract.
+Its request must contain exactly `bucket_id`, `source_digest`, `provider`,
+`scorer`, `model`, `rubric_version`, `run_id`, `trigger_reason`, and `score`.
+The server, not the client, stamps every such row as
+`source_kind=manual_bucket`. The server re-computes the named bucket's digest
+and records a terminal `source_digest.mismatch` row instead of accepting a
+stale score. Manual rows are completely excluded from formal automatic cohort
+membership, distinct-natural-day counts, coverage and score distributions,
+and all promotion evidence; they can never seed or accelerate E1.
+
+The E job has a separate cron entry from the conservative Stage-1 night run.
+An E failure can alert independently but cannot roll back or re-label a
+successful X/M night run.
+
+Deployment order is mandatory:
+
+1. inspect the exact production deployment directory, active image/container,
+   E ledgers and sidecars, and host cron in read-only mode;
+2. obtain review approval for the exact diff and exact deployment targets;
+3. create exact, checksummed backups of every file, image/rollback anchor, cron
+   entry, and existing ledger that will be changed;
+4. only then may an authorized deployment write NAS files, rebuild or switch
+   the image, install `cron/run-e-axis-shadow.sh`, and verify live shadow-only
+   health and rollback.
+
+The E script uses a separate non-blocking lock, returns exit 75 with
+`run.busy` on overlap, and does not invoke the core X/M night runner. Current
+delivery state (2026-07-31): this work is not deployed; this task has not
+changed NAS files, the production image/container, or host cron.
+
+## E1 promotion gate
+
+E0 reports always set promotion_eligible=false. At least 30 distinct Shanghai
+natural days within one formal automatic provider/model/scorer/rubric cohort
+are necessary but not sufficient; manual API rows never count. E1 also
+requires adequate coverage and sample size, stable numeric/enum distributions,
+resolved failure debt, provider calibration, real-query validation, and
+explicit human approval. There is no automatic promotion switch. Until then,
+the E ledger must not be read by recall, emotion resonance, perception, or
+ranking code.

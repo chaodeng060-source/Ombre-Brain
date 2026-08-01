@@ -1,9 +1,12 @@
 """Strict E-axis shadow contract tests."""
 
+import asyncio
 import copy
 import hashlib
 import json
 import os
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -37,9 +40,14 @@ def _annotation():
     return build_shadow_annotation(
         bucket_id="bucket-1",
         source_digest=hashlib.sha256(b"content").hexdigest(),
-        scorer="e-shadow-v1",
+        source_kind="lmc5_candidate",
+        source_run_id="lmc5-night-20260728",
+        provider="provider-a",
+        scorer="e-shadow-v2",
         model="model-a",
         rubric_version="rubric-1",
+        run_id="run-1",
+        trigger_reason="type.preference",
         score=_score(),
         scored_at="2026-07-28T00:00:00+00:00",
     )
@@ -92,12 +100,48 @@ def test_annotation_requires_bound_provenance():
     annotation, error = build_shadow_annotation(
         bucket_id="bucket-1",
         source_digest="not-a-digest",
+        source_kind="lmc5_candidate",
+        source_run_id="lmc5-night-20260728",
+        provider="provider",
         scorer="scorer",
         model="model",
         rubric_version="v1",
+        run_id="run-1",
+        trigger_reason="type.preference",
         score=_score(),
     )
     assert annotation is None and error == "schema.source_digest"
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "source_run_id"),
+    [
+        ("contains space", "lmc5-night-20260728"),
+        ("lmc5_candidate", "contains space"),
+        ("", "lmc5-night-20260728"),
+        ("lmc5_candidate", ""),
+        ("x" * 161, "lmc5-night-20260728"),
+        ("lmc5_candidate", "x" * 161),
+    ],
+)
+def test_annotation_requires_machine_source_provenance(
+    source_kind,
+    source_run_id,
+):
+    annotation, error = build_shadow_annotation(
+        bucket_id="bucket-1",
+        source_digest="a" * 64,
+        source_kind=source_kind,
+        source_run_id=source_run_id,
+        provider="provider",
+        scorer="scorer",
+        model="model",
+        rubric_version="v1",
+        run_id="run-1",
+        trigger_reason="type.preference",
+        score=_score(),
+    )
+    assert annotation is None and error == "schema.provenance"
 
 
 def test_shadow_store_is_fsynced_idempotent_and_private(tmp_path):
@@ -110,6 +154,18 @@ def test_shadow_store_is_fsynced_idempotent_and_private(tmp_path):
     assert store.load() == [annotation]
     assert os.stat(path).st_mode & 0o777 == 0o600
     assert store.lock_path.exists()
+
+
+def test_shadow_success_is_idempotent_across_runs(tmp_path):
+    annotation, _ = _annotation()
+    store = EAxisShadowStore(tmp_path / "e-shadow.jsonl")
+    assert store.append(annotation) is True
+
+    replay = copy.deepcopy(annotation)
+    replay["run_id"] = "run-2"
+    replay["scored_at"] = "2026-07-29T00:00:00+00:00"
+    assert store.append(replay) is False
+    assert store.load() == [annotation]
 
 
 def test_shadow_store_reordered_object_keys_are_the_same_normalized_row(
@@ -132,15 +188,17 @@ def test_shadow_store_reordered_object_keys_are_the_same_normalized_row(
     "mutate",
     [
         lambda row: row["score"].update(valence=-0.75),
-        lambda row: row.update(scored_at="2026-07-28T00:00:01+00:00"),
         lambda row: row.update(status="failed", category="provider.error"),
         lambda row: row.update(category="provider.error"),
         lambda row: row.update(bucket_id="bucket-2"),
         lambda row: row.update(source_digest="b" * 64),
-        lambda row: row.update(scorer="e-shadow-v2"),
+        lambda row: row.update(source_kind="manual_bucket"),
+        lambda row: row.update(source_run_id="manual-run-2"),
+        lambda row: row.update(provider="provider-b"),
+        lambda row: row.update(scorer="e-shadow-v3"),
         lambda row: row.update(model="model-b"),
         lambda row: row.update(rubric_version="rubric-2"),
-        lambda row: row.update(contract_version=2),
+        lambda row: row.update(contract_version=3),
         lambda row: row.update(shadow_only=False),
         lambda row: row.update(affects_ranking=True),
         lambda row: row.update(extra="not-allowed"),
@@ -164,32 +222,57 @@ def test_shadow_store_rejects_any_changed_row_for_existing_key(tmp_path, mutate)
     assert store.load() == [annotation]
 
 
-def test_shadow_store_failure_key_replay_must_match_category_and_time(tmp_path):
-    row = build_failure_record(
+def test_shadow_failure_replay_is_per_run_and_idempotent_within_run(tmp_path):
+    first = build_failure_record(
         bucket_id="bucket-1",
         source_digest="a" * 64,
+        source_kind="lmc5_candidate",
+        source_run_id="lmc5-night-20260728",
+        provider="provider",
         scorer="scorer",
         model="model",
         rubric_version="v1",
+        run_id="run-1",
+        trigger_reason="keyword.emotion",
         category="schema.missing",
+        retryable=False,
     )
     path = tmp_path / "e-shadow.jsonl"
     store = EAxisShadowStore(path)
-    assert store.append(row) is True
-    assert store.append(dict(reversed(list(row.items())))) is False
+    assert store.append(first) is True
+    assert store.append(dict(reversed(list(first.items())))) is False
 
-    for field, changed_value in (
-        ("category", "schema.unexpected"),
-        ("scored_at", "1900-01-01T00:00:00+00:00"),
-    ):
-        changed = copy.deepcopy(row)
+    replay = copy.deepcopy(first)
+    replay["scored_at"] = "1900-01-01T00:00:00+00:00"
+    assert store.append(replay) is False
+
+    second = build_failure_record(
+        bucket_id="bucket-1",
+        source_digest="a" * 64,
+        source_kind="lmc5_candidate",
+        source_run_id="lmc5-night-20260728",
+        provider="provider",
+        scorer="scorer",
+        model="model",
+        rubric_version="v1",
+        run_id="run-2",
+        trigger_reason="keyword.emotion",
+        category="schema.missing",
+        retryable=False,
+        scored_at="2026-07-29T00:00:00+00:00",
+    )
+    assert second["annotation_key"] != first["annotation_key"]
+    assert store.append(second) is True
+
+    for field, changed_value in (("category", "schema.unexpected"),):
+        changed = copy.deepcopy(first)
         changed[field] = changed_value
         with pytest.raises(
             EAxisShadowConflictError,
             match="annotation_key conflict",
         ):
             store.append(changed)
-    assert store.load() == [row]
+    assert store.load() == [first, second]
 
 
 def test_shadow_store_corruption_fails_closed(tmp_path):
@@ -284,7 +367,7 @@ def test_min_confidence_must_be_finite_number_in_range(value):
     "mutate",
     [
         lambda row: row.pop("contract_version"),
-        lambda row: row.update(contract_version=2),
+        lambda row: row.update(contract_version=3),
         lambda row: row.update(extra="not-allowed"),
         lambda row: row.update(shadow_only=False),
         lambda row: row.update(annotation_key="0" * 64),
@@ -314,20 +397,65 @@ def test_shadow_store_strictly_parses_raw_ledger_json(tmp_path, raw):
         EAxisShadowStore(path).load()
 
 
+def test_shadow_store_load_rejects_broken_symlink_instead_of_seeing_empty(
+    tmp_path,
+):
+    path = tmp_path / ".axis" / "e-shadow.jsonl"
+    path.parent.mkdir()
+    path.symlink_to(tmp_path / "outside-missing.jsonl")
+
+    with pytest.raises(ValueError, match="unsafe E shadow storage"):
+        EAxisShadowStore(path, maintenance_root=tmp_path).load()
+
+
 def test_failure_record_stores_no_payload_or_content():
     row = build_failure_record(
         bucket_id="bucket-1",
         source_digest="a" * 64,
+        source_kind="lmc5_candidate",
+        source_run_id="lmc5-night-20260728",
+        provider="provider",
         scorer="scorer",
         model="model",
         rubric_version="v1",
+        run_id="run-1",
+        trigger_reason="type.preference",
         category="schema.missing",
+        retryable=False,
     )
     assert row["status"] == "failed"
     assert row["contract_version"] == CONTRACT_VERSION
     assert row["shadow_only"] is True
     assert row["affects_ranking"] is False
     assert "score" not in row and "content" not in row and "raw" not in row
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "source_run_id"),
+    [
+        ("contains space", "lmc5-night-20260728"),
+        ("lmc5_candidate", "contains space"),
+    ],
+)
+def test_failure_record_requires_machine_source_provenance(
+    source_kind,
+    source_run_id,
+):
+    with pytest.raises(ValueError, match="machine text"):
+        build_failure_record(
+            bucket_id="bucket-1",
+            source_digest="a" * 64,
+            source_kind=source_kind,
+            source_run_id=source_run_id,
+            provider="provider",
+            scorer="scorer",
+            model="model",
+            rubric_version="v1",
+            run_id="run-1",
+            trigger_reason="type.preference",
+            category="schema.missing",
+            retryable=False,
+        )
 
 
 class _RawRequest:
@@ -375,14 +503,38 @@ def _route_payload(content: str):
     return {
         "bucket_id": "bucket-1",
         "source_digest": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-        "scorer": "e-shadow-v1",
+        "provider": "provider-a",
+        "scorer": "e-shadow-v2",
         "model": "model-a",
         "rubric_version": "rubric-1",
+        "run_id": "manual-run-1",
+        "trigger_reason": "manual.api",
         "score": _score(),
     }
 
 
 async def _call_shadow_route(monkeypatch, tmp_path, raw, *, min_confidence=0.3):
+    if "jieba" not in sys.modules:
+        fake_jieba = ModuleType("jieba")
+        fake_jieba.cut = lambda text: tuple(str(text))
+        fake_jieba.initialize = lambda: None
+        monkeypatch.setitem(sys.modules, "jieba", fake_jieba)
+    if "rapidfuzz" not in sys.modules:
+        fake_rapidfuzz = ModuleType("rapidfuzz")
+        fake_rapidfuzz.fuzz = SimpleNamespace(
+            ratio=lambda *_args, **_kwargs: 0,
+            partial_ratio=lambda *_args, **_kwargs: 0,
+            token_set_ratio=lambda *_args, **_kwargs: 0,
+        )
+        monkeypatch.setitem(sys.modules, "rapidfuzz", fake_rapidfuzz)
+    if "openai" not in sys.modules:
+        fake_openai = ModuleType("openai")
+        class _FakeOpenAI:
+            def __init__(self, *_args, **_kwargs):
+                pass
+        fake_openai.OpenAI = _FakeOpenAI
+        fake_openai.AsyncOpenAI = _FakeOpenAI
+        monkeypatch.setitem(sys.modules, "openai", fake_openai)
     import server
 
     async def _inline_to_thread(function, *args, **kwargs):
@@ -410,20 +562,23 @@ async def _call_shadow_route(monkeypatch, tmp_path, raw, *, min_confidence=0.3):
     return response.status_code, body, store
 
 
-@pytest.mark.asyncio
-async def test_shadow_route_is_read_only_and_duplicate_write_is_idempotent(
+def test_shadow_route_is_read_only_and_duplicate_write_is_idempotent(
     monkeypatch,
     tmp_path,
 ):
     payload = _route_payload("current memory")
     raw = json.dumps(payload, separators=(",", ":"))
 
-    status, body, store = await _call_shadow_route(monkeypatch, tmp_path, raw)
+    status, body, store = asyncio.run(
+        _call_shadow_route(monkeypatch, tmp_path, raw)
+    )
     assert status == 200
     assert body["added"] is True
     assert body["memory_mutated"] is False
 
-    status, body, _ = await _call_shadow_route(monkeypatch, tmp_path, raw)
+    status, body, _ = asyncio.run(
+        _call_shadow_route(monkeypatch, tmp_path, raw)
+    )
     assert status == 200
     assert body["added"] is False
     rows = store.load()
@@ -431,16 +586,17 @@ async def test_shadow_route_is_read_only_and_duplicate_write_is_idempotent(
     assert rows[0]["status"] == "success"
 
 
-@pytest.mark.asyncio
-async def test_shadow_route_rejects_stale_digest_without_memory_mutation(
+def test_shadow_route_rejects_stale_digest_without_memory_mutation(
     monkeypatch,
     tmp_path,
 ):
     payload = _route_payload("stale memory")
-    status, body, store = await _call_shadow_route(
-        monkeypatch,
-        tmp_path,
-        json.dumps(payload),
+    status, body, store = asyncio.run(
+        _call_shadow_route(
+            monkeypatch,
+            tmp_path,
+            json.dumps(payload),
+        )
     )
     assert status == 409
     assert "does not match" in body["error"]
@@ -450,7 +606,6 @@ async def test_shadow_route_rejects_stale_digest_without_memory_mutation(
     assert rows[0]["category"] == "source_digest.mismatch"
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "raw",
     [
@@ -479,30 +634,33 @@ async def test_shadow_route_rejects_stale_digest_without_memory_mutation(
         ),
     ],
 )
-async def test_shadow_route_rejects_non_strict_raw_json(monkeypatch, tmp_path, raw):
-    status, body, store = await _call_shadow_route(
-        monkeypatch,
-        tmp_path,
-        raw,
+def test_shadow_route_rejects_non_strict_raw_json(monkeypatch, tmp_path, raw):
+    status, body, store = asyncio.run(
+        _call_shadow_route(
+            monkeypatch,
+            tmp_path,
+            raw,
+        )
     )
     assert status == 400
     assert body["error"] == "invalid JSON"
     assert store.load() == []
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("min_confidence", [float("nan"), float("inf"), 10 ** 400])
-async def test_shadow_route_fails_closed_on_invalid_min_confidence(
+def test_shadow_route_fails_closed_on_invalid_min_confidence(
     monkeypatch,
     tmp_path,
     min_confidence,
 ):
     payload = _route_payload("current memory")
-    status, body, store = await _call_shadow_route(
-        monkeypatch,
-        tmp_path,
-        json.dumps(payload),
-        min_confidence=min_confidence,
+    status, body, store = asyncio.run(
+        _call_shadow_route(
+            monkeypatch,
+            tmp_path,
+            json.dumps(payload),
+            min_confidence=min_confidence,
+        )
     )
     assert status == 503
     assert body["error"] == "invalid E shadow min_confidence config"

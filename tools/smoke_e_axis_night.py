@@ -1,148 +1,134 @@
-"""Dependency-light smoke for the production E-axis shadow job."""
+"""Dependency-light fake-provider smoke for E0 shadow collection."""
 
 from __future__ import annotations
 
 import asyncio
-import copy
+import hashlib
 import json
+import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
-from e_axis_night import (
-    EAxisNightError,
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from e_axis_night import (  # noqa: E402
+    EAxisRunJournal,
     StrictEAxisScorer,
-    _eligible_lmc5_bucket,
     run_e_axis_shadow,
 )
-from e_axis_shadow import EAxisShadowStore
+from e_axis_shadow import EAxisShadowStore  # noqa: E402
 
 
-def bucket(bucket_id: str, content: str, *, ordinary: bool = False) -> dict:
-    return {
-        "id": bucket_id,
-        "content": content,
-        "metadata": {
-            "name": bucket_id,
-            "created": "2026-07-29T10:00:00+00:00",
-            "tags": (
-                ["ordinary"] if ordinary else ["lmc5", "night", "event"]
-            ),
-            "curated_write_key": "lmc5-x:v1:" + "b" * 64,
-            "curated_payload_sha256": "c" * 64,
-            "vector_policy": "required",
-            "lmc5_recall_state": "ready_vector",
-            "x_provenance": {
-                "source_kind": "conversation",
-                "source_session": "smoke",
-                "source_event_ids": ["event-1"],
-                "source_digest": "a" * 64,
-            },
+def candidate():
+    base_digest = hashlib.sha256(b"preference").hexdigest()
+    payload = json.dumps({
+        "axis": "X",
+        "base_digest": base_digest,
+        "draft": {
+            "type": "preference",
+            "title": "response preference",
+            "content": "I prefer direct answers.",
+            "relation_hints": [],
         },
-    }
+        "origin_run_id": "lmc5-night-smoke",
+        "schema": "ombre.lmc5-axis-candidate/v1",
+        "source": {"created_at": "2026-07-31T00:00:00+00:00"},
+    }, sort_keys=True, separators=(",", ":")).encode()
+    return SimpleNamespace(candidate_id=1, axis="X", payload=payload)
 
 
-class Buckets:
-    def __init__(self, rows: list[dict]) -> None:
-        self.rows = copy.deepcopy(rows)
-
-    async def list_all(self, **kwargs):
-        assert kwargs == {
-            "include_archive": False,
-            "include_nsfw": False,
-        }
-        return copy.deepcopy(self.rows)
+class Ledger:
+    def list_candidates(self, status, *, limit, after=None):
+        if status == "pending" and not after:
+            return (candidate(),)
+        return ()
 
 
 class Provider:
-    def __init__(self) -> None:
+    def __init__(self, output):
+        self.output = output
         self.calls = 0
 
-    def __call__(self, prompt: str) -> dict:
+    def __call__(self, prompt):
         self.calls += 1
-        assert "Do not infer hidden motives" in prompt
-        return {
-            "choices": [
-                {
-                    "finish_reason": "stop",
-                    "message": {
-                        "content": json.dumps(
-                            {
-                                "valence": 0.4,
-                                "arousal": 0.3,
-                                "tension": 0.2,
-                                "confidence": 0.9,
-                                "response_tendency": "engage",
-                                "growth_delta": "stable",
-                            }
-                        )
-                    },
-                }
-            ]
-        }
+        if isinstance(self.output, BaseException):
+            raise self.output
+        return self.output
 
 
-async def smoke() -> None:
-    lmc = bucket("lmc", "redacted derived event")
-    ordinary = bucket("ordinary", "private ordinary memory", ordinary=True)
-    assert _eligible_lmc5_bucket(lmc)
-    assert not _eligible_lmc5_bucket(ordinary)
+def envelope(content):
+    return {
+        "choices": [{
+            "finish_reason": "stop",
+            "message": {"content": content},
+        }]
+    }
 
-    provider = Provider()
-    scorer = StrictEAxisScorer(
+
+def scorer(provider):
+    return StrictEAxisScorer(
         provider,
-        model="smoke-model",
-        scorer_name="smoke-scorer",
-        rubric_version="smoke-rubric-v1",
+        provider_name="fake-provider",
+        model="fake-model",
+        scorer_name="fake-scorer",
+        rubric_version="fake-rubric",
     )
+
+
+async def smoke():
+    good = Provider(envelope(json.dumps({
+        "valence": 0.4,
+        "arousal": 0.3,
+        "tension": 0.2,
+        "confidence": 0.9,
+        "response_tendency": "engage",
+        "growth_delta": "stable",
+    })))
     with tempfile.TemporaryDirectory(prefix="e-axis-smoke-") as raw:
+        root = Path(raw)
         store = EAxisShadowStore(
-            Path(raw) / ".axis" / "e-shadow.jsonl",
-            maintenance_root=raw,
+            root / ".axis" / "e-shadow.jsonl",
+            maintenance_root=root,
         )
-        manager = Buckets([ordinary, lmc])
+        journal = EAxisRunJournal(
+            root / ".axis",
+            maintenance_root=root,
+        )
         first = await run_e_axis_shadow(
-            bucket_manager=manager,
+            ledger=Ledger(),
             store=store,
-            scorer=scorer,
+            journal=journal,
+            scorer=scorer(good),
+            run_id="smoke-success",
         )
-        assert first.eligible == 1
-        assert first.attempted == 1
-        assert first.added == 1
-        assert first.failed == 0
-        assert provider.calls == 1
-        assert manager.rows == [ordinary, lmc]
-        rows = store.load()
-        assert len(rows) == 1
-        assert rows[0]["bucket_id"] == "lmc"
-        assert rows[0]["shadow_only"] is True
-        assert rows[0]["affects_ranking"] is False
+        assert first.added == 1 and first.failed == 0
+        assert good.calls == 1
+        assert store.load()[0]["affects_ranking"] is False
 
-        second = await run_e_axis_shadow(
-            bucket_manager=manager,
-            store=store,
-            scorer=scorer,
-        )
-        assert second.attempted == 0
-        assert second.existing == 1
-        assert provider.calls == 1
-
-    incomplete = StrictEAxisScorer(
-        lambda _: {
-            "choices": [
-                {
-                    "finish_reason": "length",
-                    "message": {"content": "{}"},
-                }
-            ]
-        },
-        model="smoke-model",
-    )
-    try:
-        incomplete.score(title="title", content="content")
-    except EAxisNightError as exc:
-        assert exc.code == "provider.incomplete"
-    else:
-        raise AssertionError("incomplete provider output was accepted")
+    for name, output in (
+        ("empty", envelope("")),
+        ("timeout", TimeoutError()),
+    ):
+        with tempfile.TemporaryDirectory(prefix=f"e-axis-{name}-") as raw:
+            root = Path(raw)
+            store = EAxisShadowStore(
+                root / ".axis" / "e-shadow.jsonl",
+                maintenance_root=root,
+            )
+            journal = EAxisRunJournal(
+                root / ".axis",
+                maintenance_root=root,
+            )
+            result = await run_e_axis_shadow(
+                ledger=Ledger(),
+                store=store,
+                journal=journal,
+                scorer=scorer(Provider(output)),
+                run_id=f"smoke-{name}",
+            )
+            assert result.failed_retryable == 1
+            assert store.load()[0]["status"] == "failed"
 
 
 if __name__ == "__main__":

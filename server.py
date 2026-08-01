@@ -5766,7 +5766,7 @@ async def api_e_axis_shadow(request):
     if not _review_write_api_enabled():
         return JSONResponse({"error": "OMBRE_API_TOKEN required for E shadow writes"}, status_code=503)
     e_cfg = config.get("e_axis_shadow", {}) or {}
-    if e_cfg.get("enabled", True) is not True:
+    if e_cfg.get("enabled") is not True:
         return JSONResponse({"error": "E shadow is disabled"}, status_code=409)
     try:
         body = strict_json_loads(await request.body())
@@ -5775,9 +5775,12 @@ async def api_e_axis_shadow(request):
     required = {
         "bucket_id",
         "source_digest",
+        "provider",
         "scorer",
         "model",
         "rubric_version",
+        "run_id",
+        "trigger_reason",
         "score",
     }
     if type(body) is not dict or set(body) != required:
@@ -5794,18 +5797,30 @@ async def api_e_axis_shadow(request):
     ).hexdigest()
 
     scorer = body.get("scorer")
+    provider = body.get("provider")
     model = body.get("model")
     rubric_version = body.get("rubric_version")
+    run_id = body.get("run_id")
+    trigger_reason = body.get("trigger_reason")
+    manual_source_run_id = "manual:" + hashlib.sha256(
+        str(run_id or "").encode("utf-8")
+    ).hexdigest()
     supplied_digest = str(body.get("source_digest") or "").strip().lower()
     store = _get_e_axis_shadow_store()
     if supplied_digest != current_digest:
         failure = build_failure_record(
             bucket_id=bucket_id,
             source_digest=current_digest,
+            source_kind="manual_bucket",
+            source_run_id=manual_source_run_id,
+            provider=provider,
             scorer=scorer,
             model=model,
             rubric_version=rubric_version,
+            run_id=run_id,
+            trigger_reason=trigger_reason,
             category="source_digest.mismatch",
+            retryable=False,
         )
         try:
             await asyncio.to_thread(store.append, failure)
@@ -5822,9 +5837,14 @@ async def api_e_axis_shadow(request):
     annotation, error = build_shadow_annotation(
         bucket_id=bucket_id,
         source_digest=current_digest,
+        source_kind="manual_bucket",
+        source_run_id=manual_source_run_id,
+        provider=provider,
         scorer=scorer,
         model=model,
         rubric_version=rubric_version,
+        run_id=run_id,
+        trigger_reason=trigger_reason,
         score=body.get("score"),
         min_confidence=min_confidence,
     )
@@ -5832,10 +5852,16 @@ async def api_e_axis_shadow(request):
         failure = build_failure_record(
             bucket_id=bucket_id,
             source_digest=current_digest,
+            source_kind="manual_bucket",
+            source_run_id=manual_source_run_id,
+            provider=provider,
             scorer=scorer,
             model=model,
             rubric_version=rubric_version,
+            run_id=run_id,
+            trigger_reason=trigger_reason,
             category=error,
+            retryable=False,
         )
         try:
             await asyncio.to_thread(store.append, failure)
