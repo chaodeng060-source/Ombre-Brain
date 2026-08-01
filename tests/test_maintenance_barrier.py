@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import queue
 import sqlite3
+import stat
 import threading
 from pathlib import Path
 
@@ -33,6 +34,10 @@ def _database(path: Path, value: str) -> None:
 def _value(path: Path) -> str:
     with sqlite3.connect(path) as connection:
         return str(connection.execute("SELECT value FROM state").fetchone()[0])
+
+
+def _fd_count() -> int:
+    return len(tuple(Path("/proc/self/fd").iterdir()))
 
 
 def _child_shared_lease(root: str, events) -> None:
@@ -261,6 +266,278 @@ def test_explicit_vault_root_gives_every_store_the_same_lock_path(tmp_path):
     assert ledger._maintenance_barrier.lock_path == expected
     assert review._maintenance_barrier.lock_path == expected
     assert shadow._maintenance_barrier.lock_path == expected
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dirfd race contract")
+def test_real_root_swap_during_open_fails_before_lock_directory_creation(
+    tmp_path,
+    monkeypatch,
+):
+    parent = tmp_path / "owned"
+    root = parent / "vault"
+    root.mkdir(parents=True)
+    replacement = parent / "replacement"
+    replacement.mkdir()
+    parked = parent / "parked"
+    directory_flags = barrier_module._directory_flags()
+    real_open = barrier_module.os.open
+    swapped = False
+
+    def swap_after_stat(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if path == "vault" and dir_fd is not None and not swapped:
+            swapped = True
+            root.rename(parked)
+            replacement.rename(root)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(barrier_module.os, "open", swap_after_stat)
+    monkeypatch.setattr(
+        barrier_module,
+        "_directory_flags",
+        lambda: directory_flags,
+    )
+
+    with pytest.raises(
+        MaintenanceBarrierError,
+        match="ancestor identity changed",
+    ):
+        MaintenanceBarrier(root)
+
+    assert swapped
+    assert not (root / ".locks").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX fchmod race contract")
+def test_lock_directory_swap_cannot_chmod_external_target(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "vault"
+    root.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    os.chmod(external, 0o755)
+    external_mode = external.stat().st_mode
+    parked = root / ".locks-parked"
+    real_fchmod = barrier_module.os.fchmod
+    swapped = False
+
+    def swap_before_fchmod(descriptor, mode):
+        nonlocal swapped
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode) and not swapped:
+            swapped = True
+            (root / ".locks").rename(parked)
+            (root / ".locks").symlink_to(external, target_is_directory=True)
+        return real_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(barrier_module.os, "fchmod", swap_before_fchmod)
+
+    with pytest.raises(
+        MaintenanceBarrierError,
+        match="lock directory identity changed",
+    ):
+        MaintenanceBarrier(root)
+
+    assert swapped
+    assert external.stat().st_mode == external_mode
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX fchmod race contract")
+def test_lock_file_swap_cannot_chmod_external_target(tmp_path, monkeypatch):
+    root = tmp_path / "vault"
+    root.mkdir()
+    barrier = MaintenanceBarrier(root)
+    external = tmp_path / "external.txt"
+    external.write_bytes(b"outside-sentinel")
+    os.chmod(external, 0o644)
+    external_mode = external.stat().st_mode
+    parked = barrier.lock_path.with_suffix(".parked")
+    real_fchmod = barrier_module.os.fchmod
+    swapped = False
+
+    def swap_before_fchmod(descriptor, mode):
+        nonlocal swapped
+        if stat.S_ISREG(os.fstat(descriptor).st_mode) and not swapped:
+            swapped = True
+            barrier.lock_path.rename(parked)
+            barrier.lock_path.symlink_to(external)
+        return real_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(barrier_module.os, "fchmod", swap_before_fchmod)
+
+    with pytest.raises(
+        MaintenanceBarrierError,
+        match="lock file identity changed",
+    ):
+        with barrier.shared():
+            pytest.fail("swapped lock unexpectedly acquired")
+
+    assert swapped
+    assert external.read_bytes() == b"outside-sentinel"
+    assert external.stat().st_mode == external_mode
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="POSIX root flock contract")
+async def test_replaced_lock_directory_cannot_split_an_exclusive_lease(tmp_path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    first = MaintenanceBarrier(root)
+
+    async with first.exclusive_async():
+        (root / ".locks").rename(root / ".locks-parked")
+        (root / ".locks").mkdir(mode=0o700)
+        second = MaintenanceBarrier(root)
+
+        async def contend():
+            async with second.shared_async(timeout=0.05):
+                pytest.fail("replacement lock directory split the lease")
+
+        with pytest.raises(MaintenanceBarrierTimeout):
+            await asyncio.create_task(contend())
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="POSIX root flock contract")
+async def test_replaced_lock_file_cannot_split_an_exclusive_lease(tmp_path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    first = MaintenanceBarrier(root)
+
+    async with first.exclusive_async():
+        first.lock_path.rename(first.lock_path.with_suffix(".parked"))
+        first.lock_path.write_bytes(b"")
+        second = MaintenanceBarrier(root)
+
+        async def contend():
+            async with second.shared_async(timeout=0.05):
+                pytest.fail("replacement lock file split the lease")
+
+        with pytest.raises(MaintenanceBarrierTimeout):
+            await asyncio.create_task(contend())
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="POSIX namespace flock contract")
+async def test_replaced_vault_root_cannot_split_an_exclusive_lease(tmp_path):
+    root = tmp_path / "vault"
+    root.mkdir()
+    first = MaintenanceBarrier(root)
+
+    async with first.exclusive_async():
+        root.rename(tmp_path / "vault-parked")
+        root.mkdir()
+        second = MaintenanceBarrier(root)
+
+        async def contend():
+            async with second.shared_async(timeout=0.05):
+                pytest.fail("replacement vault root split the lease")
+
+        with pytest.raises(MaintenanceBarrierTimeout):
+            await asyncio.create_task(contend())
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="Linux fd accounting contract",
+)
+def test_sync_registration_failure_releases_all_lock_fds(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "vault"
+    root.mkdir()
+    barrier = MaintenanceBarrier(root)
+    real_register = barrier_module._register_new
+    held_before = dict(barrier_module._HELD)
+    descriptors_before = _fd_count()
+
+    def fail_registration(*_args, **_kwargs):
+        raise RuntimeError("injected registration failure")
+
+    monkeypatch.setattr(
+        barrier_module,
+        "_register_new",
+        fail_registration,
+    )
+    with pytest.raises(RuntimeError, match="injected registration failure"):
+        with barrier.exclusive():
+            pytest.fail("failed registration unexpectedly entered")
+
+    assert _fd_count() == descriptors_before
+    assert barrier_module._HELD == held_before
+    monkeypatch.setattr(barrier_module, "_register_new", real_register)
+    with barrier.exclusive():
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="Linux fd accounting contract",
+)
+async def test_async_registration_failure_releases_all_lock_fds(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "vault"
+    root.mkdir()
+    barrier = MaintenanceBarrier(root)
+    real_register = barrier_module._register_new
+    held_before = dict(barrier_module._HELD)
+    descriptors_before = _fd_count()
+
+    def fail_registration(*_args, **_kwargs):
+        raise RuntimeError("injected async registration failure")
+
+    monkeypatch.setattr(
+        barrier_module,
+        "_register_new",
+        fail_registration,
+    )
+    with pytest.raises(RuntimeError, match="injected async registration failure"):
+        async with barrier.exclusive_async(timeout=0.1):
+            pytest.fail("failed async registration unexpectedly entered")
+
+    assert _fd_count() == descriptors_before
+    assert barrier_module._HELD == held_before
+    monkeypatch.setattr(barrier_module, "_register_new", real_register)
+    async with barrier.exclusive_async(timeout=0.1):
+        pass
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="Linux fd accounting contract",
+)
+def test_context_registration_failure_rolls_back_held_entry(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "vault"
+    root.mkdir()
+    barrier = MaintenanceBarrier(root)
+    held_before = dict(barrier_module._HELD)
+    descriptors_before = _fd_count()
+
+    class BrokenContext:
+        @staticmethod
+        def get():
+            return ()
+
+        @staticmethod
+        def set(_value):
+            raise RuntimeError("injected context failure")
+
+    monkeypatch.setattr(barrier_module, "_LEASE_CONTEXT", BrokenContext())
+
+    with pytest.raises(RuntimeError, match="injected context failure"):
+        with barrier.exclusive():
+            pytest.fail("failed context registration unexpectedly entered")
+
+    assert _fd_count() == descriptors_before
+    assert barrier_module._HELD == held_before
 
 
 def test_snapshot_exclusive_lease_prevents_mixed_sqlite_timepoints(

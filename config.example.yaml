@@ -87,11 +87,21 @@ metabolism:
   mode: report_only               # exact enum: report_only | apply
 
 # --- XYZME experience axis / E 轴体验信号 ---
-# 严格验证后只写 <buckets_dir>/.axis/e-shadow.jsonl；绝不覆盖现有 valence/arousal，
-# 不参与 decay、RRF、relation 或任何排序。每条标注必须绑定当前正文 SHA-256。
+# E0 同时只读扫描 LMC-5 已脱敏 candidate 和五个固定 curated Markdown 根：
+# permanent / dynamic / archive / feel / 涩涩。只写 <buckets_dir>/.axis/ 私有 sidecar；
+# 绝不覆盖记忆或参与 decay、RRF、relation、召回与排序。manual API 由服务端标记
+# source_kind=manual_bucket，完全排除于正式 cohort、自然日、分布和晋级证据。
+# enabled 只是运行配置，不代表生产已部署；镜像与独立 cron 仍必须通过部署闸。
 e_axis_shadow:
-  enabled: true
+  enabled: true                        # absent/false fails closed
   min_confidence: 0.3
+  provider_name: "deepseek"           # required real provider lineage; no generic default
+  model: "deepseek-chat"              # may differ from dehydration.model
+  rubric_version: "lmc5-experience-20260731-v1"
+  max_per_run: 20                     # oldest eligible backlog first, 1..100
+  max_tokens: 512                     # strict six-field JSON only, 512..2048
+  max_content_chars: 12000            # longer input fails explicitly; never truncates silently
+  temperature: 0.0
 
 # --- Decay parameters / 记忆衰减参数 ---
 # 计算艾宾浩斯衰减候选；是否自动归档由 metabolism.mode 控制。

@@ -10,11 +10,15 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from e_axis_storage import (
+    EAxisStorageError,
+    open_secure_e_axis_jsonl,
+    secure_e_axis_lock,
+)
 from maintenance_barrier import MaintenanceBarrier
-from storage_safety import advisory_file_lock
 
 
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 SCORE_FIELDS = frozenset({
     "valence",
     "arousal",
@@ -26,15 +30,21 @@ SCORE_FIELDS = frozenset({
 RESPONSE_TENDENCIES = frozenset({"comfort", "engage", "withdraw", "alert"})
 GROWTH_DELTAS = frozenset({"growth", "stable", "setback"})
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_MACHINE_TEXT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
 _SUCCESS_ROW_FIELDS = frozenset({
     "contract_version",
     "annotation_key",
     "status",
     "bucket_id",
     "source_digest",
+    "source_kind",
+    "source_run_id",
+    "provider",
     "scorer",
     "model",
     "rubric_version",
+    "run_id",
+    "trigger_reason",
     "scored_at",
     "shadow_only",
     "affects_ranking",
@@ -46,10 +56,16 @@ _FAILURE_ROW_FIELDS = frozenset({
     "status",
     "bucket_id",
     "source_digest",
+    "source_kind",
+    "source_run_id",
+    "provider",
     "scorer",
     "model",
     "rubric_version",
+    "run_id",
+    "trigger_reason",
     "category",
+    "retryable",
     "scored_at",
     "shadow_only",
     "affects_ranking",
@@ -164,6 +180,13 @@ def _required_text(value, field: str, max_length: int = 160) -> str:
     return normalized
 
 
+def _required_machine_text(value, field: str) -> str:
+    normalized = _required_text(value, field)
+    if _MACHINE_TEXT_RE.fullmatch(normalized) is None:
+        raise ValueError(f"{field} must be machine text")
+    return normalized
+
+
 def _normalized_timestamp(value, field: str = "scored_at") -> str:
     try:
         parsed = datetime.fromisoformat(str(value))
@@ -177,6 +200,9 @@ def _normalized_timestamp(value, field: str = "scored_at") -> str:
 def _success_key(
     bucket_id: str,
     source_digest: str,
+    source_kind: str,
+    source_run_id: str,
+    provider: str,
     scorer: str,
     model: str,
     rubric_version: str,
@@ -184,6 +210,9 @@ def _success_key(
     key_material = "\x1f".join((
         bucket_id,
         source_digest,
+        source_kind,
+        source_run_id,
+        provider,
         scorer,
         model,
         rubric_version,
@@ -194,18 +223,28 @@ def _success_key(
 def _failure_key(
     bucket_id: str,
     source_digest: str,
+    source_kind: str,
+    source_run_id: str,
+    provider: str,
     scorer: str,
     model: str,
     rubric_version: str,
     category: str,
+    retryable: bool,
+    run_id: str,
 ) -> str:
     material = "\x1f".join((
         bucket_id,
         source_digest,
+        source_kind,
+        source_run_id,
+        provider,
         scorer,
         model,
         rubric_version,
         category,
+        "retryable" if retryable else "terminal",
+        run_id,
     ))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
@@ -214,9 +253,14 @@ def build_shadow_annotation(
     *,
     bucket_id: str,
     source_digest: str,
+    source_kind: str,
+    source_run_id: str,
+    provider: str,
     scorer: str,
     model: str,
     rubric_version: str,
+    run_id: str,
+    trigger_reason: str,
     score,
     scored_at: str | None = None,
     min_confidence: float = 0.3,
@@ -224,9 +268,14 @@ def build_shadow_annotation(
     """Build one immutable success record or return a categorized failure."""
     try:
         bucket_id = _required_text(bucket_id, "bucket_id")
+        source_kind = _required_machine_text(source_kind, "source_kind")
+        source_run_id = _required_machine_text(source_run_id, "source_run_id")
+        provider = _required_text(provider, "provider")
         scorer = _required_text(scorer, "scorer")
         model = _required_text(model, "model")
         rubric_version = _required_text(rubric_version, "rubric_version")
+        run_id = _required_text(run_id, "run_id")
+        trigger_reason = _required_text(trigger_reason, "trigger_reason")
     except ValueError:
         return None, "schema.provenance"
 
@@ -252,6 +301,9 @@ def build_shadow_annotation(
     annotation_key = _success_key(
         bucket_id,
         source_digest,
+        source_kind,
+        source_run_id,
+        provider,
         scorer,
         model,
         rubric_version,
@@ -262,9 +314,14 @@ def build_shadow_annotation(
         "status": "success",
         "bucket_id": bucket_id,
         "source_digest": source_digest,
+        "source_kind": source_kind,
+        "source_run_id": source_run_id,
+        "provider": provider,
         "scorer": scorer,
         "model": model,
         "rubric_version": rubric_version,
+        "run_id": run_id,
+        "trigger_reason": trigger_reason,
         "scored_at": scored_at,
         "shadow_only": True,
         "affects_ranking": False,
@@ -276,36 +333,65 @@ def build_failure_record(
     *,
     bucket_id: str,
     source_digest: str,
+    source_kind: str,
+    source_run_id: str,
+    provider: str,
     scorer: str,
     model: str,
     rubric_version: str,
+    run_id: str,
+    trigger_reason: str,
     category: str,
+    retryable: bool,
+    scored_at: str | None = None,
 ):
     """Build a failure row without storing model output or memory content."""
     bucket_id = str(bucket_id or "").strip()[:160]
     source_digest = str(source_digest or "").strip().lower()[:64]
+    source_kind = _required_machine_text(source_kind, "source_kind")
+    source_run_id = _required_machine_text(source_run_id, "source_run_id")
+    provider = str(provider or "").strip()[:160]
     scorer = str(scorer or "").strip()[:160]
     model = str(model or "").strip()[:160]
     rubric_version = str(rubric_version or "").strip()[:160]
+    run_id = str(run_id or "").strip()[:160]
+    trigger_reason = str(trigger_reason or "").strip()[:160]
     category = str(category or "unknown").strip()[:160]
+    if type(retryable) is not bool:
+        raise ValueError("retryable must be a boolean")
+    if scored_at is None:
+        scored_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    else:
+        scored_at = _normalized_timestamp(scored_at)
     return {
         "contract_version": CONTRACT_VERSION,
         "annotation_key": _failure_key(
             bucket_id,
             source_digest,
+            source_kind,
+            source_run_id,
+            provider,
             scorer,
             model,
             rubric_version,
             category,
+            retryable,
+            run_id,
         ),
         "status": "failed",
         "bucket_id": bucket_id,
         "source_digest": source_digest,
+        "source_kind": source_kind,
+        "source_run_id": source_run_id,
+        "provider": provider,
         "scorer": scorer,
         "model": model,
         "rubric_version": rubric_version,
+        "run_id": run_id,
+        "trigger_reason": trigger_reason,
         "category": category,
-        "scored_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "retryable": retryable,
+        "scored_at": scored_at,
         "shadow_only": True,
         "affects_ranking": False,
     }
@@ -333,7 +419,6 @@ class EAxisShadowStore:
             if maintenance_root is not None
             else parent.parent if parent.name.startswith(".") else parent
         )
-        root.mkdir(parents=True, mode=0o700, exist_ok=True)
         self._maintenance_barrier = MaintenanceBarrier(root)
 
     @staticmethod
@@ -361,11 +446,25 @@ class EAxisShadowStore:
         if type(source_digest) is not str or not _SHA256_RE.fullmatch(source_digest):
             raise ValueError("invalid source digest")
         bucket_id = _required_text(row.get("bucket_id"), "bucket_id")
+        source_kind = _required_machine_text(
+            row.get("source_kind"),
+            "source_kind",
+        )
+        source_run_id = _required_machine_text(
+            row.get("source_run_id"),
+            "source_run_id",
+        )
+        provider = _required_text(row.get("provider"), "provider")
         scorer = _required_text(row.get("scorer"), "scorer")
         model = _required_text(row.get("model"), "model")
         rubric_version = _required_text(
             row.get("rubric_version"),
             "rubric_version",
+        )
+        run_id = _required_text(row.get("run_id"), "run_id")
+        trigger_reason = _required_text(
+            row.get("trigger_reason"),
+            "trigger_reason",
         )
         scored_at = _normalized_timestamp(row.get("scored_at"))
 
@@ -379,19 +478,30 @@ class EAxisShadowStore:
             expected_key = _success_key(
                 bucket_id,
                 source_digest,
+                source_kind,
+                source_run_id,
+                provider,
                 scorer,
                 model,
                 rubric_version,
             )
         else:
             category = _required_text(row.get("category"), "category")
+            retryable = row.get("retryable")
+            if type(retryable) is not bool:
+                raise ValueError("retryable must be a boolean")
             expected_key = _failure_key(
                 bucket_id,
                 source_digest,
+                source_kind,
+                source_run_id,
+                provider,
                 scorer,
                 model,
                 rubric_version,
                 category,
+                retryable,
+                run_id,
             )
         if annotation_key != expected_key:
             raise ValueError("annotation key does not match row identity")
@@ -402,9 +512,14 @@ class EAxisShadowStore:
             "status": status,
             "bucket_id": bucket_id,
             "source_digest": source_digest,
+            "source_kind": source_kind,
+            "source_run_id": source_run_id,
+            "provider": provider,
             "scorer": scorer,
             "model": model,
             "rubric_version": rubric_version,
+            "run_id": run_id,
+            "trigger_reason": trigger_reason,
             "scored_at": scored_at,
             "shadow_only": True,
             "affects_ranking": False,
@@ -413,7 +528,18 @@ class EAxisShadowStore:
             normalized["score"] = normalized_score
         else:
             normalized["category"] = category
+            normalized["retryable"] = retryable
         return normalized
+
+    @staticmethod
+    def _same_logical_row(left: dict, right: dict) -> bool:
+        """Ignore per-attempt timestamps while preserving score immutability."""
+        left = dict(left)
+        right = dict(right)
+        for row in (left, right):
+            row.pop("run_id", None)
+            row.pop("scored_at", None)
+        return left == right
 
     @staticmethod
     def _validate_row(row: dict) -> bool:
@@ -458,11 +584,20 @@ class EAxisShadowStore:
         return rows
 
     def load(self) -> list[dict]:
-        with advisory_file_lock(self.lock_path):
-            if not self.path.exists():
-                return []
-            with open(self.path, "r", encoding="utf-8") as handle:
-                return self._load_locked(handle)
+        try:
+            with secure_e_axis_lock(self.lock_path):
+                try:
+                    self.path.lstat()
+                except FileNotFoundError:
+                    return []
+                except OSError as exc:
+                    raise ValueError(
+                        "E shadow ledger is unavailable"
+                    ) from exc
+                with open_secure_e_axis_jsonl(self.path) as handle:
+                    return self._load_locked(handle)
+        except EAxisStorageError as exc:
+            raise ValueError("unsafe E shadow storage") from exc
 
     def append(self, row: dict) -> bool:
         with self._maintenance_barrier.shared():
@@ -474,14 +609,9 @@ class EAxisShadowStore:
         key = row.get("annotation_key")
         if type(key) is not str or not _SHA256_RE.fullmatch(key):
             raise ValueError("invalid E shadow row")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with advisory_file_lock(self.lock_path):
-            fd = None
+        with secure_e_axis_lock(self.lock_path):
             try:
-                fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
-                handle = os.fdopen(fd, "r+", encoding="utf-8")
-                fd = None  # os.fdopen owns and closes it from this point.
-                with handle:
+                with open_secure_e_axis_jsonl(self.path) as handle:
                     rows = self._load_locked(handle)
                     existing = next(
                         (
@@ -498,7 +628,7 @@ class EAxisShadowStore:
                             raise EAxisShadowConflictError(
                                 "E shadow annotation_key conflict"
                             ) from exc
-                        if existing == normalized:
+                        if self._same_logical_row(existing, normalized):
                             return False
                         raise EAxisShadowConflictError(
                             "E shadow annotation_key conflict"
@@ -518,8 +648,6 @@ class EAxisShadowStore:
                     )
                     handle.flush()
                     os.fsync(handle.fileno())
-                    os.chmod(self.path, 0o600)
                     return True
-            finally:
-                if fd is not None:
-                    os.close(fd)
+            except EAxisStorageError as exc:
+                raise ValueError("unsafe E shadow storage") from exc
