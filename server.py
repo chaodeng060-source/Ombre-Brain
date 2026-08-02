@@ -72,7 +72,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 
-from bucket_manager import BucketManager
+from bucket_manager import BucketManager, bucket_revision_hash
 from dehydrator import Dehydrator, SelfContainmentError
 from decay_engine import DecayEngine
 from consolidation_engine import ConsolidationEngine
@@ -181,6 +181,10 @@ _lmc5_night_runtime_lock = threading.Lock()
 _strict_recall_errors = contextvars.ContextVar(
     "ombre_strict_recall_errors",
     default=False,
+)
+_breath_candidate_capture = contextvars.ContextVar(
+    "ombre_breath_candidate_capture",
+    default=None,
 )
 
 
@@ -1921,6 +1925,179 @@ def _strip_arbitration_context(content: str) -> str:
     return _ARBITRATION_CONTEXT_BLOCK_RE.sub("\n", content).strip()
 
 
+async def _apply_bucket_update(
+    bucket_id: str,
+    updates: dict,
+    *,
+    entities: list[dict] | None = None,
+    actor: str = "system",
+    expected_content_hash: str = "",
+    expected_revision_hash: str = "",
+) -> bool:
+    """Apply a bucket update and keep derived indexes current.
+
+    Markdown remains the source of truth.  Embedding/entity refresh failures
+    are best-effort sidecar failures and must never turn an already committed
+    update into a second newly-created bucket.
+    """
+    committed = False
+    try:
+        async with bucket_mgr._maintenance_barrier.shared_async():
+            try:
+                success = await bucket_mgr.update(
+                    bucket_id,
+                    actor=actor,
+                    expected_content_hash=expected_content_hash,
+                    expected_revision_hash=expected_revision_hash,
+                    **updates,
+                )
+            except Exception as exc:
+                success = False
+                logger.warning(
+                    "Bucket update raised before status was known: %s: %s",
+                    bucket_id,
+                    type(exc).__name__,
+                )
+            # BucketManager writes Markdown before committing its audit row.
+            # If that later bookkeeping step fails it reports False even
+            # though the source of truth already contains the new body.  Read
+            # back once so grow cannot then create a duplicate bucket.
+            if not success and "content" in updates:
+                try:
+                    latest = await bucket_mgr.get(bucket_id)
+                except Exception:
+                    latest = None
+                latest_meta = (latest or {}).get("metadata", {}) or {}
+                landed = bool(latest)
+                for key, expected_value in updates.items():
+                    actual_value = (
+                        latest.get("content")
+                        if key == "content"
+                        else latest_meta.get(key)
+                    )
+                    if actual_value != expected_value:
+                        landed = False
+                        break
+                if landed:
+                    success = True
+                    logger.warning(
+                        "Bucket update reported failure after content landed: %s",
+                        bucket_id,
+                    )
+            if not success:
+                return False
+            committed = True
+            if "content" in updates:
+                try:
+                    await embedding_engine.generate_and_store(
+                        bucket_id,
+                        updates["content"],
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Embedding refresh after bucket update failed: %s: %s",
+                        bucket_id,
+                        type(exc).__name__,
+                    )
+    except Exception as exc:
+        logger.warning(
+            "Bucket update %s: %s: %s",
+            "post-commit cleanup failed" if committed else "failed",
+            bucket_id,
+            type(exc).__name__,
+        )
+        if not committed:
+            return False
+    if "content" in updates:
+        try:
+            await _synchronize_bucket_entities(bucket_id, updates["content"], entities)
+        except Exception as exc:
+            logger.warning(
+                "Entity refresh after bucket update failed: %s: %s",
+                bucket_id,
+                type(exc).__name__,
+            )
+    return True
+
+
+async def _recall_before_write_decision(
+    content: str,
+    world: str,
+    domain: list,
+) -> str:
+    """Run one read-only top-5 recall and return a strict three-state decision.
+
+    Any retrieval/model/parse error deliberately becomes ``new``.  Incoming
+    memory must never be dropped merely because the advisory model is down.
+    """
+    if _has_redactable_secret(content):
+        logger.info("recall-before-write skipped secret-bearing content; fallback=new")
+        return "new"
+    capture: list[dict] = []
+    capture_token = _breath_candidate_capture.set(capture)
+    try:
+        await breath(
+            query=content,
+            max_tokens=4000,
+            max_results=5,
+            domain=",".join(_metadata_list(domain)),
+            world=world,
+            relation_depth=0,
+            session_id="",
+            include_images=False,
+            include_body_state=False,
+        )
+        trusted_candidates = [
+            item
+            for item in capture[:5]
+            if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and item["id"].strip()
+        ]
+        candidate_ids = list(dict.fromkeys(
+            item["id"].strip() for item in trusted_candidates
+        ))
+        if not candidate_ids:
+            logger.info("recall-before-write found no candidate; decision=new")
+            return "new"
+        recalled_text = "\n\n".join(
+            f"<candidate bucket_id={json.dumps(item['id'], ensure_ascii=False)}>\n"
+            f"{str(item.get('summary') or '')}\n</candidate>"
+            for item in trusted_candidates
+            if item["id"].strip() in candidate_ids
+        )
+        decision = await dehydrator.arbitrate_recall_before_write(
+            content,
+            recalled_text,
+            candidate_ids,
+        )
+        if decision != "new":
+            action, separator, bucket_id = str(decision).partition(":")
+            if (
+                separator != ":"
+                or action not in {"merge", "supersede"}
+                or bucket_id not in candidate_ids
+            ):
+                raise RuntimeError(
+                    "recall-before-write adapter escaped candidate allowlist"
+                )
+            decision = f"{action}:{bucket_id}"
+        logger.info(
+            "recall-before-write decision=%s candidates=%d",
+            decision.split(":", 1)[0],
+            len(candidate_ids),
+        )
+        return decision
+    except Exception as exc:
+        logger.warning(
+            "recall-before-write failed; fallback=new: %s",
+            type(exc).__name__,
+        )
+        return "new"
+    finally:
+        _breath_candidate_capture.reset(capture_token)
+
+
 # =============================================================
 # Internal helper: merge-or-create
 # 内部辅助：检查是否可合并，可以则合并，否则新建
@@ -1938,6 +2115,7 @@ async def _merge_or_create(
     world: str = "",
     chord_tag: str = "",
     require_self_contained: bool = False,
+    recall_before_write: bool = False,
     entities: list[dict] | None = None,
 ) -> tuple[str, str, bool]:
     """
@@ -1954,10 +2132,114 @@ async def _merge_or_create(
     # 五感入口层 v1：从内容识别感官标签（嗅/味/触/听），合并与新建两路都带上。
     detected_senses = detect_senses(content)
 
-    # 合并候选必须在同一个 world 内（避免日常桶被角色记忆合并污染或反过来）。
+    # grow-only Phase 2.5: breath top-5 + small-model arbitration.  Explicit
+    # ``new`` and every arbitration failure skip the legacy heuristic merge
+    # below and go straight to the existing create path.
+    if recall_before_write:
+        decision = await _recall_before_write_decision(content, world, domain)
+        action, separator, target_id = decision.partition(":")
+        if separator == ":" and action in {"merge", "supersede"}:
+            try:
+                target = await bucket_mgr.get(target_id)
+                if not target:
+                    raise RuntimeError("selected recall candidate no longer exists")
+                target_meta = target.get("metadata", {}) or {}
+                if _is_merge_protected_bucket(target, domain, chord_tag):
+                    raise RuntimeError("selected recall candidate is protected")
+                if (target_meta.get("world", "") or "").strip() != (world or "").strip():
+                    raise RuntimeError("selected recall candidate is from another world")
+                if not _bucket_primary_domain_matches(target_meta, domain):
+                    raise RuntimeError("selected recall candidate is from another domain")
+                if build_supersedes_audit(target, content):
+                    raise RuntimeError(
+                        "selected recall candidate requires explicit Z review"
+                    )
+
+                replacement = content
+                update_kwargs = {"content": replacement}
+                if action == "merge":
+                    replacement = await dehydrator.merge(target.get("content", ""), content)
+                    replacement = _strip_arbitration_context(replacement) or replacement
+                    if require_self_contained:
+                        replacement = await dehydrator.ensure_self_contained(
+                            replacement,
+                            source_context=f"{target.get('content', '')}\n\n{content}",
+                        )
+                    old_v = target_meta.get("valence", 0.5)
+                    old_a = target_meta.get("arousal", 0.3)
+                    structured_senses = senses_from_sensory({"metadata": target_meta})
+                    merged_senses = union_senses(
+                        target_meta.get("sense"),
+                        detected_senses,
+                        structured_senses,
+                    )
+                    update_kwargs = {
+                        "content": replacement,
+                        "tags": list(dict.fromkeys(
+                            _metadata_list(target_meta.get("tags", []))
+                            + _metadata_list(tags)
+                        )),
+                        "importance": max(
+                            target_meta.get("importance", 5),
+                            importance,
+                        ),
+                        "domain": list(dict.fromkeys(
+                            _metadata_list(target_meta.get("domain", []))
+                            + _metadata_list(domain)
+                        )),
+                        "valence": round((old_v + valence) / 2, 2),
+                        "arousal": round((old_a + arousal) / 2, 2),
+                    }
+                    if merged_senses:
+                        update_kwargs["sense"] = merged_senses
+                else:
+                    update_kwargs.update({
+                        "tags": list(dict.fromkeys(_metadata_list(tags))),
+                        "importance": importance,
+                        "domain": list(dict.fromkeys(_metadata_list(domain))),
+                        "valence": valence,
+                        "arousal": arousal,
+                        "sense": detected_senses,
+                    })
+                    if name:
+                        update_kwargs["name"] = name
+                expected_revision_hash = bucket_revision_hash(
+                    target.get("content", ""),
+                    target_meta,
+                )
+                update_ok = await _apply_bucket_update(
+                    target_id,
+                    update_kwargs,
+                    entities=entities if action == "supersede" else None,
+                    actor=f"grow:recall-before-write:{action}",
+                    expected_revision_hash=expected_revision_hash,
+                )
+                if not update_ok:
+                    raise RuntimeError("selected recall candidate could not be updated")
+                logger.info(
+                    "recall-before-write applied action=%s target=%s",
+                    action,
+                    target_id,
+                )
+                display_name = target_meta.get("name", target_id)
+                if action == "supersede" and name:
+                    display_name = name
+                return (
+                    target_id,
+                    display_name,
+                    True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "recall-before-write action failed; fallback=new: %s",
+                    type(exc).__name__,
+                )
+        existing = []
+
     # world="" 即日常桶，只在日常桶之间合并；通用桶单独按通用合并。
+    # 合并候选必须在同一个 world 内（避免日常桶被角色记忆合并污染或反过来）。
     world_filter = [(world or "").strip()]
-    if _has_redactable_secret(content):
+    if recall_before_write or _has_redactable_secret(content):
         existing = []
     else:
         try:
@@ -2839,6 +3121,9 @@ async def breath(
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
                 break
+            capture = _breath_candidate_capture.get()
+            if isinstance(capture, list) and len(capture) < max_results:
+                capture.append({"id": bucket["id"], "summary": summary})
             # Recall is read-only with respect to memory buckets.  Rendering a
             # search hit must not refresh last_active / activation_count or
             # trigger touch()'s bounded time ripple into neighboring buckets.
@@ -3264,6 +3549,7 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
             world=effective_world,
             chord_tag=chord_tag,
             require_self_contained=True,
+            recall_before_write=True,
             entities=analysis.get("entities", []),
         )
         _ela_m = time.perf_counter() - _t_m
@@ -3324,6 +3610,7 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
                 world=effective_world,
                 chord_tag=chord_tag,
                 require_self_contained=True,
+                recall_before_write=True,
                 entities=item.get("entities", []),
             )
 
@@ -3589,15 +3876,14 @@ async def update_bucket(
     if not kwargs:
         return "至少要传一个改动 (content / chord_tag / name)。"
 
-    try:
-        ok = await bucket_mgr.update(bucket_id.strip(), **kwargs)
-    except Exception as e:
-        return f"改桶失败: {e}"
+    ok = await _apply_bucket_update(
+        bucket_id.strip(),
+        kwargs,
+        actor="mcp:update_bucket",
+    )
 
     if not ok:
         return f"桶不存在或改写失败: {bucket_id}"
-    if "content" in kwargs:
-        await _synchronize_bucket_entities(bucket_id.strip(), kwargs["content"])
     return f"已更新桶 {bucket_id}: {', '.join(kwargs.keys())}"
 
 

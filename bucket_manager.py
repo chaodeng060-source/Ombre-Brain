@@ -26,6 +26,8 @@
 # ============================================================
 
 import asyncio
+import hashlib
+import json
 import os
 import math
 import logging
@@ -52,6 +54,21 @@ from storage_safety import advisory_file_lock, atomic_write_post
 from x_provenance import normalize_x_provenance, validate_x_provenance_update
 
 logger = logging.getLogger("ombre_brain.bucket")
+
+
+def bucket_revision_hash(content: str, metadata: dict) -> str:
+    """Stable optimistic-concurrency token for one complete bucket snapshot."""
+    payload = json.dumps(
+        {
+            "content": str(content or ""),
+            "metadata": dict(metadata or {}),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _bucket_in_time_range(bucket: dict, after: datetime = None, before: datetime = None) -> bool:
@@ -408,7 +425,14 @@ class BucketManager:
     # ---------------------------------------------------------
     # Update bucket
     # ---------------------------------------------------------
-    async def update(self, bucket_id: str, actor: str = "system", **kwargs) -> bool:
+    async def update(
+        self,
+        bucket_id: str,
+        actor: str = "system",
+        expected_content_hash: str = "",
+        expected_revision_hash: str = "",
+        **kwargs,
+    ) -> bool:
         async with self._write_guard(bucket_id):
             file_path = self._find_bucket_file(bucket_id)
             if not file_path:
@@ -417,6 +441,27 @@ class BucketManager:
             event_id = None
             try:
                 post = self._safe_load_post(file_path)
+                if expected_revision_hash:
+                    actual_revision_hash = bucket_revision_hash(
+                        post.content,
+                        post.metadata,
+                    )
+                    if actual_revision_hash != expected_revision_hash:
+                        logger.warning(
+                            "Bucket revision changed before update / 写入前桶版本已变更: %s",
+                            bucket_id,
+                        )
+                        return False
+                if expected_content_hash:
+                    actual_content_hash = hashlib.sha256(
+                        str(post.content or "").encode("utf-8")
+                    ).hexdigest()
+                    if actual_content_hash != expected_content_hash:
+                        logger.warning(
+                            "Bucket revision changed before update / 写入前桶版本已变更: %s",
+                            bucket_id,
+                        )
+                        return False
                 before = self._post_snapshot(post, file_path)
                 old_domain = post.get("domain", ["未分类"])
                 old_type = post.get("type", "dynamic")
