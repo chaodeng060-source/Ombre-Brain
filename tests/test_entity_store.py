@@ -61,6 +61,37 @@ def test_schema_sidecar_permissions_and_pragmas(tmp_path):
         assert foreign_keys == {"entities"}
 
 
+def test_private_layout_accepts_synology_zero_mode_projection(tmp_path):
+    entities_dir = tmp_path / ".entities"
+    entities_dir.mkdir(mode=0o700)
+    db = entities_dir / "entities.sqlite3"
+    db.write_bytes(b"")
+
+    os.chmod(db, 0o000)
+    EntityStore._assert_regular_private(str(db))
+    os.chmod(db, 0o600)
+
+    os.chmod(entities_dir, 0o000)
+    try:
+        EntityStore._assert_private_dir(str(entities_dir))
+    finally:
+        os.chmod(entities_dir, 0o700)
+
+
+def test_private_layout_still_rejects_group_or_other_access(tmp_path):
+    entities_dir = tmp_path / ".entities"
+    entities_dir.mkdir(mode=0o750)
+    os.chmod(entities_dir, 0o750)
+    with pytest.raises(UnsafeEntityStore, match="directory mode"):
+        EntityStore._assert_private_dir(str(entities_dir))
+
+    db = entities_dir / "entities.sqlite3"
+    db.write_bytes(b"")
+    os.chmod(db, 0o640)
+    with pytest.raises(UnsafeEntityStore, match="sidecar mode"):
+        EntityStore._assert_regular_private(str(db))
+
+
 def test_nfkc_casefold_and_whitespace_normalization(tmp_path):
     assert normalize_term("  ＶＡＥ\t  许嵩  ") == "vae 许嵩"
     store = EntityStore(

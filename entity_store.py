@@ -211,7 +211,10 @@ class EntityStore:
             raise UnsafeEntityStore(f"refusing non-regular entity sidecar: {path}")
         if info.st_nlink != 1:
             raise UnsafeEntityStore(f"refusing hardlinked entity sidecar: {path}")
-        if stat.S_IMODE(info.st_mode) != exact_mode:
+        # Synology ACL-backed Docker bind mounts may expose an owner-private
+        # 0600 file as 000.  That projection grants fewer permissions, never
+        # more; keep rejecting every other mode.
+        if stat.S_IMODE(info.st_mode) not in {0, exact_mode}:
             raise UnsafeEntityStore(f"unsafe entity sidecar mode: {path}")
 
     @staticmethod
@@ -219,7 +222,9 @@ class EntityStore:
         info = os.lstat(path)
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise UnsafeEntityStore(f"refusing non-directory entity sidecar: {path}")
-        if stat.S_IMODE(info.st_mode) != 0o700:
+        # Same Synology projection as private files: 0700 may be reported as
+        # 000 across the host/container ACL boundary.  Both deny group/other.
+        if stat.S_IMODE(info.st_mode) not in {0, 0o700}:
             raise UnsafeEntityStore(f"unsafe entity sidecar directory mode: {path}")
 
     def _ensure_layout_for_initialize(self) -> None:
