@@ -8,9 +8,10 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 from review_queue import (
-    ReviewQueue, lifecycle_updates, make_relation_entry, make_z_conflict_entry,
+    ReviewQueue, lifecycle_updates, make_metabolism_entry, make_relation_entry,
+    make_z_conflict_entry,
     make_z_pair_entry, render_md,
-    KIND_RELATION, KIND_Z_CONFLICT,
+    KIND_METABOLISM, KIND_RELATION, KIND_Z_CONFLICT,
     STATUS_PENDING, STATUS_APPLIED, STATUS_REJECTED,
     ReviewQueueCorruptError,
 )
@@ -59,20 +60,32 @@ def test_list_pending_by_kind():
     q = _q()
     q.enqueue(make_relation_entry("a", "b", "causes"))
     q.enqueue(make_z_conflict_entry("buk1", "number", "3", "5"))
-    assert len(q.list_pending()) == 2
+    q.enqueue(make_metabolism_entry(
+        "stale_important",
+        "mark_review",
+        "高重要度桶长期未激活，只建议复核。",
+        bucket_ids=["old"],
+    ))
+    assert len(q.list_pending()) == 3
     assert len(q.list_pending(KIND_RELATION)) == 1
     assert len(q.list_pending(KIND_Z_CONFLICT)) == 1
+    assert len(q.list_pending(KIND_METABOLISM)) == 1
 
 
 def test_resolve_removes_from_pending():
     q = _q()
-    e = make_z_conflict_entry("buk1", "negation", "affirmed", "negated")
+    e = make_z_pair_entry("new", "old", fact_key="profile.city")
     q.enqueue(e)
     assert len(q.list_pending()) == 1
-    assert q.resolve(e["key"], STATUS_APPLIED, verdict_note="确认翻转") is True
+    assert q.apply_lifecycle(
+        e["key"],
+        reviewer="哥哥",
+        verdict_note="确认翻转",
+    ) is True
     assert q.list_pending() == []               # 不再 pending
     rows = q.all()
     assert rows[0]["status"] == STATUS_APPLIED
+    assert rows[0]["reviewer"] == "哥哥"
     assert rows[0]["verdict_note"] == "确认翻转"
     assert "resolved_at" in rows[0]
     # 已裁决的再 resolve 不命中（只动 pending 行）
@@ -86,6 +99,11 @@ def test_resolve_rejects_bad_status():
     try:
         q.resolve(e["key"], "garbage")
         assert False, "应拒非法状态"
+    except ValueError:
+        pass
+    try:
+        q.resolve(e["key"], STATUS_APPLIED)
+        assert False, "applied must go through the paired lifecycle transaction"
     except ValueError:
         pass
 
@@ -113,10 +131,12 @@ def test_z_pair_uses_canonical_fact_contract():
     assert current == {
         "fact_status": "current",
         "fact_key": "profile.city",
+        "supersedes_bucket_ids": ["old"],
     }
     assert historical == {
         "fact_status": "historical",
         "fact_key": "profile.city",
+        "superseded_by_bucket_id": "new",
     }
     assert "active_fact" not in current and "lifecycle" not in historical
 
@@ -142,6 +162,29 @@ def test_entry_shapes():
     z = make_z_conflict_entry("b", "date", "2026-05-14", "2026-05-13", bucket_name="约定")
     assert z["kind"] == KIND_Z_CONFLICT and z["bucket_name"] == "约定"
     assert z["old"] == "2026-05-14" and z["new"] == "2026-05-13"
+    m = make_metabolism_entry(
+        "oversized_buckets",
+        "split_thread",
+        "正文超过阈值，仅建议人工拆分。",
+        severity="info",
+        bucket_ids=["b", "a", "a"],
+    )
+    assert m["kind"] == KIND_METABOLISM
+    assert m["bucket_ids"] == ["a", "b"]
+    assert m["reason"] and m["status"] == STATUS_PENDING
+
+
+def test_metabolism_entry_requires_reason_and_known_action():
+    try:
+        make_metabolism_entry("check", "archive", "")
+        assert False, "M suggestions require a human-readable reason"
+    except ValueError:
+        pass
+    try:
+        make_metabolism_entry("check", "apply_now", "must never auto-apply")
+        assert False, "unknown or mutating actions must fail closed"
+    except ValueError:
+        pass
 
 
 def test_enqueue_requires_key():
@@ -157,9 +200,16 @@ def test_render_md_smoke():
     q = _q()
     q.enqueue(make_relation_entry("a", "b", "causes", source_name="桶A", target_name="桶B"))
     q.enqueue(make_z_conflict_entry("buk1", "number", "3", "5", bucket_name="数量桶"))
+    q.enqueue(make_metabolism_entry(
+        "oversized_buckets",
+        "split_thread",
+        "正文超过阈值，仅建议人工拆分。",
+        bucket_ids=["long"],
+    ))
     md = render_md(q.list_pending())
-    assert "关系闸" in md and "Z轴" in md
+    assert "关系闸" in md and "Z轴" in md and "M轴" in md
     assert "桶A" in md and "数量桶" in md
+    assert "正文超过阈值" in md
     # 空清单也不炸
     assert "✅ 无" in render_md([])
 

@@ -21,11 +21,19 @@
 
 pinned/protected、保护域（恋爱、纪念日、约定、家庭、自省、feel）以及 `feel`、`episode`、`saga` 类型不进入 Z 轴审计或过滤。
 
-当前阶段没有自动 supersede、自动改 status 或自动写 `fact_key`。review queue
-只接受 `config.fact_slots.registry` 已登记的规范 key 并生成待审候选，不改桶。
-`apply-lifecycle` 暂停使用：Markdown 双桶写入尚无持久事务与崩溃恢复，不能用
-“写两次再按字节回滚”冒充原子提交。`lifecycle/active_fact` 是遗留字段，不再由
-新流程写入，也不参与召回真值判断。
+没有任何自动 supersede、自动改 status 或自动写 `fact_key` 的路径。发现事实翻转时，
+新旧内容保留为两个独立桶。`POST /api/review_queue/candidate` 默认
+`mode=dry-run`，只返回候选且不写队列/桶；显式 `mode=apply` 也只把候选幂等写成
+pending，不改变事实状态。review queue 只接受 `config.fact_slots.registry` 已登记的
+规范 key。
+
+`POST /api/review_queue/apply-lifecycle` 是唯一可落事实 lifecycle 的入口：必须提交
+pending key、非空 reviewer 和裁决备注，事务会再次校验注册槽与保护边界，然后把新事实
+标 `current`、旧事实标 `historical`。双桶原文、目标内容和状态机都先写入
+`.z-lifecycle-transactions/` 持久日志；中途失败自动恢复两桶，进程崩溃后启动时根据
+队列的 durable status 决定回滚或完成提交。精确重放幂等。
+
+`lifecycle/active_fact` 是遗留字段，不再由新流程写入，也不参与召回真值判断。
 
 `breath` 只在精确事实意图且查询未要求历史时过滤已登记的 `historical`。空注册表、
 未登记 key、非法 status 均 fail-open；受保护桶仍不由普通 lifecycle 事务改写。

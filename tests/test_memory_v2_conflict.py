@@ -98,7 +98,10 @@ def merge_config(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_vector_only_conflict_merge_writes_supersedes_audit(monkeypatch, merge_config):
+async def test_vector_only_conflict_stays_separate_without_auto_supersede(
+    monkeypatch,
+    merge_config,
+):
     old = _bucket("old", "period_start: 2026-05-03\nflow: light", domain=["health"])
     mgr = FakeBucketMgr([old], keyword_matches=[])
     emb = FakeEmbedding([("old", 0.93)])
@@ -117,19 +120,13 @@ async def test_vector_only_conflict_merge_writes_supersedes_audit(monkeypatch, m
         name="period",
     )
 
-    assert (bucket_id, display, is_merged) == ("old", "name-old", True)
-    assert mgr.created == []
-    assert emb.generated == [("old", "period_start: 2026-05-04\nflow: light")]
-    assert "[ARBITRATION_CONTEXT]" in dh.merge_calls[0][1]
-
-    update = mgr.updates[-1][1]
-    assert update["content"] == "period_start: 2026-05-04\nflow: light"
-    assert "new-tag" in update["tags"]
-    assert update["importance"] == 6
-    fields = {entry["field"]: entry for entry in update["supersedes"]}
-    assert fields["period_start"]["old"] == "2026-05-03"
-    assert fields["period_start"]["new"] == "2026-05-04"
-    assert fields["period_start"]["bucket_id"] == "old"
+    assert (bucket_id, display, is_merged) == ("new-bucket", "period", False)
+    assert mgr.updates == []
+    assert dh.merge_calls == []
+    assert mgr.created[-1]["content"] == "period_start: 2026-05-04\nflow: light"
+    assert emb.generated == [
+        ("new-bucket", "period_start: 2026-05-04\nflow: light")
+    ]
 
 
 @pytest.mark.asyncio

@@ -36,6 +36,8 @@ from redact import redact_embedding_input  # 出本地去外部 LLM 前脱敏
 
 logger = logging.getLogger("ombre_brain.dehydrator")
 
+MIN_DEHYDRATION_SUMMARY_CHARS = 10
+
 
 class SelfContainmentError(RuntimeError):
     """Refuse a grow write whose references cannot be resolved faithfully."""
@@ -543,8 +545,8 @@ INFER_RELATIONS_PROMPT = """你是记忆桶关系判断器。给定一个"新桶
 - kin（同类）：新桶和某个候选桶属于同一主题/同类事件，无明确因果但天然连成一组
 
 判断铁律：
-1. 关系必须实质——只有真存在因果/补充/同类时才输出，绝不为了凑数
-2. 大多数情况应该输出 [] 空数组——只有很明确相关的才建边
+1. kin（同类）判定要放开：同一件事的不同侧面、同一天的连续记录、同一主题的反复讨论、同一段关系冲突的前因后果，都应该连 kin。kin 只表示说的是同一件事，不断言因果，宁可多连一条也不要让同一件事散成孤桶。
+2. 其余五类（causes/contributes/improves/explains/updates）保持严格：只有真存在因果、补充或取代关系才输出，绝不为了凑数；判断不准就降级成 kin 或不输出。
 3. 同一候选桶最多输出一条边，挑最贴切的关系类型
 4. 总输出最多 3 条，按相关度从高到低
 5. target 必须是候选列表里的 bucket_id（不要编造）
@@ -632,17 +634,49 @@ class Dehydrator:
                 "SELECT summary FROM dehydration_cache WHERE content_hash = ?",
                 (content_hash,)
             ).fetchone()
-        return row[0] if row else None
+        if not row:
+            return None
+        summary = self._normalize_dehydration_summary(row[0])
+        if not self._is_usable_dehydration_summary(summary):
+            logger.warning(
+                "Ignoring near-empty dehydration cache entry / "
+                "忽略空或过短脱水缓存: content_hash=%s length=%d",
+                content_hash[:12],
+                len(summary),
+            )
+            return None
+        return summary
 
-    def _set_cached_summary(self, content: str, summary: str):
+    @staticmethod
+    def _normalize_dehydration_summary(summary) -> str:
+        return summary.strip() if isinstance(summary, str) else ""
+
+    @classmethod
+    def _is_usable_dehydration_summary(cls, summary) -> bool:
+        return (
+            len(cls._normalize_dehydration_summary(summary))
+            >= MIN_DEHYDRATION_SUMMARY_CHARS
+        )
+
+    def _set_cached_summary(self, content: str, summary: str) -> bool:
         """Store dehydration result in cache."""
+        summary = self._normalize_dehydration_summary(summary)
         content_hash = hashlib.sha256(content.encode()).hexdigest()
+        if not self._is_usable_dehydration_summary(summary):
+            logger.warning(
+                "Refusing to cache near-empty dehydration result / "
+                "拒绝缓存空或过短脱水结果: content_hash=%s length=%d",
+                content_hash[:12],
+                len(summary),
+            )
+            return False
         with closing(sqlite3.connect(self.cache_db_path)) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO dehydration_cache (content_hash, summary, model) VALUES (?, ?, ?)",
                 (content_hash, summary, self.model)
             )
             conn.commit()
+        return True
 
     def invalidate_cache(self, content: str):
         """Remove cached summary for specific content (call when bucket content changes)."""
@@ -1029,7 +1063,26 @@ class Dehydrator:
         if not self.api_available:
             raise RuntimeError("脱水 API 不可用，请配置 OMBRE_API_KEY")
 
-        result = await self._api_dehydrate(content)
+        try:
+            result = await self._api_dehydrate(content)
+        except Exception as exc:
+            logger.warning(
+                "Dehydration API call failed / 脱水 API 调用失败: "
+                "content_hash=%s error=%s",
+                hashlib.sha256(content.encode()).hexdigest()[:12],
+                exc,
+            )
+            raise
+
+        result = self._normalize_dehydration_summary(result)
+        if not self._is_usable_dehydration_summary(result):
+            logger.warning(
+                "Dehydration API returned near-empty result / "
+                "脱水 API 返回空或过短结果: content_hash=%s length=%d",
+                hashlib.sha256(content.encode()).hexdigest()[:12],
+                len(result),
+            )
+            raise RuntimeError("脱水 API 返回空或过短摘要")
 
         # --- Cache the result ---
         self._set_cached_summary(content, result)
@@ -1616,7 +1669,9 @@ class Dehydrator:
                     {"role": "system", "content": INFER_RELATIONS_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
-                max_tokens=400,
+                # deepseek-v4-flash counts reasoning and answer together. The
+                # old 400-token cap was exhausted by reasoning before JSON.
+                max_tokens=4000,
                 temperature=0.1,
             )
             if not response.choices:

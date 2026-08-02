@@ -91,7 +91,11 @@ from fact_slots import (
     registered_fact_key,
 )
 from query_expand import expand_query
-from recall_support import expand_relation_graph
+from recall_support import (
+    expand_relation_graph,
+    rank_within_relevance_bands,
+    retain_original_query_supported_candidates,
+)
 from e_axis_shadow import (
     EAxisShadowStore,
     build_failure_record,
@@ -105,7 +109,8 @@ from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
     world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
     rrf_fuse, rrf_fuse_channels, parse_relative_time, PROTECTED_RESOLVE_DOMAINS,
-    SAFE_RELATION_TYPES, REVIEW_RELATION_TYPES,
+    RELATION_TYPES, SAFE_RELATION_TYPES, REVIEW_RELATION_TYPES,
+    PROPAGATION_RELATION_TYPES,
     event_at_from_metadata, now_iso,
 )
 from redact import redact_embedding_input, redact_text  # 只抹 secret，不审查情感内容
@@ -116,10 +121,15 @@ from mcp_auth import (
     require_mcp_token,
 )
 from review_queue import (
-    ReviewQueue, make_relation_entry, make_z_conflict_entry, make_z_pair_entry,
+    ReviewQueue, make_relation_entry, make_z_pair_entry,
     render_md as _render_review_md,
-    KIND_RELATION, KIND_Z_CONFLICT,
+    KIND_RELATION, KIND_Z_CONFLICT, KIND_METABOLISM,
     query_requests_history, rest_resolve_status_allowed,
+)
+from z_lifecycle import (
+    ZLifecycleNotFound,
+    ZLifecycleStateError,
+    ZLifecycleTransaction,
 )
 from lmc5_ledger import (
     LMC5Ledger,
@@ -154,9 +164,10 @@ import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  
 sensory_engine = SensoryEngine(config["buckets_dir"])  # External body-state sidecar / 外部身体状态层
 
 # --- 待审队列（#2 Z轴事实演化 + #3 关系闸的共用 pending 存储）---
-# 落在 <buckets_dir>/review_queue.jsonl。两个闸默认**关**（gated），开了只是把
-# 机器自动推断的危险边 / 合并检出的事实冲突改挂 pending 给人审，不动现有部署路。
+# 落在 <buckets_dir>/review_queue.jsonl。机器提议只进 pending；Z 冲突默认
+# dry-run，只有显式 apply 才入队，只有显式人审事务才改事实 lifecycle。
 _review_queue = None
+_z_lifecycle_transaction = None
 _e_axis_shadow_store = None
 _lmc5_ledger = None
 _entity_store = None
@@ -435,6 +446,25 @@ def _get_review_queue() -> ReviewQueue:
             maintenance_root=config["buckets_dir"],
         )
     return _review_queue
+
+
+def _get_z_lifecycle_transaction() -> ZLifecycleTransaction:
+    """Lazily bind the Z approval transaction to the active test/prod vault."""
+    global _z_lifecycle_transaction
+    queue = _get_review_queue()
+    root = os.path.abspath(config["buckets_dir"])
+    if (
+        _z_lifecycle_transaction is None
+        or os.fspath(_z_lifecycle_transaction.root) != root
+        or _z_lifecycle_transaction.bucket_manager is not bucket_mgr
+        or _z_lifecycle_transaction.review_queue is not queue
+    ):
+        _z_lifecycle_transaction = ZLifecycleTransaction(
+            root,
+            bucket_mgr,
+            queue,
+        )
+    return _z_lifecycle_transaction
 
 
 def _get_e_axis_shadow_store() -> EAxisShadowStore:
@@ -725,7 +755,27 @@ def _relation_recall_neighbors(
     })
 
     relation_cfg = config.get("relation_recall", {}) or {}
-    raw_allowed_types = relation_cfg.get("allowed_types", SAFE_RELATION_TYPES)
+    raw_propagation_only = relation_cfg.get("propagation_only", False)
+    if isinstance(raw_propagation_only, str):
+        propagation_only = raw_propagation_only.strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+    else:
+        propagation_only = bool(raw_propagation_only)
+
+    if propagation_only:
+        classification = PROPAGATION_RELATION_TYPES
+        raw_allowed_types = relation_cfg.get(
+            "propagation_types", PROPAGATION_RELATION_TYPES
+        )
+    else:
+        # Exact rollback to the pre-classification behavior.  Keep this branch
+        # separate so a legacy allowed_types=[kin, explains] config cannot
+        # suppress hard-edge types after propagation mode is enabled.
+        classification = SAFE_RELATION_TYPES
+        raw_allowed_types = relation_cfg.get(
+            "allowed_types", SAFE_RELATION_TYPES
+        )
     if isinstance(raw_allowed_types, str):
         raw_allowed_types = [raw_allowed_types]
     elif not isinstance(raw_allowed_types, (list, tuple, set, frozenset)):
@@ -734,7 +784,8 @@ def _relation_recall_neighbors(
         str(value).strip()
         for value in raw_allowed_types
     }
-    allowed_types = configured_types.intersection(SAFE_RELATION_TYPES)
+    # Unknown/storage-only edge types degrade to non-propagating semantics.
+    allowed_types = configured_types.intersection(classification)
 
     def threshold(name: str, default: float) -> float:
         try:
@@ -1864,19 +1915,6 @@ async def _find_merge_candidates(
 _ARBITRATION_CONTEXT_BLOCK_RE = re.compile(r"\n?\[ARBITRATION_CONTEXT\].*?\[/ARBITRATION_CONTEXT\]\n?", re.DOTALL)
 
 
-def _with_arbitration_context(content: str, audit_entries: list[dict]) -> str:
-    if not audit_entries:
-        return content
-    lines = [
-        "[ARBITRATION_CONTEXT]",
-        "Use these newer values as authoritative for this merge. Keep the old values only in historical/audit wording if needed. Do not copy this block into the final memory.",
-    ]
-    for entry in audit_entries:
-        lines.append(f"- {entry['field']}: old={entry['old']} -> new={entry['new']}")
-    lines.append("[/ARBITRATION_CONTEXT]")
-    return f"{content}\n\n" + "\n".join(lines)
-
-
 def _strip_arbitration_context(content: str) -> str:
     if not content:
         return content
@@ -1942,63 +1980,67 @@ async def _merge_or_create(
         if not _is_merge_protected_bucket(bucket, domain, chord_tag):
             try:
                 audit_entries = build_supersedes_audit(bucket, content)
-                merge_content = _with_arbitration_context(content, audit_entries)
-                merged = await dehydrator.merge(bucket["content"], merge_content)
-                merged = _strip_arbitration_context(merged) or merged
-                if require_self_contained:
-                    merged = await dehydrator.ensure_self_contained(
-                        merged,
-                        source_context=f"{bucket['content']}\n\n{content}",
-                    )
-                old_v = bucket["metadata"].get("valence", 0.5)
-                old_a = bucket["metadata"].get("arousal", 0.3)
-                merged_valence = round((old_v + valence) / 2, 2)
-                merged_arousal = round((old_a + arousal) / 2, 2)
-                update_kwargs = dict(
-                    content=merged,
-                    tags=list(set(bucket["metadata"].get("tags", []) + tags)),
-                    importance=max(bucket["metadata"].get("importance", 5), importance),
-                    domain=list(set(bucket["metadata"].get("domain", []) + domain)),
-                    valence=merged_valence,
-                    arousal=merged_arousal,
-                )
                 if audit_entries:
-                    prior = bmeta.get("supersedes", [])
-                    if not isinstance(prior, list):
-                        prior = []
-                    update_kwargs["supersedes"] = prior + audit_entries
-                    # #2 Z轴：除了把新值标权威 / 旧值留 historical，再额外挂一条 pending
-                    # 审计行，让人/patrol 能回看「这次合并把哪个事实值悄悄改了」。
-                    # 开关默认关；保护域桶在 _is_merge_protected_bucket 已被排除出本块，
-                    # 这里只会是普通桶（感情记忆绝不走到这）。合并照常进行，仅多一条可审清单。
-                    if _review_gate("fact_evolution_audit"):
+                    # A factual flip must remain two independently reviewable
+                    # buckets.  Do not merge content, write supersedes metadata,
+                    # or enqueue a candidate implicitly; the explicit Z
+                    # dry-run/apply flow owns all three lifecycle transitions.
+                    logger.info(
+                        "Z conflict kept separate pending explicit review / "
+                        "Z轴冲突保留为独立事实待显式审查: %s",
+                        bucket["id"],
+                    )
+                else:
+                    merged = await dehydrator.merge(bucket["content"], content)
+                    merged = _strip_arbitration_context(merged) or merged
+                    if require_self_contained:
+                        merged = await dehydrator.ensure_self_contained(
+                            merged,
+                            source_context=f"{bucket['content']}\n\n{content}",
+                        )
+                    old_v = bucket["metadata"].get("valence", 0.5)
+                    old_a = bucket["metadata"].get("arousal", 0.3)
+                    merged_valence = round((old_v + valence) / 2, 2)
+                    merged_arousal = round((old_a + arousal) / 2, 2)
+                    update_kwargs = dict(
+                        content=merged,
+                        tags=list(set(bucket["metadata"].get("tags", []) + tags)),
+                        importance=max(bucket["metadata"].get("importance", 5), importance),
+                        domain=list(set(bucket["metadata"].get("domain", []) + domain)),
+                        valence=merged_valence,
+                        arousal=merged_arousal,
+                    )
+                    # 感官标签并入（合并不丢已有 sense、补上新内容触到的感官）
+                    # 结构化 sensory.spicy/touch 也映射成 sense 通道：闭环另一半——带 sensory.* 的桶
+                    # 既能被读到点燃身体，也能被「味觉/触觉」类 query 上浮（普鲁斯特钩子，小卷 #1）。
+                    structured_senses = senses_from_sensory({"metadata": bmeta})
+                    merged_senses = union_senses(
+                        bmeta.get("sense"),
+                        detected_senses,
+                        structured_senses,
+                    )
+                    if merged_senses:
+                        update_kwargs["sense"] = merged_senses
+                    async with bucket_mgr._maintenance_barrier.shared_async():
+                        await bucket_mgr.update(bucket["id"], **update_kwargs)
+                        # --- Update embedding after merge ---
+                        # 扫盘 #10：embedding 失败不再静默——语义检索会悄悄陈旧，至少留 warning
                         try:
-                            q = _get_review_queue()
-                            bname = bmeta.get("name", bucket["id"])
-                            for a in audit_entries:
-                                q.enqueue(make_z_conflict_entry(
-                                    bucket["id"], a["field"], a["old"], a["new"],
-                                    bucket_name=bname, reason="merge_supersede",
-                                ))
+                            await embedding_engine.generate_and_store(
+                                bucket["id"],
+                                merged,
+                            )
                         except Exception as e:
-                            logger.warning(f"Z轴审计入队失败（不阻塞）/ z-audit enqueue failed: {e}")
-                # 感官标签并入（合并不丢已有 sense、补上新内容触到的感官）
-                # 结构化 sensory.spicy/touch 也映射成 sense 通道：闭环另一半——带 sensory.* 的桶
-                # 既能被读到点燃身体，也能被「味觉/触觉」类 query 上浮（普鲁斯特钩子，小卷 #1）。
-                structured_senses = senses_from_sensory({"metadata": bmeta})
-                merged_senses = union_senses(bmeta.get("sense"), detected_senses, structured_senses)
-                if merged_senses:
-                    update_kwargs["sense"] = merged_senses
-                async with bucket_mgr._maintenance_barrier.shared_async():
-                    await bucket_mgr.update(bucket["id"], **update_kwargs)
-                    # --- Update embedding after merge ---
-                    # 扫盘 #10：embedding 失败不再静默——语义检索会悄悄陈旧，至少留 warning
-                    try:
-                        await embedding_engine.generate_and_store(bucket["id"], merged)
-                    except Exception as e:
-                        logger.warning(f"Embedding update after merge failed / 合并后向量更新失败: {bucket['id']}: {e}")
-                await _synchronize_bucket_entities(bucket["id"], merged, entities)
-                return bucket["id"], bucket["metadata"].get("name", bucket["id"]), True
+                            logger.warning(
+                                "Embedding update after merge failed / "
+                                f"合并后向量更新失败: {bucket['id']}: {e}"
+                            )
+                    await _synchronize_bucket_entities(bucket["id"], merged, entities)
+                    return (
+                        bucket["id"],
+                        bucket["metadata"].get("name", bucket["id"]),
+                        True,
+                    )
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
 
@@ -2072,7 +2114,7 @@ async def _startup_backfill_loop() -> None:
 
         for i, b in enumerate(candidates):
             try:
-                n = await _auto_infer_edges(
+                proposals = await _auto_infer_edges(
                     source_id=b["id"],
                     content=b["content"],
                     world=b["metadata"].get("world", ""),
@@ -2080,7 +2122,7 @@ async def _startup_backfill_loop() -> None:
                 if i % 5 == 0:
                     logger.info(
                         f"Backfill {i + 1}/{len(candidates)} | "
-                        f"{b['id'][:6]} +{n}边"
+                        f"{b['id'][:6]} +{len(proposals)}提议"
                     )
             except asyncio.CancelledError:
                 raise
@@ -2137,15 +2179,15 @@ def _maybe_start_backfill() -> None:
 # Helper: auto-edge inference for newly created bucket
 # 工具：新桶自动建边
 # Wraps embedding-similar + keyword-search candidate gathering, LLM relation
-# inference via dehydrator, and add_relation calls. All failures swallowed —
-# never blocks hold.
-# 包装 embedding 邻居 + 关键词搜索拿候选，dehydrator LLM 判边，bucket_mgr 加边。
-# 所有失败吞掉——绝不阻塞 hold 主流程。
+# inference via dehydrator, then queue proposals for explicit agent review.
+# All failures are swallowed so this never blocks hold.
+# 包装 embedding 邻居 + 关键词搜索拿候选，dehydrator LLM 判边，只挂待审提议。
+# 所有失败吞掉——绝不阻塞 hold 主流程，也绝不由自动任务直接写边。
 # =============================================================
 async def _auto_infer_edges(
     source_id: str, content: str, world: str = ""
 ) -> list[dict]:
-    """Returns list of edge dicts actually added: [{type, target, target_name, note}]."""
+    """Queue machine-inferred edge proposals; never commit them to the graph."""
     if not content or not content.strip():
         return []
 
@@ -2208,41 +2250,40 @@ async def _auto_infer_edges(
         return []
 
     cand_name_by_id = {c["id"]: c["name"] for c in candidates}
-    # #3 关系闸：只闸**机器自动推断**的边。开关默认关 → 行为不变（全部直接写）。
-    # 开了之后：safe 类（kin/explains）照写；危险类（因果/取代）改挂 pending 等人审，不写库。
-    gate_on = _review_gate("relation_review")
-    added: list[dict] = []
+    proposed: list[dict] = []
     queued = 0
     for edge in edges:
-        etype = edge.get("type", "")
-        if gate_on and etype in REVIEW_RELATION_TYPES:
-            try:
-                if _get_review_queue().enqueue(make_relation_entry(
-                    source_id, edge["target"], etype, edge.get("note", ""),
-                    target_name=cand_name_by_id.get(edge["target"], edge["target"]),
-                )):
-                    queued += 1
-            except Exception as e:
-                logger.warning(f"关系闸入队失败（不阻塞）/ relation review enqueue failed: {e}")
-            continue  # 危险边不直接写库
-        ok = await bucket_mgr.add_relation(
-            source_id, edge["target"], etype, edge.get("note", "")
-        )
-        if ok:
-            added.append({
+        etype = str(edge.get("type") or "").strip()
+        target = str(edge.get("target") or "").strip()
+        if etype not in RELATION_TYPES or target not in cand_name_by_id:
+            continue
+        try:
+            entry = make_relation_entry(
+                source_id,
+                target,
+                etype,
+                edge.get("note", ""),
+                target_name=cand_name_by_id.get(target, target),
+            )
+            if _get_review_queue().enqueue(entry):
+                queued += 1
+            proposed.append({
                 "type": etype,
-                "target": edge["target"],
-                "target_name": cand_name_by_id.get(edge["target"], edge["target"]),
+                "target": target,
+                "target_name": cand_name_by_id.get(target, target),
                 "note": edge.get("note", ""),
             })
+        except Exception as e:
+            logger.warning(
+                "关系提议入队失败（不阻塞）/ relation proposal enqueue failed: %s",
+                type(e).__name__,
+            )
     if queued:
-        logger.info(f"关系闸：{queued} 条危险边挂 pending 待审（未写库）from {source_id}")
-    if added:
         logger.info(
-            f"Auto-edge inference added {len(added)} edge(s) / 自动建边 {len(added)} 条 "
-            f"from {source_id}"
+            "Machine relation inference queued %d proposal(s); graph unchanged",
+            queued,
         )
-    return added
+    return proposed
 
 
 # =============================================================
@@ -2546,6 +2587,11 @@ async def breath(
                 query_arousal=q_arousal,
                 created_after=created_after,
                 created_before=created_before,
+                relevance_first=True,
+                # Keep a broad relevance-ranked keyword pool for RRF. The
+                # original-query literal/vector evidence gate below decides
+                # eligibility after both channels are available.
+                relevance_candidate_floor=0.0,
             ):
                 existing = keyword_by_id.get(bucket["id"])
                 if existing is None or bucket.get("score", 0) > existing.get("score", 0):
@@ -2567,14 +2613,19 @@ async def breath(
 
     # Vector channel — sim>0.5 floor blocks high-cosine noise
     vector_scores: dict[str, float] = {}
+    original_vector_scores: dict[str, float] = {}
     try:
-        for angle in query_angles:
+        for angle_index, angle in enumerate(query_angles):
             for bid, sim in await embedding_engine.search_similar(
                 angle,
                 top_k=intent_policy["vector_top_k"],
             ):
-                if sim > 0.5 and sim > vector_scores.get(bid, 0.0):
+                if sim <= 0.5:
+                    continue
+                if sim > vector_scores.get(bid, 0.0):
                     vector_scores[bid] = sim
+                if angle_index == 0 and sim > original_vector_scores.get(bid, 0.0):
+                    original_vector_scores[bid] = sim
         vector_ranked = list(vector_scores.items())
     except Exception as e:
         logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
@@ -2619,7 +2670,11 @@ async def breath(
 
     # RRF fusion of keyword + vector + the optional entity channel.
     rrf_cfg = config.get("rrf", {})
-    keyword_ranked = [(b["id"], b.get("score", 0)) for b in keyword_matches]
+    keyword_scores = {
+        b["id"]: float(b.get("score", 0) or 0)
+        for b in keyword_matches
+    }
+    keyword_ranked = list(keyword_scores.items())
     channels = [
         (keyword_ranked, intent_policy["keyword_weight"]),
         (vector_ranked, intent_policy["vector_weight"]),
@@ -2634,13 +2689,24 @@ async def breath(
     # Materialize fused list: reuse channel buckets, fetch vector-only ones.
     bucket_cache = {b["id"]: b for b in keyword_matches}
     bucket_cache.update(entity_bucket_cache)
+    literal_candidate_floor = max(
+        0.0,
+        float(
+            getattr(
+                bucket_mgr,
+                "literal_candidate_floor",
+                (config.get("matching", {}) or {}).get(
+                    "literal_candidate_floor",
+                    40.0,
+                ),
+            )
+        ),
+    )
+    topic_score_calculator = getattr(bucket_mgr, "_calc_topic_score", None)
     matches = []
     for bid, fused_score in fused_pairs:
-        if len(matches) >= recall_limit:
-            break
         if bid in bucket_cache:
             b = bucket_cache[bid]
-            b["score"] = round(fused_score * 1000, 2)
         else:
             # Vector-only bucket — fetch and re-apply filters that bucket_mgr.search applied
             b = await bucket_mgr.get(bid)
@@ -2652,7 +2718,6 @@ async def breath(
                 created_before=created_before,
             ):
                 continue
-            b["score"] = round(fused_score * 1000, 2)
             b["vector_match"] = True
         b.pop("entity_match", None)
         if bid in entity_bucket_cache:
@@ -2663,11 +2728,46 @@ async def breath(
             intent=intent_policy["intent"],
         ):
             continue
+        fused_relevance = round(fused_score * 1000, 6)
+        b["score"] = round(fused_relevance, 2)
+        b["_fused_relevance_score"] = fused_relevance
+        # Evaluate literal relevance against the audited entity-canonical query,
+        # not a generated expansion angle.  For ordinary queries recall_query is
+        # the original text; an explicit alias seed may safely replace only the
+        # matched entity name.
+        b["_literal_relevance_score"] = (
+            round(topic_score_calculator(recall_query, b) * 100.0, 4)
+            if callable(topic_score_calculator)
+            else literal_candidate_floor
+        )
+        b["_vector_relevance_score"] = round(
+            float(vector_scores.get(bid, 0.0)),
+            6,
+        )
+        b["_original_vector_relevance_score"] = round(
+            float(original_vector_scores.get(bid, 0.0)),
+            6,
+        )
         matches.append(b)
 
-    # --- Forgetting curve on fused ranking (ebbingflow 偷师) ---
-    # --- 检索排序权重掺遗忘曲线：老桶/resolved 桶自然下沉，pinned/feel 豁免 ---
-    # --- 五感入口层 v1：query 带感官线索时，同感官的 sense 桶轻微上浮（普鲁斯特钩子）---
+    # Generated expansion angles may improve ranking, but cannot introduce a
+    # candidate that neither the original words nor original embedding support.
+    matches = retain_original_query_supported_candidates(
+        matches,
+        literal_score=lambda bucket: max(
+            float(bucket.get("_literal_relevance_score", 0) or 0),
+            literal_candidate_floor if bucket.get("entity_match") else 0.0,
+        ),
+        original_vector_score=lambda bucket: bucket.get(
+            "_original_vector_relevance_score",
+            0,
+        ),
+        literal_floor=literal_candidate_floor,
+    )[:recall_limit]
+
+    # Relevance is the first ordering key.  Forgetting curve, sense and intent
+    # remain useful, but may only adjust candidates inside one narrow fused
+    # relevance band.
     sense_cfg = config.get("sense", {})
     sense_boost = (
         float(sense_cfg.get("recall_boost", 1.25))
@@ -2675,17 +2775,42 @@ async def breath(
     )
     query_senses = set(detect_senses(query)) if sense_boost != 1.0 else set()
     for b in matches:
-        b["score"] = round(decay_engine.apply_retrieval_decay(b["score"], b["metadata"]), 2)
+        tie_break_score = decay_engine.apply_retrieval_decay(
+            b["_fused_relevance_score"],
+            b["metadata"],
+        )
         if query_senses:
             b_sense = b["metadata"].get("sense")
             if isinstance(b_sense, str):
                 b_sense = [b_sense]
             if b_sense and set(b_sense) & query_senses:
-                b["score"] = round(b["score"] * sense_boost, 2)
+                tie_break_score *= sense_boost
         intent_multiplier = bucket_intent_score_multiplier(b, intent_policy)
         if intent_multiplier != 1.0:
-            b["score"] = round(b["score"] * intent_multiplier, 2)
-    matches.sort(key=lambda b: b["score"], reverse=True)
+            tie_break_score *= intent_multiplier
+        b["_non_relevance_tie_break_score"] = round(tie_break_score, 6)
+
+    fused_band = max(
+        0.0,
+        float(
+            (config.get("matching", {}) or {}).get(
+                "fused_relevance_tie_band",
+                0.35,
+            )
+        ),
+    )
+    matches = rank_within_relevance_bands(
+        matches,
+        relevance_score=lambda bucket: bucket.get(
+            "_fused_relevance_score",
+            0,
+        ),
+        tie_break_score=lambda bucket: bucket.get(
+            "_non_relevance_tie_break_score",
+            0,
+        ),
+        band_width=fused_band,
+    )
 
     matches = _filter_session_seen(matches, session_id)
     matches = await _ds_filter_candidates(
@@ -3057,12 +3182,12 @@ async def hold(
         entities=analysis.get("entities", []),
     )
 
-    # --- Step 3: auto-edge inference (only on new buckets, never on merges) ---
-    # --- 自动建边：仅对新建桶，合并桶已经融进了相关性，不再加边避免冗余 ---
-    added_edges: list[dict] = []
+    # --- Step 3: machine relation proposals (new buckets only) ---
+    # --- 机器只提关系候选；只有 agent 显式 add_relation 才写入关系图 ---
+    relation_proposals: list[dict] = []
     if not is_merged:
         try:
-            added_edges = await _auto_infer_edges(
+            relation_proposals = await _auto_infer_edges(
                 source_id=bucket_id, content=content, world=effective_world
             )
         except Exception as e:
@@ -3070,15 +3195,18 @@ async def hold(
 
     action = "合并→" if is_merged else "新建→"
     base = f"{action}{result_name} {','.join(domain)}"
-    if not added_edges:
+    if not relation_proposals:
         return base
-    # 写=读：hold 同时返回相关桶（让用户感知这条记忆和什么连着）
+    # 提议不等于图事实：明确标待审，避免调用方误以为已经落边。
     related_lines = [
         f"  • [{e['type']}] {e['target_name']} ({e['target']})"
         + (f" — {e['note']}" if e.get("note") else "")
-        for e in added_edges
+        for e in relation_proposals
     ]
-    return f"{base} +{len(added_edges)}边\n关联：\n" + "\n".join(related_lines)
+    return (
+        f"{base} +{len(relation_proposals)}条关系提议（待审，未落图）\n"
+        "候选关联：\n" + "\n".join(related_lines)
+    )
 
 
 # =============================================================
@@ -3497,8 +3625,8 @@ async def delete_bucket(bucket_id: str, confirm: bool = False) -> str:
 
 
 # =============================================================
-# Tool: backfill_relations — run auto-edge inference on existing buckets
-# 工具：backfill_relations — 给老桶批量自动建边
+# Tool: backfill_relations — propose relations for existing buckets
+# 工具：backfill_relations — 给老桶批量生成待审关系提议
 # Hold-time auto-edge only fires on new buckets; this tool fills in the
 # graph for memories that existed before the feature shipped. Batched to
 # avoid MCP timeout and to let the caller resume between calls.
@@ -3509,10 +3637,10 @@ async def backfill_relations(
     limit: int = 5,
     offset: int = 0,
 ) -> str:
-    """对已有桶批量跑自动建边。
+    """对已有桶批量生成待审关系提议，不直接写入关系图。
     bucket_id=指定单桶处理（最快验证用）。
     bucket_id 为空时按 limit/offset 批量遍历 dynamic 桶（跳过 pinned/permanent/feel/resolved），每次最多 10 个，多次调用滚动跑完。
-    返回每桶加了几条边和下一批 offset。"""
+    返回每桶生成了几条提议和下一批 offset。"""
     if bucket_id and bucket_id.strip():
         bucket = await bucket_mgr.get(bucket_id.strip())
         if not bucket:
@@ -3524,7 +3652,7 @@ async def backfill_relations(
                 world=bucket["metadata"].get("world", ""),
             )
             n = len(edges)
-            return f"{bucket['id']}: +{n}边"
+            return f"{bucket['id']}: +{n}条提议（未落图）"
         except Exception as e:
             logger.warning(f"backfill single failed {bucket_id}: {e}")
             return f"{bucket_id}: 失败 {e}"
@@ -3571,7 +3699,7 @@ async def backfill_relations(
     remaining = len(eligible) - next_offset
     return (
         f"批 {offset}-{next_offset - 1}/{len(eligible)} | "
-        f"+{total}边 | {' '.join(results)} | "
+        f"+{total}条提议（未落图） | {' '.join(results)} | "
         f"剩 {remaining}, next offset={next_offset}"
     )
 
@@ -3614,15 +3742,20 @@ async def switch_world(world: str = "") -> str:
 # =============================================================
 @mcp.tool()
 async def review_pending(kind: str = "") -> str:
-    """只读列出「待审队列」里的 pending 候选——机器自动推断的危险关系边（#3 关系闸）
-    和合并时检出的事实演化冲突（#2 Z轴），都先挂这等人显式裁决。
+    """只读列出「待审队列」里的 pending 候选——M 轴巡检建议、机器自动推断的危险
+    关系边（#3 关系闸）和事实演化冲突（#2 Z轴），都先挂这等人显式裁决。
 
     永不改库：本工具只把清单念出来，建边/supersede/resolve 都需人另外显式操作。
-    kind 可选过滤：'relation'（只看关系边）/ 'z_conflict'（只看事实冲突）/ 留空看全部。
+    kind 可选过滤：'metabolism' / 'relation' / 'z_conflict' / 留空看全部。
     """
     k = (kind or "").strip().lower()
-    if k and k not in (KIND_RELATION, KIND_Z_CONFLICT):
-        return f"kind 只能是 '{KIND_RELATION}' / '{KIND_Z_CONFLICT}' 或留空。"
+    allowed_kinds = (KIND_METABOLISM, KIND_RELATION, KIND_Z_CONFLICT)
+    if k and k not in allowed_kinds:
+        return (
+            "kind 只能是 "
+            f"'{KIND_METABOLISM}' / '{KIND_RELATION}' / "
+            f"'{KIND_Z_CONFLICT}' 或留空。"
+        )
     try:
         # The queue is a small local JSONL ledger.  Reading it inline avoids
         # depending on the process-wide default executor, which can be
@@ -4719,7 +4852,11 @@ async def api_search(request):
     if not query:
         return JSONResponse({"error": "missing q parameter"}, status_code=400)
     try:
-        matches = await bucket_mgr.search(query, limit=10)
+        matches = await bucket_mgr.search(
+            query,
+            limit=10,
+            relevance_first=True,
+        )
         result = []
         for b in matches:
             meta = b.get("metadata", {})
@@ -4828,7 +4965,7 @@ async def api_breath_debug(request):
             "time": bucket_mgr.w_time,
             "importance": bucket_mgr.w_importance,
         }
-        w_sum = sum(w.values())
+        secondary_weight = w["emotion"] + w["time"] + w["importance"]
 
         for bucket in all_buckets:
             meta = bucket.get("metadata", {})
@@ -4839,16 +4976,19 @@ async def api_breath_debug(request):
                 time_s = bucket_mgr._calc_time_score(meta)
                 imp = max(1, min(10, int(meta.get("importance", 5)))) / 10.0
 
-                raw_total = (
-                    topic * w["topic"]
-                    + emotion * w["emotion"]
+                secondary_total = (
+                    emotion * w["emotion"]
                     + time_s * w["time"]
                     + imp * w["importance"]
                 )
-                normalized = (raw_total / w_sum) * 100 if w_sum > 0 else 0
+                normalized = topic * 100.0
+                tie_break_score = (
+                    secondary_total / secondary_weight * 100.0
+                    if secondary_weight > 0 else 0.0
+                )
                 resolved = meta.get("resolved", False)
                 if resolved:
-                    normalized *= 0.3
+                    tie_break_score *= 0.3
 
                 results.append({
                     "id": bid,
@@ -4864,21 +5004,28 @@ async def api_breath_debug(request):
                         "importance": round(imp, 4),
                     },
                     "weights": w,
-                    "raw_total": round(raw_total, 4),
+                    "secondary_tie_break": round(tie_break_score, 4),
                     "normalized": round(normalized, 2),
-                    "passed_threshold": normalized >= bucket_mgr.fuzzy_threshold,
+                    "passed_threshold": (
+                        normalized >= bucket_mgr.literal_candidate_floor
+                    ),
                 })
             except Exception:
                 continue
 
-        results.sort(key=lambda x: x["normalized"], reverse=True)
+        results = rank_within_relevance_bands(
+            results,
+            relevance_score=lambda row: row["normalized"],
+            tie_break_score=lambda row: row["secondary_tie_break"],
+            band_width=bucket_mgr.keyword_relevance_tie_band,
+        )
         passed = [r for r in results if r["passed_threshold"]]
         return JSONResponse({
             "query": query,
             "valence": q_valence,
             "arousal": q_arousal,
             "weights": w,
-            "threshold": bucket_mgr.fuzzy_threshold,
+            "threshold": bucket_mgr.literal_candidate_floor,
             "total_candidates": len(results),
             "passed_count": len(passed),
             "results": results[:50],  # top 50 for debug
@@ -4936,6 +5083,7 @@ async def _probe_anchor_status(query: str) -> dict:
                 angle,
                 limit=intent_policy["keyword_top_k"],
                 world_filter=world_filter,
+                relevance_first=True,
             )
             for angle in query_angles
         ))
@@ -5085,7 +5233,7 @@ async def api_review_queue(request):
     """Return the real pending review queue; never substitute demo rows."""
     from starlette.responses import JSONResponse
     kind = (request.query_params.get("kind") or "").strip().lower()
-    if kind and kind not in (KIND_RELATION, KIND_Z_CONFLICT):
+    if kind and kind not in (KIND_RELATION, KIND_Z_CONFLICT, KIND_METABOLISM):
         return JSONResponse({"error": "invalid kind"}, status_code=400)
     try:
         items = await asyncio.to_thread(_get_review_queue().list_pending, kind or None)
@@ -5142,7 +5290,7 @@ async def api_review_queue_resolve(request):
 
 @mcp.custom_route("/api/review_queue/candidate", methods=["POST"])
 async def api_review_queue_candidate(request):
-    """Enqueue a cross-bucket Z candidate without changing either bucket."""
+    """Preview a Z pair by default; explicit mode=apply only queues pending."""
     from starlette.responses import JSONResponse
     if not _review_write_api_enabled():
         return JSONResponse({"error": "OMBRE_API_TOKEN required for review queue writes"}, status_code=503)
@@ -5152,6 +5300,18 @@ async def api_review_queue_candidate(request):
         return JSONResponse({"error": "invalid JSON"}, status_code=400)
     if not isinstance(body, dict):
         return JSONResponse({"error": "JSON object required"}, status_code=400)
+    return await _submit_review_queue_candidate(body)
+
+
+async def _submit_review_queue_candidate(body: dict):
+    """Validate one pair and either preview it or enqueue a pending decision."""
+    from starlette.responses import JSONResponse
+    mode = str(body.get("mode") or "dry-run").strip().lower()
+    if mode not in {"dry-run", "apply"}:
+        return JSONResponse(
+            {"error": "mode must be dry-run or apply"},
+            status_code=400,
+        )
     current_id = str(body.get("current_bucket_id") or "").strip()
     historical_id = str(body.get("historical_bucket_id") or "").strip()
     fact_key = registered_fact_key(body.get("fact_key"), _fact_slot_registry())
@@ -5184,38 +5344,119 @@ async def api_review_queue_candidate(request):
         current_name=_name(current),
         historical_name=_name(historical),
         reason=str(body.get("reason") or "cross_bucket_currentness")[:160],
-        source=str(body.get("source") or "quality_benchmark")[:80],
+        source=str(body.get("source") or "z_conflict_review")[:80],
     )
+    if mode == "dry-run":
+        existing = await _await_daemon_thread(
+            lambda: _get_review_queue().get(entry["key"])
+        )
+        return JSONResponse({
+            "ok": True,
+            "mode": mode,
+            "key": entry["key"],
+            "status": "preview",
+            "candidate": entry,
+            "existing_status": existing.get("status") if existing else None,
+            "queue_mutated": False,
+            "memory_mutated": False,
+        })
+
     try:
-        added = await asyncio.to_thread(_get_review_queue().enqueue, entry)
+        added = await _await_daemon_thread(
+            lambda: _get_review_queue().enqueue(entry)
+        )
+        durable = await _await_daemon_thread(
+            lambda: _get_review_queue().get(entry["key"])
+        )
     except Exception as exc:
         logger.warning("review queue candidate enqueue failed: %s", type(exc).__name__)
         return JSONResponse({"error": "review queue unavailable"}, status_code=503)
+    if not durable or durable.get("status") != "pending":
+        return JSONResponse({
+            "error": (
+                "the same Z candidate was already resolved; "
+                "create a new pair instead of reviving it"
+            ),
+            "key": entry["key"],
+            "existing_status": durable.get("status") if durable else None,
+            "queue_mutated": False,
+            "memory_mutated": False,
+        }, status_code=409)
     return JSONResponse({
         "ok": True,
+        "mode": mode,
         "key": entry["key"],
         "status": "pending",
         "added": added,
+        "queue_mutated": added,
         "memory_mutated": False,
     })
 
 
 @mcp.custom_route("/api/review_queue/apply-lifecycle", methods=["POST"])
 async def api_review_queue_apply_lifecycle(request):
-    """Retired until paired Markdown writes have a durable transaction."""
+    """Apply one pending pair after an explicit named human approval."""
     from starlette.responses import JSONResponse
     if not _review_write_api_enabled():
         return JSONResponse({"error": "OMBRE_API_TOKEN required for review queue writes"}, status_code=503)
-    return await _apply_review_queue_lifecycle({})
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON object required"}, status_code=400)
+    return await _apply_review_queue_lifecycle(body)
 
 
 async def _apply_review_queue_lifecycle(body):
     from starlette.responses import JSONResponse
+    key = str(body.get("key") or "").strip()
+    reviewer = str(body.get("reviewer") or "").strip()
+    verdict_note = str(body.get("verdict_note") or "").strip()[:500]
+    if not key:
+        return JSONResponse({"error": "key required"}, status_code=400)
+    if not reviewer:
+        return JSONResponse(
+            {"error": "reviewer required for explicit Z approval"},
+            status_code=400,
+        )
+    try:
+        result = await _await_daemon_thread(
+            lambda: _get_z_lifecycle_transaction().apply(
+                key,
+                reviewer=reviewer,
+                verdict_note=verdict_note,
+                validate_pair=_z_pair_validation_error,
+            )
+        )
+    except ZLifecycleNotFound as exc:
+        return JSONResponse({
+            "error": str(exc),
+            "memory_mutated": False,
+            "queue_mutated": False,
+        }, status_code=404)
+    except (ValueError, ZLifecycleStateError) as exc:
+        return JSONResponse({
+            "error": str(exc),
+            "memory_mutated": False,
+            "queue_mutated": False,
+        }, status_code=409)
+    except Exception as exc:
+        logger.exception(
+            "Z lifecycle transaction failed: %s",
+            type(exc).__name__,
+        )
+        return JSONResponse({
+            "error": "Z lifecycle transaction failed closed",
+            "memory_mutated": False,
+            "queue_mutated": False,
+        }, status_code=503)
     return JSONResponse({
-        "error": "Z apply is disabled until a durable paired-write transaction is available",
-        "memory_mutated": False,
-        "queue_mutated": False,
-    }, status_code=409)
+        "ok": True,
+        **result,
+        "memory_mutated": result["changed"],
+        "queue_mutated": result["changed"],
+    })
 
 
 @mcp.custom_route("/api/review_queue/apply-protected-overlay", methods=["POST"])
@@ -5950,6 +6191,17 @@ async def api_outbox_get(request):
 
 # --- Entry point / 启动入口 ---
 if __name__ == "__main__":
+    try:
+        recovered_z = _get_z_lifecycle_transaction().recover()
+        if recovered_z:
+            logger.warning(
+                "Recovered %d interrupted Z lifecycle transaction(s)",
+                len(recovered_z),
+            )
+    except Exception:
+        logger.exception("Z lifecycle recovery failed; refusing to start")
+        raise
+
     transport = config.get("transport", "stdio")
     logger.info(f"Ombre Brain starting | transport: {transport}")
 

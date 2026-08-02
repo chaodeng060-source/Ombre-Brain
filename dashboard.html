@@ -1263,7 +1263,7 @@ function renderDetailView(b) {
       '<div class="field"><label>唤醒度</label>A' + (meta.arousal || 0.3).toFixed(2) + '</div>' +
       '<div class="field"><label>模型视角</label>' + (meta.model_valence != null ? 'V' + meta.model_valence.toFixed(2) : '—') + '</div>' +
       '<div class="field"><label>重要度</label>' + (meta.importance || 5) + '/10</div>' +
-      '<div class="field"><label>权重分</label>' + b.score.toFixed(4) + '</div>' +
+      '<div class="field"><label>活跃度分</label>' + b.score.toFixed(4) + '</div>' +
       '<div class="field"><label>激活次数</label>' + (meta.activation_count || 1) + '</div>' +
       '<div class="field"><label>已解决</label>' + (meta.resolved ? '✓' : '—') + '</div>' +
       '<div class="field"><label>已消化</label>' + (meta.digested ? '✓' : '—') + '</div>' +

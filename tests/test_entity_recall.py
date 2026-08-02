@@ -174,7 +174,11 @@ async def test_entity_only_channel_reuses_all_authority_filters(tmp_path, monkey
             path=str(archive_dir / "archived.md"),
         ),
     ]
-    cfg, _manager = _configure_server(tmp_path, monkeypatch, buckets)
+    cfg, manager = _configure_server(tmp_path, monkeypatch, buckets)
+    # An audited entity link is itself original-query support.  It must survive
+    # relevance-first even when the canonical name has no literal overlap with
+    # a bucket whose body contains only the alias.
+    manager._calc_topic_score = lambda query, bucket: 0.0
     store = EntityStore(cfg)
     for bucket in buckets:
         store.resolve_and_link(bucket["id"], bucket["content"])

@@ -45,6 +45,7 @@ from utils import (
     RELATION_TYPES, PROTECTED_RESOLVE_DOMAINS, ResolvedGuardError,
     DATE_PRECISIONS, event_at_from_metadata, normalize_event_at,
 )
+from recall_support import rank_within_relevance_bands
 from mutation_audit import MutationAuditLog
 from maintenance_barrier import MaintenanceBarrier
 from storage_safety import advisory_file_lock, atomic_write_post
@@ -92,8 +93,20 @@ class BucketManager:
         self.nsfw_dir = os.path.join(self.base_dir, "涩涩")  # 色色单独文件夹：日常默认不扫
         # 当前是否处于涩涩 world（switch_world 维护）；list_all 默认跟随它决定是否加载涩涩目录
         self.nsfw_active = (config.get("current_world", "") or "").strip() == "涩涩"
-        self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
-        self.max_results = config.get("matching", {}).get("max_results", 5)
+        matching_cfg = config.get("matching", {}) or {}
+        self.fuzzy_threshold = matching_cfg.get("fuzzy_threshold", 50)
+        self.max_results = matching_cfg.get("max_results", 5)
+        self.keyword_relevance_tie_band = max(
+            0.0,
+            float(matching_cfg.get("keyword_relevance_tie_band", 3.0)),
+        )
+        self.literal_candidate_floor = max(
+            0.0,
+            min(
+                100.0,
+                float(matching_cfg.get("literal_candidate_floor", 40.0)),
+            ),
+        )
 
         # id→文件路径缓存（扫盘 #3）：_find_bucket_file 原来每次 os.walk 全 5 目录，
         # get/update/delete 高频路径 O(目录树)。命中先 isfile 校验，归档/删除移动文件后
@@ -790,6 +803,8 @@ class BucketManager:
         query_arousal: float = None,
         created_after: datetime = None,
         created_before: datetime = None,
+        relevance_first: bool = False,
+        relevance_candidate_floor: float = None,
     ) -> list[dict]:
         if not query or not query.strip():
             return []
@@ -850,25 +865,60 @@ class BucketManager:
                 time_score = self._calc_time_score(meta)
                 importance_score = max(1, min(10, int(meta.get("importance", 5)))) / 10.0
 
-                total = (
-                    topic_score * self.w_topic
-                    + emotion_score * self.w_emotion
-                    + time_score * self.w_time
-                    + importance_score * self.w_importance
-                )
-                
-                weight_sum = self.w_topic + self.w_emotion + self.w_time + self.w_importance
-                normalized = (total / weight_sum) * 100 if weight_sum > 0 else 0
+                if relevance_first:
+                    # Retrieval must be relevance-led.  Emotion, recency and
+                    # importance are retained only as a close-score tie-break.
+                    normalized = topic_score * 100.0
+                    secondary_weight = self.w_emotion + self.w_time + self.w_importance
+                    secondary_total = (
+                        emotion_score * self.w_emotion
+                        + time_score * self.w_time
+                        + importance_score * self.w_importance
+                    )
+                    tie_break_score = (
+                        secondary_total / secondary_weight * 100.0
+                        if secondary_weight > 0 else 0.0
+                    )
+                else:
+                    total = (
+                        topic_score * self.w_topic
+                        + emotion_score * self.w_emotion
+                        + time_score * self.w_time
+                        + importance_score * self.w_importance
+                    )
+                    weight_sum = (
+                        self.w_topic + self.w_emotion + self.w_time + self.w_importance
+                    )
+                    normalized = (total / weight_sum) * 100 if weight_sum > 0 else 0
+                    tie_break_score = normalized
 
                 # Threshold check uses raw (pre-penalty) score so resolved buckets
                 # remain reachable by keyword (penalty applied only to ranking).
                 # 阈值用原始分数判定，确保 resolved 桶在关键词命中时仍可被搜出
-                if normalized >= self.fuzzy_threshold:
+                candidate_floor = (
+                    (
+                        self.literal_candidate_floor
+                        if relevance_candidate_floor is None
+                        else max(
+                            0.0,
+                            min(100.0, float(relevance_candidate_floor)),
+                        )
+                    )
+                    if relevance_first else self.fuzzy_threshold
+                )
+                if normalized >= candidate_floor:
                     # Resolved buckets get ranking penalty (but still reachable by keyword)
                     # 已解决的桶仅在排序时降权
-                    if meta.get("resolved", False):
+                    if meta.get("resolved", False) and not relevance_first:
                         normalized *= 0.3
+                    elif meta.get("resolved", False):
+                        tie_break_score *= 0.3
                     bucket["score"] = round(normalized, 2)
+                    if relevance_first:
+                        bucket["_keyword_tie_break_score"] = round(
+                            tie_break_score,
+                            4,
+                        )
                     scored.append(bucket)
             except Exception as e:
                 logger.warning(
@@ -877,7 +927,18 @@ class BucketManager:
                 )
                 continue
 
-        scored.sort(key=lambda x: x["score"], reverse=True)
+        if relevance_first:
+            scored = rank_within_relevance_bands(
+                scored,
+                relevance_score=lambda item: item.get("score", 0),
+                tie_break_score=lambda item: item.get(
+                    "_keyword_tie_break_score",
+                    0,
+                ),
+                band_width=self.keyword_relevance_tie_band,
+            )
+        else:
+            scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
 
     # ---------------------------------------------------------

@@ -66,7 +66,9 @@ Use `hold()` for one memory:
 4. Otherwise call `dehydrator.analyze()` to infer `domain`, `tags`, `valence`, `arousal`, and suggested name.
 5. If `pinned=True`, create directly as `permanent`, lock `importance=10`, skip merge.
 6. Otherwise `_merge_or_create()` decides whether to append to an existing compatible bucket or create a new one.
-7. New buckets may receive auto-inferred relation edges via `_auto_infer_edges()`.
+7. New buckets may receive auto-inferred relation proposals via
+   `_auto_infer_edges()`. Automated paths only append pending review rows;
+   an agent must explicitly call `add_relation` before an edge enters the graph.
 8. Generate/update embeddings best-effort; embedding failure must not block memory writes.
 
 Use `grow()` for diary-like bulk input. It digests a long text into multiple candidate memories, then sends each through the same merge/create path. Very short inputs bypass digest to save LLM calls.

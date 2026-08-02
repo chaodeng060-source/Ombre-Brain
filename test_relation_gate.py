@@ -1,5 +1,5 @@
-"""#3 关系闸集成自测 —— 真调 server._auto_infer_edges，monkeypatch 掉
-embedding / bucket_mgr / dehydrator，验「闸开时 safe 边照写、危险边改入队不写库」。
+"""机器关系提议集成自测 —— 真调 server._auto_infer_edges，monkeypatch 掉
+embedding / bucket_mgr / dehydrator，验所有关系只入队、不直接落图。
 
 不打任何真 API、不碰真库；队列指向 tmp 文件。
 """
@@ -12,7 +12,7 @@ from review_queue import ReviewQueue, KIND_RELATION
 
 
 def run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 class _FakeEmbedding:
@@ -68,33 +68,35 @@ def _setup(monkeypatch_gate: bool | None):
     return fake_mgr, server._review_queue
 
 
-def test_gate_off_writes_all_edges():
+def test_gate_off_still_only_queues_machine_proposals():
     mgr, q = _setup(monkeypatch_gate=False)
-    added = run(server._auto_infer_edges("src", "源内容", world=""))
-    types_written = sorted(t for _, _, t in mgr.added)
-    assert types_written == ["causes", "kin"], types_written   # 闸关：全写
-    assert q.list_pending() == []                              # 没入队
-    assert sorted(e["type"] for e in added) == ["causes", "kin"]
+    proposals = run(server._auto_infer_edges("src", "源内容", world=""))
+    assert mgr.added == []
+    assert sorted(e["rel_type"] for e in q.list_pending(KIND_RELATION)) == [
+        "causes",
+        "kin",
+    ]
+    assert sorted(e["type"] for e in proposals) == ["causes", "kin"]
 
 
-def test_gate_on_diverts_dangerous_edge():
+def test_gate_on_queues_safe_and_dangerous_edges_alike():
     mgr, q = _setup(monkeypatch_gate=True)
-    added = run(server._auto_infer_edges("src", "源内容", world=""))
-    types_written = [t for _, _, t in mgr.added]
-    assert types_written == ["kin"], types_written            # 闸开：只安全 kin 写库
-    assert [e["type"] for e in added] == ["kin"]              # 返回的也只有写成功的
+    proposals = run(server._auto_infer_edges("src", "源内容", world=""))
+    assert mgr.added == []
     pend = q.list_pending(KIND_RELATION)
-    assert len(pend) == 1 and pend[0]["rel_type"] == "causes"  # 危险 causes 改入队
-    assert pend[0]["source_id"] == "src" and pend[0]["target_id"] == "buk_cause"
-    assert pend[0]["target_name"] == "因果桶"
+    assert sorted(e["rel_type"] for e in pend) == ["causes", "kin"]
+    cause = next(e for e in pend if e["rel_type"] == "causes")
+    assert cause["source_id"] == "src" and cause["target_id"] == "buk_cause"
+    assert cause["target_name"] == "因果桶"
+    assert sorted(e["type"] for e in proposals) == ["causes", "kin"]
 
 
 def test_gate_defaults_on_when_config_is_missing():
     mgr, q = _setup(monkeypatch_gate=None)
-    added = run(server._auto_infer_edges("src", "源内容", world=""))
-    assert [t for _, _, t in mgr.added] == ["kin"]
-    assert [entry["type"] for entry in added] == ["kin"]
-    assert len(q.list_pending(KIND_RELATION)) == 1
+    proposals = run(server._auto_infer_edges("src", "源内容", world=""))
+    assert mgr.added == []
+    assert len(proposals) == 2
+    assert len(q.list_pending(KIND_RELATION)) == 2
 
 
 def test_review_write_api_requires_configured_bearer(monkeypatch):

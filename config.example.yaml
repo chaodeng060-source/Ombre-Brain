@@ -160,6 +160,9 @@ scoring_weights:
 matching:
   fuzzy_threshold: 50             # Minimum match score (0-100) / 最低匹配分数
   max_results: 5                  # Max results per search / 单次搜索最多返回条数
+  literal_candidate_floor: 40.0   # Original-query topic floor for recall candidates
+  keyword_relevance_tie_band: 3.0 # Emotion/time/importance may rerank only within this topic-score gap
+  fused_relevance_tie_band: 0.35  # Decay/sense/intent may rerank only within this RRF×1000 gap
 
 # --- RRF fusion / RRF 融合检索 ---
 # breath 双通道融合参数：keyword (jieba+rapidfuzz) + vector (embedding)
@@ -235,15 +238,14 @@ intent_recall:
       temporal_recent_days: 14
 
 # --- Review gates / 待审闸（对位 lmc-5 的 Z 轴事实演化 + Y 轴关系安全）---
-# 机器只提候选、不直接改写真相：开了之后，自动推断的「危险」关系边、合并时检出的
-# 事实冲突，都先挂进 <buckets_dir>/review_queue.jsonl 等人显式 resolve。
-# 默认开启安全闸：危险关系只进待审，事实冲突额外留审计记录。
+# 机器只提候选、不直接改写真相：所有自动推断关系边和合并时检出的事实冲突，
+# 都先挂进 <buckets_dir>/review_queue.jsonl；只有 agent 显式 add_relation 才落图。
 # 只读查看：python review_queue.py --path <buckets_dir>/review_queue.jsonl
 # 红线：保护域感情桶（恋爱/纪念日/约定/家庭/自省/feel）在合并层已被排除，
-#       绝不会被自动 supersede——这层闸只兜普通桶 + 机器自动建的因果/取代边。
+#       绝不会被自动 supersede。
 review_gate:
-  relation_review: true           # #3：自动建边时把 causes/contributes/improves/updates 挂 pending（kin/explains 仍直写）
-  fact_evolution_audit: true      # #2：合并检出事实冲突时额外挂一条 pending 审计行（合并照常进行）
+  relation_review: true           # compatibility flag; auto relations are always proposals
+  fact_evolution_audit: true      # compatibility flag; conflicts stay as separate buckets until explicit Z apply
 
 # --- Stage-0 query expansion / 查询扩展 ---
 # 只在回忆/关系/时间线意图上启用，精确事实查询保留原词，避免改写过头。
@@ -264,9 +266,12 @@ recall_evidence_roles:
   enabled: false
 
 # --- Typed relation recall / 类型化关系召回 ---
-# 默认只走描述性安全边；危险因果/取代边即使历史上已存在，也不自动扩进上下文。
+# propagation_only=false 是上线前的精确旧行为/紧急回滚；打开后仅
+# causes/contributes/improves/explains 可传播，kin/updates 只记录关系。
 relation_recall:
-  allowed_types: [kin, explains]
+  propagation_only: false
+  allowed_types: [kin, explains]  # rollback/legacy mode only
+  propagation_types: [causes, contributes, improves, explains]
   hop1_min_strength: 0.4
   hop2_min_strength: 0.7
 

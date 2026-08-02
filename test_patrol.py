@@ -7,11 +7,18 @@
        命中、陈旧重要命中、整体跑通不炸。
 """
 import tempfile
+import hashlib
 import json
-from datetime import datetime
+import sqlite3
+import sys
+from datetime import date, datetime
 from pathlib import Path
 
+import pytest
+
 import patrol
+from conversation_activity import SCHEMA, TIMEZONE_NAME
+from review_queue import ReviewQueue
 
 
 def _write(dir_path, rel, text):
@@ -19,6 +26,36 @@ def _write(dir_path, rel, text):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(text, encoding="utf-8")
     return p
+
+
+def _write_embedding_db(path: Path, rows: list[tuple[str, object]]) -> Path:
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE embeddings (
+                bucket_id TEXT PRIMARY KEY,
+                embedding TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO embeddings(bucket_id, embedding, updated_at) VALUES (?, ?, ?)",
+            [
+                (bucket_id, json.dumps(embedding), "2026-07-30T12:00:00+08:00")
+                for bucket_id, embedding in rows
+            ],
+        )
+    return path
+
+
+def _activity_summary(counts: dict[str, int]) -> dict:
+    return {
+        "schema": SCHEMA,
+        "timezone": TIMEZONE_NAME,
+        "start_date": "2026-07-30",
+        "daily_user_messages": counts,
+    }
 
 
 # ---- Q2: _parse_dt 吃多种输入 ----
@@ -95,6 +132,8 @@ def test_patrol_end_to_end_flags():
     assert rep["total"] == 2
     assert any(x["id"] == "love" for x in rep["protected_resolved"])
     assert any(x["id"] == "old" for x in rep["stale_important"])
+    assert rep["suggestions"]
+    assert all(item["reason"] for item in rep["suggestions"])
     assert "巡检" in patrol.render_md(rep, Path(d), now)   # render 不炸
 
 
@@ -157,3 +196,238 @@ def test_patrol_reads_json_backup_snapshots_and_ignores_sidecars():
     assert rep["migration_candidates"] == [
         {"id": "abcdef123456", "fact_key": "profile.city", "values": ["杭州"]}
     ]
+
+
+def test_patrol_is_read_only_and_queues_reasoned_suggestions_idempotently():
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as qd:
+        bucket = _write(
+            d,
+            "dynamic/long.md",
+            "---\nid: long\nname: 长桶\ntype: dynamic\n---\n" + ("内容" * 900),
+        )
+        before = bucket.read_bytes()
+        report = patrol.patrol(Path(d), datetime(2026, 7, 30, 12, 0, 0))
+        after = bucket.read_bytes()
+
+        assert before == after
+        assert report["suggestions"]
+        assert all(
+            entry["action"] and entry["severity"] and entry["reason"]
+            for entry in report["suggestions"]
+        )
+        queue = ReviewQueue(Path(qd) / "review_queue.jsonl")
+        first = patrol.enqueue_metabolism_suggestions(report, queue)
+        second = patrol.enqueue_metabolism_suggestions(report, queue)
+        assert first >= 1
+        assert second == 0
+        pending = queue.list_pending("metabolism")
+        assert len(pending) == first
+        assert all(entry["reason"] for entry in pending)
+
+
+def test_patrol_cli_rejects_apply_before_reading_target(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["patrol.py", "--apply", "--buckets", "/definitely/not/a/vault"],
+    )
+    with pytest.raises(SystemExit, match="严格只读"):
+        patrol.main()
+
+
+def test_patrol_cli_prefers_configured_vault_over_stale_environment(
+    monkeypatch,
+    tmp_path,
+):
+    vault = tmp_path / "vault"
+    _write(
+        vault,
+        "dynamic/one.md",
+        "---\nid: one\nname: One\ntype: dynamic\n---\nbody",
+    )
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f"buckets_dir: {vault}\nfact_slots:\n  registry: {{}}\n",
+        encoding="utf-8",
+    )
+    report_path = tmp_path / "report.md"
+    monkeypatch.setenv("OMBRE_BUCKETS_DIR", "/stale/empty/mount")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "patrol.py",
+            "--config",
+            str(config_path),
+            "--out",
+            str(report_path),
+        ],
+    )
+
+    patrol.main()
+
+    assert "桶总数：**1**" in report_path.read_text(encoding="utf-8")
+
+
+def test_patrol_reports_missing_and_zero_dim_vectors_without_writing(tmp_path):
+    vault = tmp_path / "vault"
+    missing = _write(
+        vault,
+        "dynamic/missing.md",
+        "---\nid: missing\nname: Missing\ntype: dynamic\n"
+        "recorded_at: 2026-07-30T08:00:00+08:00\n---\n正文存在\n",
+    )
+    zero = _write(
+        vault,
+        "dynamic/zero.md",
+        "---\nid: zero\nname: Zero\ntype: dynamic\n"
+        "recorded_at: 2026-07-30T09:00:00+08:00\n---\n正文存在\n",
+    )
+    healthy = _write(
+        vault,
+        "dynamic/healthy.md",
+        "---\nid: healthy\nname: Healthy\ntype: dynamic\n"
+        "recorded_at: 2026-07-30T10:00:00+08:00\n---\n正文存在\n",
+    )
+    fts_only = _write(
+        vault,
+        "dynamic/fts.md",
+        "---\nid: fts\nname: FTS\ntype: dynamic\nvector_policy: fts_only\n"
+        "recorded_at: 2026-07-30T11:00:00+08:00\n---\n明确不需要向量\n",
+    )
+    db = _write_embedding_db(
+        vault / "embeddings.db",
+        [("zero", [[]]), ("healthy", [[0.1, 0.2]])],
+    )
+    bucket_hashes = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (missing, zero, healthy, fts_only)
+    }
+    db_hash = hashlib.sha256(db.read_bytes()).hexdigest()
+
+    report = patrol.patrol(vault, datetime(2026, 7, 30, 12, 0, 0))
+
+    assert report["vector_audit"]["status"] == "ok"
+    assert report["vector_audit"]["scanned_bodies"] == 3
+    assert [
+        (item["id"], item["reason"])
+        for item in report["curated_without_vector"]
+    ] == [("missing", "missing_vector"), ("zero", "zero_dimension")]
+    suggestion = next(
+        item
+        for item in report["suggestions"]
+        if item["check"] == "curated_without_vector"
+    )
+    assert suggestion["bucket_ids"] == ["missing", "zero"]
+    assert "curated_without_vector" in patrol.render_md(
+        report, vault, datetime(2026, 7, 30, 12, 0, 0)
+    )
+    assert {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (missing, zero, healthy, fts_only)
+    } == bucket_hashes
+    assert hashlib.sha256(db.read_bytes()).hexdigest() == db_hash
+
+
+def test_vector_reconciliation_supports_incremental_recorded_at_window(tmp_path):
+    vault = tmp_path / "vault"
+    _write(
+        vault,
+        "dynamic/old.md",
+        "---\nid: old\ntype: dynamic\n"
+        "recorded_at: 2026-07-29T23:59:59+08:00\n---\n旧正文\n",
+    )
+    _write(
+        vault,
+        "dynamic/new.md",
+        "---\nid: new\ntype: dynamic\n"
+        "recorded_at: 2026-07-30T00:00:00+08:00\n---\n新正文\n",
+    )
+    _write_embedding_db(vault / "embeddings.db", [])
+
+    report = patrol.patrol(
+        vault,
+        datetime(2026, 7, 30, 12, 0, 0),
+        vector_since=datetime(2026, 7, 30, 0, 0, 0),
+    )
+
+    assert [item["id"] for item in report["curated_without_vector"]] == ["new"]
+    assert report["vector_audit"]["since"] == "2026-07-30T00:00:00"
+
+
+def test_zero_deposition_alerts_after_three_active_days_without_buckets(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _write_embedding_db(vault / "embeddings.db", [])
+    report = patrol.patrol(
+        vault,
+        datetime(2026, 8, 1, 23, 59, 0),
+        activity_summary=_activity_summary({
+            "2026-07-30": 4,
+            "2026-07-31": 2,
+            "2026-08-01": 3,
+        }),
+        monitor_start_date=date(2026, 7, 30),
+    )
+
+    monitor = report["zero_deposition"]
+    assert monitor["status"] == "alert"
+    assert monitor["streak_days"] == 3
+    assert monitor["streak_start"] == "2026-07-30"
+    assert monitor["streak_end"] == "2026-08-01"
+    assert "纯寒暄" in monitor["note"]
+    rendered = patrol.render_md(
+        report,
+        vault,
+        datetime(2026, 8, 1, 23, 59, 0),
+    )
+    assert "连续零沉淀监控" in rendered
+    assert "状态：**alert**" in rendered
+    assert "纯寒暄" in rendered
+    suggestion = next(
+        item
+        for item in report["suggestions"]
+        if item["check"] == "zero_deposition_with_activity"
+    )
+    assert suggestion["severity"] == "critical"
+    assert suggestion["bucket_ids"] == []
+
+
+def test_zero_deposition_healthy_controls_do_not_false_alarm(tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _write_embedding_db(vault / "embeddings.db", [])
+    # Healthy control A: she was away for one day, so the streak must break.
+    away = patrol.patrol(
+        vault,
+        datetime(2026, 8, 1, 23, 59, 0),
+        activity_summary=_activity_summary({
+            "2026-07-30": 4,
+            "2026-07-31": 0,
+            "2026-08-01": 3,
+        }),
+    )
+    assert away["zero_deposition"]["status"] == "healthy"
+    assert away["zero_deposition"]["streak_days"] == 1
+
+    # Healthy control B: active every day, but a real bucket landed today.
+    bucket = _write(
+        vault,
+        "dynamic/landed.md",
+        "---\nid: landed\ntype: dynamic\n"
+        "recorded_at: 2026-08-01T08:00:00+08:00\n---\n已沉淀\n",
+    )
+    before = bucket.read_bytes()
+    landed = patrol.patrol(
+        vault,
+        datetime(2026, 8, 1, 23, 59, 0),
+        activity_summary=_activity_summary({
+            "2026-07-30": 4,
+            "2026-07-31": 2,
+            "2026-08-01": 3,
+        }),
+    )
+    assert landed["zero_deposition"]["status"] == "healthy"
+    assert landed["zero_deposition"]["streak_days"] == 0
+    assert landed["zero_deposition"]["days"][-1]["new_buckets"] == 1
+    assert bucket.read_bytes() == before

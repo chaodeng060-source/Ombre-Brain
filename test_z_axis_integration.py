@@ -1,8 +1,15 @@
 """Z-axis integration tests for canonical fact slots and recall gating."""
 
-import asyncio
+import hashlib
+import json
+from pathlib import Path
 
+import pytest
+
+from bucket_manager import BucketManager
 import server
+
+_ORIGINAL_GET_REVIEW_QUEUE = server._get_review_queue
 
 
 def _bucket(bucket_id, *, key="", status="", protected=False):
@@ -249,15 +256,244 @@ def test_pair_validation_rechecks_registry_context_and_existing_slot(monkeypatch
     )
 
 
-def test_z_apply_is_fail_closed_until_pair_transaction_exists():
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    response = loop.run_until_complete(
-        server._apply_review_queue_lifecycle({"key": "anything"})
+def _response_json(response):
+    return json.loads(response.body.decode("utf-8"))
+
+
+def _bucket_hash(manager, bucket_id):
+    path = Path(manager._find_bucket_file(bucket_id))
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+async def _configure_real_z_pair(monkeypatch, tmp_path):
+    buckets_dir = str(tmp_path / "buckets")
+    for directory in ("permanent", "dynamic", "archive", "feel", "涩涩"):
+        Path(buckets_dir, directory).mkdir(parents=True, exist_ok=True)
+    test_config = {
+        "buckets_dir": buckets_dir,
+        "audit": {"enabled": False},
+        "matching": {"fuzzy_threshold": 50, "max_results": 10},
+        "wikilink": {"enabled": False},
+        "scoring_weights": {},
+    }
+    config = {
+        **test_config,
+        "fact_slots": {
+            "enabled": True,
+            "registry": {
+                "profile.city": {"aliases": ["城市"]},
+            },
+        },
+    }
+    manager = BucketManager(config)
+    historical_id = await manager.create(
+        content="城市: 北京",
+        domain=["生活"],
+        name="Z验收旧城市",
     )
-    assert response.status_code == 409
-    assert b'"memory_mutated":false' in response.body
-    assert b'"queue_mutated":false' in response.body
+    current_id = await manager.create(
+        content="城市: 杭州",
+        domain=["生活"],
+        name="Z验收新城市",
+    )
+    monkeypatch.setattr(server, "config", {**server.config, **config})
+    monkeypatch.setattr(server, "bucket_mgr", manager)
+    monkeypatch.setattr(server, "_review_queue", None)
+    monkeypatch.setattr(server, "_get_review_queue", _ORIGINAL_GET_REVIEW_QUEUE)
+    monkeypatch.setattr(server, "_z_lifecycle_transaction", None)
+    body = {
+        "current_bucket_id": current_id,
+        "historical_bucket_id": historical_id,
+        "fact_key": "profile.city",
+        "reason": "integration_acceptance",
+        "source": "test",
+    }
+    return manager, current_id, historical_id, body, test_config
+
+
+@pytest.mark.asyncio
+async def test_z_candidate_defaults_to_dry_run_without_any_write(
+    monkeypatch,
+    tmp_path,
+):
+    manager, current_id, historical_id, body, test_config = await _configure_real_z_pair(
+        monkeypatch,
+        tmp_path,
+    )
+    before = {
+        current_id: _bucket_hash(manager, current_id),
+        historical_id: _bucket_hash(manager, historical_id),
+    }
+
+    response = await server._submit_review_queue_candidate(body)
+    payload = _response_json(response)
+
+    assert response.status_code == 200
+    assert payload["mode"] == "dry-run"
+    assert payload["status"] == "preview"
+    assert payload["queue_mutated"] is False
+    assert payload["memory_mutated"] is False
+    assert not Path(test_config["buckets_dir"], "review_queue.jsonl").exists()
+    assert _bucket_hash(manager, current_id) == before[current_id]
+    assert _bucket_hash(manager, historical_id) == before[historical_id]
+
+
+@pytest.mark.asyncio
+async def test_z_apply_only_enqueues_pending_and_is_idempotent(
+    monkeypatch,
+    tmp_path,
+):
+    manager, current_id, historical_id, body, _ = await _configure_real_z_pair(
+        monkeypatch,
+        tmp_path,
+    )
+    before = {
+        current_id: _bucket_hash(manager, current_id),
+        historical_id: _bucket_hash(manager, historical_id),
+    }
+
+    first = _response_json(
+        await server._submit_review_queue_candidate({**body, "mode": "apply"})
+    )
+    second = _response_json(
+        await server._submit_review_queue_candidate({**body, "mode": "apply"})
+    )
+    current = await manager.get(current_id)
+    historical = await manager.get(historical_id)
+
+    assert first["status"] == "pending" and first["added"] is True
+    assert second["status"] == "pending" and second["added"] is False
+    assert first["memory_mutated"] is False
+    assert len(server._get_review_queue().list_pending("z_conflict")) == 1
+    assert "fact_status" not in current["metadata"]
+    assert "fact_status" not in historical["metadata"]
+    assert _bucket_hash(manager, current_id) == before[current_id]
+    assert _bucket_hash(manager, historical_id) == before[historical_id]
+
+
+@pytest.mark.asyncio
+async def test_z_human_approval_atomically_marks_old_fact_historical(
+    monkeypatch,
+    tmp_path,
+):
+    manager, current_id, historical_id, body, _ = await _configure_real_z_pair(
+        monkeypatch,
+        tmp_path,
+    )
+    queued = _response_json(
+        await server._submit_review_queue_candidate({**body, "mode": "apply"})
+    )
+
+    response = await server._apply_review_queue_lifecycle({
+        "key": queued["key"],
+        "reviewer": "human-reviewer",
+        "verdict_note": "确认杭州为当前事实",
+    })
+    payload = _response_json(response)
+    current = await manager.get(current_id)
+    historical = await manager.get(historical_id)
+    durable = server._get_review_queue().get(queued["key"])
+
+    assert response.status_code == 200
+    assert payload["status"] == "applied"
+    assert payload["memory_mutated"] is True
+    assert current["metadata"]["fact_key"] == "profile.city"
+    assert current["metadata"]["fact_status"] == "current"
+    assert current["metadata"]["supersedes_bucket_ids"] == [historical_id]
+    assert historical["metadata"]["fact_key"] == "profile.city"
+    assert historical["metadata"]["fact_status"] == "historical"
+    assert historical["metadata"]["superseded_by_bucket_id"] == current_id
+    assert durable["status"] == "applied"
+    assert durable["reviewer"] == "human-reviewer"
+    assert durable["verdict_note"] == "确认杭州为当前事实"
+
+    replay = _response_json(await server._apply_review_queue_lifecycle({
+        "key": queued["key"],
+        "reviewer": "human-reviewer",
+        "verdict_note": "确认杭州为当前事实",
+    }))
+    assert replay["changed"] is False
+
+
+@pytest.mark.asyncio
+async def test_z_approval_failure_restores_both_buckets_and_keeps_pending(
+    monkeypatch,
+    tmp_path,
+):
+    manager, current_id, historical_id, body, _ = await _configure_real_z_pair(
+        monkeypatch,
+        tmp_path,
+    )
+    queued = _response_json(
+        await server._submit_review_queue_candidate({**body, "mode": "apply"})
+    )
+    before = {
+        current_id: _bucket_hash(manager, current_id),
+        historical_id: _bucket_hash(manager, historical_id),
+    }
+    transaction = server._get_z_lifecycle_transaction()
+    real_write = transaction._write_bucket
+    calls = 0
+
+    def fail_second_bucket(path, text):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected second bucket failure")
+        real_write(path, text)
+
+    monkeypatch.setattr(transaction, "_write_bucket", fail_second_bucket)
+    response = await server._apply_review_queue_lifecycle({
+        "key": queued["key"],
+        "reviewer": "human-reviewer",
+        "verdict_note": "failure injection",
+    })
+
+    assert response.status_code == 503
+    assert _bucket_hash(manager, current_id) == before[current_id]
+    assert _bucket_hash(manager, historical_id) == before[historical_id]
+    assert server._get_review_queue().get(queued["key"])["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_z_startup_recovery_rolls_back_an_interrupted_pair(
+    monkeypatch,
+    tmp_path,
+):
+    manager, current_id, historical_id, body, _ = await _configure_real_z_pair(
+        monkeypatch,
+        tmp_path,
+    )
+    queued = _response_json(
+        await server._submit_review_queue_candidate({**body, "mode": "apply"})
+    )
+    before = {
+        current_id: _bucket_hash(manager, current_id),
+        historical_id: _bucket_hash(manager, historical_id),
+    }
+    transaction = server._get_z_lifecycle_transaction()
+    real_write = transaction._write_bucket
+    calls = 0
+
+    def crash_on_second_bucket(path, text):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt("simulated process death")
+        real_write(path, text)
+
+    with monkeypatch.context() as crash:
+        crash.setattr(transaction, "_write_bucket", crash_on_second_bucket)
+        with pytest.raises(KeyboardInterrupt):
+            transaction.apply(
+                queued["key"],
+                reviewer="human-reviewer",
+                verdict_note="crash recovery injection",
+                validate_pair=server._z_pair_validation_error,
+            )
+
+    assert _bucket_hash(manager, current_id) != before[current_id]
+    assert transaction.recover() == [queued["key"]]
+    assert _bucket_hash(manager, current_id) == before[current_id]
+    assert _bucket_hash(manager, historical_id) == before[historical_id]
+    assert server._get_review_queue().get(queued["key"])["status"] == "pending"
