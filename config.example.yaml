@@ -171,6 +171,22 @@ rrf:
   keyword_weight: 1.0             # keyword channel weight / 关键词通道权重
   vector_weight: 1.0              # vector channel weight / 向量通道权重
 
+# --- Entity resolution + alias recall / 实体消歧与别名召回 ---
+# Additive SQLite sidecar under <buckets_dir>/.entities; never changes bucket
+# frontmatter/body.  Only explicit operator seeds may unify different names.
+# The model may identify exact mentions and coarse types, but cannot invent
+# alias equivalence.  If one alias points to multiple entities, entity recall
+# fails open to the legacy keyword/vector channels instead of guessing.
+entities:
+  enabled: true
+  rrf_weight: 1.0
+  top_k: 20
+  seeds: []
+  # Dedicated deployments can add audited private mappings, for example:
+  # - canonical_name: "Example Person"
+  #   aliases: ["Example Nickname"]
+  #   type: person
+
 # --- Intent-aware recall / 意图感知检索 ---
 # Classify breath(query=...) into fact/recall/relation/temporal, then assign
 # channel budgets before the existing RRF merge. The default policy mirrors the

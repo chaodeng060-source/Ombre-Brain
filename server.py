@@ -80,6 +80,7 @@ from episode_engine import EpisodeEngine
 from saga_engine import SagaEngine
 from sense_tagger import detect_senses, union_senses
 from embedding_engine import EmbeddingEngine
+from entity_store import EntityStore, entity_mention_present
 from import_memory import ImportEngine
 from intent_recall import bucket_intent_score_multiplier, resolve_intent_recall_policy
 from fact_conflicts import build_supersedes_audit
@@ -103,7 +104,7 @@ from sensory_engine import SensoryEngine, format_body_state_block, senses_from_s
 from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
     world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
-    rrf_fuse, parse_relative_time, PROTECTED_RESOLVE_DOMAINS,
+    rrf_fuse, rrf_fuse_channels, parse_relative_time, PROTECTED_RESOLVE_DOMAINS,
     SAFE_RELATION_TYPES, REVIEW_RELATION_TYPES,
     event_at_from_metadata, now_iso,
 )
@@ -158,6 +159,11 @@ sensory_engine = SensoryEngine(config["buckets_dir"])  # External body-state sid
 _review_queue = None
 _e_axis_shadow_store = None
 _lmc5_ledger = None
+_entity_store = None
+_entity_store_key = None
+_entity_store_initialized = False
+_entity_sync_locks: dict[tuple[str, str], object] = {}
+_entity_sync_locks_guard = threading.Lock()
 _lmc5_ledger_lock = threading.Lock()
 _lmc5_night_runtime = None
 _lmc5_night_runtime_lock = threading.Lock()
@@ -169,6 +175,253 @@ _strict_recall_errors = contextvars.ContextVar(
 
 class RecallOperationalError(RuntimeError):
     """A required recall channel failed instead of returning valid evidence."""
+
+
+def _entity_registry_key() -> tuple[str, str]:
+    """Stable key for the runtime entity sidecar and its audited seeds."""
+    entities_cfg = config.get("entities", {}) or {}
+    try:
+        seed_key = json.dumps(
+            entities_cfg.get("seeds") or [],
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+    except (TypeError, ValueError):
+        seed_key = "[]"
+    return os.path.abspath(str(config.get("buckets_dir") or "")), seed_key
+
+
+def _get_entity_store(*, initialize: bool) -> EntityStore | None:
+    """Return the additive entity sidecar without creating it on recall.
+
+    ``breath`` always asks for ``initialize=False``.  A missing/corrupt sidecar
+    therefore degrades to the legacy keyword/vector channels and never turns a
+    read into a filesystem write.  Only hold/grow initialize schema and seeds.
+    """
+    global _entity_store, _entity_store_key, _entity_store_initialized
+    entities_cfg = config.get("entities", {}) or {}
+    if not entities_cfg.get("enabled", True):
+        return None
+    key = _entity_registry_key()
+    if (
+        _entity_store is None
+        or _entity_store_key != key
+        or (initialize and not _entity_store_initialized)
+    ):
+        try:
+            _entity_store = EntityStore(config, initialize=initialize)
+            _entity_store_key = key
+            _entity_store_initialized = initialize
+        except Exception as exc:
+            logger.warning(
+                "Entity sidecar unavailable; legacy channels remain active: %s",
+                type(exc).__name__,
+            )
+            _entity_store = None
+            _entity_store_key = key
+            _entity_store_initialized = False
+    return _entity_store
+
+
+def _resolve_entity_recall(query: str) -> tuple[str, list[tuple[str, float]]]:
+    """Resolve aliases and return a read-only third ranked channel."""
+    store = _get_entity_store(initialize=False)
+    if store is None:
+        return query, []
+    try:
+        resolution = store.resolve_query(query)
+        recall_query = getattr(resolution, "canonical_query", "") or query
+        entity_ids = list(getattr(resolution, "entity_ids", ()) or ())
+        linked_ids = store.linked_bucket_ids(entity_ids=entity_ids) if entity_ids else []
+        return recall_query, [(bucket_id, 1.0) for bucket_id in linked_ids]
+    except Exception as exc:
+        logger.warning(
+            "Entity recall failed open to legacy channels: %s",
+            type(exc).__name__,
+        )
+        return query, []
+
+
+def _entity_recall_settings() -> tuple[int, float]:
+    """Parse optional channel tuning without letting bad config break recall."""
+    entity_cfg = config.get("entities", {}) or {}
+    try:
+        top_k = int(entity_cfg.get("top_k", 20) or 20)
+    except (TypeError, ValueError):
+        top_k = 20
+    try:
+        weight = float(entity_cfg.get("rrf_weight", 1.0) or 0.0)
+    except (TypeError, ValueError):
+        weight = 1.0
+    return max(1, min(top_k, 100)), max(0.0, weight)
+
+
+def _link_bucket_entities(
+    bucket_id: str,
+    content: str,
+    candidates: list[dict] | None = None,
+) -> None:
+    """Best-effort post-write link; bucket success never depends on sidecar."""
+    entities_cfg = config.get("entities", {}) or {}
+    clean_candidates = []
+    for candidate in candidates or ():
+        if not isinstance(candidate, dict):
+            continue
+        mention = candidate.get("mention")
+        entity_type = candidate.get("type")
+        if (
+            isinstance(mention, str)
+            and mention
+            and entity_mention_present(content, mention)
+            and entity_type in {"person", "place", "project"}
+        ):
+            clean_candidates.append({"mention": mention, "type": entity_type})
+
+    should_initialize = bool(clean_candidates or (entities_cfg.get("seeds") or []))
+    store = _get_entity_store(initialize=should_initialize)
+    if store is None:
+        return
+    if not should_initialize and not os.path.isfile(store.db_path):
+        # Generic deployments with no audited aliases and no prior entity DB
+        # preserve the old zero-sidecar behavior.
+        return
+    try:
+        store.resolve_and_link(bucket_id, content, candidates=clean_candidates)
+    except ValueError as exc:
+        # Model candidates are advisory.  If one still fails validation, retry
+        # without them so audited seed scanning and the exact-content hash are
+        # refreshed instead of leaving an older link permanently stale.
+        if clean_candidates:
+            logger.warning(
+                "Entity candidates rejected for %s; retrying seed-only: %s",
+                bucket_id,
+                type(exc).__name__,
+            )
+            try:
+                store.resolve_and_link(bucket_id, content, candidates=())
+                return
+            except Exception as retry_exc:
+                exc = retry_exc
+        logger.warning(
+            "Entity link failed for %s; bucket write remains valid: %s",
+            bucket_id,
+            type(exc).__name__,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Entity link failed for %s; bucket write remains valid: %s",
+            bucket_id,
+            type(exc).__name__,
+        )
+
+
+def _unlink_bucket_entities(bucket_id: str) -> None:
+    """Best-effort sidecar cleanup after an authorized bucket deletion."""
+    store = _get_entity_store(initialize=False)
+    if store is None or not os.path.isfile(store.db_path):
+        return
+    try:
+        store.unlink_bucket(bucket_id)
+    except Exception as exc:
+        logger.warning(
+            "Entity unlink failed for %s: %s",
+            bucket_id,
+            type(exc).__name__,
+        )
+
+
+async def _synchronize_bucket_entities(
+    bucket_id: str,
+    content: str,
+    candidates: list[dict] | None = None,
+) -> None:
+    """Link the latest bucket body, repairing post-write races safely.
+
+    Bucket Markdown and the additive SQLite registry cannot share one atomic
+    transaction.  Per-bucket serialization plus a read-before-link rule means
+    a late older writer always links the current bucket body, never its stale
+    argument.  Re-read after each sidecar commit to absorb bucket updates that
+    land while this synchronizer is active.
+    """
+    requested_content = str(content or "")
+    lock_key = (
+        os.path.abspath(str(config.get("buckets_dir") or "")),
+        str(bucket_id),
+    )
+    # MCP tools may run in worker threads with distinct event loops.  An
+    # asyncio.Lock cached at module scope becomes bound to the first contended
+    # loop and fails in the next one.  A process-wide threading.Lock is
+    # loop-neutral; acquire it non-blockingly so a contending coroutine never
+    # blocks its event-loop thread.
+    with _entity_sync_locks_guard:
+        lock = _entity_sync_locks.get(lock_key)
+        if lock is None:
+            lock = threading.Lock()
+            _entity_sync_locks[lock_key] = lock
+    while not lock.acquire(blocking=False):
+        await asyncio.sleep(0.005)
+    try:
+        get_bucket = getattr(bucket_mgr, "get", None)
+        if not callable(get_bucket):
+            _link_bucket_entities(bucket_id, requested_content, candidates)
+            return
+
+        current_candidates = candidates
+        for _attempt in range(3):
+            try:
+                latest = await get_bucket(bucket_id)
+            except (AttributeError, NotImplementedError):
+                _link_bucket_entities(bucket_id, requested_content, candidates)
+                return
+            except Exception as exc:
+                logger.warning(
+                    "Entity pre-link verification failed for %s: %s",
+                    bucket_id,
+                    type(exc).__name__,
+                )
+                return
+            if not latest:
+                _unlink_bucket_entities(bucket_id)
+                return
+
+            latest_content = str(latest.get("content") or "")
+            if latest_content != requested_content:
+                # Model spans were extracted from another revision.  The
+                # audited seed catalog may still scan the actual latest body.
+                current_candidates = None
+            _link_bucket_entities(bucket_id, latest_content, current_candidates)
+
+            try:
+                verified = await get_bucket(bucket_id)
+            except Exception as exc:
+                logger.warning(
+                    "Entity post-link verification failed for %s: %s",
+                    bucket_id,
+                    type(exc).__name__,
+                )
+                return
+            if not verified:
+                _unlink_bucket_entities(bucket_id)
+                return
+            verified_content = str(verified.get("content") or "")
+            if verified_content == latest_content:
+                return
+            requested_content = verified_content
+            current_candidates = None
+
+        # A writer that changed the bucket during all three checks has its own
+        # synchronizer queued on this same lock; it will read the latest body
+        # before linking.  Until then the exact hash gate keeps recall safe.
+        logger.warning("Entity link remained busy after bounded retries: %s", bucket_id)
+    finally:
+        lock.release()
+
+
+# ImportEngine is constructed before helper definitions.  Attach the optional
+# content callback here so raw/create/merge/recovery paths share the same
+# entity synchronization boundary without changing any public API.
+import_engine.content_sync = _synchronize_bucket_entities
 
 
 def _get_review_queue() -> ReviewQueue:
@@ -365,6 +618,41 @@ def _is_main_recall_bucket(bucket: dict) -> bool:
             # A malformed/unrelated path is not evidence that an otherwise
             # ordinary in-memory candidate belongs to the cold store.
             pass
+    return True
+
+
+def _passes_nonkeyword_recall_filters(
+    bucket: dict,
+    *,
+    world_filter_set: set | None,
+    domain_filter: list[str] | None = None,
+    created_after=None,
+    created_before=None,
+    exclude_core: bool = True,
+) -> bool:
+    """Mirror BucketManager.search authority filters for side channels."""
+    if not _is_main_recall_bucket(bucket):
+        return False
+    metadata = bucket.get("metadata", {}) or {}
+    if exclude_core and (metadata.get("pinned") or metadata.get("protected")):
+        return False
+    if world_filter_set is not None and not world_matches(
+        metadata.get("world", ""), world_filter_set
+    ):
+        return False
+    if created_after is not None or created_before is not None:
+        from bucket_manager import _bucket_in_time_range
+        if not _bucket_in_time_range(bucket, created_after, created_before):
+            return False
+    if domain_filter:
+        bucket_domains = metadata.get("domain", [])
+        if isinstance(bucket_domains, str):
+            bucket_domains = [bucket_domains]
+        elif not isinstance(bucket_domains, list):
+            bucket_domains = []
+        requested = {str(value).lower() for value in domain_filter}
+        if not ({str(value).lower() for value in bucket_domains} & requested):
+            return False
     return True
 
 
@@ -1612,6 +1900,7 @@ async def _merge_or_create(
     world: str = "",
     chord_tag: str = "",
     require_self_contained: bool = False,
+    entities: list[dict] | None = None,
 ) -> tuple[str, str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -1708,6 +1997,7 @@ async def _merge_or_create(
                         await embedding_engine.generate_and_store(bucket["id"], merged)
                     except Exception as e:
                         logger.warning(f"Embedding update after merge failed / 合并后向量更新失败: {bucket['id']}: {e}")
+                await _synchronize_bucket_entities(bucket["id"], merged, entities)
                 return bucket["id"], bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
@@ -1731,6 +2021,7 @@ async def _merge_or_create(
             await embedding_engine.generate_and_store(bucket_id, content)
         except Exception as e:
             logger.warning(f"Embedding for new bucket failed / 新桶向量生成失败: {bucket_id}: {e}")
+    await _synchronize_bucket_entities(bucket_id, content, entities)
     display = name if name else bucket_id
     return bucket_id, display, False
 
@@ -2210,8 +2501,9 @@ async def breath(
     domain_filter = [d.strip() for d in domain.split(",") if d.strip()] or None
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
+    recall_query, raw_entity_ranked = _resolve_entity_recall(query)
     intent_policy = _resolve_recall_policy(
-        query,
+        recall_query,
         base_recall_limit=recall_limit,
         requested_relation_depth=relation_depth,
     )
@@ -2224,22 +2516,22 @@ async def breath(
             f"vector_top_k={intent_policy['vector_top_k']}"
         )
 
-    query_angles = [query]
+    query_angles = [recall_query]
     qe_cfg = config.get("query_expansion", {}) or {}
     qe_allowed = set(qe_cfg.get("allowed_intents") or ["recall", "relation", "temporal"])
     if qe_cfg.get("enabled", False) and intent_policy.get("intent") in qe_allowed:
         try:
             query_angles = await expand_query(
-                query,
+                recall_query,
                 getattr(dehydrator, "client", None),
                 getattr(dehydrator, "model", "deepseek-chat"),
                 qe_cfg,
-            ) or [query]
+            ) or [recall_query]
         except Exception as e:
             logger.warning(f"Query expansion failed, using original / 查询扩展失败，回退原词: {e}")
-            query_angles = [query]
-    if query_angles[0] != query:
-        query_angles = [query] + [q for q in query_angles if q != query]
+            query_angles = [recall_query]
+    if query_angles[0] != recall_query:
+        query_angles = [recall_query] + [q for q in query_angles if q != recall_query]
 
     # Keyword channel (already filtered by world/domain/threshold inside)
     keyword_by_id: dict[str, dict] = {}
@@ -2264,7 +2556,7 @@ async def breath(
                 for bucket in keyword_by_id.values()
                 if _is_main_recall_bucket(bucket)
             ),
-            query=query,
+            query=recall_query,
             intent=intent_policy["intent"],
         )
     except Exception as e:
@@ -2290,19 +2582,58 @@ async def breath(
             raise RecallOperationalError("vector_search_failed") from e
         vector_ranked = []
 
-    # RRF fusion of two ranked channels
+    # Entity channel — linked ids are advisory until their content hash and the
+    # same authority filters as vector-only candidates have been revalidated.
+    entity_top_k, entity_weight = _entity_recall_settings()
+    entity_store = _get_entity_store(initialize=False)
+    entity_bucket_cache: dict[str, dict] = {}
+    entity_ranked: list[tuple[str, float]] = []
+    for bid, score in raw_entity_ranked[:entity_top_k]:
+        try:
+            bucket = keyword_by_id.get(bid) or await bucket_mgr.get(bid)
+            if not bucket or not _passes_nonkeyword_recall_filters(
+                bucket,
+                world_filter_set=wf_set,
+                domain_filter=domain_filter,
+                created_after=created_after,
+                created_before=created_before,
+            ):
+                continue
+            if entity_store is None or not entity_store.link_is_current(
+                bid, bucket.get("content", "")
+            ):
+                continue
+            if not _filter_z_fact_candidates(
+                [bucket],
+                query=recall_query,
+                intent=intent_policy["intent"],
+            ):
+                continue
+            entity_bucket_cache[bid] = bucket
+            entity_ranked.append((bid, score))
+        except Exception as exc:
+            logger.warning(
+                "Entity candidate skipped after validation: %s",
+                type(exc).__name__,
+            )
+
+    # RRF fusion of keyword + vector + the optional entity channel.
     rrf_cfg = config.get("rrf", {})
     keyword_ranked = [(b["id"], b.get("score", 0)) for b in keyword_matches]
-    fused_pairs = rrf_fuse(
-        keyword_ranked,
-        vector_ranked,
+    channels = [
+        (keyword_ranked, intent_policy["keyword_weight"]),
+        (vector_ranked, intent_policy["vector_weight"]),
+    ]
+    if entity_ranked and entity_weight > 0:
+        channels.append((entity_ranked, entity_weight))
+    fused_pairs = rrf_fuse_channels(
+        channels,
         k=rrf_cfg.get("k", 60),
-        keyword_weight=intent_policy["keyword_weight"],
-        vector_weight=intent_policy["vector_weight"],
     )
 
-    # Materialize fused list: reuse keyword-channel buckets, fetch vector-only ones
+    # Materialize fused list: reuse channel buckets, fetch vector-only ones.
     bucket_cache = {b["id"]: b for b in keyword_matches}
+    bucket_cache.update(entity_bucket_cache)
     matches = []
     for bid, fused_score in fused_pairs:
         if len(matches) >= recall_limit:
@@ -2313,31 +2644,22 @@ async def breath(
         else:
             # Vector-only bucket — fetch and re-apply filters that bucket_mgr.search applied
             b = await bucket_mgr.get(bid)
-            if not b or not _is_main_recall_bucket(b):
+            if not b or not _passes_nonkeyword_recall_filters(
+                b,
+                world_filter_set=wf_set,
+                domain_filter=domain_filter,
+                created_after=created_after,
+                created_before=created_before,
+            ):
                 continue
-            meta = b["metadata"]
-            if meta.get("pinned") or meta.get("protected"):
-                continue
-            if wf_set is not None and not world_matches(meta.get("world", ""), wf_set):
-                continue
-            if created_after is not None or created_before is not None:
-                from bucket_manager import _bucket_in_time_range
-                if not _bucket_in_time_range(b, created_after, created_before):
-                    continue
-            if domain_filter:
-                b_domain = meta.get("domain", [])
-                if isinstance(b_domain, str):
-                    b_domain = [b_domain]
-                elif not isinstance(b_domain, list):
-                    b_domain = []
-                domain_lower = {str(d).lower() for d in domain_filter}
-                if not ({str(d).lower() for d in b_domain} & domain_lower):
-                    continue
             b["score"] = round(fused_score * 1000, 2)
             b["vector_match"] = True
+        b.pop("entity_match", None)
+        if bid in entity_bucket_cache:
+            b["entity_match"] = True
         if not _filter_z_fact_candidates(
             [b],
-            query=query,
+            query=recall_query,
             intent=intent_policy["intent"],
         ):
             continue
@@ -2367,7 +2689,7 @@ async def breath(
 
     matches = _filter_session_seen(matches, session_id)
     matches = await _ds_filter_candidates(
-        query,
+        recall_query,
         matches,
         mode="search",
         max_results=max_results,
@@ -2395,7 +2717,15 @@ async def breath(
             # Recall is read-only with respect to memory buckets.  Rendering a
             # search hit must not refresh last_active / activation_count or
             # trigger touch()'s bounded time ripple into neighboring buckets.
-            if bucket.get("vector_match"):
+            if bucket.get("entity_match"):
+                prefix = _recall_prefix(
+                    bucket["id"],
+                    "main",
+                    "curated_rrf",
+                    marker="[实体关联]",
+                )
+                summary = f"{prefix} {summary}"
+            elif bucket.get("vector_match"):
                 prefix = _recall_prefix(
                     bucket["id"],
                     "main",
@@ -2443,7 +2773,7 @@ async def breath(
             relation_neighbors = _relation_recall_neighbors(
                 graph_buckets,
                 result_ids,
-                query=query,
+                query=recall_query,
                 intent=intent_policy["intent"],
                 world_filter=world_filter,
                 domain_filter=domain_filter,
@@ -2530,7 +2860,7 @@ async def breath(
             ]
             low_weight = _filter_z_fact_candidates(
                 low_weight,
-                query=query,
+                query=recall_query,
                 intent=intent_policy["intent"],
             )
             if low_weight:
@@ -2663,6 +2993,7 @@ async def hold(
                     await bucket_mgr.update(source_bucket.strip(), **update_kwargs)
                 except Exception as e:
                     logger.warning(f"Failed to mark source as digested / 标记已消化失败: {e}")
+        await _synchronize_bucket_entities(bucket_id, content)
         return f"🫧feel→{bucket_id}"
 
     # --- Step 1: auto-tagging / 自动打标 ---
@@ -2672,7 +3003,7 @@ async def hold(
         logger.warning(f"Auto-tagging failed, using defaults / 自动打标失败: {e}")
         analysis = {
             "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
-            "tags": [], "suggested_name": "",
+            "tags": [], "suggested_name": "", "entities": [],
         }
 
     # 显式 domain override（用于跨 Agent 工程日志隔离，如 hajimi-工程）
@@ -2707,6 +3038,9 @@ async def hold(
                 await embedding_engine.generate_and_store(bucket_id, content)
             except Exception:
                 pass
+        await _synchronize_bucket_entities(
+            bucket_id, content, analysis.get("entities", [])
+        )
         return f"📌钉选→{bucket_id} {','.join(domain)}"
 
     # --- Step 2: merge or create / 合并或新建 ---
@@ -2720,6 +3054,7 @@ async def hold(
         name=suggested_name,
         world=effective_world,
         chord_tag=chord_tag,
+        entities=analysis.get("entities", []),
     )
 
     # --- Step 3: auto-edge inference (only on new buckets, never on merges) ---
@@ -2786,7 +3121,7 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
             logger.warning(f"Fast-path analyze failed / 快速路径打标失败: {e}")
             analysis = {
                 "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
-                "tags": [], "suggested_name": "",
+                "tags": [], "suggested_name": "", "entities": [],
             }
             _ela_a = time.perf_counter() - _t_a
         _t_m = time.perf_counter()
@@ -2801,6 +3136,7 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
             world=effective_world,
             chord_tag=chord_tag,
             require_self_contained=True,
+            entities=analysis.get("entities", []),
         )
         _ela_m = time.perf_counter() - _t_m
         _ela_total = time.perf_counter() - _grow_t0
@@ -2860,6 +3196,7 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
                 world=effective_world,
                 chord_tag=chord_tag,
                 require_self_contained=True,
+                entities=item.get("entities", []),
             )
 
             if is_merged:
@@ -2926,6 +3263,8 @@ async def trace(
             success = await bucket_mgr.delete(bucket_id)
             if success:
                 embedding_engine.delete_embedding(bucket_id)
+        if success:
+            _unlink_bucket_entities(bucket_id)
         return f"已遗忘记忆桶: {bucket_id}" if success else f"未找到记忆桶: {bucket_id}"
 
     bucket = await bucket_mgr.get(bucket_id)
@@ -3005,6 +3344,8 @@ async def trace(
                         logger.warning(f"Embedding refresh after update failed / 改内容后向量刷新失败: {bucket_id}: {e}")
         except ResolvedGuardError as e:
             return f"❌ 守卫拦截: {e}。这条铁律是 5.10 黑洞修复后落代码的兜底——保护域桶=持续状态，不该有'完结'。"
+        if success and "content" in updates:
+            await _synchronize_bucket_entities(bucket_id, updates["content"])
         if not success:
             return f"修改失败: {bucket_id}"
     else:
@@ -3127,6 +3468,8 @@ async def update_bucket(
 
     if not ok:
         return f"桶不存在或改写失败: {bucket_id}"
+    if "content" in kwargs:
+        await _synchronize_bucket_entities(bucket_id.strip(), kwargs["content"])
     return f"已更新桶 {bucket_id}: {', '.join(kwargs.keys())}"
 
 
@@ -3149,6 +3492,7 @@ async def delete_bucket(bucket_id: str, confirm: bool = False) -> str:
 
     if not ok:
         return f"桶不存在 / 受保护 / 文件删除失败: {bucket_id}"
+    _unlink_bucket_entities(bucket_id.strip())
     return f"已删除桶 {bucket_id}"
 
 
@@ -4359,6 +4703,9 @@ async def api_bucket_update(request):
                 except Exception:
                     pass
 
+        if success and "content" in updates:
+            await _synchronize_bucket_entities(bucket_id, updates["content"])
+
     return JSONResponse({
         "ok": True,
         "updated": list(updates.keys()),
@@ -4567,15 +4914,16 @@ async def _probe_anchor_status(query: str) -> dict:
     """Run the read-only recall candidate path without touching bucket access time."""
     started = time.monotonic()
     recall_limit = BREATH_RECALL_POOL_SIZE
+    recall_query, raw_entity_ranked = _resolve_entity_recall(query)
     intent_policy = _resolve_recall_policy(
-        query,
+        recall_query,
         base_recall_limit=recall_limit,
         requested_relation_depth=0,
     )
     # Hot-path arbitration is deterministic: do not call the generative query
     # expander before every Claude turn. Normal breath keeps its existing
     # expansion behavior; P0 trace makes this boundary explicit.
-    query_angles = [query]
+    query_angles = [recall_query]
     qe_cfg = config.get("query_expansion", {}) or {}
 
     world_filter = _resolve_world_filter("", config.get("current_world", ""))
@@ -4602,7 +4950,7 @@ async def _probe_anchor_status(query: str) -> dict:
             bucket["id"]: bucket
             for bucket in _filter_z_fact_candidates(
                 keyword_by_id.values(),
-                query=query,
+                query=recall_query,
                 intent=intent_policy["intent"],
             )
         }
@@ -4626,34 +4974,68 @@ async def _probe_anchor_status(query: str) -> dict:
             if similarity > 0.5 and similarity > vector_scores.get(bucket_id, 0.0):
                 vector_scores[bucket_id] = similarity
 
-    matches: list[dict] = []
-    if vector_status == "ok" and not keyword_error:
-        keyword_ranked = [(bucket["id"], bucket.get("score", 0)) for bucket in keyword_by_id.values()]
-        fused_pairs = rrf_fuse(
-            keyword_ranked,
-            list(vector_scores.items()),
-            k=(config.get("rrf", {}) or {}).get("k", 60),
-            keyword_weight=intent_policy["keyword_weight"],
-            vector_weight=intent_policy["vector_weight"],
-        )
-        for bucket_id, fused_score in fused_pairs[:recall_limit]:
+    entity_top_k, entity_weight = _entity_recall_settings()
+    entity_store = _get_entity_store(initialize=False)
+    entity_by_id: dict[str, dict] = {}
+    entity_ranked: list[tuple[str, float]] = []
+    for bucket_id, score in raw_entity_ranked[:entity_top_k]:
+        try:
             bucket = keyword_by_id.get(bucket_id) or await bucket_mgr.get(bucket_id)
-            if not bucket or not _is_main_recall_bucket(bucket):
+            if not bucket or not _passes_nonkeyword_recall_filters(
+                bucket,
+                world_filter_set=wf_set,
+            ):
                 continue
-            meta = bucket.get("metadata", {})
-            if meta.get("pinned") or meta.get("protected"):
-                continue
-            if wf_set is not None and not world_matches(meta.get("world", ""), wf_set):
+            if entity_store is None or not entity_store.link_is_current(
+                bucket_id, bucket.get("content", "")
+            ):
                 continue
             if not _filter_z_fact_candidates(
                 [bucket],
-                query=query,
+                query=recall_query,
+                intent=intent_policy["intent"],
+            ):
+                continue
+            entity_by_id[bucket_id] = bucket
+            entity_ranked.append((bucket_id, score))
+        except Exception as exc:
+            logger.warning(
+                "anchor status entity candidate skipped: %s",
+                type(exc).__name__,
+            )
+
+    matches: list[dict] = []
+    if vector_status == "ok" and not keyword_error:
+        keyword_ranked = [(bucket["id"], bucket.get("score", 0)) for bucket in keyword_by_id.values()]
+        channels = [
+            (keyword_ranked, intent_policy["keyword_weight"]),
+            (list(vector_scores.items()), intent_policy["vector_weight"]),
+        ]
+        if entity_ranked and entity_weight > 0:
+            channels.append((entity_ranked, entity_weight))
+        fused_pairs = rrf_fuse_channels(
+            channels,
+            k=(config.get("rrf", {}) or {}).get("k", 60),
+        )
+        for bucket_id, fused_score in fused_pairs[:recall_limit]:
+            bucket = keyword_by_id.get(bucket_id) or entity_by_id.get(bucket_id)
+            bucket = bucket or await bucket_mgr.get(bucket_id)
+            if not bucket or not _passes_nonkeyword_recall_filters(
+                bucket,
+                world_filter_set=wf_set,
+            ):
+                continue
+            if not _filter_z_fact_candidates(
+                [bucket],
+                query=recall_query,
                 intent=intent_policy["intent"],
             ):
                 continue
             bucket["score"] = round(fused_score * 1000, 2)
             matches.append(bucket)
-        matches = await _ds_filter_candidates(query, matches, mode="search", max_results=2)
+        matches = await _ds_filter_candidates(
+            recall_query, matches, mode="search", max_results=2
+        )
 
     has_evidence = bool(matches) if vector_status == "ok" and not keyword_error else False
     if keyword_error and vector_status == "ok":
@@ -4667,6 +5049,8 @@ async def _probe_anchor_status(query: str) -> dict:
         "vector_status": vector_status,
         "keyword_candidate_count": len(keyword_by_id),
         "vector_candidate_count": len(vector_scores),
+        "entity_candidate_count": len(entity_ranked),
+        "entity_query_canonicalized": recall_query != query,
         "final_candidate_count": len(matches),
         "has_evidence": has_evidence,
         "timing_ms": round((time.monotonic() - started) * 1000, 2),
@@ -5227,6 +5611,7 @@ async def api_import_review(request):
             elif action == "delete":
                 if not await bucket_mgr.delete(bid):
                     raise RuntimeError(f"delete failed: {bid}")
+                _unlink_bucket_entities(bid)
             applied += 1
         except Exception as e:
             logger.warning(f"Review action failed for {bid}: {e}")
@@ -5567,6 +5952,16 @@ async def api_outbox_get(request):
 if __name__ == "__main__":
     transport = config.get("transport", "stdio")
     logger.info(f"Ombre Brain starting | transport: {transport}")
+
+    # Seed initialization is an explicit startup mutation, never a breath
+    # side effect.  This makes audited aliases available immediately after a
+    # restart while keeping every recall call filesystem-read-only.
+    entity_cfg = config.get("entities", {}) or {}
+    if entity_cfg.get("enabled", True) and (entity_cfg.get("seeds") or []):
+        if _get_entity_store(initialize=True) is None:
+            logger.warning("Entity seed initialization failed; legacy recall remains active")
+        else:
+            logger.info("Entity alias sidecar initialized from audited seeds")
 
     if transport in ("sse", "streamable-http"):
         import threading

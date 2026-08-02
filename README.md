@@ -250,8 +250,8 @@ Ombre Brain gives it persistent memory — not cold key-value storage, but a sys
 - **情感坐标打标 / Emotional tagging**: 每条记忆用 Russell 环形情感模型的 valence（效价）和 arousal（唤醒度）两个连续维度标记。不是"开心/难过"这种离散标签。
   Each memory is tagged with two continuous dimensions from Russell's circumplex model: valence and arousal. Not discrete labels like "happy/sad".
 
-- **双通道检索 / Dual-channel search**: 关键词模糊匹配 + 向量语义相似度并联检索。关键词通道用 rapidfuzz 做模糊匹配；语义通道用 embedding（默认 `gemini-embedding-001`，3072 维）计算 cosine similarity，能在"今天很累"这种没有精确关键词的查询里找到"身体不适"、"睡眠问题"等语义相关记忆。两个通道用 RRF（Reciprocal Rank Fusion, k=60）融合排序，向量通道 sim>0.5 兜底挡高 cosine 噪音，token 预算截断。
-  Keyword fuzzy matching + vector semantic similarity in parallel. Keyword channel uses rapidfuzz; semantic channel uses embeddings (default `gemini-embedding-001`, 3072 dims) with cosine similarity — finds semantically related memories even without exact keyword matches (e.g. "feeling tired" → "health issues", "sleep problems"). The two ranked channels are fused via RRF (Reciprocal Rank Fusion, k=60), with a sim>0.5 floor on the vector side to filter high-cosine noise. Token budget truncated.
+- **三通道检索 / Three-channel search**: 关键词模糊匹配 + 向量语义相似度 + 可选实体别名通道。实体表放在独立 SQLite sidecar，不改 Markdown 桶 schema；只有人工配置的 seed 能把不同名字认成同一实体，冲突时宁可跳过、不猜。三个通道用 RRF（Reciprocal Rank Fusion, k=60）融合，向量通道保留 sim>0.5 噪音下限。
+  Keyword fuzzy matching + vector similarity + an optional entity-alias channel. The entity registry is an additive SQLite sidecar and never changes the Markdown bucket schema. Only operator-audited seeds may unify different names; collisions are skipped rather than guessed. All active channels are fused with RRF (k=60), retaining the vector sim>0.5 noise floor.
 
 - **自然遗忘 / Natural forgetting**: 改进版艾宾浩斯遗忘曲线。不活跃的记忆自动衰减归档，高情绪强度的记忆衰减更慢。
   Modified Ebbinghaus forgetting curve. Inactive memories naturally decay and archive. High-arousal memories decay slower.
@@ -297,25 +297,24 @@ Claude ←→ MCP Protocol ←→ server.py
         bucket_manager   dehydrator     decay_engine
          (CRUD + 搜索)    (压缩 + 打标)   (遗忘曲线)
               │               │
-        Obsidian Vault   embedding_engine
-       (Markdown files)  (向量语义检索)
-                              │
-                         embeddings.db
-                         (SQLite, 3072-dim)
+        Obsidian Vault   embedding_engine ─ entity_store
+       (Markdown files)  (向量语义检索)    (实体/别名旁路)
+                              │                 │
+                         embeddings.db     .entities/entities.sqlite3
 ```
 
 ### 检索架构 / Search Architecture
 
 ```
-breath(query="今天很累")
+breath(query="昵称")
          │
-    ┌────┴────┐
-    │         │
- Channel 1  Channel 2
- 关键词匹配   向量语义
- (rapidfuzz)  (cosine similarity)
-    │         │
-    └────┬────┘
+    ┌────┼─────────┐
+    │    │         │
+ Channel 1  Channel 2  Channel 3
+ 关键词匹配   向量语义    实体别名
+ (rapidfuzz)  (cosine)  (audited seeds)
+    │    │         │
+    └────┼─────────┘
          │
     RRF 融合排序 (k=60)
     sim>0.5 兜底
@@ -330,7 +329,7 @@ breath(query="今天很累")
 
 | 工具 Tool | 作用 Purpose |
 |-----------|-------------|
-| `breath` | 浮现或检索记忆。无参数=推送未解决记忆；有参数=关键词+向量语义双通道检索。支持 domain/valence/arousal 过滤 / Surface or search memories. No args = surface unresolved; with query = keyword + vector dual-channel search. Supports domain/valence/arousal filters |
+| `breath` | 浮现或检索记忆。无参数=推送未解决记忆；有参数=关键词+向量+可选实体别名通道。支持 domain/valence/arousal 过滤 / Surface or search memories. No args = surface unresolved; with query = keyword + vector + optional entity-alias search. Supports domain/valence/arousal filters |
 | `hold` | 存储单条记忆，自动打标+合并相似桶+生成 embedding。`feel=True` 写模型自己的感受 / Store a single memory with auto-tagging, merging, and embedding. `feel=True` for model's own reflections |
 | `grow` | 日记归档，自动拆分长内容为多个记忆桶，每个桶自动生成 embedding / Diary digest, auto-split into multiple buckets with embeddings |
 | `trace` | 修改元数据、标记已解决、删除 / Modify metadata, mark resolved, delete |
@@ -374,7 +373,7 @@ export OMBRE_API_KEY="your-api-key"
 Supports any OpenAI-compatible API. Just change `base_url` and `model` in `config.yaml`.
 
 > **💡 向量化检索（Embedding）**
-> Ombre Brain 内置双通道检索：关键词匹配 + 向量语义搜索。每次 `hold`/`grow` 存入记忆时自动生成 embedding 并存入 `embeddings.db`（SQLite）。
+> Ombre Brain 的基础检索是关键词 + 向量语义；配置 `entities.seeds` 后会增加实体别名第三通道。每次 `hold`/`grow` 存入记忆时自动生成 embedding 并存入 `embeddings.db`（SQLite）。
 > 推荐：**Google AI Studio 的 `gemini-embedding-001`**（免费，1500 次/天，3072 维向量）。在 `config.yaml` 的 `embedding` 部分配置。
 > 不配置 embedding 也能用，系统会降级到纯 fuzzy matching 模式。
 >
@@ -384,7 +383,7 @@ Supports any OpenAI-compatible API. Just change `base_url` and `model` in `confi
 > ```
 > Docker 用户：`docker exec -e OMBRE_BUCKETS_DIR=/data ombre-brain python3 backfill_embeddings.py --batch-size 20`
 >
-> **Embedding support**: Built-in dual-channel search: keyword + vector semantic. Embeddings are auto-generated on each `hold`/`grow` and stored in `embeddings.db` (SQLite). Recommended: **Google AI Studio `gemini-embedding-001`** (free, 1500 req/day, 3072-dim). Configure in `config.yaml` under `embedding`. Without it, falls back to fuzzy matching. For existing buckets, run `backfill_embeddings.py`.
+> **Embedding support**: The base search uses keyword + vector semantics; configuring `entities.seeds` adds the third entity-alias channel. Embeddings are auto-generated on each `hold`/`grow` and stored in `embeddings.db` (SQLite). Recommended: **Google AI Studio `gemini-embedding-001`** (free, 1500 req/day, 3072-dim). Configure in `config.yaml` under `embedding`. Without it, search falls back to keyword plus any configured entity channel. For existing buckets, run `backfill_embeddings.py`.
 
 ### 接入 Claude Desktop / Connect to Claude Desktop
 

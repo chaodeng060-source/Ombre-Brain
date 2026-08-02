@@ -128,13 +128,15 @@ def _payload(item=MEMORY_ITEM):
     return json.dumps([item], ensure_ascii=False)
 
 
-def _engine(test_config, manager, dehydrator, embedding=None):
-    return ImportEngine(
+def _engine(test_config, manager, dehydrator, embedding=None, content_sync=None):
+    engine = ImportEngine(
         test_config,
         bucket_mgr=manager,
         dehydrator=dehydrator,
         embedding_engine=embedding,
     )
+    engine.content_sync = content_sync
+    return engine
 
 
 @pytest.fixture
@@ -355,6 +357,38 @@ async def test_crash_after_merge_marker_does_not_merge_twice(test_config):
     assert manager.buckets["existing"]["content"] == merged_once
     assert dehydrator.merge_calls == 1
     assert dehydrator.completions.calls == 1
+
+
+@pytest.mark.anyio
+async def test_successful_import_merge_notifies_content_sidecars(test_config):
+    existing = {
+        "id": "existing",
+        "content": "旧内容",
+        "score": 100,
+        "metadata": {
+            "tags": [],
+            "domain": ["AI"],
+            "importance": 5,
+            "valence": 0.5,
+            "arousal": 0.3,
+        },
+    }
+    manager = _BucketManager(existing=existing)
+    dehydrator = _Dehydrator([_payload()])
+    synced = []
+
+    async def content_sync(bucket_id, content):
+        synced.append((bucket_id, content))
+
+    result = await _engine(
+        test_config,
+        manager,
+        dehydrator,
+        content_sync=content_sync,
+    ).start(SOURCE, filename="history.md")
+
+    assert result["status"] == "completed"
+    assert synced == [("existing", manager.buckets["existing"]["content"])]
 
 
 @pytest.mark.anyio

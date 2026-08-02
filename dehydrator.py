@@ -288,6 +288,7 @@ DIGEST_PROMPT = """你是一个日记整理专家。用户会发送一段包含�
 10. 只能把指代还原为本次原文中逐字出现、且能唯一确认的实体；任一事实无法唯一确认时，整批输出 entries=[] 并把指代写入 unresolved_references，绝不猜实体、悄悄丢掉坏条后只返回部分结果
 11. 每个条目保持单一主题和原子事实，不要为了补上下文把其他主题整段复制进来
 12. 改写只做保真消歧：日期、数字、否定、可能性、待办状态和逐字引语不得改变，不得把建议/假设写成已发生事实。若逐字引语内部仍含无法独立理解的指代，因引语不能改字，整批必须 unresolved，不得强改引语
+13. entities 只列 content 中逐字出现的人、地点、项目；每项只给 mention 和 type(person/place/project)。不确定就省略，不得发明规范名或别名关系
 
 【JSON 合法性铁律】字符串值（尤其 content）内部如果要引用某句话或词，一律用中文引号「」或""，绝对禁止使用英文双引号 " ——英文双引号会破坏 JSON 结构导致整批解析失败。
 
@@ -300,7 +301,8 @@ DIGEST_PROMPT = """你是一个日记整理专家。用户会发送一段包含�
     "valence": 0.7,
     "arousal": 0.4,
     "tags": ["核心词1", "核心词2", "扩展词1", "扩展词2"],
-    "importance": 5
+    "importance": 5,
+    "entities": [{"mention": "朝灯", "type": "person"}]
   }
 ], "unresolved_references": []}
 
@@ -370,6 +372,7 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
    两步合并为一个 tags 数组，总计 10~15 个
 5. suggested_name（建议桶名）：10字以内的简短标题
 6. 在 tags 和 suggested_name 中不要使用 [[]] 双链标记
+7. entities 只列原文中逐字出现的人、地点、项目；每项只给 mention 和 type(person/place/project)。不确定就省略，不得发明规范名或别名关系
 
 输出格式（纯 JSON，无其他内容）：
 {
@@ -377,7 +380,8 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
   "valence": 0.7,
   "arousal": 0.4,
   "tags": ["核心词1", "核心词2", "扩展词1", "扩展词2", "..."],
-  "suggested_name": "简短标题"
+  "suggested_name": "简短标题",
+  "entities": [{"mention": "朝灯", "type": "person"}]
 }"""
 
 
@@ -683,6 +687,41 @@ class Dehydrator:
                 conn.commit()
         except Exception:
             return
+
+    @staticmethod
+    def _validated_entity_mentions(value, content: str) -> list[dict]:
+        """Accept only exact source spans and the three Phase-2 entity types.
+
+        The model may identify a span and its coarse type.  It is never
+        allowed to mint canonical names or alias equivalences; those belong to
+        the local entity registry and explicit operator-provided seeds.
+        """
+        if not isinstance(value, list):
+            return []
+        source = str(content or "")
+        accepted: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for raw in value[:32]:
+            if not isinstance(raw, dict):
+                continue
+            mention = str(raw.get("mention") or "").strip()
+            entity_type = str(raw.get("type") or "").strip().lower()
+            if (
+                entity_type not in {"person", "place", "project"}
+                or not mention
+                or len(mention) > 80
+                or mention not in source
+                or any(ord(char) < 32 for char in mention)
+                or find_unresolved_references(mention)
+                or re.search(r"某人|某地|某处|某项目|原文未指明|不详", mention)
+            ):
+                continue
+            key = (mention.casefold(), entity_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            accepted.append({"mention": mention, "type": entity_type})
+        return accepted
 
     @staticmethod
     def _parse_self_contained_payload(raw: str) -> dict:
@@ -1141,7 +1180,9 @@ class Dehydrator:
 
         # --- Cache check: same content → same tags, skip API ---
         # --- 先查缓存：内容没变就不重新打标（键 = 实际发给 API 的 content[:2000]）---
-        cache_key = content[:2000]
+        # Schema bump: pre-Phase-2 analyze cache rows have no ``entities``
+        # field and must not silently suppress write-time entity extraction.
+        cache_key = "analyze:v2-entities:\n" + content[:2000]
         cached = self._get_cached_json("analyze", cache_key)
         if cached is not None:
             return cached
@@ -1177,7 +1218,7 @@ class Dehydrator:
                 {"role": "system", "content": ANALYZE_PROMPT},
                 {"role": "user", "content": content[:2000]},
             ],
-            max_tokens=256,
+            max_tokens=512,
             temperature=0.1,
         )
 
@@ -1188,14 +1229,14 @@ class Dehydrator:
         if not raw.strip():
             return self._default_analysis()
 
-        return self._parse_analysis(raw)
+        return self._parse_analysis(raw, content)
 
     # ---------------------------------------------------------
     # Parse API JSON response with safety checks
     # 解析 API 返回的 JSON，做安全校验
     # Ensure valence/arousal in 0~1, domain/tags valid
     # ---------------------------------------------------------
-    def _parse_analysis(self, raw: str) -> dict:
+    def _parse_analysis(self, raw: str, source_content: str = "") -> dict:
         """
         Parse and validate API tagging result.
         解析并校验 API 返回的打标结果。
@@ -1227,6 +1268,9 @@ class Dehydrator:
             "arousal": arousal,
             "tags": result.get("tags", [])[:15],
             "suggested_name": str(result.get("suggested_name", ""))[:20],
+            "entities": self._validated_entity_mentions(
+                result.get("entities"), source_content
+            ),
         }
 
     # ---------------------------------------------------------
@@ -1244,6 +1288,7 @@ class Dehydrator:
             "arousal": 0.3,
             "tags": [],
             "suggested_name": "",
+            "entities": [],
         }
 
     # ---------------------------------------------------------
@@ -1356,6 +1401,9 @@ class Dehydrator:
                             checked.get("content", ""),
                             source_context=content,
                         )
+                        checked["entities"] = self._validated_entity_mentions(
+                            checked.get("entities"), checked["content"]
+                        )
                         validated.append(checked)
                 except SelfContainmentError as exc:
                     last_self_containment_error = exc
@@ -1445,6 +1493,9 @@ class Dehydrator:
                 "arousal": arousal,
                 "tags": item.get("tags", [])[:15],
                 "importance": importance,
+                "entities": self._validated_entity_mentions(
+                    item.get("entities"), str(item.get("content", ""))
+                ),
             })
 
         return validated

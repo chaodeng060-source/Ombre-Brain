@@ -193,3 +193,38 @@ async def test_validation_clamps_out_of_range_fields(digest_dehy):
     assert 0.0 <= it["valence"] <= 1.0       # valence 夹到 [0,1]
     assert 0.0 <= it["arousal"] <= 1.0       # arousal 夹到 [0,1]
     assert len(it["domain"]) <= 3            # domain 最多 3 个
+
+
+def test_analysis_entities_accept_only_exact_source_mentions(digest_dehy):
+    raw = (
+        '{"domain":["日常"],"valence":0.5,"arousal":0.3,"tags":[],'
+        '"suggested_name":"见面","entities":['
+        '{"mention":"朝灯","type":"person","canonical_name":"模型乱猜"},'
+        '{"mention":"老婆","type":"person"},'
+        '{"mention":"她","type":"person"},'
+        '{"mention":"深圳","type":"organization"}]}'
+    )
+
+    parsed = digest_dehy._parse_analysis(raw, "朝灯去了深圳")
+
+    assert parsed["entities"] == [{"mention": "朝灯", "type": "person"}]
+
+
+@pytest.mark.asyncio
+async def test_digest_entities_never_accept_model_alias_equivalence(digest_dehy):
+    raw = (
+        '{"entries":[{"name":"工程","content":"[[朝灯]]检查 [[Ombre]] 项目",'
+        '"domain":["工程"],"valence":0.5,"arousal":0.3,"tags":[],'
+        '"importance":5,"entities":['
+        '{"mention":"朝灯","type":"person","aliases":["老婆"]},'
+        '{"mention":"Ombre","type":"project"},'
+        '{"mention":"Rosita","type":"person"}]}]}'
+    )
+    _install(digest_dehy, _create_returning(raw))
+
+    items = await digest_dehy.digest("[[朝灯]]检查 [[Ombre]] 项目")
+
+    assert items[0]["entities"] == [
+        {"mention": "朝灯", "type": "person"},
+        {"mention": "Ombre", "type": "project"},
+    ]

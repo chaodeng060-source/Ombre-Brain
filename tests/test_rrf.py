@@ -16,7 +16,7 @@
 
 import pytest
 
-from utils import rrf_fuse
+from utils import rrf_fuse, rrf_fuse_channels
 
 
 def test_rrf_empty_inputs():
@@ -87,3 +87,70 @@ def test_rrf_returns_sorted_descending():
     fused = rrf_fuse(keyword, vector)
     scores = [s for _, s in fused]
     assert scores == sorted(scores, reverse=True)
+
+
+def test_rrf_wrapper_preserves_exact_two_channel_result():
+    keyword = [("a", 0.9), ("b", 0.7), ("c", 0.5)]
+    vector = [("c", 0.95), ("a", 0.8), ("d", 0.6)]
+
+    assert rrf_fuse(keyword, vector) == [
+        ("a", 1.0 / 61 + 1.0 / 62),
+        ("c", 1.0 / 63 + 1.0 / 61),
+        ("b", 1.0 / 62),
+        ("d", 1.0 / 63),
+    ]
+
+
+def test_rrf_wrapper_preserves_legacy_duplicate_accumulation():
+    keyword = [("a", 1.0), ("a", 0.5), ("b", 0.4)]
+
+    assert rrf_fuse(keyword, []) == [
+        ("a", 1.0 / 61 + 1.0 / 62),
+        ("b", 1.0 / 63),
+    ]
+
+
+def test_rrf_three_channel_consensus_accumulates():
+    channels = [
+        ([("keyword-only", 1.0), ("shared", 0.9)], 1.0),
+        ([("vector-only", 1.0), ("shared", 0.9)], 1.0),
+        ([("entity-only", 1.0), ("shared", 0.9)], 1.0),
+    ]
+
+    fused = rrf_fuse_channels(channels)
+
+    assert fused[0] == ("shared", 3.0 / 62)
+    assert {bucket_id for bucket_id, _ in fused} == {
+        "shared",
+        "keyword-only",
+        "vector-only",
+        "entity-only",
+    }
+
+
+def test_rrf_empty_entity_channel_preserves_two_channel_result():
+    keyword = [("a", 0.9), ("b", 0.7)]
+    vector = [("b", 0.95), ("c", 0.8)]
+
+    assert rrf_fuse_channels(
+        [(keyword, 1.5), (vector, 0.75), ([], 2.0)],
+        k=42,
+    ) == rrf_fuse(
+        keyword,
+        vector,
+        k=42,
+        keyword_weight=1.5,
+        vector_weight=0.75,
+    )
+
+
+def test_rrf_channels_deduplicates_and_breaks_ties_stably():
+    channels = [
+        ([("first", 1.0), ("first", 0.5)], 1.0),
+        ([("second", 1.0)], 1.0),
+    ]
+
+    assert rrf_fuse_channels(channels) == [
+        ("first", 1.0 / 61),
+        ("second", 1.0 / 61),
+    ]

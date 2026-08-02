@@ -139,6 +139,15 @@ def load_config(config_path: str = None) -> dict:
             "keyword_weight": 1.0,
             "vector_weight": 1.0,
         },
+        # Entity registry is an additive SQLite sidecar.  Empty seeds preserve
+        # legacy recall exactly; private alias decisions belong in deployment
+        # config, never in generic code or model output.
+        "entities": {
+            "enabled": True,
+            "rrf_weight": 1.0,
+            "top_k": 20,
+            "seeds": [],
+        },
         # Stage-0 query expansion is deliberately limited to memory-shaped
         # intents. Exact fact lookups keep the user's literal query untouched.
         "query_expansion": {
@@ -270,6 +279,22 @@ def load_config(config_path: str = None) -> dict:
     if env_sense_boost:
         try:
             config.setdefault("sense", {})["recall_boost"] = float(env_sense_boost)
+        except ValueError:
+            pass
+
+    # --- Entity recall env overrides (seeds remain config-only) ---
+    env_entities_enabled = os.environ.get("OMBRE_ENTITIES_ENABLED", "")
+    if env_entities_enabled:
+        config.setdefault("entities", {})["enabled"] = (
+            env_entities_enabled.lower() not in ("0", "false", "no", "off")
+        )
+
+    env_entity_weight = os.environ.get("OMBRE_ENTITY_RRF_WEIGHT", "")
+    if env_entity_weight:
+        try:
+            config.setdefault("entities", {})["rrf_weight"] = max(
+                0.0, float(env_entity_weight)
+            )
         except ValueError:
             pass
 
@@ -552,16 +577,53 @@ def world_matches(bucket_world: str, world_filter_set: set) -> bool:
 
 
 # --- Reciprocal Rank Fusion / 倒数排名融合 ---
-# Combines two ranked channels (keyword + vector) into a single fused ranking.
-# 将两个 ranked 通道（关键词 + 向量）融合成一个统一排序。
+# Combines ranked recall channels into a single fused ranking.
+# 将多个 ranked 召回通道融合成一个统一排序。
 #
-# Formula: score(d) = w_k/(k + rank_k(d)) + w_v/(k + rank_v(d))
-# 公式：桶 d 的融合分 = 关键词权重/(k + 关键词通道排名) + 向量权重/(k + 向量通道排名)
+# Formula: score(d) = sum(w_i/(k + rank_i(d)))
+# 公式：桶 d 的融合分 = 各通道 weight/(k + 通道内排名) 之和
 #
 # Buckets present in only one channel only contribute that channel's term.
-# 只在单通道出现的桶，只贡献该通道的项。
+# A duplicate within one channel contributes only its first (best) rank.
+# 只在单通道出现的桶，只贡献该通道的项；通道内重复桶只采用第一次（最佳）排名。
 #
 # k 默认 60（标准 RRF 取值）。k 越大，相邻 rank 间分差越平缓。
+
+
+def rrf_fuse_channels(channels: list, k: int = 60) -> list:
+    """Fuse any number of weighted ranked channels with stable ordering.
+
+    ``channels`` is an ordered list of ``(ranked_items, weight)`` pairs. Each
+    ranked item follows the existing ``(bucket_id, score)`` shape; the source
+    score is intentionally ignored because RRF uses rank only.
+
+    The first occurrence of a bucket within a channel owns that channel's
+    contribution. Across channels, contributions accumulate. Equal fused
+    scores retain the bucket's first-seen order across the ordered channels,
+    making both de-duplication and tie ordering deterministic.
+    """
+    scores: dict = {}
+    first_seen: dict = {}
+    seen_order = 0
+
+    for ranked_items, weight in channels:
+        seen_in_channel = set()
+        for rank, item in enumerate(ranked_items, start=1):
+            bid = item[0]
+            if bid in seen_in_channel:
+                continue
+            seen_in_channel.add(bid)
+
+            if bid not in first_seen:
+                first_seen[bid] = seen_order
+                seen_order += 1
+            scores[bid] = scores.get(bid, 0.0) + weight / (k + rank)
+
+    return sorted(
+        scores.items(),
+        key=lambda item: (-item[1], first_seen[item[0]]),
+    )
+
 
 def rrf_fuse(
     keyword_ranked: list,
@@ -583,6 +645,10 @@ def rrf_fuse(
     Returns:
         list of (bucket_id, fused_score), sorted by fused_score descending
     """
+    # Preserve the original public two-channel contract exactly, including
+    # accumulation when an upstream channel happens to repeat a bucket id.
+    # The new multi-channel helper has a stricter per-channel de-duplication
+    # contract and is used only by the new call sites that opt into it.
     scores: dict = {}
     for rank, item in enumerate(keyword_ranked, start=1):
         bid = item[0]

@@ -18,6 +18,7 @@
 import os
 import json
 import hashlib
+import inspect
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -570,6 +571,10 @@ class ImportEngine:
         self.bucket_mgr = bucket_mgr
         self.dehydrator = dehydrator
         self.embedding_engine = embedding_engine
+        # Optional best-effort callback installed by server.py.  Keeping this
+        # out of the constructor preserves the existing ImportEngine API for
+        # standalone users and tests.
+        self.content_sync = None
         self.state = ImportState(config["buckets_dir"])
         self._maintenance_barrier = getattr(
             bucket_mgr,
@@ -955,6 +960,24 @@ class ImportEngine:
                 f"required embedding write failed for {bucket_id}"
             )
 
+    async def _sync_written_content(self, bucket_id: str, content: str) -> None:
+        """Notify additive sidecars after any durable content write/recovery."""
+        callback = self.content_sync
+        if not callable(callback):
+            return
+        try:
+            result = callback(bucket_id, content)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            # Import durability must not depend on an additive index.  The
+            # entity recall hash gate fails closed until a later recovery run.
+            logger.warning(
+                "Post-import content sync failed for %s: %s",
+                bucket_id,
+                type(exc).__name__,
+            )
+
     async def _find_stored_output(
         self,
         output_id: str,
@@ -1003,6 +1026,10 @@ class ImportEngine:
         recovered = await self._find_stored_output(output_id)
         if recovered:
             bucket, action = recovered
+            await self._sync_written_content(
+                bucket["id"],
+                bucket.get("content", item["content"]),
+            )
             await self._ensure_embedding(
                 bucket["id"],
                 bucket.get("content", item["content"]),
@@ -1036,6 +1063,7 @@ class ImportEngine:
             )
             if not bucket_id:
                 raise ImportStorageError("bucket create returned no id")
+            await self._sync_written_content(bucket_id, item["content"])
             await self._ensure_embedding(
                 bucket_id,
                 item["content"],
@@ -1203,6 +1231,7 @@ class ImportEngine:
         if existing and existing[0].get("score", 0) > merge_threshold:
             bucket = existing[0]
             if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
+                merged = None
                 try:
                     try:
                         merged = await self.dehydrator.merge(
@@ -1237,6 +1266,7 @@ class ImportEngine:
                         raise ImportStorageError(
                             f"bucket update failed for {bucket['id']}"
                         )
+                    await self._sync_written_content(bucket["id"], merged)
                     await self._ensure_embedding(
                         bucket["id"],
                         merged,
@@ -1244,6 +1274,14 @@ class ImportEngine:
                     )
                     return "merged", bucket["id"]
                 except Exception as e:
+                    # ``BucketManager.update`` may fail after its atomic file
+                    # replacement.  Re-read synchronization is safe whether
+                    # the old or new body is durable and prevents stale links
+                    # while the import ledger waits for recovery.
+                    await self._sync_written_content(
+                        bucket["id"],
+                        merged if isinstance(merged, str) else bucket["content"],
+                    )
                     logger.warning(f"Merge failed during import: {e}")
                     if output_id:
                         raise
@@ -1265,6 +1303,7 @@ class ImportEngine:
         )
         if not bucket_id:
             raise ImportStorageError("bucket create returned no id")
+        await self._sync_written_content(bucket_id, content)
         await self._ensure_embedding(
             bucket_id,
             content,
