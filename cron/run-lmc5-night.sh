@@ -19,15 +19,7 @@ else
     exit "$night_status"
 fi
 
-if "$DOCKER_BIN" exec "$CONTAINER" \
+exec "$DOCKER_BIN" exec "$CONTAINER" \
     python /app/patrol_night.py \
     --config /app/config.yaml \
-    --state-dir "$PATROL_STATE_DIR"; then
-    :
-else
-    patrol_status=$?
-    exit "$patrol_status"
-fi
-
-exec "$DOCKER_BIN" exec "$CONTAINER" \
-    python /app/e_axis_night.py
+    --state-dir "$PATROL_STATE_DIR"

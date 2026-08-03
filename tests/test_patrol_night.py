@@ -110,23 +110,21 @@ def _run_cron(tmp_path: Path, *, fail_patrol: int = 0):
     return result, calls.read_text(encoding="utf-8").splitlines()
 
 
-def test_cron_runs_night_then_patrol_then_e_axis(tmp_path):
+def test_cron_runs_night_then_patrol_only(tmp_path):
     result, calls = _run_cron(tmp_path)
 
     assert result.returncode == 0
-    assert len(calls) == 3
+    assert len(calls) == 2
     assert "night_run_trigger.py" in calls[0]
     assert "patrol_night.py" in calls[1]
-    assert "e_axis_night.py" in calls[2]
 
 
-def test_cron_propagates_patrol_failure_and_skips_e_axis(tmp_path):
+def test_cron_propagates_patrol_failure(tmp_path):
     result, calls = _run_cron(tmp_path, fail_patrol=23)
 
     assert result.returncode == 23
     assert len(calls) == 2
     assert "patrol_night.py" in calls[1]
-    assert all("e_axis_night.py" not in call for call in calls)
 
 
 def test_default_config_has_a_real_constrained_fact_slot_registry(
