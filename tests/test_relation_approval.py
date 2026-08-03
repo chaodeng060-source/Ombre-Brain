@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 from bucket_manager import BucketManager
+import relation_approval
 from relation_approval import (
     RelationApprovalStateError,
     RelationApprovalTransaction,
@@ -110,6 +112,110 @@ async def test_relation_approval_failure_rolls_back_and_keeps_pending(
 
     source = await manager.get(entry["source_id"])
     assert source["metadata"].get("relations", []) == []
+    assert queue.get(entry["key"])["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_relation_approval_rejects_symlinked_bucket_ancestor(tmp_path):
+    manager, queue, transaction, entry = await _candidate(tmp_path)
+    source = Path(manager._find_bucket_file(entry["source_id"]))
+    bucket_parent = source.parent / "nested"
+    bucket_parent.mkdir()
+    nested_source = bucket_parent / source.name
+    source.rename(nested_source)
+    manager._bucket_path_cache[entry["source_id"]] = str(nested_source)
+    escaped_parent = tmp_path / "escaped-bucket-parent"
+    bucket_parent.rename(escaped_parent)
+    bucket_parent.symlink_to(escaped_parent, target_is_directory=True)
+    escaped_source = escaped_parent / nested_source.name
+    before = escaped_source.read_bytes()
+
+    with pytest.raises(RelationApprovalStateError, match="must be real"):
+        transaction.apply(entry["key"], reviewer="朝灯")
+
+    assert escaped_source.read_bytes() == before
+    assert queue.get(entry["key"])["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_relation_approval_rejects_symlinked_journal_root(tmp_path):
+    manager, queue, transaction, entry = await _candidate(tmp_path)
+    escaped_journal = tmp_path / "escaped-journal"
+    escaped_journal.mkdir()
+    journal = Path(manager.base_dir) / transaction.JOURNAL_DIR
+    journal.symlink_to(escaped_journal, target_is_directory=True)
+
+    with pytest.raises(
+        RelationApprovalStateError,
+        match="transaction directory must be real",
+    ):
+        transaction.apply(entry["key"], reviewer="朝灯")
+
+    assert list(escaped_journal.iterdir()) == []
+    assert queue.get(entry["key"])["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_relation_approval_rejects_bucket_symlink_swap_between_stat_and_open(
+    tmp_path,
+    monkeypatch,
+):
+    manager, queue, transaction, entry = await _candidate(tmp_path)
+    source = Path(manager._find_bucket_file(entry["source_id"]))
+    outside = tmp_path / "outside.md"
+    outside.write_text("outside must not change\n", encoding="utf-8")
+    original_open = relation_approval.os.open
+    swapped = False
+
+    def swap_after_lstat(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if not swapped and dir_fd is not None and path == source.name:
+            swapped = True
+            source.rename(source.with_name(f".{source.name}.original"))
+            source.symlink_to(outside)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(relation_approval.os, "open", swap_after_lstat)
+    os.supports_dir_fd.add(swap_after_lstat)
+    try:
+        with pytest.raises(RelationApprovalStateError, match="bucket open failed"):
+            transaction.apply(entry["key"], reviewer="朝灯")
+    finally:
+        os.supports_dir_fd.discard(swap_after_lstat)
+
+    assert outside.read_text(encoding="utf-8") == "outside must not change\n"
+    assert queue.get(entry["key"])["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_relation_approval_refuses_concurrent_inode_and_content_swap(
+    tmp_path,
+    monkeypatch,
+):
+    manager, queue, transaction, entry = await _candidate(tmp_path)
+    source = Path(manager._find_bucket_file(entry["source_id"]))
+    original_write_target = transaction._write_target
+    foreign = b"---\nname: concurrent-writer\n---\nforeign revision\n"
+    swapped = False
+
+    def swap_before_commit(root_fd, transaction_fd, manifest):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            replacement = source.with_name(f".{source.name}.concurrent")
+            replacement.write_bytes(foreign)
+            os.replace(replacement, source)
+        return original_write_target(root_fd, transaction_fd, manifest)
+
+    monkeypatch.setattr(transaction, "_write_target", swap_before_commit)
+
+    with pytest.raises(
+        RelationApprovalStateError,
+        match="revision|concurrent",
+    ):
+        transaction.apply(entry["key"], reviewer="朝灯")
+
+    assert source.read_bytes() == foreign
     assert queue.get(entry["key"])["status"] == "pending"
 
 

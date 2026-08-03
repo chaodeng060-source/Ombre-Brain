@@ -265,6 +265,22 @@ def load_config(config_path: str = None) -> dict:
                 file_config = yaml.safe_load(f) or {}
             if isinstance(file_config, dict):
                 config = _deep_merge(defaults, file_config)
+                fact_slots_override = file_config.get("fact_slots")
+                if (
+                    isinstance(fact_slots_override, dict)
+                    and "registry" in fact_slots_override
+                ):
+                    # An explicitly provided registry is an operator decision,
+                    # including the empty mapping used to disable every
+                    # built-in slot.  Generic deep-merge semantics would turn
+                    # ``registry: {}`` back into the audited defaults and make
+                    # that production kill switch impossible to express.
+                    raw_registry = fact_slots_override.get("registry")
+                    config.setdefault("fact_slots", {})["registry"] = (
+                        deepcopy(raw_registry)
+                        if isinstance(raw_registry, dict)
+                        else {}
+                    )
             else:
                 logging.warning(
                     f"Config file is not a valid YAML dict, using defaults / "

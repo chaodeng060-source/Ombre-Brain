@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -138,6 +139,48 @@ def test_cron_still_runs_patrol_when_night_fails(tmp_path):
     assert "patrol_night.py" in calls[1]
 
 
+def test_cron_double_failure_preserves_m_failure_evidence(tmp_path):
+    script = Path(__file__).resolve().parents[1] / "cron" / "run-lmc5-night.sh"
+    patrol_script = Path(__file__).resolve().parents[1] / "patrol_night.py"
+    state = tmp_path / "patrol-state"
+    config = tmp_path / "invalid-config.yaml"
+    config.write_text(
+        f"buckets_dir: {tmp_path / 'missing-buckets'}\n",
+        encoding="utf-8",
+    )
+    fake = tmp_path / "docker"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *night_run_trigger.py*) exit 19 ;;\n"
+        "  *patrol_night.py*) exec \"$PYTHON_BIN\" \"$PATROL_SCRIPT\" "
+        "--config \"$PATROL_CONFIG\" --state-dir \"$PATROL_STATE\" ;;\n"
+        "esac\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake.chmod(0o700)
+    env = {
+        **os.environ,
+        "DOCKER_BIN": str(fake),
+        "PYTHON_BIN": sys.executable,
+        "PATROL_SCRIPT": str(patrol_script),
+        "PATROL_CONFIG": str(config),
+        "PATROL_STATE": str(state),
+        "OMBRE_LMC5_LOCK_FILE": str(tmp_path / "night.lock"),
+    }
+
+    result = subprocess.run(["sh", str(script)], env=env, check=False)
+
+    latest = json.loads((state / "latest.json").read_text(encoding="utf-8"))
+    history = (state / "history.jsonl").read_text(encoding="utf-8").splitlines()
+    assert result.returncode == 19
+    assert latest["ok"] is False
+    assert latest["error_type"] == "ValueError"
+    assert len(history) == 1
+    assert json.loads(history[0]) == latest
+
+
 def test_default_config_has_a_real_constrained_fact_slot_registry(
     tmp_path,
     monkeypatch,
@@ -149,3 +192,16 @@ def test_default_config_has_a_real_constrained_fact_slot_registry(
     assert "preference.ui.primary_color" in registry
     assert registry["preference.ui.primary_color"]["domains"] == ["创作"]
     assert registry["preference.ui.primary_color"]["types"] == ["dynamic"]
+
+
+def test_explicit_empty_fact_slot_registry_disables_built_in_slots(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "fact_slots:\n  enabled: true\n  registry: {}\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(str(config_path))
+
+    assert config["fact_slots"]["enabled"] is True
+    assert config["fact_slots"]["registry"] == {}
