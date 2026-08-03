@@ -62,7 +62,8 @@ class _Decay(_NoopLoop):
 
 
 class _Dehydrator:
-    async def dehydrate(self, content, metadata):
+    async def dehydrate(self, content, metadata, *, write_cache=True):
+        assert write_cache is False
         return content
 
 

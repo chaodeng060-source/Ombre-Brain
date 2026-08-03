@@ -1,5 +1,6 @@
 import hashlib
 import logging
+from pathlib import Path
 import sqlite3
 
 import pytest
@@ -53,6 +54,76 @@ def _dehydrator(test_config, content, *, choices=True):
 
 def _long_content():
     return "朝灯问起4.7的第一晚，我要保留具体事件、时间、感受和后续影响。" * 12
+
+
+@pytest.mark.asyncio
+async def test_read_only_dehydrate_cache_miss_keeps_database_byte_identical(
+    test_config,
+):
+    valid = '{"core_facts":["4.7的第一晚发生了具体事件"],"summary":"保留正文摘要"}'
+    dehydrator, completions = _dehydrator(test_config, valid)
+    cache_path = Path(dehydrator.cache_db_path)
+    before = cache_path.read_bytes()
+
+    output = await dehydrator.dehydrate(_long_content(), write_cache=False)
+
+    assert completions.calls == 1
+    assert "4.7的第一晚发生了具体事件" in output
+    assert cache_path.read_bytes() == before
+    with sqlite3.connect(dehydrator.cache_db_path) as conn:
+        count = conn.execute(
+            "SELECT count(*) FROM dehydration_cache"
+        ).fetchone()[0]
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_read_only_dehydrate_reuses_bounded_process_cache(test_config):
+    valid = '{"core_facts":["4.7的第一晚发生了具体事件"],"summary":"保留正文摘要"}'
+    dehydrator, completions = _dehydrator(test_config, valid)
+    cache_path = Path(dehydrator.cache_db_path)
+    before = cache_path.read_bytes()
+
+    first = await dehydrator.dehydrate(_long_content(), write_cache=False)
+    second = await dehydrator.dehydrate(_long_content(), write_cache=False)
+
+    assert first == second
+    assert completions.calls == 1
+    assert len(dehydrator._read_only_summary_cache) == 1
+    assert cache_path.read_bytes() == before
+    with sqlite3.connect(dehydrator.cache_db_path) as conn:
+        count = conn.execute(
+            "SELECT count(*) FROM dehydration_cache"
+        ).fetchone()[0]
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_read_only_dehydrate_cache_hit_keeps_database_byte_identical(
+    test_config,
+):
+    cached_summary = (
+        '{"core_facts":["4.7的第一晚发生了具体事件"],'
+        '"summary":"命中只读缓存"}'
+    )
+    dehydrator, completions = _dehydrator(test_config, "must not be called")
+    content = _long_content()
+    content_hash = hashlib.sha256(content.encode()).hexdigest()
+    with sqlite3.connect(dehydrator.cache_db_path) as conn:
+        conn.execute(
+            "INSERT INTO dehydration_cache "
+            "(content_hash, summary, model) VALUES (?, ?, ?)",
+            (content_hash, cached_summary, dehydrator.model),
+        )
+        conn.commit()
+    cache_path = Path(dehydrator.cache_db_path)
+    before = cache_path.read_bytes()
+
+    output = await dehydrator.dehydrate(content, write_cache=False)
+
+    assert completions.calls == 0
+    assert "命中只读缓存" in output
+    assert cache_path.read_bytes() == before
 
 
 @pytest.mark.asyncio

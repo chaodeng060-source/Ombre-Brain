@@ -29,7 +29,9 @@ import hashlib
 import sqlite3
 import logging
 import asyncio
+from collections import OrderedDict
 from contextlib import closing
+from pathlib import Path
 from openai import AsyncOpenAI
 from e_axis_shadow import strict_json_loads
 from utils import count_tokens_approx
@@ -38,6 +40,7 @@ from redact import redact_embedding_input  # 出本地去外部 LLM 前脱敏
 logger = logging.getLogger("ombre_brain.dehydrator")
 
 MIN_DEHYDRATION_SUMMARY_CHARS = 10
+READ_ONLY_DEHYDRATION_CACHE_LIMIT = 256
 
 
 class SelfContainmentError(RuntimeError):
@@ -615,6 +618,7 @@ class Dehydrator:
         # --- SQLite 脱水缓存：content hash → summary ---
         db_path = os.path.join(config["buckets_dir"], "dehydration_cache.db")
         self.cache_db_path = db_path
+        self._read_only_summary_cache: OrderedDict[str, str] = OrderedDict()
         self._init_cache_db()
 
     def _init_cache_db(self):
@@ -644,10 +648,25 @@ class Dehydrator:
             """)
             conn.commit()
 
-    def _get_cached_summary(self, content: str) -> str | None:
+    def _get_cached_summary(
+        self,
+        content: str,
+        *,
+        read_only: bool = False,
+    ) -> str | None:
         """Look up cached dehydration result by content hash."""
         content_hash = hashlib.sha256(content.encode()).hexdigest()
-        with closing(sqlite3.connect(self.cache_db_path)) as conn:
+        if read_only:
+            cache_path = Path(self.cache_db_path).resolve()
+            if not cache_path.is_file():
+                return None
+            connection = sqlite3.connect(
+                f"{cache_path.as_uri()}?mode=ro",
+                uri=True,
+            )
+        else:
+            connection = sqlite3.connect(self.cache_db_path)
+        with closing(connection) as conn:
             row = conn.execute(
                 "SELECT summary FROM dehydration_cache WHERE content_hash = ?",
                 (content_hash,)
@@ -696,9 +715,42 @@ class Dehydrator:
             conn.commit()
         return True
 
+    def _read_only_cache_key(self, content: str) -> str:
+        """Key the process-local recall cache by model and exact content."""
+        return hashlib.sha256(
+            f"{self.model}\x00{content}".encode()
+        ).hexdigest()
+
+    def _get_read_only_memory_summary(self, content: str) -> str | None:
+        """Read a recall-only summary without touching persistent storage."""
+        cache_key = self._read_only_cache_key(content)
+        summary = self._read_only_summary_cache.pop(cache_key, None)
+        if summary is None:
+            return None
+        summary = self._normalize_dehydration_summary(summary)
+        if not self._is_usable_dehydration_summary(summary):
+            return None
+        self._read_only_summary_cache[cache_key] = summary
+        return summary
+
+    def _set_read_only_memory_summary(self, content: str, summary: str) -> None:
+        """Bound repeated recall misses without writing the SQLite cache."""
+        summary = self._normalize_dehydration_summary(summary)
+        if not self._is_usable_dehydration_summary(summary):
+            return
+        cache_key = self._read_only_cache_key(content)
+        self._read_only_summary_cache.pop(cache_key, None)
+        self._read_only_summary_cache[cache_key] = summary
+        while len(self._read_only_summary_cache) > READ_ONLY_DEHYDRATION_CACHE_LIMIT:
+            self._read_only_summary_cache.popitem(last=False)
+
     def invalidate_cache(self, content: str):
         """Remove cached summary for specific content (call when bucket content changes)."""
         content_hash = hashlib.sha256(content.encode()).hexdigest()
+        self._read_only_summary_cache.pop(
+            self._read_only_cache_key(content),
+            None,
+        )
         with closing(sqlite3.connect(self.cache_db_path)) as conn:
             conn.execute("DELETE FROM dehydration_cache WHERE content_hash = ?", (content_hash,))
             conn.commit()
@@ -1048,7 +1100,13 @@ class Dehydrator:
     # API only (no local fallback)
     # 仅通过 API 脱水（无本地回退）
     # ---------------------------------------------------------
-    async def dehydrate(self, content: str, metadata: dict = None) -> str:
+    async def dehydrate(
+        self,
+        content: str,
+        metadata: dict = None,
+        *,
+        write_cache: bool = True,
+    ) -> str:
         """
         Dehydrate/compress memory content.
         Returns formatted summary string ready for Claude context injection.
@@ -1072,9 +1130,13 @@ class Dehydrator:
 
         # --- Check cache first ---
         # --- 先查缓存 ---
-        cached = self._get_cached_summary(content)
+        cached = self._get_cached_summary(content, read_only=not write_cache)
         if cached:
             return self._format_output(cached, metadata)
+        if not write_cache:
+            cached = self._get_read_only_memory_summary(content)
+            if cached:
+                return self._format_output(cached, metadata)
 
         # --- API dehydration (no local fallback) ---
         # --- API 脱水（无本地降级）---
@@ -1103,7 +1165,10 @@ class Dehydrator:
             raise RuntimeError("脱水 API 返回空或过短摘要")
 
         # --- Cache the result ---
-        self._set_cached_summary(content, result)
+        if write_cache:
+            self._set_cached_summary(content, result)
+        else:
+            self._set_read_only_memory_summary(content, result)
 
         return self._format_output(result, metadata)
 

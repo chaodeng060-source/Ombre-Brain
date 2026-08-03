@@ -50,7 +50,8 @@ class FakeDecay:
 
 
 class FakeDehydrator:
-    async def dehydrate(self, content, meta):
+    async def dehydrate(self, content, meta, *, write_cache=True):
+        assert write_cache is False
         return f"SUMMARY:{content}"
 
 
