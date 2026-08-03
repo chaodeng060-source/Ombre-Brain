@@ -11,15 +11,26 @@ if ! /usr/bin/flock -n 9; then
     exit 0
 fi
 
+night_status=0
+patrol_status=0
+
 if "$DOCKER_BIN" exec "$CONTAINER" \
     python /app/night_run_trigger.py; then
     :
 else
     night_status=$?
-    exit "$night_status"
 fi
 
-exec "$DOCKER_BIN" exec "$CONTAINER" \
+if "$DOCKER_BIN" exec "$CONTAINER" \
     python /app/patrol_night.py \
     --config /app/config.yaml \
-    --state-dir "$PATROL_STATE_DIR"
+    --state-dir "$PATROL_STATE_DIR"; then
+    :
+else
+    patrol_status=$?
+fi
+
+if [ "$night_status" -ne 0 ]; then
+    exit "$night_status"
+fi
+exit "$patrol_status"

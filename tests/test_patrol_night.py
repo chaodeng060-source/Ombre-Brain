@@ -87,6 +87,7 @@ def _fake_docker(tmp_path: Path) -> tuple[Path, Path]:
         "#!/bin/sh\n"
         "printf '%s\\n' \"$*\" >> \"$CALL_LOG\"\n"
         "case \"$*\" in\n"
+        "  *night_run_trigger.py*) exit \"${FAIL_NIGHT:-0}\" ;;\n"
         "  *patrol_night.py*) exit \"${FAIL_PATROL:-0}\" ;;\n"
         "esac\n"
         "exit 0\n",
@@ -96,13 +97,14 @@ def _fake_docker(tmp_path: Path) -> tuple[Path, Path]:
     return fake, calls
 
 
-def _run_cron(tmp_path: Path, *, fail_patrol: int = 0):
+def _run_cron(tmp_path: Path, *, fail_night: int = 0, fail_patrol: int = 0):
     fake, calls = _fake_docker(tmp_path)
     script = Path(__file__).resolve().parents[1] / "cron" / "run-lmc5-night.sh"
     env = {
         **os.environ,
         "DOCKER_BIN": str(fake),
         "CALL_LOG": str(calls),
+        "FAIL_NIGHT": str(fail_night),
         "FAIL_PATROL": str(fail_patrol),
         "OMBRE_LMC5_LOCK_FILE": str(tmp_path / "night.lock"),
     }
@@ -124,6 +126,15 @@ def test_cron_propagates_patrol_failure(tmp_path):
 
     assert result.returncode == 23
     assert len(calls) == 2
+    assert "patrol_night.py" in calls[1]
+
+
+def test_cron_still_runs_patrol_when_night_fails(tmp_path):
+    result, calls = _run_cron(tmp_path, fail_night=19)
+
+    assert result.returncode == 19
+    assert len(calls) == 2
+    assert "night_run_trigger.py" in calls[0]
     assert "patrol_night.py" in calls[1]
 
 
