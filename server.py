@@ -143,6 +143,11 @@ from lmc5_ledger import (
     LedgerError,
     LedgerValidationError,
 )
+from lmc5_ingest_guard import (
+    RawIngestBusy,
+    RawIngestGuardError,
+    shared_ingest_guard,
+)
 from night_run_coordinator import NightRunCoordinatorError
 from night_run_runtime import (
     NightRunRuntimeError,
@@ -1590,8 +1595,29 @@ async def lmc5_raw_events_hook(request):
         # Ledger setup and FULL-synchronous SQLite writes can wait on a busy
         # writer.  Keep the HTTP event loop responsive, but await the worker
         # before issuing the durable acknowledgement.
-        results = await _await_daemon_thread(
-            lambda: _get_lmc5_ledger().append_raw_events(normalized)
+        def append_under_ingest_guard():
+            # Acquire before constructing the lazy ledger and retain the lease
+            # until its FULL-synchronous append transaction has completed.
+            with shared_ingest_guard():
+                return _get_lmc5_ledger().append_raw_events(normalized)
+
+        results = await _await_daemon_thread(append_under_ingest_guard)
+    except RawIngestBusy:
+        return JSONResponse(
+            {
+                "error": "raw-event ingest is paused",
+                "code": "raw_ingest.busy",
+            },
+            status_code=503,
+        )
+    except RawIngestGuardError:
+        logger.exception("LMC-5 raw-ingest guard is unavailable")
+        return JSONResponse(
+            {
+                "error": "raw-event ingest is unavailable",
+                "code": "raw_ingest.unavailable",
+            },
+            status_code=503,
         )
     except LedgerConflictError:
         return JSONResponse({"error": "raw event identity conflict"}, status_code=409)

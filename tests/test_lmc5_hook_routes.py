@@ -1,9 +1,11 @@
 import json
 import threading
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
+import lmc5_ingest_guard
 import server
 
 
@@ -31,10 +33,23 @@ def _json(response):
 
 @pytest.fixture(autouse=True)
 def _hook_environment(monkeypatch, test_config):
+    lock_path = lmc5_ingest_guard.RAW_INGEST_LOCK_PATH.with_name(
+        f"ombre-lmc5-raw-ingest-test-{uuid4().hex}.lock"
+    )
+    monkeypatch.setattr(
+        lmc5_ingest_guard,
+        "RAW_INGEST_LOCK_PATH",
+        lock_path,
+    )
     monkeypatch.setenv("OMBRE_HOOK_TOKEN", "hook-secret")
     monkeypatch.setitem(server.config, "buckets_dir", test_config["buckets_dir"])
     monkeypatch.setattr(server, "_lmc5_ledger", None)
     monkeypatch.setattr(server, "_lmc5_night_runtime", None)
+    yield
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 @pytest.mark.asyncio
@@ -102,6 +117,94 @@ async def test_raw_event_durable_write_runs_off_event_loop(monkeypatch):
     assert response.status_code == 200
     assert observed["thread"] != caller_thread
     assert len(observed["events"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_raw_event_busy_does_not_initialize_ledger_or_ack(monkeypatch):
+    calls = {"ledger": 0}
+
+    def unexpected_ledger():
+        calls["ledger"] += 1
+        raise AssertionError("busy ingest must not initialize the ledger")
+
+    monkeypatch.setattr(server, "_get_lmc5_ledger", unexpected_ledger)
+    request = _Request(
+        {
+            "schema_version": 1,
+            "session_id": "session-gated",
+            "events": [
+                {
+                    "source_event_id": "event-1",
+                    "payload": '{"uuid":"event-1"}',
+                }
+            ],
+        }
+    )
+
+    with lmc5_ingest_guard.exclusive_ingest_guard(timeout=0.5):
+        response = await server.lmc5_raw_events_hook(request)
+
+    assert response.status_code == 503
+    assert _json(response) == {
+        "error": "raw-event ingest is paused",
+        "code": "raw_ingest.busy",
+    }
+    assert calls["ledger"] == 0
+    assert server._lmc5_ledger is None
+
+
+@pytest.mark.asyncio
+async def test_raw_event_succeeds_exactly_once_after_guard_releases():
+    request = _Request(
+        {
+            "schema_version": 1,
+            "session_id": "session-after-gate",
+            "events": [
+                {
+                    "source_event_id": "event-1",
+                    "payload": '{"uuid":"event-1","value":"exact"}',
+                }
+            ],
+        }
+    )
+
+    with lmc5_ingest_guard.exclusive_ingest_guard(timeout=0.5):
+        blocked = await server.lmc5_raw_events_hook(request)
+    first = await server.lmc5_raw_events_hook(request)
+    replay = await server.lmc5_raw_events_hook(request)
+
+    assert blocked.status_code == 503
+    assert _json(first)["inserted"] == 1
+    assert _json(replay)["inserted"] == 0
+    report = server._get_lmc5_ledger().coverage_report()
+    assert report.total_raw_events == 1
+
+
+@pytest.mark.asyncio
+async def test_raw_event_append_exception_releases_shared_guard(monkeypatch):
+    class BrokenLedger:
+        def append_raw_events(self, _events):
+            raise server.LedgerError("injected append failure")
+
+    monkeypatch.setattr(server, "_get_lmc5_ledger", lambda: BrokenLedger())
+    response = await server.lmc5_raw_events_hook(
+        _Request(
+            {
+                "schema_version": 1,
+                "session_id": "session-failure",
+                "events": [
+                    {
+                        "source_event_id": "event-1",
+                        "payload": '{"uuid":"event-1"}',
+                    }
+                ],
+            }
+        )
+    )
+
+    assert response.status_code == 500
+    with lmc5_ingest_guard.exclusive_ingest_guard(timeout=0.5):
+        pass
 
 
 @pytest.mark.asyncio
