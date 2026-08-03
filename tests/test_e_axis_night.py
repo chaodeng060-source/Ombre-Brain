@@ -321,6 +321,10 @@ class EAxisNightTests(unittest.IsolatedAsyncioTestCase):
             parsed_report = json.loads(report)
             self.assertFalse(parsed_report["promotion_eligible"])
             self.assertEqual(
+                parsed_report["curated_timestamp_policy"],
+                "aware_only",
+            )
+            self.assertEqual(
                 parsed_report["promotion_guards"]["minimum_natural_days"],
                 30,
             )
@@ -329,6 +333,43 @@ class EAxisNightTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(parsed_report["coverage"]["score_rate"], 1.0)
             self.assertFalse(
                 parsed_report["coverage"]["denominator_zero"]
+            )
+
+    async def test_legacy_naive_utc_is_passed_to_reader_and_reported(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "feel" / "legacy.md"
+            source.parent.mkdir()
+            source.write_text(
+                "---\n"
+                "id: legacy\n"
+                "name: legacy\n"
+                "type: feel\n"
+                "semantic_type: preference\n"
+                "created: '2026-07-31T00:00:00'\n"
+                "tags: []\n"
+                "---\n"
+                "这是带完整秒的旧记录。",
+                encoding="utf-8",
+            )
+            store, journal = _paths(root)
+
+            result = await run_e_axis_shadow(
+                ledger=_Ledger([]),
+                curated_buckets_dir=root,
+                legacy_naive_timestamps_utc=True,
+                store=store,
+                journal=journal,
+                scorer=_scorer(_Provider([_envelope()])),
+                run_id="e-run-legacy-naive",
+            )
+
+            self.assertEqual(result.added, 1)
+            report = json.loads(journal.reports_path.read_text())
+            self.assertEqual(
+                report["curated_timestamp_policy"],
+                "legacy_naive_utc",
             )
 
     async def test_success_is_terminal_and_does_not_call_provider_twice(self):
@@ -792,7 +833,7 @@ def test_main_returns_75_when_secure_run_lock_is_busy(
     monkeypatch.setattr(
         e_axis_night_module,
         "build_e_axis_runtime",
-        lambda _config: (None, None, None, None, 1, tmp_path),
+        lambda _config: (None, None, None, None, 1, tmp_path, False),
     )
 
     @contextmanager
@@ -810,6 +851,46 @@ def test_main_returns_75_when_secure_run_lock_is_busy(
     assert json.loads(capsys.readouterr().out) == {
         "ok": False,
         "code": "run.busy",
+    }
+
+
+def test_main_passes_legacy_naive_utc_policy_to_runner(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    captured = {}
+    monkeypatch.setattr(e_axis_night_module, "load_config", lambda: {})
+    monkeypatch.setattr(
+        e_axis_night_module,
+        "build_e_axis_runtime",
+        lambda _config: (None, None, None, None, 1, tmp_path, True),
+    )
+
+    @contextmanager
+    def available_lock(*_args, **_kwargs):
+        yield
+
+    async def stop_after_capture(**kwargs):
+        captured.update(kwargs)
+        raise EAxisNightError("test.stop")
+
+    monkeypatch.setattr(
+        e_axis_night_module,
+        "secure_e_axis_lock",
+        available_lock,
+    )
+    monkeypatch.setattr(
+        e_axis_night_module,
+        "run_e_axis_shadow",
+        stop_after_capture,
+    )
+
+    assert e_axis_night_module.main() == 1
+    assert captured["legacy_naive_timestamps_utc"] is True
+    assert json.loads(capsys.readouterr().out) == {
+        "ok": False,
+        "code": "test.stop",
     }
 
 
@@ -835,6 +916,21 @@ class EAxisRuntimeConfigTests(unittest.TestCase):
                 },
                 "e_axis_shadow": {"enabled": True},
             })
+
+    def test_legacy_naive_timestamps_utc_must_be_a_real_boolean(self):
+        for value in (1, 0, "true", None, [], {}):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    EAxisNightError,
+                    "config.legacy_naive_timestamps_utc_invalid",
+                ):
+                    build_e_axis_runtime({
+                        "buckets_dir": "/does/not/matter",
+                        "e_axis_shadow": {
+                            "enabled": True,
+                            "legacy_naive_timestamps_utc": value,
+                        },
+                    })
 
     def test_scorer_identity_changes_with_sampling_configuration(self):
         base = {

@@ -38,8 +38,11 @@ def _write_bucket(
     return raw
 
 
-def _subjects(root: Path):
-    scan = iter_curated_subjects(root)
+def _subjects(root: Path, *, legacy_naive_timestamps_utc: bool = False):
+    scan = iter_curated_subjects(
+        root,
+        legacy_naive_timestamps_utc=legacy_naive_timestamps_utc,
+    )
     return (
         scan.subjects,
         scan.scanned,
@@ -158,6 +161,180 @@ def test_oldest_first_uses_aware_timestamp_in_utc(tmp_path):
         "bucket:later",
     ]
     assert all(item.created_at.endswith("+00:00") for item in subjects)
+
+
+@pytest.mark.parametrize("explicit_false", [False, True])
+def test_naive_timestamp_is_rejected_without_enabled_compatibility(
+    tmp_path,
+    explicit_false,
+):
+    _write_bucket(
+        tmp_path / "feel" / "naive.md",
+        bucket_id="naive",
+        created="2026-07-31T00:00:00",
+        extra="semantic_type: preference\n",
+    )
+
+    with pytest.raises(
+        EAxisCuratedError,
+        match="curated.created_at_timezone_missing",
+    ):
+        if explicit_false:
+            _subjects(tmp_path, legacy_naive_timestamps_utc=False)
+        else:
+            _subjects(tmp_path)
+
+
+def test_legacy_naive_utc_accepts_full_seconds_sorts_and_stays_read_only(
+    tmp_path,
+):
+    root = tmp_path / "feel"
+    quoted = root / "quoted.md"
+    decoded = root / "decoded.md"
+    _write_bucket(
+        quoted,
+        bucket_id="quoted",
+        created="2026-07-31T00:00:00.123456",
+        extra="semantic_type: preference\n",
+    )
+    decoded.parent.mkdir(parents=True, exist_ok=True)
+    decoded.write_text(
+        "---\n"
+        "id: decoded\n"
+        "name: memory-decoded\n"
+        "type: dynamic\n"
+        "created: 2026-07-30T23:59:59\n"
+        "tags: []\n"
+        "semantic_type: preference\n"
+        "---\n"
+        "plain memory",
+        encoding="utf-8",
+    )
+    os.chmod(quoted, 0o640)
+    os.chmod(decoded, 0o640)
+    fixed_ns = 1_700_000_000_000_000_000
+    os.utime(quoted, ns=(fixed_ns, fixed_ns))
+    os.utime(decoded, ns=(fixed_ns, fixed_ns))
+    before = {
+        path: (
+            path.read_bytes(),
+            path.stat().st_mode,
+            path.stat().st_mtime_ns,
+            path.stat().st_atime_ns,
+        )
+        for path in (quoted, decoded)
+    }
+    before_entries = tuple(
+        sorted(str(item.relative_to(tmp_path)) for item in tmp_path.rglob("*"))
+    )
+
+    subjects, scanned, skipped, reasons = _subjects(
+        tmp_path,
+        legacy_naive_timestamps_utc=True,
+    )
+
+    assert [item.source_id for item in subjects] == [
+        "bucket:decoded",
+        "bucket:quoted",
+    ]
+    assert [item.created_at for item in subjects] == [
+        "2026-07-30T23:59:59.000000+00:00",
+        "2026-07-31T00:00:00.123456+00:00",
+    ]
+    assert (scanned, skipped, reasons) == (2, 0, {})
+    after_entries = tuple(
+        sorted(str(item.relative_to(tmp_path)) for item in tmp_path.rglob("*"))
+    )
+    for path, expected in before.items():
+        after = path.stat()
+        assert (
+            path.read_bytes(),
+            after.st_mode,
+            after.st_mtime_ns,
+            after.st_atime_ns,
+        ) == expected
+    assert after_entries == before_entries
+    assert not (tmp_path / ".axis").exists()
+
+
+@pytest.mark.parametrize(
+    "created_line",
+    [
+        "created: 2026-07-31\n",
+        "created: '2026-07-31'\n",
+        "created: '2026-07-31T00:00'\n",
+    ],
+)
+def test_legacy_naive_utc_still_rejects_date_or_missing_seconds(
+    tmp_path,
+    created_line,
+):
+    path = tmp_path / "dynamic" / "bad.md"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "---\n"
+        "id: bad-time\n"
+        "name: bad-time\n"
+        "type: dynamic\n"
+        f"{created_line}"
+        "tags: []\n"
+        "semantic_type: preference\n"
+        "---\n"
+        "plain memory",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        EAxisCuratedError,
+        match="curated.created_at_timezone_missing",
+    ):
+        _subjects(tmp_path, legacy_naive_timestamps_utc=True)
+
+
+def test_legacy_naive_utc_still_rejects_whitespace_pollution(tmp_path):
+    path = tmp_path / "dynamic" / "bad.md"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        "---\n"
+        "id: bad-time\n"
+        "name: bad-time\n"
+        "type: dynamic\n"
+        "created: ' 2026-07-31T00:00:00'\n"
+        "tags: []\n"
+        "semantic_type: preference\n"
+        "---\n"
+        "plain memory",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        EAxisCuratedError,
+        match="curated.created_at_invalid",
+    ):
+        _subjects(tmp_path, legacy_naive_timestamps_utc=True)
+
+
+@pytest.mark.parametrize(
+    "created",
+    [
+        "2026-07-31T00:00+00:00",
+        "2026-07-31 00:00:00+00:00",
+        "2026-07-31X00:00:00+00:00",
+    ],
+)
+def test_timestamp_strings_require_strict_t_and_seconds_even_when_aware(
+    tmp_path,
+    created,
+):
+    _write_bucket(
+        tmp_path / "feel" / "bad-shape.md",
+        bucket_id="bad-shape",
+        created=created,
+        extra="semantic_type: preference\n",
+    )
+
+    with pytest.raises(EAxisCuratedError):
+        _subjects(tmp_path, legacy_naive_timestamps_utc=True)
 
 
 def test_digest_binds_only_canonical_e_input_and_run_id_is_stable(tmp_path):

@@ -9,9 +9,16 @@ universe is the union of:
 
 Both source kinds pass the official type, keyword, and emotional-link gate.
 The curated reader is strictly read-only: it rejects unsafe ancestors,
-symlinks, hardlinks, malformed frontmatter, naive timestamps, and duplicate
-IDs. It never creates, touches, or rewrites a memory file, never reads raw
-events, and never traverses outside those five roots. Both curated Markdown and
+symlinks, hardlinks, malformed frontmatter, and duplicate IDs. Timestamps are
+timezone-aware by default. An audited legacy corpus may explicitly set the
+strict boolean `e_axis_shadow.legacy_naive_timestamps_utc: true`; only complete
+quoted `YYYY-MM-DDTHH:MM:SS[.ffffff]` strings or YAML-decoded naive full-second
+`datetime` values are then interpreted as UTC. YAML dates, quoted date-only
+values, missing-seconds values, and non-boolean configuration still fail
+closed. The selected policy is recorded in every coverage report as
+`curated_timestamp_policy=aware_only|legacy_naive_utc`. The reader never
+creates, touches, or rewrites a memory file, never reads raw events, and never
+traverses outside those five roots. Both curated Markdown and
 the LMC-5 SQLite source are opened through held directory descriptors with
 `O_NOFOLLOW|O_NOATIME`; unsupported filesystems or permissions fail closed
 instead of falling back to metadata-touching reads. The SQLite main file is

@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import errno
+import re
 import stat
 from collections import Counter
 from collections.abc import Mapping
@@ -33,6 +34,10 @@ from lmc5_proposer import CANDIDATE_TYPES
 CURATED_BUCKET_ROOTS = ("permanent", "dynamic", "archive", "feel", "涩涩")
 _INPUT_SCHEMA = "ombre.e-axis-curated-input/v1"
 _MAX_BUCKET_BYTES = 16 * 1024 * 1024
+_STRICT_TIMESTAMP = re.compile(
+    r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?"
+    r"(?:Z|[+-]\d{2}:\d{2})?\Z"
+)
 _MACHINE_ID_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-"
 )
@@ -83,7 +88,11 @@ def _required_text(
     return normalized
 
 
-def _canonical_timestamp(value: object) -> str:
+def _canonical_timestamp(
+    value: object,
+    *,
+    legacy_naive_timestamps_utc: bool = False,
+) -> str:
     if isinstance(value, datetime):
         parsed = value
     elif isinstance(value, date):
@@ -98,17 +107,32 @@ def _canonical_timestamp(value: object) -> str:
             parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
         except ValueError as exc:
             raise EAxisCuratedError("curated.created_at_invalid") from exc
+        if _STRICT_TIMESTAMP.fullmatch(raw) is None:
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise EAxisCuratedError(
+                    "curated.created_at_timezone_missing"
+                )
+            raise EAxisCuratedError("curated.created_at_invalid")
     else:
         raise EAxisCuratedError("curated.created_at_invalid")
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise EAxisCuratedError("curated.created_at_timezone_missing")
+        if not legacy_naive_timestamps_utc:
+            raise EAxisCuratedError("curated.created_at_timezone_missing")
+        parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
 
 
-def _created_at(metadata: Mapping[str, Any]) -> str:
+def _created_at(
+    metadata: Mapping[str, Any],
+    *,
+    legacy_naive_timestamps_utc: bool = False,
+) -> str:
     for field in ("created", "recorded_at", "event_at"):
         if field in metadata:
-            return _canonical_timestamp(metadata[field])
+            return _canonical_timestamp(
+                metadata[field],
+                legacy_naive_timestamps_utc=legacy_naive_timestamps_utc,
+            )
     raise EAxisCuratedError("curated.created_at_missing")
 
 
@@ -449,13 +473,18 @@ def _title(metadata: Mapping[str, Any], bucket_id: str) -> str:
 
 def _subject_from_file(
     raw: bytes,
+    *,
+    legacy_naive_timestamps_utc: bool = False,
 ) -> tuple[EAxisSubject | None, str, str]:
     metadata, content = _parse_markdown(raw)
     bucket_id = _bucket_id(metadata)
     title = _title(metadata, bucket_id)
     memory_type = _memory_type(metadata)
     relation_hints = _relation_hints(metadata)
-    created_at = _created_at(metadata)
+    created_at = _created_at(
+        metadata,
+        legacy_naive_timestamps_utc=legacy_naive_timestamps_utc,
+    )
     decision = decide_e_axis_trigger(
         memory_type=memory_type,
         title=title,
@@ -500,8 +529,13 @@ def _subject_from_file(
 
 def iter_curated_subjects(
     buckets_dir: str | os.PathLike[str],
+    *,
+    legacy_naive_timestamps_utc: bool = False,
 ) -> EAxisSourceScan:
     """Return eligible curated subjects and explicit gate coverage counts."""
+
+    if type(legacy_naive_timestamps_utc) is not bool:
+        raise EAxisCuratedError("curated.legacy_naive_timestamps_utc_invalid")
 
     root = Path(os.path.abspath(os.fspath(buckets_dir)))
     root_fd = _open_root_directory(root)
@@ -532,7 +566,12 @@ def iter_curated_subjects(
             )
             try:
                 for raw in _iter_markdown_bytes(source_fd):
-                    subject, skip_reason, bucket_id = _subject_from_file(raw)
+                    subject, skip_reason, bucket_id = _subject_from_file(
+                        raw,
+                        legacy_naive_timestamps_utc=(
+                            legacy_naive_timestamps_utc
+                        ),
+                    )
                     if bucket_id in seen_ids:
                         raise EAxisCuratedError("curated.duplicate_id")
                     seen_ids.add(bucket_id)

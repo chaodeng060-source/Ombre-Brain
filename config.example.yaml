@@ -98,6 +98,7 @@ metabolism:
 # enabled 只是运行配置，不代表生产已部署；镜像与独立 cron 仍必须通过部署闸。
 e_axis_shadow:
   enabled: true                        # absent/false fails closed
+  legacy_naive_timestamps_utc: false   # true only for audited legacy full timestamps; date-only still fails
   min_confidence: 0.3
   provider_name: "deepseek"           # required real provider lineage; no generic default
   model: "deepseek-chat"              # may differ from dehydration.model

@@ -762,12 +762,15 @@ async def run_e_axis_shadow(
     scorer: StrictEAxisScorer,
     run_id: str,
     curated_buckets_dir: str | os.PathLike[str] | None = None,
+    legacy_naive_timestamps_utc: bool = False,
     max_per_run: int = DEFAULT_MAX_PER_RUN,
     clock: Callable[[], datetime] = _now,
 ) -> EAxisNightResult:
     """Collect one bounded cohort without mutating the source ledger."""
 
     run_id = _required_text(run_id, "run.id_invalid")
+    if type(legacy_naive_timestamps_utc) is not bool:
+        raise EAxisNightError("config.legacy_naive_timestamps_utc_invalid")
     max_per_run = _plain_int(
         max_per_run,
         default=DEFAULT_MAX_PER_RUN,
@@ -781,7 +784,12 @@ async def run_e_axis_shadow(
         if curated_buckets_dir is not None:
             scans.append((
                 "curated_memory",
-                iter_curated_subjects(Path(curated_buckets_dir)),
+                iter_curated_subjects(
+                    Path(curated_buckets_dir),
+                    legacy_naive_timestamps_utc=(
+                        legacy_naive_timestamps_utc
+                    ),
+                ),
             ))
         source_scan = _merge_source_scans(tuple(scans))
     except (EAxisSourceError, EAxisCuratedError) as exc:
@@ -959,6 +967,11 @@ async def run_e_axis_shadow(
         },
         "shadow_only": True,
         "affects_ranking": False,
+        "curated_timestamp_policy": (
+            "legacy_naive_utc"
+            if legacy_naive_timestamps_utc
+            else "aware_only"
+        ),
     })
     _append_report(journal, report_payload)
     return result
@@ -973,12 +986,19 @@ def build_e_axis_runtime(
     StrictEAxisScorer,
     int,
     Path,
+    bool,
 ]:
     section = config.get("e_axis_shadow", {}) or {}
     if type(section) is not dict:
         raise EAxisNightError("config.section_invalid")
     if section.get("enabled") is not True:
         raise EAxisNightError("config.disabled")
+    legacy_naive_timestamps_utc = section.get(
+        "legacy_naive_timestamps_utc",
+        False,
+    )
+    if type(legacy_naive_timestamps_utc) is not bool:
+        raise EAxisNightError("config.legacy_naive_timestamps_utc_invalid")
     max_per_run = _plain_int(
         section.get("max_per_run"),
         default=DEFAULT_MAX_PER_RUN,
@@ -1078,15 +1098,29 @@ def build_e_axis_runtime(
         min_confidence=min_confidence,
         max_content_chars=max_content_chars,
     )
-    return ledger, store, journal, scorer, max_per_run, root
+    return (
+        ledger,
+        store,
+        journal,
+        scorer,
+        max_per_run,
+        root,
+        legacy_naive_timestamps_utc,
+    )
 
 
 def main() -> int:
     try:
         config = load_config()
-        ledger, store, journal, scorer, max_per_run, root = build_e_axis_runtime(
-            config
-        )
+        (
+            ledger,
+            store,
+            journal,
+            scorer,
+            max_per_run,
+            root,
+            legacy_naive_timestamps_utc,
+        ) = build_e_axis_runtime(config)
         with secure_e_axis_lock(
             root / ".axis" / "e-shadow-run.lock",
             blocking=False,
@@ -1098,6 +1132,7 @@ def main() -> int:
                 scorer=scorer,
                 run_id=_new_run_id(),
                 curated_buckets_dir=root,
+                legacy_naive_timestamps_utc=legacy_naive_timestamps_utc,
                 max_per_run=max_per_run,
             ))
     except EAxisStorageBusy:
