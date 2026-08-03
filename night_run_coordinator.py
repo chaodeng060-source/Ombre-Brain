@@ -490,62 +490,78 @@ class NightRunCoordinator:
     async def _propose_pending(
         self, run_id: str, counts: dict[str, int]
     ) -> None:
+        after: int | None = None
+        retryable_errors = 0
         while True:
-            pending_rows = self.ledger.list_pending_proposer_chunks(limit=1)
-            if not pending_rows:
-                return
-            pending = pending_rows[0]
-            if len(pending.source_event_ids) != 1:
-                raise NightRunCoordinatorError("proposer.source_cardinality")
-            try:
-                text = pending.content.decode("utf-8", errors="strict")
-            except UnicodeError as exc:
-                raise NightRunCoordinatorError("proposer.chunk_utf8") from exc
-            try:
-                batch = await self.proposer.propose(
-                    (ProposerChunk(id=pending.chunk_id, text=text),),
-                    frozenset(),
-                )
-            except ProposerContractError as exc:
-                self._record_proposer_error(run_id, pending, exc.code)
-                raise NightRunCoordinatorError("proposer.failed") from exc
-            candidate_specs = self._candidate_specs(
-                run_id=run_id,
-                pending=pending,
-                batch=batch,
+            pending_rows = self.ledger.list_pending_proposer_chunks(
+                limit=self.policy.pending_page_size,
+                after=after,
             )
-            with self.ledger.transaction() as tx:
-                candidate_keys: list[str] = []
-                for key, axis, payload in candidate_specs:
-                    tx.record_candidate(
-                        key,
-                        axis,
-                        payload,
-                        (pending.chunk_id,),
+            if not pending_rows:
+                break
+            for pending in pending_rows:
+                after = pending.row_id
+                if len(pending.source_event_ids) != 1:
+                    raise NightRunCoordinatorError(
+                        "proposer.source_cardinality"
                     )
-                    candidate_keys.append(key)
-                outcome = (
-                    "candidates_persisted"
-                    if candidate_keys
-                    else "zero_candidates"
-                )
-                outcome_key = self._proposer_outcome_key(
+                try:
+                    text = pending.content.decode("utf-8", errors="strict")
+                except UnicodeError as exc:
+                    raise NightRunCoordinatorError(
+                        "proposer.chunk_utf8"
+                    ) from exc
+                try:
+                    batch = await self.proposer.propose(
+                        (ProposerChunk(id=pending.chunk_id, text=text),),
+                        frozenset(),
+                    )
+                except ProposerContractError as exc:
+                    self._record_proposer_error(run_id, pending, exc.code)
+                    retryable_errors += 1
+                    counts["proposer_errors"] = retryable_errors
+                    continue
+                candidate_specs = self._candidate_specs(
                     run_id=run_id,
                     pending=pending,
                     batch=batch,
-                    candidate_keys=candidate_keys,
-                    outcome=outcome,
                 )
-                tx.record_chunk_proposer_outcome(
-                    outcome_key,
-                    pending.chunk_id,
-                    outcome,
-                    candidate_keys=candidate_keys,
+                with self.ledger.transaction() as tx:
+                    candidate_keys: list[str] = []
+                    for key, axis, payload in candidate_specs:
+                        tx.record_candidate(
+                            key,
+                            axis,
+                            payload,
+                            (pending.chunk_id,),
+                        )
+                        candidate_keys.append(key)
+                    outcome = (
+                        "candidates_persisted"
+                        if candidate_keys
+                        else "zero_candidates"
+                    )
+                    outcome_key = self._proposer_outcome_key(
+                        run_id=run_id,
+                        pending=pending,
+                        batch=batch,
+                        candidate_keys=candidate_keys,
+                        outcome=outcome,
+                    )
+                    tx.record_chunk_proposer_outcome(
+                        outcome_key,
+                        pending.chunk_id,
+                        outcome,
+                        candidate_keys=candidate_keys,
+                    )
+                counts["proposer_chunks"] = (
+                    counts.get("proposer_chunks", 0) + 1
                 )
-            counts["proposer_chunks"] = counts.get("proposer_chunks", 0) + 1
-            counts["candidates"] = counts.get("candidates", 0) + len(
-                candidate_specs
-            )
+                counts["candidates"] = counts.get("candidates", 0) + len(
+                    candidate_specs
+                )
+        if retryable_errors:
+            raise NightRunCoordinatorError("proposer.failed")
 
     def _record_proposer_error(
         self,

@@ -306,6 +306,123 @@ async def test_provider_failure_metadata_cannot_masquerade_as_empty(envelope, co
     assert "secret provider detail" not in caught.value.detail
 
 
+@pytest.mark.asyncio
+async def test_incomplete_response_gets_one_compact_retry():
+    prompts = []
+    responses = iter(
+        (
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": "truncated"},
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(_document(_candidate()))
+                        },
+                    }
+                ]
+            },
+        )
+    )
+
+    async def provider(prompt):
+        prompts.append(prompt)
+        return next(responses)
+
+    batch = await StrictOmbreProposer(provider).propose(CHUNKS)
+
+    assert batch.candidates[0].title == "雨声偏好"
+    assert len(prompts) == 2
+    assert "RETRY ONE INCOMPLETE MODEL RESPONSE" not in prompts[0]
+    assert "RETRY ONE INCOMPLETE MODEL RESPONSE" in prompts[1]
+    assert "return at most 4 high-signal candidates" in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_incomplete_response_is_retried_only_once_and_stays_retryable():
+    prompts = []
+
+    async def provider(prompt):
+        prompts.append(prompt)
+        return {
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"content": "truncated"},
+                }
+            ]
+        }
+
+    with pytest.raises(ProposerContractError) as caught:
+        await StrictOmbreProposer(provider).propose(CHUNKS)
+
+    assert caught.value.code == "provider.incomplete"
+    assert len(prompts) == 2
+
+
+@pytest.mark.asyncio
+async def test_compact_retry_enforces_its_smaller_candidate_bound():
+    prompts = []
+    responses = iter(
+        (
+            {
+                "choices": [
+                    {
+                        "finish_reason": "length",
+                        "message": {"content": "truncated"},
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": json.dumps(
+                                _document(*(_candidate() for _ in range(5)))
+                            )
+                        },
+                    }
+                ]
+            },
+        )
+    )
+
+    async def provider(prompt):
+        prompts.append(prompt)
+        return next(responses)
+
+    with pytest.raises(ProposerContractError) as caught:
+        await StrictOmbreProposer(provider).propose(CHUNKS)
+
+    assert caught.value.code == "schema_root"
+    assert len(prompts) == 2
+
+
+@pytest.mark.asyncio
+async def test_candidate_count_is_bounded_in_prompt_and_validator():
+    prompts = []
+    too_many = json.dumps(_document(*(_candidate() for _ in range(9))))
+
+    async def provider(prompt):
+        prompts.append(prompt)
+        return {"choices": [{"message": {"content": too_many}}]}
+
+    with pytest.raises(ProposerContractError) as caught:
+        await StrictOmbreProposer(provider).propose(CHUNKS)
+
+    assert caught.value.code == "schema_root"
+    assert len(prompts) == 2
+    assert "Return at most 8 high-signal candidates" in prompts[0]
+
+
 @pytest.mark.parametrize(
     "timeout_seconds",
     [True, 0, -1, float("nan"), float("inf"), 10**1000],

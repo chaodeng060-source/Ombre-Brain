@@ -57,6 +57,8 @@ _MAX_CONTENT_BYTES = 16 * 1024
 _MAX_THREAD_HINT_BYTES = 512
 _MAX_EVIDENCE_BYTES = 4 * 1024
 _MAX_RELATION_REASON_BYTES = 2 * 1024
+_MAX_CANDIDATES = 8
+_COMPACT_RETRY_MAX_CANDIDATES = 4
 _REPAIRABLE_MODEL_CODES = frozenset(
     {
         "provenance_evidence",
@@ -66,6 +68,14 @@ _REPAIRABLE_MODEL_CODES = frozenset(
         "schema_relation",
         "schema_root",
     }
+)
+_INCOMPLETE_RETRY_INSTRUCTION = (
+    "RETRY ONE INCOMPLETE MODEL RESPONSE: Regenerate the whole JSON object "
+    "from the original INPUT and return at most "
+    f"{_COMPACT_RETRY_MAX_CANDIDATES} high-signal candidates. Prefer fewer "
+    "candidates over a truncated response. Keep title, content, thread_hint, "
+    "evidence, and relation reasons concise while preserving literal evidence "
+    "and every original schema/provenance rule. Return JSON only."
 )
 _CONTRACT_REPAIR_INSTRUCTION = (
     "REPAIR ONE MODEL CONTRACT ERROR ({code}): Regenerate the whole JSON "
@@ -336,17 +346,28 @@ class StrictOmbreProposer:
         effective_prompt = prompt
         try:
             candidates = await self._call_and_validate(
-                prompt, chunk_tuple, targets
+                prompt,
+                chunk_tuple,
+                targets,
+                max_candidates=_MAX_CANDIDATES,
             )
         except ProposerContractError as exc:
-            if exc.code not in _REPAIRABLE_MODEL_CODES:
+            if exc.code == "provider.incomplete":
+                effective_prompt = self._build_incomplete_retry_prompt(prompt)
+                max_candidates = _COMPACT_RETRY_MAX_CANDIDATES
+            elif exc.code in _REPAIRABLE_MODEL_CODES:
+                effective_prompt = self._build_contract_repair_prompt(
+                    prompt, exc.code
+                )
+                max_candidates = _MAX_CANDIDATES
+            else:
                 raise
-            effective_prompt = self._build_contract_repair_prompt(
-                prompt, exc.code
-            )
             self._validate_prompt_size(effective_prompt)
             candidates = await self._call_and_validate(
-                effective_prompt, chunk_tuple, targets
+                effective_prompt,
+                chunk_tuple,
+                targets,
+                max_candidates=max_candidates,
             )
 
         normalized = {
@@ -381,6 +402,8 @@ class StrictOmbreProposer:
         prompt: str,
         chunks: tuple[ProposerChunk, ...],
         targets: frozenset[str],
+        *,
+        max_candidates: int,
     ) -> tuple[CandidateDraft, ...]:
         envelope = await self._call_provider(prompt)
         response = self._extract_message(envelope)
@@ -399,7 +422,12 @@ class StrictOmbreProposer:
                 "provider.empty_response", "provider message was blank"
             )
         parsed = self._parse_json(response)
-        return self._validate_root(parsed, chunks, targets)
+        return self._validate_root(
+            parsed,
+            chunks,
+            targets,
+            max_candidates=max_candidates,
+        )
 
     async def _call_provider(self, prompt: str) -> Any:
         caller_loop = asyncio.get_running_loop()
@@ -547,7 +575,9 @@ class StrictOmbreProposer:
         rules = (
             "Return exactly one JSON object and no markdown. Root keys must be "
             "exactly schema_version,candidates. Candidate and relation keys "
-            "must exactly match output_schema. Never emit axis, fact status, E, "
+            f"must exactly match output_schema. Return at most {_MAX_CANDIDATES} "
+            "high-signal candidates and prefer fewer concise candidates over "
+            "a long or truncated response. Never emit axis, fact status, E, "
             "protected, archive, or delete controls. If no candidate is "
             "supported, return the exact schema with candidates:[]. Every "
             "candidate needs non-empty unique source_chunk_ids and non-empty "
@@ -565,6 +595,10 @@ class StrictOmbreProposer:
     def _build_contract_repair_prompt(prompt: str, code: str) -> str:
         instruction = _CONTRACT_REPAIR_INSTRUCTION.format(code=code)
         return f"{instruction}\n{prompt}"
+
+    @staticmethod
+    def _build_incomplete_retry_prompt(prompt: str) -> str:
+        return f"{_INCOMPLETE_RETRY_INSTRUCTION}\n{prompt}"
 
     @staticmethod
     def _extract_message(envelope: Any) -> str:
@@ -659,6 +693,8 @@ class StrictOmbreProposer:
         parsed: Any,
         chunks: tuple[ProposerChunk, ...],
         targets: frozenset[str],
+        *,
+        max_candidates: int,
     ) -> tuple[CandidateDraft, ...]:
         root = _expect_exact_mapping(
             parsed,
@@ -670,6 +706,7 @@ class StrictOmbreProposer:
             not _is_plain_int(root["schema_version"])
             or root["schema_version"] != SCHEMA_VERSION
             or not isinstance(root["candidates"], list)
+            or len(root["candidates"]) > max_candidates
         ):
             raise ProposerContractError(
                 "schema_root", "root values do not match schema"

@@ -366,6 +366,83 @@ async def test_provider_failure_is_retryable_and_run_is_error(
 
 
 @pytest.mark.asyncio
+async def test_retryable_head_chunk_does_not_block_later_proposals(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    prompts: list[str] = []
+
+    async def provider(prompt: str) -> dict[str, Any]:
+        prompts.append(prompt)
+        raw_input = prompt.split("INPUT=", 1)[1]
+        proposer_input = json.loads(raw_input)
+        chunk = proposer_input["chunks"][0]
+        if "poison proposal" in chunk["text"]:
+            return {"choices": []}
+        content = json.dumps(
+            {
+                "schema_version": 1,
+                "candidates": [
+                    {
+                        "type": "event",
+                        "title": "健康候选",
+                        "content": "健康候选仍被提议。",
+                        "importance": 6,
+                        "thread_hint": "night",
+                        "relation_hints": [],
+                        "source_chunk_ids": [chunk["id"]],
+                        "evidence": "healthy proposal",
+                        "risk": "normal",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        return {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": content},
+                }
+            ]
+        }
+
+    harness.coordinator.proposer = StrictOmbreProposer(provider)
+    harness.ledger.append_raw_event(
+        "room-main", "poison", '{"message":"poison proposal"}'
+    )
+    harness.ledger.append_raw_event(
+        "room-main", "healthy", '{"message":"healthy proposal"}'
+    )
+
+    with pytest.raises(NightRunCoordinatorError) as raised:
+        await harness.coordinator.run(
+            run_id="night-head-skip",
+            cutoff=datetime.now(timezone.utc),
+        )
+
+    assert raised.value.code == "proposer.failed"
+    run = harness.ledger.get_night_run("night-head-skip")
+    assert run.stage == "error"
+    assert run.counts["proposer_errors"] == 1
+    assert run.counts["proposer_chunks"] == 1
+    assert len(prompts) == 2
+    pending = harness.ledger.list_pending_proposer_chunks(limit=10)
+    assert len(pending) == 1
+    assert b"poison proposal" in pending[0].content
+    with sqlite3.connect(harness.ledger.path) as connection:
+        assert connection.execute(
+            "SELECT outcome, error_code FROM chunk_proposer_outcomes "
+            "ORDER BY id"
+        ).fetchall() == [
+            ("retryable_error", "provider.no_choices"),
+            ("candidates_persisted", None),
+        ]
+    assert len(harness.ledger.list_candidates("pending")) == 2
+    assert harness.curated.calls == []
+
+
+@pytest.mark.asyncio
 async def test_invalid_raw_json_stays_uncovered_and_fails_closed(
     tmp_path: Path,
 ) -> None:
