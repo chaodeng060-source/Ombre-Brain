@@ -340,7 +340,11 @@ class StrictOmbreProposer:
         chunk_tuple, targets = self._validate_input(
             chunks, allowed_relation_targets
         )
-        prompt = self._build_prompt(chunk_tuple, targets)
+        prompt = self._build_prompt(
+            chunk_tuple,
+            targets,
+            max_candidates=_MAX_CANDIDATES,
+        )
         self._validate_prompt_size(prompt)
 
         effective_prompt = prompt
@@ -353,7 +357,10 @@ class StrictOmbreProposer:
             )
         except ProposerContractError as exc:
             if exc.code == "provider.incomplete":
-                effective_prompt = self._build_incomplete_retry_prompt(prompt)
+                effective_prompt = self._build_incomplete_retry_prompt(
+                    chunk_tuple,
+                    targets,
+                )
                 max_candidates = _COMPACT_RETRY_MAX_CANDIDATES
             elif exc.code in _REPAIRABLE_MODEL_CODES:
                 effective_prompt = self._build_contract_repair_prompt(
@@ -541,6 +548,8 @@ class StrictOmbreProposer:
         self,
         chunks: tuple[ProposerChunk, ...],
         targets: frozenset[str],
+        *,
+        max_candidates: int,
     ) -> str:
         schema = {
             "schema_version": 1,
@@ -575,7 +584,7 @@ class StrictOmbreProposer:
         rules = (
             "Return exactly one JSON object and no markdown. Root keys must be "
             "exactly schema_version,candidates. Candidate and relation keys "
-            f"must exactly match output_schema. Return at most {_MAX_CANDIDATES} "
+            f"must exactly match output_schema. Return at most {max_candidates} "
             "high-signal candidates and prefer fewer concise candidates over "
             "a long or truncated response. Never emit axis, fact status, E, "
             "protected, archive, or delete controls. If no candidate is "
@@ -596,9 +605,17 @@ class StrictOmbreProposer:
         instruction = _CONTRACT_REPAIR_INSTRUCTION.format(code=code)
         return f"{instruction}\n{prompt}"
 
-    @staticmethod
-    def _build_incomplete_retry_prompt(prompt: str) -> str:
-        return f"{_INCOMPLETE_RETRY_INSTRUCTION}\n{prompt}"
+    def _build_incomplete_retry_prompt(
+        self,
+        chunks: tuple[ProposerChunk, ...],
+        targets: frozenset[str],
+    ) -> str:
+        compact_prompt = self._build_prompt(
+            chunks,
+            targets,
+            max_candidates=_COMPACT_RETRY_MAX_CANDIDATES,
+        )
+        return f"{_INCOMPLETE_RETRY_INSTRUCTION}\n{compact_prompt}"
 
     @staticmethod
     def _extract_message(envelope: Any) -> str:

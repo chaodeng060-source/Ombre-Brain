@@ -343,6 +343,8 @@ async def test_incomplete_response_gets_one_compact_retry():
     assert "RETRY ONE INCOMPLETE MODEL RESPONSE" not in prompts[0]
     assert "RETRY ONE INCOMPLETE MODEL RESPONSE" in prompts[1]
     assert "return at most 4 high-signal candidates" in prompts[1]
+    assert "Return at most 4 high-signal candidates" in prompts[1]
+    assert "Return at most 8 high-signal candidates" not in prompts[1]
 
 
 @pytest.mark.asyncio
