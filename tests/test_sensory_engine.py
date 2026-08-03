@@ -1,8 +1,10 @@
 import json
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import pytest
 
+import lmc5_ingest_guard
 import server
 from sensory_engine import (
     SensoryEngine,
@@ -177,6 +179,58 @@ def test_sensory_engine_spicy_chain_and_time_decay(tmp_path):
     assert second.sensory["spicy"] == 0.0
     assert second.body_state["oral_burn"] == pytest.approx(0.212, abs=0.001)
     assert second.body_state["drink_water"] == pytest.approx(0.18, abs=0.001)
+
+
+def test_exclusive_acceptance_fences_read_side_writes_without_breaking_read(
+    tmp_path,
+    monkeypatch,
+):
+    engine = SensoryEngine(str(tmp_path))
+    monkeypatch.setitem(server.config, "buckets_dir", str(tmp_path))
+    monkeypatch.setattr(server, "sensory_engine", engine)
+    now = datetime(2026, 8, 3, 10, 43, tzinfo=timezone.utc)
+    content = json.dumps({"sensory": {"spicy": 0.8}}, ensure_ascii=False)
+    engine.current_state(now=now)
+    body_path = tmp_path / "body_state.json"
+    before = body_path.read_bytes()
+    before_mtime_ns = body_path.stat().st_mtime_ns
+    lock_path = lmc5_ingest_guard.RAW_INGEST_LOCK_PATH.with_name(
+        f"ombre-lmc5-read-side-test-{uuid4().hex}.lock"
+    )
+    monkeypatch.setattr(lmc5_ingest_guard, "RAW_INGEST_LOCK_PATH", lock_path)
+    try:
+        with lmc5_ingest_guard.exclusive_ingest_guard(timeout=0.5):
+            result = engine.stimulate_from_buckets(
+                [_bucket("hot", content)],
+                now=now + timedelta(seconds=1),
+            )
+            assert result.triggered_bucket_ids == ["hot"]
+            assert result.body_state["oral_burn"] > 0
+            assert body_path.read_bytes() == before
+            assert body_path.stat().st_mtime_ns == before_mtime_ns
+            rendered = server._append_body_state_block(
+                "remembered",
+                [_bucket("hot", content)],
+                session_id="acceptance",
+            )
+            assert rendered.startswith("remembered")
+            assert body_path.read_bytes() == before
+            assert body_path.stat().st_mtime_ns == before_mtime_ns
+            assert not (
+                tmp_path / ".session_surface" / "acceptance.json"
+            ).exists()
+
+        engine.stimulate_from_buckets(
+            [_bucket("hot", content)],
+            now=now + timedelta(seconds=2),
+        )
+        assert body_path.read_bytes() != before
+        server._remember_session_seen_ids("acceptance", ["hot"])
+        assert json.loads(
+            (tmp_path / ".session_surface" / "acceptance.json").read_text()
+        ) == ["hot"]
+    finally:
+        lock_path.unlink(missing_ok=True)
 
 
 def test_sensory_engine_keyboard_touch_chain_and_time_decay(tmp_path):

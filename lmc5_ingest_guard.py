@@ -224,6 +224,28 @@ def shared_ingest_guard() -> Iterator[None]:
 
 
 @contextmanager
+def shared_acceptance_write_guard() -> Iterator[None]:
+    """Fence soft read-side writes during a deployment acceptance window.
+
+    The production deployment already holds the raw-ingest guard exclusively
+    from the Y/Z before-snapshot through the E after-snapshot.  Reusing that
+    same coordination domain avoids a second lock and the gap between taking
+    a fingerprint and starting E0.  Non-POSIX runtimes preserve the previous
+    best-effort write behaviour because the deployment contract is Linux-only.
+    """
+
+    if os.name != "posix":  # pragma: no cover - deployment is POSIX
+        yield
+        return
+    try:
+        import fcntl  # noqa: F401
+    except ImportError as exc:  # pragma: no cover - defensive POSIX fallback
+        raise RawIngestGuardError("POSIX flock is required") from exc
+    with shared_ingest_guard():
+        yield
+
+
+@contextmanager
 def exclusive_ingest_guard(*, timeout: float | None = None) -> Iterator[None]:
     """Take the deployment window's exclusive lease with an optional timeout."""
 

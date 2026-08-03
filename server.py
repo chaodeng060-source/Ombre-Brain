@@ -146,6 +146,7 @@ from lmc5_ledger import (
 from lmc5_ingest_guard import (
     RawIngestBusy,
     RawIngestGuardError,
+    shared_acceptance_write_guard,
     shared_ingest_guard,
 )
 from night_run_coordinator import NightRunCoordinatorError
@@ -996,13 +997,18 @@ def _load_session_seen_ids(session_id: str) -> set[str]:
 def _remember_session_seen_ids(session_id: str, bucket_ids: list[str]) -> None:
     if not session_id or not session_id.strip() or not bucket_ids:
         return
-    seen = _load_session_seen_ids(session_id)
-    seen.update(str(x) for x in bucket_ids if x)
-    path = _session_seen_path(session_id)
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(sorted(seen), f, ensure_ascii=False)
+        with shared_acceptance_write_guard():
+            seen = _load_session_seen_ids(session_id)
+            seen.update(str(x) for x in bucket_ids if x)
+            path = _session_seen_path(session_id)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(sorted(seen), f, ensure_ascii=False)
+    except RawIngestGuardError:
+        # A strict acceptance window suppresses read-side persistence only;
+        # the memory response itself remains available.
+        return
     except OSError as e:
         logger.warning(f"Session surface dedup write failed / 会话去重写入失败: {e}")
 

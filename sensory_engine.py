@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from lmc5_ingest_guard import RawIngestGuardError, shared_acceptance_write_guard
 from sense_tagger import SENSES
 
 
@@ -172,12 +173,16 @@ class SensoryEngine:
 
     def _write_state(self, state: dict[str, Any]) -> None:
         try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            with open(self.path, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False, indent=2)
-        except OSError:
+            # The deployment's existing full-acceptance guard fences this soft
+            # read-side write across the complete before/job/after window.
+            with shared_acceptance_write_guard():
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                with open(self.path, "w", encoding="utf-8") as f:
+                    json.dump(state, f, ensure_ascii=False, indent=2)
+        except (OSError, RawIngestGuardError):
             # Body state is a soft prior. Memory retrieval must never fail because
-            # this sidecar cannot be written.
+            # this sidecar cannot be written or a strict maintenance window is
+            # active.  The in-memory result remains available to the read path.
             return
 
 

@@ -6,6 +6,7 @@ import stat
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -38,6 +39,9 @@ def test_exclusive_blocks_shared_and_exception_releases(guard_paths):
         with pytest.raises(guard.RawIngestBusy):
             with guard.shared_ingest_guard():
                 pass
+        with pytest.raises(guard.RawIngestBusy):
+            with guard.shared_acceptance_write_guard():
+                pass
 
     with pytest.raises(RuntimeError, match="injected"):
         with guard.shared_ingest_guard():
@@ -51,6 +55,17 @@ def test_exclusive_blocks_shared_and_exception_releases(guard_paths):
         assert fcntl.fcntl(descriptor, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
     finally:
         guard._release(descriptor)
+
+
+def test_acceptance_write_guard_preserves_non_posix_write_behavior(monkeypatch):
+    monkeypatch.setattr(guard, "os", SimpleNamespace(name="nt"))
+
+    def unexpected_shared_guard():
+        raise AssertionError("non-POSIX runtime must not require flock")
+
+    monkeypatch.setattr(guard, "shared_ingest_guard", unexpected_shared_guard)
+    with guard.shared_acceptance_write_guard():
+        pass
 
 
 def test_hold_status_probe_and_o_excl_release(guard_paths, capsys):
