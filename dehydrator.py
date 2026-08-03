@@ -102,6 +102,15 @@ _SUBJECT_LABEL_RE = re.compile(
     r"(\[\[[^\]\n]{1,40}\]\]|[A-Za-z0-9_.\-一-鿿]{1,40})"
 )
 _WIKILINK_RE = re.compile(r"\[\[([^\[\]\n]{1,80})\]\]")
+_QUOTED_SELF_PERSON_ANCHORS = frozenset({
+    "朝灯",
+    "哥哥",
+    "小卷",
+    "哈基米",
+    "Claude",
+    "Codex",
+    "Gemini",
+})
 
 _SELF_CONTAINMENT_RULE_VERSION = "mapping-v2"
 
@@ -169,6 +178,56 @@ def _is_locally_anchored_reference(text: str, start: int, token: str) -> bool:
     )
 
 
+def _is_quoted_named_self_reference(
+    text: str,
+    start: int,
+    token: str,
+    quote_start: int,
+) -> bool:
+    """Accept only an immediately named ``<person>自己`` inside a quote.
+
+    The quote stays byte-for-byte unchanged.  This merely prevents the suffix
+    ``自己`` from being treated as an unresolved reference when its person
+    anchor is already written beside it.  Predicates, coordination, placeholders
+    and other reference words keep the phrase on the fail-closed path.
+    """
+    if token != "自己":
+        return False
+    quoted_prefix = text[quote_start + 1:start]
+    segment = quoted_prefix[max(
+        quoted_prefix.rfind(mark) + 1
+        for mark in "。！？；;，,：:\n"
+    ):]
+    if segment != segment.rstrip():
+        return False
+    segment = segment.lstrip()
+    match = re.search(
+        r"(?P<anchor>\[\[[^\]\n]{1,80}\]\]|"
+        r"朝灯|哥哥|小卷|哈基米|Claude|Codex|Gemini)$",
+        segment,
+    )
+    if match is None:
+        return False
+    raw_anchor = match.group("anchor")
+    anchor = raw_anchor.removeprefix("[[").removesuffix("]]").strip()
+    if anchor not in _QUOTED_SELF_PERSON_ANCHORS:
+        return False
+    prefix = segment[:match.start()]
+    if prefix and not any(
+        prefix.endswith(marker)
+        for marker in ("靠", "由", "让", "叫", "请")
+    ):
+        return False
+    masked_anchor = _mask_non_reference_words(anchor)
+    return not (
+        _PLACEHOLDER_REFERENCE_RE.search(anchor)
+        or re.match(r"^(?:这|那|该|此|本|上述|前述)", anchor)
+        or _PERSON_COORDINATION_RE.search(segment)
+        or _PERSON_REFERENCE_RE.search(masked_anchor)
+        or _DEICTIC_REFERENCE_RE.search(masked_anchor)
+    )
+
+
 def _reference_occurrences(content: str) -> list[dict]:
     """Return every risky reference with stable offsets for local replacement."""
     text = str(content or "")
@@ -176,21 +235,33 @@ def _reference_occurrences(content: str) -> list[dict]:
     quoted_spans = [(m.start(), m.end()) for m in _QUOTED_SPAN_RE.finditer(text)]
     matches: list[tuple[int, int, str, str]] = []
     for kind, pattern in (("person", _PERSON_REFERENCE_RE), ("context", _DEICTIC_REFERENCE_RE)):
-        matches.extend(
-            (match.start(), match.end(), match.group(0), kind)
-            for match in pattern.finditer(scan)
-            if not (
-                not any(
-                    q_start <= match.start() < q_end
+        for match in pattern.finditer(scan):
+            quoted_span = next(
+                (
+                    (q_start, q_end)
                     for q_start, q_end in quoted_spans
+                    if q_start <= match.start() < q_end
+                ),
+                None,
+            )
+            inside_quote = quoted_span is not None
+            locally_anchored = (
+                _is_quoted_named_self_reference(
+                    text,
+                    match.start(),
+                    match.group(0),
+                    quoted_span[0],
                 )
-                and _is_locally_anchored_reference(
+                if inside_quote
+                else _is_locally_anchored_reference(
                     text,
                     match.start(),
                     match.group(0),
                 )
             )
-        )
+            if locally_anchored:
+                continue
+            matches.append((match.start(), match.end(), match.group(0), kind))
     # Prefer the longest match when patterns ever overlap, then restore source order.
     selected: list[tuple[int, int, str, str]] = []
     for item in sorted(matches, key=lambda x: (x[0], -(x[1] - x[0]))):

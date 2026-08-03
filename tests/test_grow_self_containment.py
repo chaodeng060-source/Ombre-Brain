@@ -123,7 +123,81 @@ def test_reference_detector_covers_broad_references_and_ignores_words():
     assert find_unresolved_references("朝灯和哥哥自己去") == ["自己"]
     assert find_unresolved_references(
         "朝灯说：「从恢复聊天之后靠哥哥自己写。」"
-    ) == ["之后", "自己"]
+    ) == ["之后"]
+
+
+@pytest.mark.parametrize("anchor", ["哥哥", "朝灯", "[[小卷]]"])
+def test_quoted_named_self_is_locally_anchored(anchor):
+    from dehydrator import find_unresolved_references
+
+    assert find_unresolved_references(
+        f"[[朝灯]]说：「{anchor}自己会写。」"
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("left_quote", "right_quote"),
+    [
+        ("「", "」"),
+        ("“", "”"),
+        ("”", "”"),
+        ("‘", "’"),
+        ("’", "’"),
+        ('"', '"'),
+        ("'", "'"),
+    ],
+)
+def test_quoted_named_self_supports_all_verbatim_quote_pairs(
+    left_quote,
+    right_quote,
+):
+    from dehydrator import find_unresolved_references
+
+    content = f"[[朝灯]]说：{left_quote}哥哥自己会写。{right_quote}"
+    assert find_unresolved_references(content) == []
+
+
+@pytest.mark.asyncio
+async def test_quoted_named_self_preserves_quote_without_api(test_config):
+    dehydrator, create = _dehydrator(test_config, "unused")
+    content = "[[朝灯]]说：「哥哥自己会写。」"
+
+    result = await dehydrator.ensure_self_contained(content, source_context=content)
+
+    assert result == content
+    assert create.calls == []
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "自己会写。",
+        "他自己会写。",
+        "某人自己会写。",
+        "那个人自己会写。",
+        "朝灯和哥哥自己会写。",
+        "朝灯告诉哥哥自己会写。",
+        "朝灯问哥哥自己会写。",
+        "哥哥自己说她会写。",
+        "哥哥 自己会写。",
+        "哥哥\t自己会写。",
+        "[[LMC-5]]自己会写。",
+        "[[深圳]]自己会写。",
+        "某个哥哥自己会写。",
+        "那位哥哥自己会写。",
+        "朝灯的哥哥自己会写。",
+    ],
+)
+@pytest.mark.asyncio
+async def test_quoted_ambiguous_self_still_fails_closed(test_config, quote):
+    dehydrator, create = _dehydrator(test_config, "unused")
+    from dehydrator import SelfContainmentError
+
+    content = f"[[朝灯]]记录：「{quote}」"
+    with pytest.raises(SelfContainmentError):
+        await dehydrator.ensure_self_contained(content, source_context=content)
+
+    assert create.calls == []
 
 
 @pytest.mark.asyncio
