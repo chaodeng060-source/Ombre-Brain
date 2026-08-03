@@ -21,6 +21,8 @@ from night_run_runtime import (
     NightRunRuntime,
     NightRunRuntimeError,
     OpenAIChatProvider,
+    _proposer_disable_thinking,
+    _proposer_json_object,
     _proposer_max_chunks_per_run,
     _proposer_max_tokens,
     _proposer_temperature,
@@ -563,6 +565,45 @@ def test_proposer_temperature_is_deterministic_and_independent() -> None:
     assert _proposer_temperature({"lmc5_night": None}) == 0.0
 
 
+def test_proposer_provider_flags_are_explicit_opt_ins() -> None:
+    assert _proposer_disable_thinking({"lmc5_night": None}) is False
+    assert _proposer_json_object({"lmc5_night": None}) is False
+    config = {
+        "lmc5_night": {
+            "proposer_disable_thinking": True,
+            "proposer_json_object": True,
+        },
+    }
+    assert _proposer_disable_thinking(config) is True
+    assert _proposer_json_object(config) is True
+
+
+@pytest.mark.parametrize(
+    ("loader", "key", "code"),
+    (
+        (
+            _proposer_disable_thinking,
+            "proposer_disable_thinking",
+            "provider.disable_thinking_invalid",
+        ),
+        (
+            _proposer_json_object,
+            "proposer_json_object",
+            "provider.json_object_invalid",
+        ),
+    ),
+)
+@pytest.mark.parametrize("value", (None, 0, 1, "true", [], {}))
+def test_proposer_provider_flags_reject_non_booleans(
+    loader: Any,
+    key: str,
+    code: str,
+    value: object,
+) -> None:
+    with pytest.raises(NightRunRuntimeError, match=f"^{code}$"):
+        loader({"lmc5_night": {key: value}})
+
+
 @pytest.mark.parametrize(
     "section",
     (
@@ -660,20 +701,26 @@ def test_openai_provider_rejects_budget_outside_contract(value: object) -> None:
         "night_section",
         "expected_tokens",
         "expected_temperature",
+        "expected_disable_thinking",
+        "expected_json_object",
         "expected_chunk_cap",
         "expected_wall_budget",
     ),
     (
-        (None, 4096, 0.0, 16, 3000),
+        (None, 4096, 0.0, False, False, 16, 3000),
         (
             {
                 "proposer_max_tokens": 2048,
                 "proposer_temperature": 0.2,
+                "proposer_disable_thinking": True,
+                "proposer_json_object": True,
                 "proposer_max_chunks_per_run": 7,
                 "proposer_wall_budget_seconds": 900,
             },
             2048,
             0.2,
+            True,
+            True,
             7,
             900,
         ),
@@ -682,9 +729,11 @@ def test_openai_provider_rejects_budget_outside_contract(value: object) -> None:
 def test_runtime_builder_wires_dedicated_proposer_controls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    night_section: dict[str, int | float] | None,
+    night_section: dict[str, int | float | bool] | None,
     expected_tokens: int,
     expected_temperature: float,
+    expected_disable_thinking: bool,
+    expected_json_object: bool,
     expected_chunk_cap: int,
     expected_wall_budget: int,
 ) -> None:
@@ -756,6 +805,8 @@ def test_runtime_builder_wires_dedicated_proposer_controls(
     assert isinstance(runtime, NightRunRuntime)
     assert captured["max_tokens"] == expected_tokens
     assert captured["temperature"] == expected_temperature
+    assert captured["disable_thinking"] is expected_disable_thinking
+    assert captured["json_object"] is expected_json_object
     assert captured["policy"].proposer_max_chunks_per_run == expected_chunk_cap
     assert (
         captured["policy"].proposer_wall_budget_seconds

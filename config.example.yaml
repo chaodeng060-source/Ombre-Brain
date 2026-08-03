@@ -79,6 +79,10 @@ dehydration:
 # 下次必须用新 run_id 重试，绝不把 partial JSON 当成空候选。
 lmc5_night:
   proposer_max_tokens: 4096       # plain integer, 512..8192
+  # DeepSeek V4 defaults to thinking mode; only enable these for providers that
+  # explicitly support the matching OpenAI-compatible request extensions.
+  proposer_disable_thinking: false # strict boolean; sends thinking.type=disabled
+  proposer_json_object: false      # strict boolean; requests JSON object output
   # 冻结本轮 event_chunks 水位后，只处理一个有界切片；未清空时写入
   # truthful deferred，后续同日 -rN/次日夜班续跑，不伪装 complete。
   proposer_max_chunks_per_run: 16 # plain integer, 1..16

@@ -43,6 +43,8 @@ DEFAULT_MAX_ATTEMPTS = 8
 DEFAULT_SCHEDULE_TIME = time(hour=4, minute=30)
 DEFAULT_PROPOSER_MAX_TOKENS = 4096
 DEFAULT_PROPOSER_TEMPERATURE = 0.0
+DEFAULT_PROPOSER_DISABLE_THINKING = False
+DEFAULT_PROPOSER_JSON_OBJECT = False
 DEFAULT_PROPOSER_MAX_CHUNKS_PER_RUN = 16
 DEFAULT_PROPOSER_WALL_BUDGET_SECONDS = 3000
 MIN_PROPOSER_MAX_TOKENS = 512
@@ -95,6 +97,36 @@ def _proposer_temperature(config: dict[str, Any]) -> float:
     ):
         raise NightRunRuntimeError("provider.temperature_invalid")
     return float(value)
+
+
+def _proposer_disable_thinking(config: dict[str, Any]) -> bool:
+    section = config.get("lmc5_night", {})
+    if section is None:
+        section = {}
+    if type(section) is not dict:
+        raise NightRunRuntimeError("provider.disable_thinking_invalid")
+    value = section.get(
+        "proposer_disable_thinking",
+        DEFAULT_PROPOSER_DISABLE_THINKING,
+    )
+    if type(value) is not bool:
+        raise NightRunRuntimeError("provider.disable_thinking_invalid")
+    return value
+
+
+def _proposer_json_object(config: dict[str, Any]) -> bool:
+    section = config.get("lmc5_night", {})
+    if section is None:
+        section = {}
+    if type(section) is not dict:
+        raise NightRunRuntimeError("provider.json_object_invalid")
+    value = section.get(
+        "proposer_json_object",
+        DEFAULT_PROPOSER_JSON_OBJECT,
+    )
+    if type(value) is not bool:
+        raise NightRunRuntimeError("provider.json_object_invalid")
+    return value
 
 
 def _proposer_max_chunks_per_run(config: dict[str, Any]) -> int:
@@ -393,6 +425,8 @@ def build_night_run_runtime(
     model = str(dehydration.get("model") or "deepseek-chat")
     max_tokens = _proposer_max_tokens(config)
     temperature = _proposer_temperature(config)
+    disable_thinking = _proposer_disable_thinking(config)
+    json_object = _proposer_json_object(config)
     max_chunks_per_run = _proposer_max_chunks_per_run(config)
     wall_budget_seconds = _proposer_wall_budget_seconds(config)
     provider_timeout = 75.0
@@ -403,6 +437,8 @@ def build_night_run_runtime(
         max_tokens=max_tokens,
         temperature=temperature,
         timeout_seconds=provider_timeout,
+        disable_thinking=disable_thinking,
+        json_object=json_object,
     )
     proposer = StrictOmbreProposer(
         provider,
