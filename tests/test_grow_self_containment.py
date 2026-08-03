@@ -105,6 +105,25 @@ def test_reference_detector_covers_broad_references_and_ignores_words():
     assert find_unresolved_references(
         "随后回到此处，现在处理那份文件和该模块"
     ) == ["随后", "此处", "现在", "那份", "该模块"]
+    assert find_unresolved_references(
+        "从恢复聊天之后所有内容只能靠哥哥自己去海马体写"
+    ) == []
+    assert find_unresolved_references("在那件事之后只能靠自己处理") == [
+        "之后",
+        "自己",
+    ]
+    assert find_unresolved_references("之后由自己继续") == ["之后", "自己"]
+    assert find_unresolved_references("从那次之后由哥哥自己继续") == [
+        "那次",
+        "之后",
+    ]
+    assert find_unresolved_references("朝灯告诉哥哥自己会去") == ["自己"]
+    assert find_unresolved_references("朝灯问哥哥自己能否去") == ["自己"]
+    assert find_unresolved_references("他自己去") == ["他", "自己"]
+    assert find_unresolved_references("朝灯和哥哥自己去") == ["自己"]
+    assert find_unresolved_references(
+        "朝灯说：「从恢复聊天之后靠哥哥自己写。」"
+    ) == ["之后", "自己"]
 
 
 @pytest.mark.asyncio
@@ -165,8 +184,31 @@ async def test_mapping_replaces_only_named_spans_from_same_source(test_config):
     assert len(create.calls) == 1
     request = create.calls[0]
     assert request["response_format"] == {"type": "json_object"}
+    assert "extra_body" not in request
     assert '"id": "r0"' in request["messages"][1]["content"]
     assert '"start": 0' in request["messages"][1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_deepseek_self_containment_disables_thinking(test_config):
+    config = dict(test_config)
+    config["dehydration"] = dict(
+        test_config["dehydration"],
+        base_url="https://api.deepseek.com/v1",
+    )
+    resolved = _mapping_payload(_mapping("r0", "朝灯", "subject"))
+    dehydrator, create = _dehydrator(config, resolved)
+
+    result = await dehydrator.ensure_self_contained(
+        "她完成了测试。",
+        source_context="朝灯完成了测试。",
+    )
+
+    assert result == "朝灯完成了测试。"
+    assert create.calls[0]["extra_body"] == {
+        "thinking": {"type": "disabled"},
+    }
+    assert create.calls[0]["response_format"] == {"type": "json_object"}
 
 
 @pytest.mark.asyncio
@@ -220,41 +262,39 @@ async def test_multi_candidate_mapping_is_retried_then_rejected(test_config):
             source_context="朝灯和小卷都参加了测试。",
         )
 
-    assert create.calls == []
+    assert len(create.calls) == 2
 
 
 @pytest.mark.asyncio
-async def test_model_cannot_hide_coordinated_person_candidates(test_config):
-    dishonest_unique = _mapping_payload(
+async def test_coordinated_person_candidates_are_decided_by_api(test_config):
+    resolved = _mapping_payload(
         _mapping("r0", "朝灯", "subject", candidates=["朝灯"]),
     )
-    dehydrator, create = _dehydrator(test_config, dishonest_unique)
-    from dehydrator import SelfContainmentError
+    dehydrator, create = _dehydrator(test_config, resolved)
 
-    with pytest.raises(SelfContainmentError, match="并列候选"):
-        await dehydrator.ensure_self_contained(
-            "她完成了测试。",
-            source_context="朝灯和小卷都参加了测试。",
-        )
+    result = await dehydrator.ensure_self_contained(
+        "她完成了测试。",
+        source_context="朝灯和小卷都参加了测试。",
+    )
 
-    assert create.calls == []
+    assert result == "朝灯完成了测试。"
+    assert len(create.calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_model_cannot_hide_people_listed_in_separate_sentences(test_config):
-    dishonest_unique = _mapping_payload(
-        _mapping("r0", "朝灯", "subject", candidates=["朝灯"]),
+async def test_separate_source_subjects_are_decided_by_api(test_config):
+    resolved = _mapping_payload(
+        _mapping("r0", "小卷", "subject", candidates=["小卷"]),
     )
-    dehydrator, create = _dehydrator(test_config, dishonest_unique)
-    from dehydrator import SelfContainmentError
+    dehydrator, create = _dehydrator(test_config, resolved)
 
-    with pytest.raises(SelfContainmentError, match="并列候选"):
-        await dehydrator.ensure_self_contained(
-            "她完成了测试。",
-            source_context="朝灯参加了测试。小卷也参加了测试。她完成了测试。",
-        )
+    result = await dehydrator.ensure_self_contained(
+        "她完成了测试。",
+        source_context="朝灯参加了测试。小卷也参加了测试。她完成了测试。",
+    )
 
-    assert create.calls == []
+    assert result == "小卷完成了测试。"
+    assert len(create.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -415,12 +455,16 @@ async def test_digest_rejects_ambiguous_source_before_digest_call(
     test_config,
 ):
     from dehydrator import SelfContainmentError
-    dehydrator, create = _dehydrator(test_config, "unused")
+    ambiguous = json.dumps(
+        {"status": "ambiguous", "mappings": [], "subject_anchors": [], "unresolved": ["她"]},
+        ensure_ascii=False,
+    )
+    dehydrator, create = _dehydrator(test_config, ambiguous)
 
     with pytest.raises(SelfContainmentError):
         await dehydrator.digest("朝灯和小卷都参加了测试，她完成了测试。")
 
-    assert create.calls == []
+    assert len(create.calls) == 1
 
 
 @pytest.mark.asyncio

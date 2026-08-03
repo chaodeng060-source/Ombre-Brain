@@ -126,6 +126,49 @@ def _mask_non_reference_words(content: str) -> str:
     )
 
 
+def _is_locally_anchored_reference(text: str, start: int, token: str) -> bool:
+    """Keep explicit ``event+之后`` and ``entity+自己`` phrases intact.
+
+    These suffixes are self-contained when their anchor is written immediately
+    beside them.  Treating the suffix alone as deictic creates a false rewrite:
+    replacing ``恢复聊天之后`` or ``哥哥自己`` would duplicate/corrupt the
+    already explicit anchor.
+    """
+    segment = text[max(
+        text.rfind(mark, 0, start) + 1
+        for mark in "。！？；;，,：:\n"
+    ):start].strip()
+    if not segment:
+        return False
+
+    if token == "之后":
+        match = re.search(
+            r"从"
+            r"(?P<anchor>\[\[[^\]\n]{1,80}\]\]|[A-Za-z0-9_.\-一-鿿]{2,40})$",
+            segment,
+        )
+    elif token == "自己":
+        match = re.search(
+            r"(?:靠|由|让|叫|请)"
+            r"(?P<anchor>\[\[[^\]\n]{1,80}\]\]|[A-Za-z][A-Za-z0-9_.\-]{1,31}|[一-鿿]{2,8})$",
+            segment,
+        )
+    else:
+        return False
+    if match is None:
+        return False
+    anchor = match.group("anchor").strip()
+    masked_anchor = _mask_non_reference_words(anchor)
+    return not (
+        _PLACEHOLDER_REFERENCE_RE.search(anchor)
+        or re.match(r"^(?:这|那|该|此|本|上述|前述)", anchor)
+        or re.search(r"很久|不久|一段时间|一会儿", anchor)
+        or _PERSON_COORDINATION_RE.search(anchor)
+        or _PERSON_REFERENCE_RE.search(masked_anchor)
+        or _DEICTIC_REFERENCE_RE.search(masked_anchor)
+    )
+
+
 def _reference_occurrences(content: str) -> list[dict]:
     """Return every risky reference with stable offsets for local replacement."""
     text = str(content or "")
@@ -136,6 +179,17 @@ def _reference_occurrences(content: str) -> list[dict]:
         matches.extend(
             (match.start(), match.end(), match.group(0), kind)
             for match in pattern.finditer(scan)
+            if not (
+                not any(
+                    q_start <= match.start() < q_end
+                    for q_start, q_end in quoted_spans
+                )
+                and _is_locally_anchored_reference(
+                    text,
+                    match.start(),
+                    match.group(0),
+                )
+            )
         )
     # Prefer the longest match when patterns ever overlap, then restore source order.
     selected: list[tuple[int, int, str, str]] = []
@@ -599,6 +653,17 @@ class Dehydrator:
         self.base_url = dehy_cfg.get("base_url", "https://api.deepseek.com/v1")
         self.max_tokens = dehy_cfg.get("max_tokens", 1024)
         self.temperature = dehy_cfg.get("temperature", 0.1)
+        # DeepSeek reasoning models count hidden reasoning against max_tokens.
+        # The self-containment pass needs strict JSON rather than chain-of-thought;
+        # keep the provider extension scoped to that pass so generic OpenAI-
+        # compatible digest/analyze calls retain their existing contract.
+        self.self_containment_disable_thinking = (
+            dehy_cfg.get("self_containment_disable_thinking") is True
+            or (
+                "self_containment_disable_thinking" not in dehy_cfg
+                and str(self.base_url).lower().startswith("https://api.deepseek.com")
+            )
+        )
 
         # --- API availability / 是否有可用的 API ---
         self.api_available = bool(self.api_key)
@@ -890,12 +955,6 @@ class Dehydrator:
                 return "", "person_role_mismatch"
             if occurrence["kind"] == "person" and len(replacement) > 40:
                 return "", "person_replacement_too_long"
-            if occurrence["kind"] == "person":
-                source_subjects = _source_subject_candidates(source)
-                if len(source_subjects) > 1:
-                    return "", "multiple_source_subjects"
-                if source_subjects and replacement not in source_subjects:
-                    return "", "replacement_not_source_subject"
             if (
                 mapping.get("role") == "subject"
                 and _RELATIVE_TIME_REFERENCE_RE.fullmatch(occurrence["text"])
@@ -984,15 +1043,6 @@ class Dehydrator:
             )
         if not self.api_available or self.client is None:
             raise SelfContainmentError("自包含审计 API 不可用，已拒绝写入")
-        if (
-            any(item["kind"] == "person" for item in occurrences)
-            and (
-                _PERSON_COORDINATION_RE.search(source)
-                or len(_source_subject_candidates(source)) > 1
-            )
-        ):
-            raise SelfContainmentError("来源中存在并列候选主体，已拒绝猜测指代")
-
         source_for_api = redacted_source[:5000]
         draft_for_api = redacted_draft[:3000]
         if len(source) > len(source_for_api) or len(draft) > len(draft_for_api):
@@ -1053,13 +1103,16 @@ class Dehydrator:
                     ),
                 })
             try:
-                response = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    max_tokens=min(max(int(self.max_tokens), 512), 2048),
-                    temperature=0.0,
-                    response_format={"type": "json_object"},
-                )
+                request = {
+                    "model": self.model,
+                    "messages": messages,
+                    "max_tokens": min(max(int(self.max_tokens), 512), 2048),
+                    "temperature": 0.0,
+                    "response_format": {"type": "json_object"},
+                }
+                if self.self_containment_disable_thinking:
+                    request["extra_body"] = {"thinking": {"type": "disabled"}}
+                response = await self.client.chat.completions.create(**request)
             except Exception as exc:
                 last_error = f"api_{type(exc).__name__}"
                 continue

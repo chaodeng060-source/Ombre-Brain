@@ -73,6 +73,10 @@ dehydration:
   # api_key: ""    # ⚠️ Use env var OMBRE_API_KEY instead / 请使用环境变量 OMBRE_API_KEY
   max_tokens: 1024
   temperature: 0.1
+  # Strict self-containment JSON should not spend its answer budget on hidden
+  # reasoning. Official DeepSeek endpoints enable this automatically; set true
+  # for compatible DeepSeek proxies, or false to force the generic contract.
+  self_containment_disable_thinking: true
 
 # --- LMC-5 conservative night runtime / LMC-5 保守夜班 ---
 # Proposer 的结构化 JSON 预算与普通脱水任务分离；输出被截断时仍 fail closed，
