@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from maintenance_barrier import MaintenanceBarrier
 from night_run_coordinator import (
     NightRunCoordinator,
     NightRunCoordinatorError,
+    NightRunPolicy,
 )
 from snapshot_manager import SnapshotManager
 
@@ -186,6 +188,7 @@ def _harness(
     invalid_provider: bool = False,
     empty_provider: bool = False,
     unsafe_decay: bool = False,
+    policy: NightRunPolicy | None = None,
 ) -> _Harness:
     source = tmp_path / "vault"
     backups = tmp_path / "snapshots"
@@ -221,6 +224,7 @@ def _harness(
         curated=curated,
         decay_engine=decay,
         consolidation_engine=consolidation,
+        policy=policy,
     )
     return _Harness(
         source=source,
@@ -259,7 +263,17 @@ async def test_event_run_completes_snapshot_chunk_x_and_report_only_m(
     )
 
     assert outcome.run.stage == "complete"
-    assert outcome.counts == {
+    assert {
+        key: outcome.counts[key]
+        for key in (
+            "raw_events",
+            "chunks",
+            "proposer_chunks",
+            "candidates",
+            "x_ready",
+            "m_computed",
+        )
+    } == {
         "raw_events": 1,
         "chunks": 1,
         "proposer_chunks": 1,
@@ -267,6 +281,9 @@ async def test_event_run_completes_snapshot_chunk_x_and_report_only_m(
         "x_ready": 1,
         "m_computed": 1,
     }
+    assert outcome.counts["proposer_attempted"] == 1
+    assert outcome.counts["proposer_succeeded"] == 1
+    assert outcome.counts["proposer_pending_after"] == 0
     assert len(harness.curated.calls) == 1
     assert harness.curated.calls[0]["vector_policy"] == "required"
     assert (
@@ -340,7 +357,7 @@ async def test_preference_axes_are_explicitly_deferred_without_x_write(
 
 
 @pytest.mark.asyncio
-async def test_provider_failure_is_retryable_and_run_is_error(
+async def test_provider_failure_is_retryable_and_run_is_deferred(
     tmp_path: Path,
 ) -> None:
     harness = _harness(tmp_path, invalid_provider=True)
@@ -348,16 +365,18 @@ async def test_provider_failure_is_retryable_and_run_is_error(
         "room-main", "message-1", '{"message":"provider failure"}'
     )
 
-    with pytest.raises(NightRunCoordinatorError) as raised:
-        await harness.coordinator.run(
-            run_id="night-provider-error",
-            cutoff=datetime.now(timezone.utc),
-        )
+    outcome = await harness.coordinator.run(
+        run_id="night-provider-error",
+        cutoff=datetime.now(timezone.utc),
+    )
 
-    assert raised.value.code == "proposer.failed"
+    assert outcome.run.stage == "deferred"
     run = harness.ledger.get_night_run("night-provider-error")
-    assert run.stage == "error"
-    assert run.errors == ("proposer.failed",)
+    assert run.stage == "deferred"
+    assert run.errors == ()
+    assert run.counts["proposer_attempted"] == 1
+    assert run.counts["proposer_retryable"] == 1
+    assert run.counts["proposer_pending_after"] == 1
     assert len(harness.ledger.list_pending_proposer_chunks(limit=10)) == 1
     with sqlite3.connect(harness.ledger.path) as connection:
         assert connection.execute(
@@ -415,15 +434,14 @@ async def test_retryable_head_chunk_does_not_block_later_proposals(
         "room-main", "healthy", '{"message":"healthy proposal"}'
     )
 
-    with pytest.raises(NightRunCoordinatorError) as raised:
-        await harness.coordinator.run(
-            run_id="night-head-skip",
-            cutoff=datetime.now(timezone.utc),
-        )
+    outcome = await harness.coordinator.run(
+        run_id="night-head-skip",
+        cutoff=datetime.now(timezone.utc),
+    )
 
-    assert raised.value.code == "proposer.failed"
+    assert outcome.run.stage == "deferred"
     run = harness.ledger.get_night_run("night-head-skip")
-    assert run.stage == "error"
+    assert run.stage == "deferred"
     assert run.counts["proposer_errors"] == 1
     assert run.counts["proposer_chunks"] == 1
     assert len(prompts) == 2
@@ -438,8 +456,136 @@ async def test_retryable_head_chunk_does_not_block_later_proposals(
             ("retryable_error", "provider.no_choices"),
             ("candidates_persisted", None),
         ]
-    assert len(harness.ledger.list_candidates("pending")) == 2
-    assert harness.curated.calls == []
+    assert harness.ledger.list_candidates("pending") == ()
+    assert len(harness.curated.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_proposer_cap_defers_then_next_run_drains_without_repeats(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(
+        tmp_path,
+        empty_provider=True,
+        policy=NightRunPolicy(proposer_max_chunks_per_run=2),
+    )
+    for index in range(3):
+        harness.ledger.append_raw_event(
+            "room-main",
+            f"event-{index}",
+            json.dumps({"message": f"bounded-{index}"}),
+        )
+    cutoff = datetime.now(timezone.utc)
+
+    first = await harness.coordinator.run(
+        run_id="night-bounded-1",
+        cutoff=cutoff,
+    )
+    assert first.run.stage == "deferred"
+    assert first.counts["proposer_attempted"] == 2
+    assert first.counts["proposer_succeeded"] == 2
+    assert first.counts["proposer_pending_before"] == 3
+    assert first.counts["proposer_pending_after"] == 1
+
+    second = await harness.coordinator.run(
+        run_id="night-bounded-2",
+        cutoff=cutoff,
+    )
+    assert second.run.stage == "complete"
+    assert second.counts["proposer_attempted"] == 1
+    assert second.counts["proposer_pending_before"] == 1
+    assert second.counts["proposer_pending_after"] == 0
+    assert len(harness.provider.prompts) == 3
+
+
+@pytest.mark.asyncio
+async def test_three_consecutive_proposer_errors_open_circuit_without_faking_terminal(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path, invalid_provider=True)
+    for index in range(4):
+        harness.ledger.append_raw_event(
+            "room-main",
+            f"poison-{index}",
+            json.dumps({"message": f"poison-{index}"}),
+        )
+
+    outcome = await harness.coordinator.run(
+        run_id="night-circuit-1",
+        cutoff=datetime.now(timezone.utc),
+    )
+
+    assert outcome.run.stage == "deferred"
+    assert outcome.counts["proposer_attempted"] == 3
+    assert outcome.counts["proposer_retryable"] == 3
+    assert outcome.counts["proposer_circuit_breaker"] == 1
+    assert outcome.counts["proposer_pending_after"] == 4
+    assert outcome.counts["proposer_quarantined"] == 0
+    assert len(harness.ledger.list_pending_proposer_chunks(limit=10)) == 4
+
+
+@pytest.mark.asyncio
+async def test_repeated_poison_is_visible_as_quarantined_but_remains_pending(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path, invalid_provider=True)
+    harness.ledger.append_raw_event(
+        "room-main", "poison", '{"message":"repeat poison"}'
+    )
+    cutoff = datetime.now(timezone.utc)
+
+    outcomes = []
+    for attempt in range(1, 4):
+        outcomes.append(
+            await harness.coordinator.run(
+                run_id=f"night-quarantine-{attempt}",
+                cutoff=cutoff,
+            )
+        )
+
+    assert [outcome.run.stage for outcome in outcomes] == [
+        "deferred",
+        "deferred",
+        "deferred",
+    ]
+    assert outcomes[-1].counts["proposer_quarantined"] == 1
+    pending = harness.ledger.list_pending_proposer_chunks(limit=10)
+    assert len(pending) == 1
+    assert pending[0].retry_count == 3
+
+
+@pytest.mark.asyncio
+async def test_proposer_wall_budget_times_out_as_retryable_deferred(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(
+        tmp_path,
+        policy=NightRunPolicy(proposer_wall_budget_seconds=1),
+    )
+
+    class _SlowProposer:
+        async def propose(self, *args, **kwargs):
+            await asyncio.sleep(10)
+
+    harness.coordinator.proposer = _SlowProposer()
+    harness.ledger.append_raw_event(
+        "room-main", "slow", '{"message":"slow provider"}'
+    )
+
+    outcome = await harness.coordinator.run(
+        run_id="night-wall-budget",
+        cutoff=datetime.now(timezone.utc),
+    )
+
+    assert outcome.run.stage == "deferred"
+    assert outcome.counts["proposer_attempted"] == 1
+    assert outcome.counts["proposer_retryable"] == 1
+    assert outcome.counts["proposer_wall_budget_exhausted"] == 1
+    assert outcome.counts["proposer_pending_after"] == 1
+    with sqlite3.connect(harness.ledger.path) as connection:
+        assert connection.execute(
+            "SELECT outcome, error_code FROM chunk_proposer_outcomes"
+        ).fetchall() == [("retryable_error", "provider.run_budget")]
 
 
 @pytest.mark.asyncio

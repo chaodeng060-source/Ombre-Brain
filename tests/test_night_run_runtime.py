@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,8 +21,10 @@ from night_run_runtime import (
     NightRunRuntime,
     NightRunRuntimeError,
     OpenAIChatProvider,
+    _proposer_max_chunks_per_run,
     _proposer_max_tokens,
     _proposer_temperature,
+    _proposer_wall_budget_seconds,
     build_night_run_runtime,
 )
 from night_run_trigger import (
@@ -57,6 +60,36 @@ class _CompletingCoordinator:
             snapshot_manifest_sha256="a" * 64,
             cutoff_utc=cutoff.isoformat(timespec="microseconds"),
             counts={"processed": 1},
+        )
+
+
+class _DeferredCoordinator(_CompletingCoordinator):
+    async def run(
+        self,
+        *,
+        run_id: str,
+        cutoff: datetime,
+    ) -> NightRunOutcome:
+        self.calls.append((run_id, cutoff))
+        current = self.ledger.start_night_run(run_id, run_id, counts={})
+        for stage in NIGHT_RUN_FORWARD_STAGES[1:-1]:
+            current = self.ledger.record_night_stage(
+                run_id,
+                stage,
+                counts={"proposer_pending_after": 1},
+                expected_stage=current.stage,
+            )
+        current = self.ledger.record_night_stage(
+            run_id,
+            "deferred",
+            counts={"proposer_pending_after": 1},
+            expected_stage=current.stage,
+        )
+        return NightRunOutcome(
+            run=current,
+            snapshot_manifest_sha256="b" * 64,
+            cutoff_utc=cutoff.isoformat(timespec="microseconds"),
+            counts={"proposer_pending_after": 1},
         )
 
 
@@ -267,6 +300,38 @@ async def test_failed_daily_attempt_uses_new_bounded_run_id(
 
 
 @pytest.mark.asyncio
+async def test_deferred_daily_attempt_is_preserved_before_fresh_retry(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    now = datetime(2026, 7, 29, 20, 30, tzinfo=timezone.utc)
+    first_coordinator = _DeferredCoordinator(ledger)
+    first_runtime = NightRunRuntime(
+        coordinator=first_coordinator,
+        ledger=ledger,
+        clock=lambda: now,
+    )
+
+    first = await first_runtime.run_once()
+    retry_coordinator = _CompletingCoordinator(ledger)
+    retry_runtime = NightRunRuntime(
+        coordinator=retry_coordinator,
+        ledger=ledger,
+        clock=lambda: now,
+    )
+    retry = await retry_runtime.run_once()
+
+    assert first.run_id == "lmc5-night-20260730"
+    assert first.stage == "deferred"
+    assert first.already_complete is False
+    assert retry.run_id == "lmc5-night-20260730-r2"
+    assert retry_coordinator.calls[0][1] == first_coordinator.calls[0][1]
+    historical = ledger.get_night_run(first.run_id)
+    assert historical.stage == "deferred"
+    assert historical.errors == ()
+
+
+@pytest.mark.asyncio
 async def test_interrupted_attempt_is_sealed_before_fresh_retry(
     tmp_path: Path,
 ) -> None:
@@ -440,6 +505,8 @@ def test_proposer_budget_accepts_plain_integer_boundaries(value: int) -> None:
 
 def test_null_night_section_uses_safe_default() -> None:
     assert _proposer_max_tokens({"lmc5_night": None}) == 4096
+    assert _proposer_max_chunks_per_run({"lmc5_night": None}) == 16
+    assert _proposer_wall_budget_seconds({"lmc5_night": None}) == 3000
 
 
 def test_proposer_temperature_is_deterministic_and_independent() -> None:
@@ -502,6 +569,34 @@ def test_proposer_budget_rejects_unsafe_config(section: object) -> None:
         _proposer_max_tokens({"lmc5_night": section})
 
 
+@pytest.mark.parametrize(
+    "value",
+    (None, True, False, 0, -1, 17, 16.0, "16"),
+)
+def test_proposer_chunk_cap_rejects_unsafe_config(value: object) -> None:
+    with pytest.raises(
+        NightRunRuntimeError,
+        match="^proposer\\.chunk_cap_invalid$",
+    ):
+        _proposer_max_chunks_per_run(
+            {"lmc5_night": {"proposer_max_chunks_per_run": value}}
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    (None, True, False, 0, -1, 3600, 3000.0, "3000"),
+)
+def test_proposer_wall_budget_rejects_unsafe_config(value: object) -> None:
+    with pytest.raises(
+        NightRunRuntimeError,
+        match="^proposer\\.wall_budget_invalid$",
+    ):
+        _proposer_wall_budget_seconds(
+            {"lmc5_night": {"proposer_wall_budget_seconds": value}}
+        )
+
+
 @pytest.mark.parametrize("value", (None, True, False, 0, -1, 511, 8193, 512.0, "512"))
 def test_openai_provider_rejects_budget_outside_contract(value: object) -> None:
     with pytest.raises(
@@ -520,16 +615,26 @@ def test_openai_provider_rejects_budget_outside_contract(value: object) -> None:
 
 
 @pytest.mark.parametrize(
-    ("night_section", "expected_tokens", "expected_temperature"),
     (
-        (None, 4096, 0.0),
+        "night_section",
+        "expected_tokens",
+        "expected_temperature",
+        "expected_chunk_cap",
+        "expected_wall_budget",
+    ),
+    (
+        (None, 4096, 0.0, 16, 3000),
         (
             {
                 "proposer_max_tokens": 2048,
                 "proposer_temperature": 0.2,
+                "proposer_max_chunks_per_run": 7,
+                "proposer_wall_budget_seconds": 900,
             },
             2048,
             0.2,
+            7,
+            900,
         ),
     ),
 )
@@ -539,6 +644,8 @@ def test_runtime_builder_wires_dedicated_proposer_controls(
     night_section: dict[str, int | float] | None,
     expected_tokens: int,
     expected_temperature: float,
+    expected_chunk_cap: int,
+    expected_wall_budget: int,
 ) -> None:
     captured: dict[str, Any] = {}
 
@@ -551,6 +658,7 @@ def test_runtime_builder_wires_dedicated_proposer_controls(
 
     class CoordinatorStub:
         def __init__(self, **kwargs: Any) -> None:
+            captured["policy"] = kwargs["policy"]
             self.maintenance_barrier = object()
             self.policy = SimpleNamespace(barrier_timeout_seconds=1.0)
 
@@ -607,6 +715,11 @@ def test_runtime_builder_wires_dedicated_proposer_controls(
     assert isinstance(runtime, NightRunRuntime)
     assert captured["max_tokens"] == expected_tokens
     assert captured["temperature"] == expected_temperature
+    assert captured["policy"].proposer_max_chunks_per_run == expected_chunk_cap
+    assert (
+        captured["policy"].proposer_wall_budget_seconds
+        == expected_wall_budget
+    )
 
 
 def test_trigger_summary_strips_snapshot_and_internal_fields() -> None:
@@ -626,6 +739,28 @@ def test_trigger_summary_strips_snapshot_and_internal_fields() -> None:
         "run_id": "night-1",
         "counts": {"x_ready": 1},
     }
+
+
+def test_trigger_summary_and_cli_accept_truthful_deferred(
+    monkeypatch,
+    capsys,
+) -> None:
+    payload = {
+        "ok": True,
+        "contract": "lmc5-conservative-stage1",
+        "run_id": "night-1",
+        "stage": "deferred",
+        "already_complete": False,
+        "complete": False,
+        "degraded": True,
+        "counts": {"proposer_pending_after": 12},
+    }
+
+    assert _safe_summary(payload) == payload
+    monkeypatch.setattr(night_run_trigger, "trigger", lambda: payload)
+
+    assert night_run_trigger.main() == 0
+    assert json.loads(capsys.readouterr().out) == payload
 
 
 def test_trigger_ignores_proxy_environment_and_uses_origin_form(

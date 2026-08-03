@@ -40,7 +40,9 @@ PROPOSER_OUTCOMES = frozenset(
 SUCCESSFUL_PROPOSER_OUTCOMES = frozenset(
     {"zero_candidates", "candidates_persisted"}
 )
-TERMINAL_NIGHT_STAGES = frozenset({"complete", "rolled_back", "error"})
+TERMINAL_NIGHT_STAGES = frozenset(
+    {"complete", "deferred", "rolled_back", "error"}
+)
 NIGHT_RUN_FORWARD_STAGES = (
     "started",
     "snapshotted",
@@ -52,7 +54,7 @@ NIGHT_RUN_FORWARD_STAGES = (
     "complete",
 )
 NIGHT_RUN_STAGES = frozenset(
-    (*NIGHT_RUN_FORWARD_STAGES, "error", "rolled_back")
+    (*NIGHT_RUN_FORWARD_STAGES, "deferred", "error", "rolled_back")
 )
 _NIGHT_STAGE_TRANSITIONS = {
     stage: frozenset(
@@ -64,6 +66,10 @@ _NIGHT_STAGE_TRANSITIONS = {
     for index, stage in enumerate(NIGHT_RUN_FORWARD_STAGES[:-1])
 }
 _NIGHT_STAGE_TRANSITIONS["complete"] = frozenset()
+_NIGHT_STAGE_TRANSITIONS["validated"] = frozenset(
+    {"complete", "deferred", "error"}
+)
+_NIGHT_STAGE_TRANSITIONS["deferred"] = frozenset()
 _NIGHT_STAGE_TRANSITIONS["error"] = frozenset()
 _NIGHT_STAGE_TRANSITIONS["rolled_back"] = frozenset()
 
@@ -328,6 +334,14 @@ class PendingProposerChunk:
     content_digest: str
     source_event_ids: tuple[EventIdentity, ...]
     created_at: str
+    retry_count: int
+
+
+@dataclass(frozen=True)
+class ProposerBacklogStats:
+    pending: int
+    unattempted: int
+    quarantined: int
 
 
 @dataclass(frozen=True)
@@ -1605,6 +1619,8 @@ class LMC5Ledger:
         *,
         limit: int = 100,
         after: int | None = None,
+        through: int | None = None,
+        prioritize_retries: bool = False,
     ) -> tuple[PendingProposerChunk, ...]:
         """Return chunks without a successful terminal proposer outcome.
 
@@ -1617,6 +1633,13 @@ class LMC5Ledger:
 
         safe_limit = _read_limit(limit)
         safe_after = _after_id(after) if after is not None else 0
+        safe_through = _after_id(through) if through is not None else None
+        if not isinstance(prioritize_retries, bool):
+            raise LedgerValidationError("prioritize_retries must be a boolean")
+        if prioritize_retries and after is not None:
+            raise LedgerValidationError(
+                "after cannot be combined with retry-priority ordering"
+            )
         connection = self._connect()
         try:
             connection.execute("BEGIN")
@@ -1624,9 +1647,16 @@ class LMC5Ledger:
             rows = connection.execute(
                 """
                 SELECT ec.rowid AS row_id, ec.chunk_id, ec.content,
-                       ec.content_digest, ec.created_at
+                       ec.content_digest, ec.created_at,
+                       (
+                           SELECT COUNT(*)
+                           FROM chunk_proposer_outcomes retry
+                           WHERE retry.chunk_id = ec.chunk_id
+                             AND retry.outcome = 'retryable_error'
+                       ) AS retry_count
                 FROM event_chunks ec
                 WHERE ec.rowid > ?
+                  AND (? IS NULL OR ec.rowid <= ?)
                   AND NOT EXISTS(
                       SELECT 1
                       FROM chunk_proposer_outcomes cpo
@@ -1635,10 +1665,18 @@ class LMC5Ledger:
                             'zero_candidates', 'candidates_persisted'
                         )
                   )
-                ORDER BY ec.rowid
+                ORDER BY
+                    CASE WHEN ? THEN retry_count ELSE 0 END,
+                    ec.rowid
                 LIMIT ?
                 """,
-                (safe_after, safe_limit),
+                (
+                    safe_after,
+                    safe_through,
+                    safe_through,
+                    int(prioritize_retries),
+                    safe_limit,
+                ),
             ).fetchall()
             results: list[PendingProposerChunk] = []
             for row in rows:
@@ -1673,6 +1711,7 @@ class LMC5Ledger:
                         content_digest=row["content_digest"],
                         source_event_ids=sources,
                         created_at=row["created_at"],
+                        retry_count=int(row["retry_count"]),
                     )
                 )
             connection.commit()
@@ -1686,6 +1725,87 @@ class LMC5Ledger:
                 connection.rollback()
             raise LedgerCorruptionError(
                 "unable to read pending proposer chunks"
+            ) from exc
+        finally:
+            connection.close()
+
+    def proposer_watermark(self) -> int:
+        """Return the current append-only event-chunk row-id watermark."""
+
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(rowid), 0) AS watermark FROM event_chunks"
+            ).fetchone()
+            watermark = int(row["watermark"])
+            if watermark < 0:
+                raise LedgerCorruptionError("invalid proposer watermark")
+            return watermark
+        except LedgerError:
+            raise
+        except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+            raise LedgerCorruptionError(
+                "unable to read proposer watermark"
+            ) from exc
+        finally:
+            connection.close()
+
+    def proposer_backlog_stats(
+        self, *, through: int
+    ) -> ProposerBacklogStats:
+        """Count the frozen proposer workset without changing its outcomes."""
+
+        safe_through = _after_id(through)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            self._verify_proposer_outcomes(connection)
+            row = connection.execute(
+                """
+                SELECT
+                    COUNT(*) AS pending,
+                    COALESCE(SUM(retry_count = 0), 0) AS unattempted,
+                    COALESCE(SUM(retry_count >= 3), 0) AS quarantined
+                FROM (
+                    SELECT ec.chunk_id,
+                           (
+                               SELECT COUNT(*)
+                               FROM chunk_proposer_outcomes retry
+                               WHERE retry.chunk_id = ec.chunk_id
+                                 AND retry.outcome = 'retryable_error'
+                           ) AS retry_count
+                    FROM event_chunks ec
+                    WHERE ec.rowid <= ?
+                      AND NOT EXISTS(
+                          SELECT 1
+                          FROM chunk_proposer_outcomes terminal
+                          WHERE terminal.chunk_id = ec.chunk_id
+                            AND terminal.outcome IN (
+                                'zero_candidates', 'candidates_persisted'
+                            )
+                      )
+                ) pending_chunks
+                """,
+                (safe_through,),
+            ).fetchone()
+            values = tuple(
+                int(row[field])
+                for field in ("pending", "unattempted", "quarantined")
+            )
+            if any(value < 0 for value in values):
+                raise LedgerCorruptionError("invalid proposer backlog counts")
+            result = ProposerBacklogStats(*values)
+            connection.commit()
+            return result
+        except LedgerError:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+            if connection.in_transaction:
+                connection.rollback()
+            raise LedgerCorruptionError(
+                "unable to count proposer backlog"
             ) from exc
         finally:
             connection.close()

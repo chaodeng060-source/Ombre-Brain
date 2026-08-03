@@ -199,6 +199,62 @@ def test_pending_proposer_chunks_require_a_successful_terminal_outcome(tmp_path)
             ledger.list_pending_proposer_chunks(after=bad_after)
 
 
+def test_pending_proposer_watermark_priority_and_backlog_stats(tmp_path):
+    ledger = _ledger(tmp_path)
+    rows = {}
+    for index in range(1, 5):
+        event_id = f"event-{index}"
+        chunk_id = f"chunk-{index}"
+        ledger.append_raw_event("s", event_id, f"raw-{index}")
+        ledger.record_event_chunk(
+            chunk_id,
+            f"chunk-body-{index}",
+            [EventIdentity("s", event_id)],
+        )
+        rows[chunk_id] = ledger.list_pending_proposer_chunks(
+            limit=10
+        )[-1].row_id
+
+    for attempt in range(3):
+        ledger.record_chunk_proposer_outcome(
+            f"chunk-1-retry-{attempt}",
+            "chunk-1",
+            "retryable_error",
+            error_code="provider.timeout",
+        )
+    ledger.record_chunk_proposer_outcome(
+        "chunk-2-retry-0",
+        "chunk-2",
+        "retryable_error",
+        error_code="provider.timeout",
+    )
+
+    assert ledger.proposer_watermark() == rows["chunk-4"]
+    assert [
+        row.chunk_id
+        for row in ledger.list_pending_proposer_chunks(
+            limit=10,
+            through=rows["chunk-3"],
+            prioritize_retries=True,
+        )
+    ] == ["chunk-3", "chunk-2", "chunk-1"]
+    stats = ledger.proposer_backlog_stats(through=rows["chunk-4"])
+    assert (stats.pending, stats.unattempted, stats.quarantined) == (4, 2, 1)
+
+    for bad_through in (-1, True):
+        with pytest.raises(LedgerValidationError):
+            ledger.list_pending_proposer_chunks(through=bad_through)
+        with pytest.raises(LedgerValidationError):
+            ledger.proposer_backlog_stats(through=bad_through)
+    with pytest.raises(LedgerValidationError):
+        ledger.list_pending_proposer_chunks(prioritize_retries=1)
+    with pytest.raises(LedgerValidationError):
+        ledger.list_pending_proposer_chunks(
+            after=0,
+            prioritize_retries=True,
+        )
+
+
 def test_proposer_outcome_replay_is_exact_and_success_is_terminal(tmp_path):
     ledger = _ledger(tmp_path)
     _seed_chunk(ledger)

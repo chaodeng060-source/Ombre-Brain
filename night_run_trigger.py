@@ -36,6 +36,8 @@ def _safe_summary(payload: object) -> dict[str, object]:
         "local_date",
         "stage",
         "already_complete",
+        "complete",
+        "degraded",
         "counts",
         "deferred_axes",
         "code",

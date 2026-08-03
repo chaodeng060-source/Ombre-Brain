@@ -33,6 +33,7 @@ from night_run_coordinator import (
     NightRunCoordinator,
     NightRunCoordinatorError,
     NightRunOutcome,
+    NightRunPolicy,
 )
 from snapshot_manager import SnapshotManager
 
@@ -42,6 +43,8 @@ DEFAULT_MAX_ATTEMPTS = 8
 DEFAULT_SCHEDULE_TIME = time(hour=4, minute=30)
 DEFAULT_PROPOSER_MAX_TOKENS = 4096
 DEFAULT_PROPOSER_TEMPERATURE = 0.0
+DEFAULT_PROPOSER_MAX_CHUNKS_PER_RUN = 16
+DEFAULT_PROPOSER_WALL_BUDGET_SECONDS = 3000
 MIN_PROPOSER_MAX_TOKENS = 512
 MAX_PROPOSER_MAX_TOKENS = 8192
 
@@ -92,6 +95,36 @@ def _proposer_temperature(config: dict[str, Any]) -> float:
     ):
         raise NightRunRuntimeError("provider.temperature_invalid")
     return float(value)
+
+
+def _proposer_max_chunks_per_run(config: dict[str, Any]) -> int:
+    section = config.get("lmc5_night", {})
+    if section is None:
+        section = {}
+    if type(section) is not dict:
+        raise NightRunRuntimeError("proposer.chunk_cap_invalid")
+    value = section.get(
+        "proposer_max_chunks_per_run",
+        DEFAULT_PROPOSER_MAX_CHUNKS_PER_RUN,
+    )
+    if type(value) is not int or not 1 <= value <= 16:
+        raise NightRunRuntimeError("proposer.chunk_cap_invalid")
+    return value
+
+
+def _proposer_wall_budget_seconds(config: dict[str, Any]) -> int:
+    section = config.get("lmc5_night", {})
+    if section is None:
+        section = {}
+    if type(section) is not dict:
+        raise NightRunRuntimeError("proposer.wall_budget_invalid")
+    value = section.get(
+        "proposer_wall_budget_seconds",
+        DEFAULT_PROPOSER_WALL_BUDGET_SECONDS,
+    )
+    if type(value) is not int or not 1 <= value < 3600:
+        raise NightRunRuntimeError("proposer.wall_budget_invalid")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +277,11 @@ class NightRunRuntime:
                     snapshot_manifest_sha256="",
                     counts=dict(existing.counts),
                 )
+            if existing.stage == "deferred":
+                # A bounded proposer slice ended truthfully with backlog left.
+                # It is a terminal historical result, not an interrupted run:
+                # preserve it and allocate the next same-day retry id.
+                continue
             if existing.stage not in {"error", "rolled_back"}:
                 self.ledger.record_night_stage(
                     existing.run_id,
@@ -342,6 +380,8 @@ def build_night_run_runtime(
     model = str(dehydration.get("model") or "deepseek-chat")
     max_tokens = _proposer_max_tokens(config)
     temperature = _proposer_temperature(config)
+    max_chunks_per_run = _proposer_max_chunks_per_run(config)
+    wall_budget_seconds = _proposer_wall_budget_seconds(config)
     provider_timeout = 75.0
     provider = OpenAIChatProvider(
         api_key=api_key,
@@ -366,6 +406,10 @@ def build_night_run_runtime(
         curated=curated,
         decay_engine=decay_engine,
         consolidation_engine=consolidation_engine,
+        policy=NightRunPolicy(
+            proposer_max_chunks_per_run=max_chunks_per_run,
+            proposer_wall_budget_seconds=wall_budget_seconds,
+        ),
     )
     return NightRunRuntime(coordinator=coordinator, ledger=ledger)
 

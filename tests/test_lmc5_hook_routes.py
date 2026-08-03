@@ -295,8 +295,53 @@ async def test_night_route_returns_conservative_stage1_contract(
     payload = _json(response)
     assert payload["contract"] == "lmc5-conservative-stage1"
     assert payload["stage"] == "complete"
+    assert payload["complete"] is True
+    assert payload["degraded"] is False
     assert payload["deferred_axes"] == ["Y", "Z", "E"]
     assert payload["counts"] == {"x_ready": 1, "m_computed": 1}
+
+
+@pytest.mark.asyncio
+async def test_night_route_returns_truthful_deferred_success(monkeypatch):
+    monkeypatch.setenv("OMBRE_LMC5_NIGHT_ENABLED", "1")
+
+    class Runtime:
+        async def run_once(self):
+            return SimpleNamespace(
+                run_id="lmc5-night-20260729",
+                local_date="2026-07-29",
+                stage="deferred",
+                already_complete=False,
+                cutoff_utc="2026-07-29T20:30:00+00:00",
+                snapshot_manifest_sha256="a" * 64,
+                counts={"proposer_pending_after": 12},
+            )
+
+    monkeypatch.setattr(
+        server,
+        "_get_lmc5_night_runtime",
+        lambda: Runtime(),
+    )
+
+    response = await server.lmc5_night_maintenance(
+        _Request({"schema_version": 1})
+    )
+
+    assert response.status_code == 200
+    assert _json(response) == {
+        "ok": True,
+        "contract": "lmc5-conservative-stage1",
+        "run_id": "lmc5-night-20260729",
+        "local_date": "2026-07-29",
+        "stage": "deferred",
+        "already_complete": False,
+        "complete": False,
+        "degraded": True,
+        "cutoff_utc": "2026-07-29T20:30:00+00:00",
+        "snapshot_manifest_sha256": "a" * 64,
+        "counts": {"proposer_pending_after": 12},
+        "deferred_axes": ["Y", "Z", "E"],
+    }
 
 
 @pytest.mark.asyncio

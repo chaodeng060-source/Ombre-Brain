@@ -7,7 +7,8 @@
 3. 用严格 proposer 生成候选。
 4. 只自动写入 `risk=normal`、无关系边、`type=event` 的 X 候选。
 5. M 只运行 `report_only`，不会归档、digest、resolve 或写报告桶。
-6. 校验快照、账本、raw coverage、候选终态后才标记 `complete`。
+6. 校验快照、账本、raw coverage、候选终态后，冻结水位内已清空才标记
+   `complete`；仍有 proposer 积压则如实标记 `deferred`。
 
 Y、Z、E 在这条无人值守链上明确保持 `deferred`。这不是完整五轴夜班，
 也不能以完整五轴名义验收。
@@ -53,6 +54,13 @@ I/O 密集任务争抢同一数据目录：
 ## 失败语义
 
 - 同一逻辑日完成过一次后，重复触发只返回原终态，不重复写入。
+- proposer 每个 run 最多处理 16 个 chunk，且总墙钟预算低于 3600 秒；
+  本轮开始时冻结 `event_chunks` rowid 水位，运行中新增的 chunk 留给下一轮。
+- `deferred` 是干净的历史终态，不是失败也不会被改写成 `error`。同一逻辑日
+  再触发会使用新的 `-rN`，优先处理从未尝试或重试较少的 chunk。
+- 单块 provider/合同错误只记录为 `retryable_error`；连续三块错误会熔断本轮。
+  重试三次以上的块计入 `proposer_quarantined` 以便审计，但仍保持 pending，
+  不伪造成功终态，也不永久丢弃。
 - 失败或被中断的 run 永久保留为证据；重试使用有界的新 run ID，
   且所有 `-rN` 使用完全相同的固定 cutoff。
 - X 正文先进入冷仓，required 向量成功后才提升；相同 idempotency key
@@ -66,8 +74,14 @@ I/O 密集任务争抢同一数据目录：
 
 - 匿名 `/api/maintenance/lmc5-night` 返回 401。
 - 容器内带 Token 触发返回 `contract=lmc5-conservative-stage1` 和
-  `stage=complete`。
-- 首轮运行后不存在 `pending` raw chunk/candidate。
+  `stage=complete|deferred`；前者必须是 `complete=true,degraded=false`，
+  后者必须是 `complete=false,degraded=true`。
+- 账本必须满足 `attempted=succeeded+retryable`、
+  `pending_before=succeeded+pending_after`，且 `attempted<=16`；
+  `complete` 要求 `pending_after=0`，`deferred` 要求 `pending_after>0`。
+- 本轮不存在未派发的 candidate；未处理的 proposer chunk 只能作为有精确
+  计数的 `deferred` 积压存在。
 - 旧记忆正文与元数据未因 M 改写。
-- 同一逻辑日第二次触发 `already_complete=true`，且不新增 X 桶。
+- 只有同一逻辑日已经 `complete` 时，第二次触发才返回
+  `already_complete=true`；若上一轮 `deferred`，则必须创建新的 `-rN` 续跑。
 - cron 只有一条 LMC-5 任务，并与 04:00 备份错峰。

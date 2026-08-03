@@ -70,12 +70,20 @@ class NightRunCoordinatorError(RuntimeError):
 class NightRunPolicy:
     raw_page_size: int = 100
     pending_page_size: int = 100
+    proposer_max_chunks_per_run: int = 16
+    proposer_wall_budget_seconds: int = 3000
     chunk_bytes: int = 24 * 1024
     barrier_timeout_seconds: float = 60.0
     vector_policy: str = "required"
 
     def __post_init__(self) -> None:
-        for field in ("raw_page_size", "pending_page_size", "chunk_bytes"):
+        for field in (
+            "raw_page_size",
+            "pending_page_size",
+            "proposer_max_chunks_per_run",
+            "proposer_wall_budget_seconds",
+            "chunk_bytes",
+        ):
             value = getattr(self, field)
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{field} must be a positive integer")
@@ -83,6 +91,10 @@ class NightRunPolicy:
             raise ValueError("ledger page sizes cannot exceed 1000")
         if self.chunk_bytes > 256 * 1024:
             raise ValueError("chunk_bytes exceeds the proposer input contract")
+        if self.proposer_max_chunks_per_run > 16:
+            raise ValueError("proposer run chunk cap cannot exceed 16")
+        if self.proposer_wall_budget_seconds >= 3600:
+            raise ValueError("proposer wall budget must be below 3600 seconds")
         timeout = self.barrier_timeout_seconds
         if (
             isinstance(timeout, bool)
@@ -342,7 +354,13 @@ class NightRunCoordinator:
                 self._chunk_uncovered(cutoff_iso, counts)
                 self._advance(run_id, "snapshotted", "chunked", counts)
 
-                await self._propose_pending(run_id, counts)
+                proposer_watermark = self.ledger.proposer_watermark()
+                counts["proposer_watermark"] = proposer_watermark
+                await self._propose_pending(
+                    run_id,
+                    counts,
+                    watermark=proposer_watermark,
+                )
                 self._advance(run_id, "chunked", "proposed", counts)
 
                 await self._dispatch_pending(counts)
@@ -360,6 +378,7 @@ class NightRunCoordinator:
                     run_id=run_id,
                     cutoff_iso=cutoff_iso,
                     snapshot=snapshot,
+                    counts=counts,
                 )
                 self._advance(
                     run_id,
@@ -367,8 +386,13 @@ class NightRunCoordinator:
                     "validated",
                     counts,
                 )
+                terminal_stage = (
+                    "deferred"
+                    if counts["proposer_pending_after"] > 0
+                    else "complete"
+                )
                 completed = self._advance(
-                    run_id, "validated", "complete", counts
+                    run_id, "validated", terminal_stage, counts
                 )
                 return NightRunOutcome(
                     run=completed,
@@ -488,80 +512,116 @@ class NightRunCoordinator:
         return tuple(results)
 
     async def _propose_pending(
-        self, run_id: str, counts: dict[str, int]
+        self,
+        run_id: str,
+        counts: dict[str, int],
+        *,
+        watermark: int,
     ) -> None:
-        after: int | None = None
-        retryable_errors = 0
-        while True:
-            pending_rows = self.ledger.list_pending_proposer_chunks(
-                limit=self.policy.pending_page_size,
-                after=after,
-            )
-            if not pending_rows:
+        before = self.ledger.proposer_backlog_stats(through=watermark)
+        counts["proposer_pending_before"] = before.pending
+        counts["proposer_attempted"] = 0
+        counts["proposer_succeeded"] = 0
+        counts["proposer_retryable"] = 0
+        counts["proposer_circuit_breaker"] = 0
+        counts["proposer_wall_budget_exhausted"] = 0
+
+        pending_rows = self.ledger.list_pending_proposer_chunks(
+            limit=self.policy.proposer_max_chunks_per_run,
+            through=watermark,
+            prioritize_retries=True,
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.policy.proposer_wall_budget_seconds
+        consecutive_errors = 0
+        for pending in pending_rows:
+            if len(pending.source_event_ids) != 1:
+                raise NightRunCoordinatorError("proposer.source_cardinality")
+            try:
+                text = pending.content.decode("utf-8", errors="strict")
+            except UnicodeError as exc:
+                raise NightRunCoordinatorError("proposer.chunk_utf8") from exc
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                counts["proposer_wall_budget_exhausted"] = 1
                 break
-            for pending in pending_rows:
-                after = pending.row_id
-                if len(pending.source_event_ids) != 1:
-                    raise NightRunCoordinatorError(
-                        "proposer.source_cardinality"
-                    )
-                try:
-                    text = pending.content.decode("utf-8", errors="strict")
-                except UnicodeError as exc:
-                    raise NightRunCoordinatorError(
-                        "proposer.chunk_utf8"
-                    ) from exc
-                try:
-                    batch = await self.proposer.propose(
+            counts["proposer_attempted"] += 1
+            try:
+                batch = await asyncio.wait_for(
+                    self.proposer.propose(
                         (ProposerChunk(id=pending.chunk_id, text=text),),
                         frozenset(),
+                    ),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                self._record_proposer_error(
+                    run_id,
+                    pending,
+                    "provider.run_budget",
+                )
+                counts["proposer_retryable"] += 1
+                counts["proposer_errors"] = counts["proposer_retryable"]
+                consecutive_errors += 1
+                counts["proposer_wall_budget_exhausted"] = 1
+                if consecutive_errors >= 3:
+                    counts["proposer_circuit_breaker"] = 1
+                break
+            except ProposerContractError as exc:
+                self._record_proposer_error(run_id, pending, exc.code)
+                counts["proposer_retryable"] += 1
+                counts["proposer_errors"] = counts["proposer_retryable"]
+                consecutive_errors += 1
+                if consecutive_errors >= 3:
+                    counts["proposer_circuit_breaker"] = 1
+                    break
+                continue
+            consecutive_errors = 0
+            candidate_specs = self._candidate_specs(
+                run_id=run_id,
+                pending=pending,
+                batch=batch,
+            )
+            with self.ledger.transaction() as tx:
+                candidate_keys: list[str] = []
+                for key, axis, payload in candidate_specs:
+                    tx.record_candidate(
+                        key,
+                        axis,
+                        payload,
+                        (pending.chunk_id,),
                     )
-                except ProposerContractError as exc:
-                    self._record_proposer_error(run_id, pending, exc.code)
-                    retryable_errors += 1
-                    counts["proposer_errors"] = retryable_errors
-                    continue
-                candidate_specs = self._candidate_specs(
+                    candidate_keys.append(key)
+                outcome = (
+                    "candidates_persisted"
+                    if candidate_keys
+                    else "zero_candidates"
+                )
+                outcome_key = self._proposer_outcome_key(
                     run_id=run_id,
                     pending=pending,
                     batch=batch,
+                    candidate_keys=candidate_keys,
+                    outcome=outcome,
                 )
-                with self.ledger.transaction() as tx:
-                    candidate_keys: list[str] = []
-                    for key, axis, payload in candidate_specs:
-                        tx.record_candidate(
-                            key,
-                            axis,
-                            payload,
-                            (pending.chunk_id,),
-                        )
-                        candidate_keys.append(key)
-                    outcome = (
-                        "candidates_persisted"
-                        if candidate_keys
-                        else "zero_candidates"
-                    )
-                    outcome_key = self._proposer_outcome_key(
-                        run_id=run_id,
-                        pending=pending,
-                        batch=batch,
-                        candidate_keys=candidate_keys,
-                        outcome=outcome,
-                    )
-                    tx.record_chunk_proposer_outcome(
-                        outcome_key,
-                        pending.chunk_id,
-                        outcome,
-                        candidate_keys=candidate_keys,
-                    )
-                counts["proposer_chunks"] = (
-                    counts.get("proposer_chunks", 0) + 1
+                tx.record_chunk_proposer_outcome(
+                    outcome_key,
+                    pending.chunk_id,
+                    outcome,
+                    candidate_keys=candidate_keys,
                 )
-                counts["candidates"] = counts.get("candidates", 0) + len(
-                    candidate_specs
-                )
-        if retryable_errors:
-            raise NightRunCoordinatorError("proposer.failed")
+            counts["proposer_succeeded"] += 1
+            counts["proposer_chunks"] = counts["proposer_succeeded"]
+            counts["candidates"] = counts.get("candidates", 0) + len(
+                candidate_specs
+            )
+
+        after = self.ledger.proposer_backlog_stats(through=watermark)
+        counts["proposer_pending_after"] = after.pending
+        counts["proposer_quarantined"] = after.quarantined
+        counts["proposer_unattempted_after"] = after.unattempted
+        counts.setdefault("proposer_errors", 0)
+        counts.setdefault("proposer_chunks", 0)
 
     def _record_proposer_error(
         self,
@@ -911,6 +971,7 @@ class NightRunCoordinator:
         run_id: str,
         cutoff_iso: str,
         snapshot: SnapshotResult,
+        counts: Mapping[str, int],
     ) -> None:
         verified = await _await_daemon_thread(
             lambda: self.snapshots.verify_snapshot(
@@ -925,8 +986,38 @@ class NightRunCoordinator:
             limit=1, created_before=cutoff_iso
         ):
             raise NightRunCoordinatorError("validation.raw_uncovered")
-        if self.ledger.list_pending_proposer_chunks(limit=1):
-            raise NightRunCoordinatorError("validation.proposer_pending")
+        required_counts = (
+            "proposer_watermark",
+            "proposer_pending_before",
+            "proposer_attempted",
+            "proposer_succeeded",
+            "proposer_retryable",
+            "proposer_pending_after",
+            "proposer_quarantined",
+            "proposer_circuit_breaker",
+            "proposer_wall_budget_exhausted",
+        )
+        if any(key not in counts for key in required_counts):
+            raise NightRunCoordinatorError("validation.proposer_counts")
+        attempted = counts["proposer_attempted"]
+        succeeded = counts["proposer_succeeded"]
+        retryable = counts["proposer_retryable"]
+        pending_before = counts["proposer_pending_before"]
+        pending_after = counts["proposer_pending_after"]
+        if (
+            attempted > self.policy.proposer_max_chunks_per_run
+            or attempted != succeeded + retryable
+            or pending_before != succeeded + pending_after
+        ):
+            raise NightRunCoordinatorError("validation.proposer_counts")
+        backlog = self.ledger.proposer_backlog_stats(
+            through=counts["proposer_watermark"]
+        )
+        if (
+            backlog.pending != pending_after
+            or backlog.quarantined != counts["proposer_quarantined"]
+        ):
+            raise NightRunCoordinatorError("validation.proposer_counts")
         if self.ledger.list_candidates("pending", limit=1):
             raise NightRunCoordinatorError("validation.candidate_pending")
         if self.ledger.list_candidates("error", limit=1):

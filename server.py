@@ -1686,11 +1686,15 @@ async def lmc5_night_maintenance(request):
             status_code=503,
         )
 
+    complete = result.stage == "complete"
+    degraded = result.stage == "deferred"
     logger.info(
-        "LMC-5 conservative night run complete: run_id=%s stage=%s "
-        "already_complete=%s counts=%s",
+        "LMC-5 conservative night run finished: run_id=%s stage=%s "
+        "complete=%s degraded=%s already_complete=%s counts=%s",
         result.run_id,
         result.stage,
+        complete,
+        degraded,
         result.already_complete,
         dict(result.counts),
     )
@@ -1702,6 +1706,8 @@ async def lmc5_night_maintenance(request):
             "local_date": result.local_date,
             "stage": result.stage,
             "already_complete": result.already_complete,
+            "complete": complete,
+            "degraded": degraded,
             "cutoff_utc": result.cutoff_utc,
             "snapshot_manifest_sha256": result.snapshot_manifest_sha256,
             "counts": result.counts,
