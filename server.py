@@ -131,6 +131,11 @@ from z_lifecycle import (
     ZLifecycleStateError,
     ZLifecycleTransaction,
 )
+from relation_approval import (
+    RelationApprovalNotFound,
+    RelationApprovalStateError,
+    RelationApprovalTransaction,
+)
 from lmc5_ledger import (
     LMC5Ledger,
     LedgerConflictError,
@@ -168,6 +173,7 @@ sensory_engine = SensoryEngine(config["buckets_dir"])  # External body-state sid
 # dry-run，只有显式 apply 才入队，只有显式人审事务才改事实 lifecycle。
 _review_queue = None
 _z_lifecycle_transaction = None
+_relation_approval_transaction = None
 _e_axis_shadow_store = None
 _lmc5_ledger = None
 _entity_store = None
@@ -469,6 +475,25 @@ def _get_z_lifecycle_transaction() -> ZLifecycleTransaction:
             queue,
         )
     return _z_lifecycle_transaction
+
+
+def _get_relation_approval_transaction() -> RelationApprovalTransaction:
+    """Lazily bind named relation approval to the active test/prod vault."""
+    global _relation_approval_transaction
+    queue = _get_review_queue()
+    root = os.path.abspath(config["buckets_dir"])
+    if (
+        _relation_approval_transaction is None
+        or os.fspath(_relation_approval_transaction.root) != root
+        or _relation_approval_transaction.bucket_manager is not bucket_mgr
+        or _relation_approval_transaction.review_queue is not queue
+    ):
+        _relation_approval_transaction = RelationApprovalTransaction(
+            root,
+            bucket_mgr,
+            queue,
+        )
+    return _relation_approval_transaction
 
 
 def _get_e_axis_shadow_store() -> EAxisShadowStore:
@@ -5745,6 +5770,74 @@ async def _apply_review_queue_lifecycle(body):
     })
 
 
+@mcp.custom_route("/api/review_queue/apply-relation", methods=["POST"])
+async def api_review_queue_apply_relation(request):
+    """Apply one dangerous pending edge after explicit named approval."""
+    from starlette.responses import JSONResponse
+    if not _review_write_api_enabled():
+        return JSONResponse(
+            {"error": "OMBRE_API_TOKEN required for review queue writes"},
+            status_code=503,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON object required"}, status_code=400)
+    return await _apply_review_queue_relation(body)
+
+
+async def _apply_review_queue_relation(body):
+    from starlette.responses import JSONResponse
+    key = str(body.get("key") or "").strip()
+    reviewer = str(body.get("reviewer") or "").strip()
+    verdict_note = str(body.get("verdict_note") or "").strip()[:500]
+    if not key:
+        return JSONResponse({"error": "key required"}, status_code=400)
+    if not reviewer:
+        return JSONResponse(
+            {"error": "reviewer required for explicit relation approval"},
+            status_code=400,
+        )
+    try:
+        result = await _await_daemon_thread(
+            lambda: _get_relation_approval_transaction().apply(
+                key,
+                reviewer=reviewer,
+                verdict_note=verdict_note,
+            )
+        )
+    except RelationApprovalNotFound as exc:
+        return JSONResponse({
+            "error": str(exc),
+            "memory_mutated": False,
+            "queue_mutated": False,
+        }, status_code=404)
+    except (ValueError, RelationApprovalStateError) as exc:
+        return JSONResponse({
+            "error": str(exc),
+            "memory_mutated": False,
+            "queue_mutated": False,
+        }, status_code=409)
+    except Exception as exc:
+        logger.exception(
+            "relation approval transaction failed: %s",
+            type(exc).__name__,
+        )
+        return JSONResponse({
+            "error": "relation approval transaction failed closed",
+            "memory_mutated": False,
+            "queue_mutated": False,
+        }, status_code=503)
+    return JSONResponse({
+        "ok": True,
+        **result,
+        "memory_mutated": result["changed"],
+        "queue_mutated": result["queue_changed"],
+    })
+
+
 @mcp.custom_route("/api/review_queue/apply-protected-overlay", methods=["POST"])
 async def api_review_queue_apply_protected_overlay(request):
     """Retired: protected/narrative memories are outside Z currentness."""
@@ -6512,6 +6605,16 @@ if __name__ == "__main__":
             )
     except Exception:
         logger.exception("Z lifecycle recovery failed; refusing to start")
+        raise
+    try:
+        recovered_relations = _get_relation_approval_transaction().recover()
+        if recovered_relations:
+            logger.warning(
+                "Recovered %d interrupted relation approval transaction(s)",
+                len(recovered_relations),
+            )
+    except Exception:
+        logger.exception("Relation approval recovery failed; refusing to start")
         raise
 
     transport = config.get("transport", "stdio")

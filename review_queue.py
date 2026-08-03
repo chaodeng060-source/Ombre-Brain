@@ -438,7 +438,7 @@ class ReviewQueue:
         """Acknowledge or reject one row without applying memory changes."""
         if status == STATUS_APPLIED:
             raise ValueError(
-                "applied is reserved for the paired Z lifecycle transaction"
+                "applied is reserved for an explicit memory transaction"
             )
         with self._maintenance_barrier.shared():
             return self._resolve_locked(
@@ -447,6 +447,7 @@ class ReviewQueue:
                 verdict_note=verdict_note,
                 reviewer=reviewer,
                 require_lifecycle=False,
+                require_relation=False,
                 now=now,
             )
 
@@ -464,14 +465,36 @@ class ReviewQueue:
                 verdict_note=verdict_note,
                 reviewer=reviewer,
                 require_lifecycle=True,
+                require_relation=False,
+                now=now,
+            )
+
+    def apply_relation(self, key: str, *, reviewer: str,
+                       verdict_note: str = "",
+                       now: Optional[datetime] = None) -> bool:
+        """Mark a relation row applied from its crash-recoverable transaction."""
+        reviewer = str(reviewer or "").strip()
+        if not reviewer:
+            raise ValueError("reviewer is required")
+        with self._maintenance_barrier.shared():
+            return self._resolve_locked(
+                key,
+                STATUS_APPLIED,
+                verdict_note=verdict_note,
+                reviewer=reviewer,
+                require_lifecycle=False,
+                require_relation=True,
                 now=now,
             )
 
     def _resolve_locked(self, key: str, status: str, *, verdict_note: str = "",
                         reviewer: str = "", require_lifecycle: bool = False,
+                        require_relation: bool = False,
                         now: Optional[datetime] = None) -> bool:
         if status not in (STATUS_REVIEWED, STATUS_APPLIED, STATUS_REJECTED):
             raise ValueError(f"非法 resolve 状态: {status}")
+        if require_lifecycle and require_relation:
+            raise ValueError("review transaction kind is ambiguous")
         with advisory_file_lock(self.lock_path):
             rows = self._load_unlocked()
             hit = False
@@ -483,6 +506,10 @@ class ReviewQueue:
                     ):
                         raise ValueError(
                             "applied requires a cross-bucket lifecycle candidate"
+                        )
+                    if require_relation and r.get("kind") != KIND_RELATION:
+                        raise ValueError(
+                            "applied requires a relation review candidate"
                         )
                     r["status"] = status
                     r["resolved_at"] = _now_iso(now)

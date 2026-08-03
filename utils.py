@@ -14,10 +14,35 @@ import re
 import uuid
 import yaml
 import logging
+from copy import deepcopy
 from pathlib import Path
 from datetime import date, datetime, timedelta
 
 from intent_recall import DEFAULT_INTENT_RECALL_CONFIG
+
+
+# Audited Z-axis slots that are safe to activate without a private deployment
+# overlay.  Keeping the same constrained registry in code and
+# ``config.example.yaml`` prevents a production install with no config override
+# from silently degrading Z into an empty shell.  The context predicates remain
+# deliberately narrow: unrelated narrative/relationship memories cannot be
+# promoted into mutable fact slots merely because they mention a colour/font.
+DEFAULT_FACT_SLOT_REGISTRY = {
+    "preference.ui.primary_color": {
+        "aliases": ["主色"],
+        "domains": ["创作"],
+        "types": ["dynamic"],
+        "tags_any": ["UI偏好", "朝灯UI偏好", "UI设计", "前端调色"],
+        "name_contains": ["UI", "前端", "调色"],
+    },
+    "preference.ui.font_style": {
+        "aliases": ["字体倾向"],
+        "domains": ["创作"],
+        "types": ["dynamic"],
+        "tags_any": ["UI偏好", "朝灯UI偏好", "UI设计", "前端调色"],
+        "name_contains": ["UI", "前端", "调色"],
+    },
+}
 
 
 # 6 类关系边：causes/contributes/improves/explains/updates 有向，kin 无向（仍单边记一次）
@@ -197,10 +222,12 @@ def load_config(config_path: str = None) -> dict:
             "hop2_min_strength": 0.7,
         },
         # Optional deterministic Z-axis slots.  Empty registry means no bucket
-        # is treated as a versioned fact; models cannot mint slot names.
+        # beyond this audited baseline is treated as a versioned fact; models
+        # cannot mint slot names.  A deployment may explicitly set registry: {}
+        # to fail open and disable all fact-slot currentness semantics.
         "fact_slots": {
             "enabled": True,
-            "registry": {},
+            "registry": deepcopy(DEFAULT_FACT_SLOT_REGISTRY),
         },
         "intent_recall": DEFAULT_INTENT_RECALL_CONFIG,
         # Safety gates default closed-to-write: inferred causal/update edges

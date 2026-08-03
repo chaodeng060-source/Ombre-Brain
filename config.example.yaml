@@ -246,7 +246,8 @@ intent_recall:
 
 # --- Review gates / 待审闸（对位 lmc-5 的 Z 轴事实演化 + Y 轴关系安全）---
 # 机器只提候选、不直接改写真相：所有自动推断关系边和合并时检出的事实冲突，
-# 都先挂进 <buckets_dir>/review_queue.jsonl；只有 agent 显式 add_relation 才落图。
+# 都先挂进 <buckets_dir>/review_queue.jsonl。危险关系候选只有经过
+# /api/review_queue/apply-relation 的具名人工审批事务才落图。
 # 只读查看：python review_queue.py --path <buckets_dir>/review_queue.jsonl
 # 红线：保护域感情桶（恋爱/纪念日/约定/家庭/自省/feel）在合并层已被排除，
 #       绝不会被自动 supersede。
@@ -284,7 +285,8 @@ relation_recall:
 
 # --- Z-axis fact slots / Z 轴事实槽 ---
 # 只有这里登记的规范 key 才被视为事实槽；LLM/桶里临时出现的任意 fact_key 不生效。
-# 空 registry 完全不改变现有召回。aliases 只用于只读迁移候选扫描，落盘仍使用规范 key。
+# 下列窄约束 UI 槽也是代码内置默认；部署可显式设 registry: {} 关闭全部槽。
+# aliases 只用于只读迁移候选扫描，落盘仍使用规范 key。
 # fact_status 仅允许 current/historical/contested；resolved 仍是注意力状态，不表示事实过期。
 fact_slots:
   enabled: true
