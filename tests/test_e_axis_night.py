@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from e_axis_night import (
     EAxisNightError,
@@ -948,6 +949,69 @@ class EAxisRuntimeConfigTests(unittest.TestCase):
         changed = _scorer_lineage_name(**{**base, "temperature": 0.1})
         self.assertEqual(first, second)
         self.assertNotEqual(first, changed)
+
+    def test_e_runtime_requests_non_thinking_json_without_changing_x(self):
+        captured = {}
+
+        class ProviderSpy:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def __call__(self, _prompt):
+                return {}
+
+        config = {
+            "buckets_dir": "/safe/test/root",
+            "dehydration": {
+                "api_key": "test-key",
+                "base_url": "https://example.invalid/v1",
+                "model": "test-model",
+            },
+            "e_axis_shadow": {
+                "enabled": True,
+                "provider_name": "test-provider",
+                "max_tokens": 512,
+            },
+        }
+        with (
+            mock.patch.object(
+                e_axis_night_module,
+                "OpenAIChatProvider",
+                ProviderSpy,
+            ),
+            mock.patch.object(
+                e_axis_night_module,
+                "ReadOnlyLMC5CandidateLedger",
+                lambda *_args, **_kwargs: object(),
+            ),
+            mock.patch.object(
+                e_axis_night_module,
+                "EAxisShadowStore",
+                lambda *_args, **_kwargs: object(),
+            ),
+            mock.patch.object(
+                e_axis_night_module,
+                "EAxisRunJournal",
+                lambda *_args, **_kwargs: object(),
+            ),
+        ):
+            runtime = build_e_axis_runtime(config)
+
+        self.assertIsInstance(runtime[3], StrictEAxisScorer)
+        self.assertIs(captured["disable_thinking"], True)
+        self.assertIs(captured["json_object"], True)
+
+    def test_non_stop_provider_responses_remain_retryable_failures(self):
+        for finish_reason in ("length", "content_filter"):
+            with self.subTest(finish_reason=finish_reason):
+                with self.assertRaisesRegex(
+                    EAxisNightError,
+                    "provider.incomplete",
+                ) as caught:
+                    StrictEAxisScorer._content(
+                        _envelope(finish_reason=finish_reason)
+                    )
+                self.assertTrue(caught.exception.retryable)
 
 
 if __name__ == "__main__":

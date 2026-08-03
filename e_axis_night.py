@@ -165,8 +165,10 @@ def _scorer_lineage_name(
         "model": model,
         "prompt_contract": SCORER_NAME,
         "provider": provider_name,
+        "response_format": "json_object",
         "rubric_version": rubric_version,
         "temperature": temperature,
+        "thinking": "disabled",
         "timeout_seconds": 75.0,
     }
     digest = hashlib.sha256(json.dumps(
@@ -1071,6 +1073,8 @@ def build_e_axis_runtime(
             max_tokens=max_tokens,
             temperature=temperature,
             timeout_seconds=75.0,
+            disable_thinking=True,
+            json_object=True,
         )
     except NightRunRuntimeError as exc:
         raise EAxisNightError(exc.code) from exc

@@ -151,6 +151,8 @@ class OpenAIChatProvider:
         temperature: float,
         timeout_seconds: float,
         client: Any | None = None,
+        disable_thinking: bool = False,
+        json_object: bool = False,
     ) -> None:
         if not isinstance(api_key, str) or not api_key:
             raise NightRunRuntimeError("provider.unconfigured")
@@ -175,6 +177,10 @@ class OpenAIChatProvider:
             or float(timeout_seconds) <= 0
         ):
             raise NightRunRuntimeError("provider.timeout_invalid")
+        if type(disable_thinking) is not bool:
+            raise NightRunRuntimeError("provider.disable_thinking_invalid")
+        if type(json_object) is not bool:
+            raise NightRunRuntimeError("provider.json_object_invalid")
 
         if client is None:
             from openai import OpenAI
@@ -188,14 +194,21 @@ class OpenAIChatProvider:
         self.model = model.strip()
         self.max_tokens = max_tokens
         self.temperature = float(temperature)
+        self.disable_thinking = disable_thinking
+        self.json_object = json_object
 
     def __call__(self, prompt: str) -> dict[str, Any]:
-        response = self._client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-        )
+        request: dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+        }
+        if self.disable_thinking:
+            request["extra_body"] = {"thinking": {"type": "disabled"}}
+        if self.json_object:
+            request["response_format"] = {"type": "json_object"}
+        response = self._client.chat.completions.create(**request)
         dump = getattr(response, "model_dump", None)
         if not callable(dump):
             raise RuntimeError("provider response cannot be serialized")

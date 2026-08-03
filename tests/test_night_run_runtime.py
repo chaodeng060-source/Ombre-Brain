@@ -482,6 +482,47 @@ def test_openai_provider_returns_plain_json_envelope() -> None:
     assert captured["model"] == "test-model"
     assert captured["max_tokens"] == 4096
     assert captured["temperature"] == 0.1
+    assert "extra_body" not in captured
+    assert "response_format" not in captured
+
+
+def test_openai_provider_can_request_strict_non_thinking_json() -> None:
+    captured: dict[str, Any] = {}
+
+    def create(**kwargs: Any):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            model_dump=lambda **_: {
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": "{}"},
+                    }
+                ]
+            }
+        )
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=create),
+        )
+    )
+    provider = OpenAIChatProvider(
+        api_key="test-key",
+        base_url="https://example.invalid/v1",
+        model="test-model",
+        max_tokens=512,
+        temperature=0.0,
+        timeout_seconds=5,
+        client=client,
+        disable_thinking=True,
+        json_object=True,
+    )
+
+    provider("strict prompt")
+
+    assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert captured["response_format"] == {"type": "json_object"}
 
 
 def test_proposer_budget_is_independent_from_dehydration_budget() -> None:
