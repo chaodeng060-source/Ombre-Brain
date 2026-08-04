@@ -103,6 +103,17 @@ from e_axis_shadow import (
     normalize_min_confidence,
     strict_json_loads,
 )
+from e_axis_recall import (
+    apply_resonance_tie_break,
+    derive_response_posture,
+    format_response_posture,
+    group_candidate_rows,
+    infer_query_emotion,
+    load_e_axis_recall_config,
+    rank_annotation_bucket_ids,
+    resonance_score as e_axis_resonance_score,
+    select_current_annotation,
+)
 from r2_storage import r2_storage
 from sensory_engine import SensoryEngine, format_body_state_block, senses_from_sensory
 from utils import (
@@ -2896,6 +2907,30 @@ async def breath(
     domain_filter = [d.strip() for d in domain.split(",") if d.strip()] or None
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
+    e_recall_cfg = None
+    e_query_emotion = None
+    e_rows_by_bucket = {}
+    try:
+        e_recall_cfg = load_e_axis_recall_config(config)
+        if e_recall_cfg.enabled:
+            e_query_emotion = infer_query_emotion(
+                query,
+                valence_01=q_valence,
+                arousal=q_arousal,
+            )
+            e_rows = await asyncio.to_thread(_get_e_axis_shadow_store().load)
+            e_rows_by_bucket = group_candidate_rows(e_rows, e_recall_cfg)
+    except Exception as exc:
+        # E is an optional behavioural projection.  A corrupt ledger or bad
+        # live config fails closed to the relevance-first legacy path instead
+        # of taking factual recall down with it.
+        logger.warning(
+            "E live projection unavailable; factual recall unchanged: %s",
+            type(exc).__name__,
+        )
+        e_recall_cfg = None
+        e_query_emotion = None
+        e_rows_by_bucket = {}
     recall_query, raw_entity_ranked = _resolve_entity_recall(query)
     intent_policy = _resolve_recall_policy(
         recall_query,
@@ -3142,6 +3177,32 @@ async def breath(
         intent_multiplier = bucket_intent_score_multiplier(b, intent_policy)
         if intent_multiplier != 1.0:
             tie_break_score *= intent_multiplier
+        if e_recall_cfg is not None and e_query_emotion is not None:
+            try:
+                e_annotation = select_current_annotation(
+                    e_rows_by_bucket.get(str(b.get("id") or ""), ()),
+                    b,
+                    e_recall_cfg,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "E annotation rejected for recall candidate %s: %s",
+                    b.get("id"),
+                    type(exc).__name__,
+                )
+                e_annotation = None
+            if e_annotation is not None:
+                e_resonance = e_axis_resonance_score(
+                    e_query_emotion,
+                    e_annotation,
+                )
+                tie_break_score = apply_resonance_tie_break(
+                    tie_break_score,
+                    e_resonance,
+                    weight=e_recall_cfg.tie_break_weight,
+                )
+                b["_e_axis_annotation"] = e_annotation
+                b["_e_axis_resonance"] = e_resonance
         b["_non_relevance_tie_break_score"] = round(tie_break_score, 6)
 
     fused_band = max(
@@ -3178,6 +3239,7 @@ async def breath(
     token_used = 0
     result_buckets = []
     result_ids = []
+    selected_e_evidence = []
     for bucket in matches:
         if token_used >= max_tokens:
             break
@@ -3221,6 +3283,11 @@ async def breath(
             results.append(summary)
             result_buckets.append(bucket)
             result_ids.append(bucket["id"])
+            if bucket.get("_e_axis_annotation") is not None:
+                selected_e_evidence.append((
+                    bucket["_e_axis_annotation"],
+                    float(bucket.get("_e_axis_resonance", 0.0) or 0.0),
+                ))
             token_used += summary_tokens
         except Exception as e:
             logger.warning(f"Failed to dehydrate search result / 检索结果脱水失败: {e}")
@@ -3316,6 +3383,97 @@ async def breath(
                 + "\n---\n".join(neighbor_msgs)
             )
 
+    # --- E-axis independent resonance channel (bounded supporting evidence) ---
+    # Only explicit emotional wording/coordinates unlock E-only memories.  A
+    # neutral query can still use E to break close topical ties above, but it
+    # cannot pull an unrelated emotional memory into the prompt.
+    if (
+        e_recall_cfg is not None
+        and e_query_emotion is not None
+        and e_query_emotion.explicit
+        and e_recall_cfg.side_channel_limit > 0
+        and token_used < max_tokens
+    ):
+        e_side_messages = []
+        excluded_e_ids = set(result_ids) | _load_session_seen_ids(session_id)
+        prelim_ids = rank_annotation_bucket_ids(
+            e_rows_by_bucket,
+            e_query_emotion,
+            limit=e_recall_cfg.side_channel_scan_limit,
+        )
+        for e_bucket_id in prelim_ids:
+            if len(e_side_messages) >= e_recall_cfg.side_channel_limit:
+                break
+            if e_bucket_id in excluded_e_ids:
+                continue
+            try:
+                e_bucket = await bucket_mgr.get(e_bucket_id)
+                if not e_bucket or not _passes_nonkeyword_recall_filters(
+                    e_bucket,
+                    world_filter_set=wf_set,
+                    domain_filter=domain_filter,
+                    created_after=created_after,
+                    created_before=created_before,
+                ):
+                    continue
+                if not _filter_z_fact_candidates(
+                    [e_bucket],
+                    query=recall_query,
+                    intent=intent_policy["intent"],
+                ):
+                    continue
+                e_annotation = select_current_annotation(
+                    e_rows_by_bucket.get(e_bucket_id, ()),
+                    e_bucket,
+                    e_recall_cfg,
+                )
+                if e_annotation is None:
+                    continue
+                e_resonance = e_axis_resonance_score(
+                    e_query_emotion,
+                    e_annotation,
+                )
+                if e_resonance < e_recall_cfg.side_channel_min_resonance:
+                    continue
+                clean_meta = {
+                    key: value
+                    for key, value in e_bucket["metadata"].items()
+                    if key != "tags"
+                }
+                summary = await _dehydrate_for_recall(
+                    strip_wikilinks(e_bucket["content"]),
+                    clean_meta,
+                )
+                summary_tokens = count_tokens_approx(summary)
+                if token_used + summary_tokens > max_tokens:
+                    break
+                prefix = _recall_prefix(
+                    e_bucket_id,
+                    "side_channel",
+                    "e_emotion",
+                    marker="[情绪共鸣]",
+                )
+                e_side_messages.append(
+                    f"{prefix} [resonance:{e_resonance:.3f}] {summary}"
+                )
+                token_used += summary_tokens
+                result_buckets.append(e_bucket)
+                result_ids.append(e_bucket_id)
+                excluded_e_ids.add(e_bucket_id)
+                selected_e_evidence.append((e_annotation, e_resonance))
+            except Exception as exc:
+                logger.warning(
+                    "E resonance candidate skipped after validation: %s",
+                    type(exc).__name__,
+                )
+                continue
+        if e_side_messages:
+            results.append(
+                "--- E轴情绪共鸣旁证（supporting experience only，"
+                "不可替代事实） ---\n"
+                + "\n---\n".join(e_side_messages)
+            )
+
     # --- Random surfacing is opt-in after PR-1 noise reduction.
     # --- 减噪后随机漂浮改为显式配置，默认关闭，避免检索不足时硬塞旧噪音。
     random_cfg = config.get("random_surfacing", {}) or {}
@@ -3370,6 +3528,17 @@ async def breath(
         )
 
     text = "\n---\n".join(results)
+    if e_recall_cfg is not None and selected_e_evidence:
+        e_posture = derive_response_posture(selected_e_evidence)
+        if e_posture is not None:
+            text = (
+                text
+                + "\n---\n"
+                + format_response_posture(
+                    e_posture,
+                    activation_id=e_recall_cfg.activation_id,
+                )
+            )
     text = _append_body_state_block(
         text,
         result_buckets,

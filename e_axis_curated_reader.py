@@ -16,6 +16,7 @@ import re
 import stat
 from collections import Counter
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -45,6 +46,23 @@ _MACHINE_ID_CHARS = frozenset(
 
 class EAxisCuratedError(EAxisSourceError):
     """A curated source violated the fail-closed read contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class CuratedSourceBinding:
+    """Canonical identity shared by E0 scoring and E live recall.
+
+    The binding contains no bucket payload.  Recall uses it only to prove that
+    an immutable E0 annotation still describes the current authoritative
+    Markdown bucket before that annotation may influence behaviour.
+    """
+
+    bucket_id: str
+    title: str
+    memory_type: str
+    relation_hints: tuple[str, ...]
+    trigger_reason: str
+    source_digest: str
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -471,20 +489,27 @@ def _title(metadata: Mapping[str, Any], bucket_id: str) -> str:
     return bucket_id
 
 
-def _subject_from_file(
-    raw: bytes,
-    *,
-    legacy_naive_timestamps_utc: bool = False,
-) -> tuple[EAxisSubject | None, str, str]:
-    metadata, content = _parse_markdown(raw)
+def bind_curated_source(
+    metadata: Mapping[str, Any],
+    content: str,
+) -> CuratedSourceBinding | None:
+    """Return the exact E source identity for one parsed current bucket.
+
+    This is deliberately the single digest implementation for both the
+    read-only E0 scanner and the live projection.  A bucket that is no longer
+    eligible, or whose relevant metadata/body changed, cannot reuse an older
+    emotional annotation.
+    """
+
+    if not isinstance(metadata, Mapping):
+        raise EAxisCuratedError("curated.frontmatter_invalid")
+    if type(content) is not str or not content.strip():
+        raise EAxisCuratedError("curated.content_empty")
+
     bucket_id = _bucket_id(metadata)
     title = _title(metadata, bucket_id)
     memory_type = _memory_type(metadata)
     relation_hints = _relation_hints(metadata)
-    created_at = _created_at(
-        metadata,
-        legacy_naive_timestamps_utc=legacy_naive_timestamps_utc,
-    )
     decision = decide_e_axis_trigger(
         memory_type=memory_type,
         title=title,
@@ -492,7 +517,7 @@ def _subject_from_file(
         relation_hints=relation_hints,
     )
     if not decision.included:
-        return None, decision.reason, bucket_id
+        return None
 
     canonical_input = {
         "bucket_id": bucket_id,
@@ -510,20 +535,50 @@ def _subject_from_file(
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+    return CuratedSourceBinding(
+        bucket_id=bucket_id,
+        title=title,
+        memory_type=memory_type,
+        relation_hints=relation_hints,
+        trigger_reason=decision.reason,
+        source_digest=hashlib.sha256(encoded).hexdigest(),
+    )
+
+
+def _subject_from_file(
+    raw: bytes,
+    *,
+    legacy_naive_timestamps_utc: bool = False,
+) -> tuple[EAxisSubject | None, str, str]:
+    metadata, content = _parse_markdown(raw)
+    bucket_id = _bucket_id(metadata)
+    created_at = _created_at(
+        metadata,
+        legacy_naive_timestamps_utc=legacy_naive_timestamps_utc,
+    )
+    binding = bind_curated_source(metadata, content)
+    if binding is None:
+        decision = decide_e_axis_trigger(
+            memory_type=_memory_type(metadata),
+            title=_title(metadata, bucket_id),
+            content=content,
+            relation_hints=_relation_hints(metadata),
+        )
+        return None, decision.reason, bucket_id
     source_run_id = "curated:" + hashlib.sha256(
         bucket_id.encode("utf-8")
     ).hexdigest()[:32]
     return EAxisSubject(
         source_id="bucket:" + bucket_id,
         source_kind="curated_memory",
-        source_digest=hashlib.sha256(encoded).hexdigest(),
+        source_digest=binding.source_digest,
         source_run_id=source_run_id,
-        memory_type=memory_type,
-        title=title,
+        memory_type=binding.memory_type,
+        title=binding.title,
         content=content,
-        relation_hints=relation_hints,
+        relation_hints=binding.relation_hints,
         created_at=created_at,
-        trigger_reason=decision.reason,
+        trigger_reason=binding.trigger_reason,
     ), "", bucket_id
 
 
@@ -598,6 +653,8 @@ def iter_curated_subjects(
 
 __all__ = [
     "CURATED_BUCKET_ROOTS",
+    "CuratedSourceBinding",
     "EAxisCuratedError",
+    "bind_curated_source",
     "iter_curated_subjects",
 ]

@@ -398,7 +398,7 @@ def build_failure_record(
 
 
 def rank_multiplier(_annotation) -> float:
-    """E is annotation-only in stage 1 and can never change ordering."""
+    """Raw E0 annotations are permanently neutral; E1 projection is separate."""
     return 1.0
 
 

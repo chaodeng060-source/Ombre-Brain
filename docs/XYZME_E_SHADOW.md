@@ -1,7 +1,7 @@
-# XYZME E axis: E0 shadow collection
+# XYZME E axis: E0 shadow collection and E1 live projection
 
-E0 is an observation pipeline, not a recall feature. Its automatic source
-universe is the union of:
+E0 is an immutable observation pipeline. Its automatic source universe is the
+union of:
 
 - validated, already-redacted X-axis candidate payloads from the LMC-5 ledger;
 - Markdown memories recursively read from exactly the five authoritative
@@ -57,8 +57,8 @@ new calibration cohort instead of silently mixing distributions.
 
 The producer reads no raw events and no memory directory outside the five
 curated roots. It never updates candidate status, memory body/frontmatter,
-facts, relations, decay, RRF, or any recall score. Every annotation permanently
-sets shadow_only=true and affects_ranking=false.
+facts, relations, decay, RRF, or any recall score. Every E0 annotation
+permanently sets shadow_only=true and affects_ranking=false.
 
 The authoritative score ledger is contract_version=2. It intentionally fails
 closed on v1 rows; an existing v1 ledger must be archived or migrated in a
@@ -92,17 +92,29 @@ Deployment order is mandatory:
    health and rollback.
 
 The E script uses a separate non-blocking lock, returns exit 75 with
-`run.busy` on overlap, and does not invoke the core X/M night runner. Current
-delivery state (2026-07-31): this work is not deployed; this task has not
-changed NAS files, the production image/container, or host cron.
+`run.busy` on overlap, and does not invoke the core X/M night runner. E0 cron
+success means score collection only; it is not evidence that recall behaviour
+has changed.
 
-## E1 promotion gate
+## E1 live projection
 
-E0 reports always set promotion_eligible=false. At least 30 distinct Shanghai
-natural days within one formal automatic provider/model/scorer/rubric cohort
-are necessary but not sufficient; manual API rows never count. E1 also
-requires adequate coverage and sample size, stable numeric/enum distributions,
-resolved failure debt, provider calibration, real-query validation, and
-explicit human approval. There is no automatic promotion switch. Until then,
-the E ledger must not be read by recall, emotion resonance, perception, or
-ranking code.
+E1 is a separate read-time projection over E0, not a mutation of E0 rows. It is
+only active when `e_axis_recall.enabled=true`, `mode=active`, and a named
+`activation_id` plus approved rubric list are configured.
+
+E1 may consume only `source_kind=curated_memory` success rows whose current
+bucket body and relevant frontmatter still hash to the recorded
+`source_digest`. It excludes manual API rows, candidate rows, stale bucket
+digests, low-confidence scores, malformed rows, and unapproved rubrics.
+
+E1 has exactly three allowed effects:
+
+- break ties inside existing relevance bands after X/Y/Z authority filters;
+- add a bounded labelled "supporting experience" side channel for explicit
+  emotional queries;
+- add a compact response-posture block.
+
+E1 must never rewrite facts, change Z status, create/update/archive buckets,
+write relations, change decay, or cross a stronger factual relevance band.
+Disabling E1 restores the legacy factual recall path without touching buckets,
+relations, fact lifecycle state, or any E0 sidecar.

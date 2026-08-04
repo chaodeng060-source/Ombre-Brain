@@ -101,8 +101,9 @@ metabolism:
 # --- XYZME experience axis / E 轴体验信号 ---
 # E0 同时只读扫描 LMC-5 已脱敏 candidate 和五个固定 curated Markdown 根：
 # permanent / dynamic / archive / feel / 涩涩。只写 <buckets_dir>/.axis/ 私有 sidecar；
-# 绝不覆盖记忆或参与 decay、RRF、relation、召回与排序。manual API 由服务端标记
-# source_kind=manual_bucket，完全排除于正式 cohort、自然日、分布和晋级证据。
+# E0 原始行永久不覆盖记忆，也不自行参与 decay/RRF/relation。只有下方具名 E1
+# live projection 可在逐桶重验 source_digest 后消费 curated_memory 行。manual API
+# 标记为 source_kind=manual_bucket，完全排除于正式 cohort、自然日、分布和 E1。
 # enabled 只是运行配置，不代表生产已部署；镜像与独立 cron 仍必须通过部署闸。
 e_axis_shadow:
   enabled: true                        # absent/false fails closed
@@ -115,6 +116,21 @@ e_axis_shadow:
   max_tokens: 512                     # strict six-field JSON only, 512..2048
   max_content_chars: 12000            # longer input fails explicitly; never truncates silently
   temperature: 0.0
+
+# --- LMC-5 E1 live projection / E 轴正式召回投影 ---
+# 可逆消费 E0 的不可变评分：只在既有相关性窄带内细排；显式情绪查询最多补 1 条
+# supporting experience；并注入回应姿态。它永远不能覆盖事实、跨过 Z 轴或把
+# manual/candidate 行升级成权威。关闭 enabled 即恢复旧召回，不改任何账本/桶。
+e_axis_recall:
+  enabled: true
+  mode: active
+  activation_id: "lmc5-e1-20260804-v1"
+  allowed_rubric_versions: ["lmc5-experience-20260731-v1"]
+  min_confidence: 0.5
+  tie_break_weight: 0.2              # 0..0.25, 且仅在 relevance band 内生效
+  side_channel_limit: 1              # 显式情绪查询的额外旁证，0..2
+  side_channel_scan_limit: 128       # 先按 E 分数预排，再逐桶验 digest/Z/world/domain
+  side_channel_min_resonance: 0.55
 
 # --- Decay parameters / 记忆衰减参数 ---
 # 计算艾宾浩斯衰减候选；是否自动归档由 metabolism.mode 控制。
