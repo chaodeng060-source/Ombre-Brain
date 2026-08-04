@@ -91,6 +91,7 @@ from fact_slots import (
     registered_fact_key,
 )
 from query_expand import expand_query
+from lmc5_recall_adapter import fuse_ranked_channels as lmc5_fuse_ranked_channels
 from recall_support import (
     expand_relation_graph,
     rank_within_relevance_bands,
@@ -3167,7 +3168,7 @@ async def breath(
     ]
     if entity_ranked and entity_weight > 0:
         channels.append((entity_ranked, entity_weight))
-    fused_pairs = rrf_fuse_channels(
+    fused_pairs = lmc5_fuse_ranked_channels(
         channels,
         k=rrf_cfg.get("k", 60),
     )
