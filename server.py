@@ -147,6 +147,11 @@ from relation_approval import (
     RelationApprovalStateError,
     RelationApprovalTransaction,
 )
+from recall_history import (
+    JsonFileRecallHistory,
+    default_content_fingerprint,
+    recall_identity,
+)
 from lmc5_ledger import (
     LMC5Ledger,
     LedgerConflictError,
@@ -896,6 +901,26 @@ PULSE_NAV_SUMMARY_CHARS = 110
 MCP_IMAGE_MAX_ITEMS = 3
 MCP_IMAGE_MAX_BYTES = 900_000
 SESSION_SURFACE_DIRNAME = ".session_surface"
+
+
+def _bounded_env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+SESSION_RECALL_TTL_SECONDS = _bounded_env_int(
+    "OMBRE_SESSION_RECALL_TTL_SECONDS",
+    2 * 86400,
+    60,
+)
+SESSION_RECALL_MAX_KEYS = _bounded_env_int(
+    "OMBRE_SESSION_RECALL_MAX_KEYS",
+    1024,
+    1,
+)
 IMAGE_MARKDOWN_RE = re.compile(r"!\[([^\]]*)\]\((https?://[^\s)]+)\)")
 
 
@@ -984,22 +1009,53 @@ def _format_pulse_line(bucket: dict, score: float, full: bool = False) -> str:
     )
 
 
-def _session_seen_path(session_id: str) -> str:
-    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", session_id.strip())[:80]
-    safe_id = safe_id.strip("._-") or "default"
-    base = os.path.join(config["buckets_dir"], SESSION_SURFACE_DIRNAME)
-    return os.path.join(base, f"{safe_id}.json")
+def _session_recall_history() -> JsonFileRecallHistory:
+    return JsonFileRecallHistory(
+        os.path.join(config["buckets_dir"], SESSION_SURFACE_DIRNAME),
+        ttl_seconds=SESSION_RECALL_TTL_SECONDS,
+        max_keys_per_session=SESSION_RECALL_MAX_KEYS,
+    )
+
+
+def _session_bucket_key(bucket_id: str) -> str:
+    return recall_identity("curated", str(bucket_id))
+
+
+def _session_seen_bucket_ids(buckets: list[dict], session_id: str) -> set[str]:
+    if not session_id or not session_id.strip() or not buckets:
+        return set()
+    keyed = {
+        _session_bucket_key(str(bucket.get("id"))): str(bucket.get("id"))
+        for bucket in buckets
+        if isinstance(bucket, dict) and bucket.get("id")
+    }
+    try:
+        seen = _session_recall_history().seen(session_id.strip(), keyed)
+    except Exception as exc:
+        logger.warning("Session recall history read failed open: %s", type(exc).__name__)
+        return set()
+    return (
+        {keyed[key] for key in seen if key in keyed}
+        | _load_session_seen_ids(session_id)
+    )
 
 
 def _load_session_seen_ids(session_id: str) -> set[str]:
+    """Read only pre-53a4aaa plaintext state during the format migration."""
     if not session_id or not session_id.strip():
         return set()
-    path = _session_seen_path(session_id)
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", session_id.strip())[:80]
+    safe_id = safe_id.strip("._-") or "default"
+    path = os.path.join(
+        config["buckets_dir"],
+        SESSION_SURFACE_DIRNAME,
+        f"{safe_id}.json",
+    )
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with open(path, "r", encoding="utf-8") as file:
+            data = json.load(file)
         if isinstance(data, list):
-            return {str(x) for x in data if x}
+            return {str(value) for value in data if value}
     except (OSError, json.JSONDecodeError, TypeError, ValueError):
         pass
     return set()
@@ -1010,12 +1066,8 @@ def _remember_session_seen_ids(session_id: str, bucket_ids: list[str]) -> None:
         return
     try:
         with shared_acceptance_write_guard():
-            seen = _load_session_seen_ids(session_id)
-            seen.update(str(x) for x in bucket_ids if x)
-            path = _session_seen_path(session_id)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(sorted(seen), f, ensure_ascii=False)
+            keys = [_session_bucket_key(str(value)) for value in bucket_ids if value]
+            _session_recall_history().mark(session_id.strip(), keys)
     except RawIngestGuardError:
         # A strict acceptance window suppresses read-side persistence only;
         # the memory response itself remains available.
@@ -1025,10 +1077,40 @@ def _remember_session_seen_ids(session_id: str, bucket_ids: list[str]) -> None:
 
 
 def _filter_session_seen(buckets: list[dict], session_id: str) -> list[dict]:
-    seen = _load_session_seen_ids(session_id)
+    seen = _session_seen_bucket_ids(buckets, session_id)
     if not seen:
         return buckets
-    return [b for b in buckets if b.get("id") not in seen]
+    return [bucket for bucket in buckets if str(bucket.get("id")) not in seen]
+
+
+def _dedupe_recall_content(buckets: list[dict]) -> tuple[list[dict], int, int]:
+    """Port LMC-5's same-turn content dedup without duplicate score inflation."""
+    output: list[dict] = []
+    by_fingerprint: dict[str, int] = {}
+    suppressed = 0
+    errors = 0
+    for bucket in buckets:
+        try:
+            fingerprint = default_content_fingerprint(str(bucket.get("content") or ""))
+        except Exception:
+            fingerprint = None
+            errors += 1
+        if not fingerprint:
+            output.append(bucket)
+            continue
+        existing_index = by_fingerprint.get(fingerprint)
+        if existing_index is None:
+            by_fingerprint[fingerprint] = len(output)
+            output.append(bucket)
+            continue
+        suppressed += 1
+        winner = output[existing_index]
+        metadata = winner.setdefault("metadata", {})
+        if isinstance(metadata, dict):
+            metadata["content_duplicates_merged"] = (
+                int(metadata.get("content_duplicates_merged") or 0) + 1
+            )
+    return output, suppressed, errors
 
 
 def _get_sensory_engine() -> SensoryEngine:
@@ -1053,7 +1135,7 @@ def _append_body_state_block(
     if not include_body_state:
         return text
     try:
-        seen = _load_session_seen_ids(session_id) if session_id else set()
+        seen = _session_seen_bucket_ids(buckets, session_id) if session_id else set()
         result = _get_sensory_engine().stimulate_from_buckets(
             buckets,
             seen_ids=seen,
@@ -3227,6 +3309,13 @@ async def breath(
         band_width=fused_band,
     )
 
+    matches, content_suppressed, content_fingerprint_errors = _dedupe_recall_content(matches)
+    if content_suppressed or content_fingerprint_errors:
+        logger.info(
+            "Recall content dedup: suppressed=%d fingerprint_errors=%d",
+            content_suppressed,
+            content_fingerprint_errors,
+        )
     matches = _filter_session_seen(matches, session_id)
     matches = await _ds_filter_candidates(
         recall_query,
@@ -3239,6 +3328,7 @@ async def breath(
     token_used = 0
     result_buckets = []
     result_ids = []
+    selected_content_fingerprints: set[str] = set()
     selected_e_evidence = []
     for bucket in matches:
         if token_used >= max_tokens:
@@ -3283,6 +3373,9 @@ async def breath(
             results.append(summary)
             result_buckets.append(bucket)
             result_ids.append(bucket["id"])
+            fingerprint = default_content_fingerprint(str(bucket.get("content") or ""))
+            if fingerprint:
+                selected_content_fingerprints.add(fingerprint)
             if bucket.get("_e_axis_annotation") is not None:
                 selected_e_evidence.append((
                     bucket["_e_axis_annotation"],
@@ -3330,7 +3423,10 @@ async def breath(
                 created_before=created_before,
                 max_depth=intent_policy["relation_depth"],
                 max_results=relation_neighbor_cap,
-                excluded_ids=_load_session_seen_ids(session_id),
+                excluded_ids=(
+                    _session_seen_bucket_ids(graph_buckets, session_id)
+                    | _load_session_seen_ids(session_id)
+                ),
             )
         except Exception as exc:
             logger.warning("Relation graph expansion failed / 关系网扩展失败: %s", type(exc).__name__)
@@ -3344,6 +3440,9 @@ async def breath(
             if not neighbor:
                 continue
             try:
+                fingerprint = default_content_fingerprint(str(neighbor.get("content") or ""))
+                if fingerprint and fingerprint in selected_content_fingerprints:
+                    continue
                 clean_meta = {
                     key: value
                     for key, value in neighbor["metadata"].items()
@@ -3371,6 +3470,8 @@ async def breath(
                 token_used += summary_tokens
                 result_buckets.append(neighbor)
                 result_ids.append(relation_neighbor.bucket_id)
+                if fingerprint:
+                    selected_content_fingerprints.add(fingerprint)
             except Exception as exc:
                 logger.warning(
                     "Failed to dehydrate relation neighbor / 关系邻居脱水失败: %s",
@@ -3416,6 +3517,11 @@ async def breath(
                     created_before=created_before,
                 ):
                     continue
+                if not _filter_session_seen([e_bucket], session_id):
+                    continue
+                fingerprint = default_content_fingerprint(str(e_bucket.get("content") or ""))
+                if fingerprint and fingerprint in selected_content_fingerprints:
+                    continue
                 if not _filter_z_fact_candidates(
                     [e_bucket],
                     query=recall_query,
@@ -3459,6 +3565,8 @@ async def breath(
                 token_used += summary_tokens
                 result_buckets.append(e_bucket)
                 result_ids.append(e_bucket_id)
+                if fingerprint:
+                    selected_content_fingerprints.add(fingerprint)
                 excluded_e_ids.add(e_bucket_id)
                 selected_e_evidence.append((e_annotation, e_resonance))
             except Exception as exc:
@@ -3490,7 +3598,10 @@ async def breath(
                 if _is_main_recall_bucket(bucket)
             ]
             matched_ids = set(result_ids)
-            seen_ids = _load_session_seen_ids(session_id)
+            seen_ids = (
+                _session_seen_bucket_ids(all_buckets, session_id)
+                | _load_session_seen_ids(session_id)
+            )
             low_weight = [
                 b for b in all_buckets
                 if b["id"] not in matched_ids
