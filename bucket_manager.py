@@ -741,7 +741,14 @@ class BucketManager:
     # ---------------------------------------------------------
     # Touch bucket
     # ---------------------------------------------------------
-    async def touch(self, bucket_id: str, actor: str = "system:touch") -> None:
+    async def touch(
+        self,
+        bucket_id: str,
+        actor: str = "system:touch",
+        *,
+        ripple: bool = True,
+        raise_on_error: bool = False,
+    ) -> bool:
         # One touch includes its bounded time ripple.  Keep the maintenance
         # lease across both phases so an exclusive night snapshot cannot land
         # between the primary mutation and its derived mutations.
@@ -750,7 +757,9 @@ class BucketManager:
             async with self._write_guard(bucket_id):
                 file_path = self._find_bucket_file(bucket_id)
                 if not file_path:
-                    return
+                    if raise_on_error:
+                        raise FileNotFoundError(bucket_id)
+                    return False
 
                 event_id = None
                 try:
@@ -781,9 +790,12 @@ class BucketManager:
                     logger.warning(
                         f"Failed to touch bucket / 触碰桶失败: {bucket_id}: {e}"
                     )
-                    return
-            if current_time is not None:
+                    if raise_on_error:
+                        raise
+                    return False
+            if ripple and current_time is not None:
                 await self._time_ripple(bucket_id, current_time)
+            return current_time is not None
 
     async def _time_ripple(self, source_id: str, reference_time: datetime, hours: float = 48.0) -> None:
         try:

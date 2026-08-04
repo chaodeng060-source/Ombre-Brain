@@ -96,6 +96,7 @@ from recall_support import (
     rank_within_relevance_bands,
     retain_original_query_supported_candidates,
 )
+from recall_receipt import RecallReceiptConflict, RecallReceiptStore, normalize_bucket_ids
 from e_axis_shadow import (
     EAxisShadowStore,
     build_failure_record,
@@ -203,6 +204,8 @@ _entity_store_key = None
 _entity_store_initialized = False
 _entity_sync_locks: dict[tuple[str, str], object] = {}
 _entity_sync_locks_guard = threading.Lock()
+_recall_receipt_store = None
+_recall_receipt_store_key = None
 _lmc5_ledger_lock = threading.Lock()
 _lmc5_night_runtime = None
 _lmc5_night_runtime_lock = threading.Lock()
@@ -218,6 +221,18 @@ _breath_candidate_capture = contextvars.ContextVar(
 
 class RecallOperationalError(RuntimeError):
     """A required recall channel failed instead of returning valid evidence."""
+
+
+def _get_recall_receipt_store() -> RecallReceiptStore:
+    """Return the write-only final-injection ledger for this bucket vault."""
+    global _recall_receipt_store, _recall_receipt_store_key
+    key = os.path.abspath(str(config.get("buckets_dir") or ""))
+    if _recall_receipt_store is None or _recall_receipt_store_key != key:
+        store = RecallReceiptStore(key)
+        store.initialize()
+        _recall_receipt_store = store
+        _recall_receipt_store_key = key
+    return _recall_receipt_store
 
 
 def _entity_registry_key() -> tuple[str, str]:
@@ -6663,6 +6678,75 @@ async def api_breath(request):
     else:
         text = str(result)
     return JSONResponse({"raw": text})
+
+
+@mcp.custom_route("/api/recall-receipt", methods=["POST"])
+async def api_recall_receipt(request):
+    """Idempotently activate only memories committed to a final model prompt.
+
+    ``breath`` remains read-only.  This separate write endpoint is best-effort
+    from the caller's perspective: a failed receipt must never suppress the
+    recall text or the assistant response.  No query or memory content enters
+    the receipt ledger.
+    """
+    from starlette.responses import JSONResponse
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "JSON object required"}, status_code=400)
+    event_id = str(body.get("event_id") or "").strip()
+    raw_ids = body.get("bucket_ids") or []
+    if isinstance(raw_ids, str):
+        raw_ids = [part.strip() for part in raw_ids.split(",") if part.strip()]
+    try:
+        bucket_ids = normalize_bucket_ids(raw_ids)
+        store = _get_recall_receipt_store()
+        begun = store.begin(
+            event_id,
+            bucket_ids,
+            str(body.get("source") or "twin_prompt_injection"),
+        )
+    except RecallReceiptConflict:
+        return JSONResponse({"error": "event_id payload conflict"}, status_code=409)
+    except (OSError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception:
+        logger.exception("Recall receipt ledger unavailable")
+        return JSONResponse({"error": "receipt ledger unavailable"}, status_code=503)
+
+    applied_now = 0
+    failed = []
+    actor_key = hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:24]
+    for bucket_id in begun["pending"]:
+        try:
+            if await bucket_mgr.get(bucket_id) is None:
+                raise KeyError("bucket not found")
+            # Anchor spreads heat only over explicit conductive edges.  Ombre's
+            # legacy touch ripple is temporal rather than conductive, so this
+            # first adapter deliberately activates the injected root only.
+            await bucket_mgr.touch(
+                bucket_id,
+                actor=f"system:recall_receipt:{actor_key}",
+                ripple=False,
+                raise_on_error=True,
+            )
+            store.mark_applied(event_id, bucket_id)
+            applied_now += 1
+        except Exception as exc:
+            store.mark_failed(event_id, bucket_id, exc)
+            failed.append({"bucket_id": bucket_id, "error": type(exc).__name__})
+    status = store.status(event_id)
+    return JSONResponse({
+        "ok": not failed,
+        "event_id": event_id,
+        "duplicate": bool(begun["duplicate"]),
+        "applied_now": applied_now,
+        "failed": failed,
+        **status,
+    })
 
 
 @mcp.custom_route("/api/hold", methods=["POST"])
