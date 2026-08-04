@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 import server
-from e_axis_curated_reader import bind_curated_source
+from e_axis_curated_reader import bind_loaded_curated_source
 from e_axis_recall import (
     apply_resonance_tie_break,
     derive_response_posture,
@@ -72,7 +72,10 @@ def _row(
     rubric: str = RUBRIC,
     scored_at: str = "2026-08-04T08:00:00+00:00",
 ) -> dict:
-    binding = bind_curated_source(bucket["metadata"], bucket["content"])
+    binding = bind_loaded_curated_source(
+        bucket["metadata"],
+        bucket["content"],
+    )
     assert binding is not None
     row, error = build_shadow_annotation(
         bucket_id="bucket:" + bucket["id"],

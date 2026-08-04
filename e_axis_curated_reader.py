@@ -545,6 +545,26 @@ def bind_curated_source(
     )
 
 
+def bind_loaded_curated_source(
+    metadata: Mapping[str, Any],
+    content: str,
+) -> CuratedSourceBinding | None:
+    """Bind a bucket loaded through ``python-frontmatter``.
+
+    Ombre's canonical Markdown writer serializes ``---\n\n<body>`` after the
+    closing frontmatter delimiter.  The strict E0 scanner deliberately hashes
+    the bytes after that delimiter, including the first newline, while
+    ``python-frontmatter`` removes exactly that separator newline when
+    ``BucketManager`` loads the same bucket.  Reconstituting it here makes E1
+    compare the same canonical source representation as E0.  No whitespace in
+    the actual memory body is otherwise normalized or ignored.
+    """
+
+    if type(content) is not str:
+        raise EAxisCuratedError("curated.content_empty")
+    return bind_curated_source(metadata, "\n" + content)
+
+
 def _subject_from_file(
     raw: bytes,
     *,

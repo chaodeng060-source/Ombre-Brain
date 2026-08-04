@@ -4,12 +4,14 @@ import os
 import errno
 from pathlib import Path
 
+import frontmatter
 import pytest
 import e_axis_curated_reader as curated_reader
 
 from e_axis_curated_reader import (
     CURATED_BUCKET_ROOTS,
     EAxisCuratedError,
+    bind_loaded_curated_source,
     iter_curated_subjects,
 )
 
@@ -367,6 +369,25 @@ def test_digest_binds_only_canonical_e_input_and_run_id_is_stable(tmp_path):
     assert changed_input.source_digest != first.source_digest
     assert first.source_run_id == metadata_only.source_run_id
     assert changed_input.source_run_id == first.source_run_id
+
+
+def test_loaded_bucket_binding_restores_frontmatter_separator_newline(tmp_path):
+    path = tmp_path / "permanent" / "memory.md"
+    _write_bucket(
+        path,
+        bucket_id="loaded",
+        content="\nI prefer concise answers.",
+        extra="semantic_type: preference\n",
+    )
+    subject = _subjects(tmp_path)[0][0]
+    post = frontmatter.load(path)
+
+    # BucketManager/python-frontmatter removes the first separator newline.
+    assert post.content == "I prefer concise answers."
+    binding = bind_loaded_curated_source(dict(post.metadata), post.content)
+
+    assert binding is not None
+    assert binding.source_digest == subject.source_digest
 
 
 def test_reader_does_not_change_file_bits_or_timestamps_or_create_sidecars(tmp_path):

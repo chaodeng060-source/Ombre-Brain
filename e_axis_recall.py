@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Iterable, Mapping, Sequence
 
-from e_axis_curated_reader import bind_curated_source
+from e_axis_curated_reader import bind_loaded_curated_source
 from e_axis_shadow import validate_shadow_score
 
 
@@ -304,7 +304,7 @@ def select_current_annotation(
     content = bucket.get("content")
     if not isinstance(metadata, Mapping) or type(content) is not str:
         return None
-    binding = bind_curated_source(metadata, content)
+    binding = bind_loaded_curated_source(metadata, content)
     if binding is None or str(bucket.get("id") or "") != binding.bucket_id:
         return None
     expected_id = "bucket:" + binding.bucket_id
