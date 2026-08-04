@@ -184,13 +184,18 @@ def _is_quoted_named_self_reference(
     token: str,
     quote_start: int,
 ) -> bool:
-    """Accept only an immediately named ``<person>自己`` inside a quote.
+    """Accept only audited, immediately anchored suffixes inside a quote.
 
     The quote stays byte-for-byte unchanged.  This merely prevents the suffix
-    ``自己`` from being treated as an unresolved reference when its person
-    anchor is already written beside it.  Predicates, coordination, placeholders
-    and other reference words keep the phrase on the fail-closed path.
+    from being treated as unresolved when its anchor is already written beside
+    it.  Predicates, coordination, placeholders and other reference words keep
+    the phrase on the fail-closed path.
     """
+    if token == "之后":
+        # Reuse the audited ``从<explicit event>之后`` validator.  A mere
+        # non-punctuation prefix is not enough: ``那件事之后`` would otherwise
+        # suppress the only unresolved-reference signal inside the quote.
+        return _is_locally_anchored_reference(text, start, token)
     if token != "自己":
         return False
     quoted_prefix = text[quote_start + 1:start]

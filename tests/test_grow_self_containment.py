@@ -123,7 +123,45 @@ def test_reference_detector_covers_broad_references_and_ignores_words():
     assert find_unresolved_references("朝灯和哥哥自己去") == ["自己"]
     assert find_unresolved_references(
         "朝灯说：「从恢复聊天之后靠哥哥自己写。」"
-    ) == ["之后"]
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("left_quote", "right_quote"),
+    [
+        ("「", "」"),
+        ("“", "”"),
+        ("”", "”"),
+        ("‘", "’"),
+        ("’", "’"),
+        ('"', '"'),
+        ("'", "'"),
+    ],
+)
+def test_quoted_after_supports_all_verbatim_quote_pairs(
+    left_quote,
+    right_quote,
+):
+    from dehydrator import find_unresolved_references
+
+    content = f"[[朝灯]]说：{left_quote}从恢复聊天之后继续写。{right_quote}"
+    assert find_unresolved_references(content) == []
+
+
+@pytest.mark.parametrize(
+    ("quote", "expected"),
+    [
+        ("之后继续写。", ["之后"]),
+        ("。之后继续写。", ["之后"]),
+        ("他走了之后继续写。", ["他", "之后"]),
+        ("那件事之后继续写。", ["之后"]),
+        ("从那次之后继续写。", ["那次", "之后"]),
+    ],
+)
+def test_quoted_after_keeps_unanchored_references_strict(quote, expected):
+    from dehydrator import find_unresolved_references
+
+    assert find_unresolved_references(f"[[朝灯]]说：「{quote}」") == expected
 
 
 @pytest.mark.parametrize("anchor", ["哥哥", "朝灯", "[[小卷]]"])
