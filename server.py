@@ -3040,7 +3040,9 @@ async def breath(
                 valence_01=q_valence,
                 arousal=q_arousal,
             )
-            e_rows = await asyncio.to_thread(_get_e_axis_shadow_store().load)
+            e_rows = await _await_daemon_thread(
+                _get_e_axis_shadow_store().load
+            )
             e_rows_by_bucket = group_candidate_rows(e_rows, e_recall_cfg)
     except Exception as exc:
         # E is an optional behavioural projection.  A corrupt ledger or bad
