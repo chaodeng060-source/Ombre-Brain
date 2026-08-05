@@ -213,6 +213,61 @@ def test_ds_keep_parser_distinguishes_valid_empty_from_bad_payload():
     assert server._normalize_anchor_recall_policy("made-up") == "search"
 
 
+def test_anchor_quality_gate_uses_adapted_absolute_score(monkeypatch):
+    monkeypatch.setenv("OMBRE_ANCHOR_QUALITY_GATE_ENABLED", "1")
+    monkeypatch.setenv(
+        "OMBRE_ANCHOR_QUALITY_GATE_POLICIES",
+        "conversation,reflex",
+    )
+    high_vector = _bucket("high-vector", "A")
+    high_vector["_original_vector_relevance_score"] = 0.60
+    low_vector = _bucket("low-vector", "B")
+    low_vector["_original_vector_relevance_score"] = 0.54
+    high_literal = _bucket("high-literal", "C")
+    high_literal["_literal_relevance_score"] = 60.0
+    low_literal = _bucket("low-literal", "D")
+    low_literal["_literal_relevance_score"] = 54.0
+    anchored_entity = _bucket("entity", "E")
+    anchored_entity["entity_match"] = True
+    unscored = _bucket("unscored", "F")
+    candidates = [
+        high_vector,
+        low_vector,
+        high_literal,
+        low_literal,
+        anchored_entity,
+        unscored,
+    ]
+
+    kept = server._filter_anchor_policy_candidates(candidates, "conversation")
+
+    assert [bucket["id"] for bucket in kept] == [
+        "high-vector",
+        "high-literal",
+        "entity",
+        "unscored",
+    ]
+    assert high_vector["_anchor_adapted_relevance_score"] == 0.27
+    assert low_vector["_anchor_adapted_relevance_score"] == 0.243
+    # Search/manual recall keeps its wider existing contract.
+    assert server._filter_anchor_policy_candidates(candidates, "search") == candidates
+
+
+def test_anchor_quality_gate_is_configurable_and_fail_open(monkeypatch):
+    candidate = _bucket("low", "A")
+    candidate["_original_vector_relevance_score"] = 0.01
+
+    monkeypatch.setenv("OMBRE_ANCHOR_QUALITY_GATE_ENABLED", "0")
+    assert server._filter_anchor_policy_candidates(
+        [candidate], "conversation"
+    ) == [candidate]
+
+    monkeypatch.setenv("OMBRE_ANCHOR_QUALITY_GATE_ENABLED", "1")
+    assert server._filter_anchor_policy_candidates(
+        [_bucket("unscored", "B")], "conversation"
+    )[0]["id"] == "unscored"
+
+
 @pytest.mark.asyncio
 async def test_anchor_conversation_policy_allows_valid_empty(monkeypatch):
     monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
@@ -231,6 +286,43 @@ async def test_anchor_conversation_policy_allows_valid_empty(monkeypatch):
     assert [b["id"] for b in await server._ds_filter_candidates(
         "主动搜索", buckets, mode="search", max_results=2, allow_empty=False
     )] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_breath_conversation_gate_can_stay_silent_while_search_remains_wide(
+    tmp_path,
+    monkeypatch,
+):
+    bucket = _bucket("a", "alpha")
+    fake_mgr = FakeBucketMgr([bucket])
+    monkeypatch.setenv("OMBRE_ANCHOR_QUALITY_GATE_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_ANCHOR_QUALITY_GATE_POLICIES", "conversation,reflex")
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "0")
+    monkeypatch.setitem(server.config, "buckets_dir", str(tmp_path))
+    monkeypatch.setitem(server.config, "random_surfacing", {})
+    monkeypatch.setattr(server, "bucket_mgr", fake_mgr)
+    monkeypatch.setattr(server, "decay_engine", FakeDecay())
+    monkeypatch.setattr(server, "dehydrator", FakeDehydrator())
+    monkeypatch.setattr(server, "embedding_engine", FakeEmbedding())
+    monkeypatch.setattr(server, "_backfill_started", True)
+
+    conversation = await server.breath(
+        query="O.o",
+        policy="conversation",
+        max_results=1,
+        relation_depth=0,
+        include_images=False,
+    )
+    search = await server.breath(
+        query="O.o",
+        policy="search",
+        max_results=1,
+        relation_depth=0,
+        include_images=False,
+    )
+
+    assert conversation == "未找到相关记忆。"
+    assert "[bucket_id:a]" in search
 
 
 @pytest.mark.asyncio

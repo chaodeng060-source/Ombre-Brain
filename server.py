@@ -1190,6 +1190,105 @@ def _normalize_anchor_recall_policy(value: str) -> str:
     return policy if policy in ANCHOR_RECALL_POLICIES else "search"
 
 
+def _anchor_quality_gate_enabled(policy: str) -> bool:
+    """Return whether the vendored Anchor threshold applies to this path."""
+    flag = os.getenv("OMBRE_ANCHOR_QUALITY_GATE_ENABLED", "1").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return False
+    configured = os.getenv(
+        "OMBRE_ANCHOR_QUALITY_GATE_POLICIES",
+        "conversation,reflex",
+    )
+    enabled_policies = {
+        value.strip().lower()
+        for value in configured.split(",")
+        if value.strip()
+    }
+    return policy in enabled_policies
+
+
+def _anchor_adapted_relevance_score(bucket: dict) -> float | None:
+    """Map Ombre's absolute query evidence onto Anchor's score scale.
+
+    Anchor ``recall_v2._anchor_item`` gives query similarity a 0.45 weight.
+    Ombre's fused RRF score is rank-relative and therefore cannot be compared
+    with Anchor's absolute 0.25 conversation threshold.  Literal relevance
+    (0..100) and original-vector similarity (0..1) are absolute query signals,
+    so normalising those and applying the same 0.45 weight creates a conservative
+    lower bound on the vendored scale.  Importance, decay and E resonance are
+    deliberately excluded: none of them proves that this memory answers the
+    current query.
+    """
+    similarities: list[float] = []
+
+    literal = bucket.get("_literal_relevance_score")
+    if isinstance(literal, (int, float)):
+        similarities.append(max(0.0, min(1.0, float(literal) / 100.0)))
+
+    vector = bucket.get("_original_vector_relevance_score")
+    if isinstance(vector, (int, float)):
+        similarities.append(max(0.0, min(1.0, float(vector))))
+
+    # A current, validated entity link means the query explicitly named the
+    # entity.  Treat that as anchored query evidence, not a ranking bonus.
+    if bucket.get("entity_match"):
+        similarities.append(1.0)
+
+    if not similarities:
+        return None
+    return round(0.45 * max(similarities), 6)
+
+
+def _filter_anchor_policy_candidates(
+    candidates: list[dict],
+    policy: str,
+) -> list[dict]:
+    """Apply Anchor's policy threshold without changing search/manual recall.
+
+    Missing score evidence is kept (fail-open) so an adapter/config regression
+    cannot silently erase the existing recall path.  A genuine score below the
+    selected Anchor threshold is allowed to disappear for conversation/reflex,
+    which is the upstream legal-empty contract.
+    """
+    recall_policy = _normalize_anchor_recall_policy(policy)
+    if not candidates or not _anchor_quality_gate_enabled(recall_policy):
+        return candidates
+
+    preset = ANCHOR_RECALL_POLICIES.get(recall_policy)
+    if not isinstance(preset, dict):
+        return candidates
+    try:
+        threshold = float(preset["min_score"])
+    except (KeyError, TypeError, ValueError):
+        logger.warning("Anchor quality gate missing threshold; keeping candidates")
+        return candidates
+
+    kept: list[dict] = []
+    scored = 0
+    for bucket in candidates:
+        score = _anchor_adapted_relevance_score(bucket)
+        if score is None:
+            kept.append(bucket)
+            continue
+        scored += 1
+        bucket["_anchor_adapted_relevance_score"] = score
+        if score >= threshold:
+            kept.append(bucket)
+
+    if scored == 0:
+        logger.warning("Anchor quality gate had no absolute scores; keeping candidates")
+        return candidates
+    logger.info(
+        "Anchor quality gate policy=%s threshold=%.3f input=%d scored=%d kept=%d",
+        recall_policy,
+        threshold,
+        len(candidates),
+        scored,
+        len(kept),
+    )
+    return kept
+
+
 def _parse_ds_keep_indices(raw: str, n: int) -> list[int] | None:
     """解析 DeepSeek 返回的 ``keep``。
 
@@ -3359,6 +3458,7 @@ async def breath(
             content_fingerprint_errors,
         )
     matches = _filter_session_seen(matches, session_id)
+    matches = _filter_anchor_policy_candidates(matches, recall_policy)
     matches = await _ds_filter_candidates(
         recall_query,
         matches,
