@@ -377,7 +377,14 @@ async def test_real_breath_changes_close_order_and_injects_posture(
     monkeypatch.setattr(server, "_entity_store", None)
     monkeypatch.setattr(server, "_e_axis_shadow_store", None)
 
-    async def passthrough(_query, values, *, mode, max_results):
+    async def passthrough(
+        _query,
+        values,
+        *,
+        mode,
+        max_results,
+        allow_empty=False,
+    ):
         return values[:max_results]
 
     monkeypatch.setattr(server, "_ds_filter_candidates", passthrough)

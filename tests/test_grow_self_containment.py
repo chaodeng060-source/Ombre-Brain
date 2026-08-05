@@ -356,6 +356,31 @@ async def test_ambiguous_reference_fails_closed(test_config):
 
 
 @pytest.mark.asyncio
+async def test_ambiguous_reference_fail_open_preserves_original_and_records_reason(
+    test_config,
+):
+    ambiguous = json.dumps(
+        {"status": "ambiguous", "content": "", "unresolved": ["她"]},
+        ensure_ascii=False,
+    )
+    dehydrator, create = _dehydrator(test_config, ambiguous)
+    sink = []
+    content = "朝灯和小卷都参加了测试，她完成了测试。"
+
+    result = await dehydrator.ensure_self_contained(
+        content,
+        source_context=content,
+        fail_open=True,
+        unresolved_sink=sink,
+    )
+
+    assert result == content
+    assert len(create.calls) == 1
+    assert len(sink) == 1
+    assert "无法唯一确认" in sink[0]
+
+
+@pytest.mark.asyncio
 async def test_multi_candidate_mapping_is_retried_then_rejected(test_config):
     non_unique = _mapping_payload(
         _mapping(
@@ -521,6 +546,22 @@ async def test_reference_plus_secret_never_calls_rewrite_api(test_config):
 
 
 @pytest.mark.asyncio
+async def test_fail_open_never_bypasses_sensitive_credential_rejection(test_config):
+    dehydrator, create = _dehydrator(test_config, "unused")
+    from dehydrator import SelfContainmentError
+
+    with pytest.raises(SelfContainmentError, match="敏感凭据"):
+        await dehydrator.ensure_self_contained(
+            "她保存了 api_key=sk-secret123456789。",
+            source_context="朝灯保存了 api_key=sk-secret123456789。",
+            fail_open=True,
+            unresolved_sink=[],
+        )
+
+    assert create.calls == []
+
+
+@pytest.mark.asyncio
 async def test_digest_retries_whole_batch_after_ambiguous_item(
     test_config,
     monkeypatch,
@@ -577,6 +618,63 @@ async def test_digest_rejects_ambiguous_source_before_digest_call(
         await dehydrator.digest("朝灯和小卷都参加了测试，她完成了测试。")
 
     assert len(create.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_digest_fail_open_preserves_ambiguous_source_and_disables_thinking(
+    test_config,
+):
+    config = dict(test_config)
+    config["dehydration"] = dict(
+        test_config["dehydration"],
+        base_url="https://api.deepseek.com/v1",
+    )
+    ambiguous = json.dumps(
+        {"status": "ambiguous", "mappings": [], "unresolved": ["她"]},
+        ensure_ascii=False,
+    )
+    clean_digest = _digest_entry("[[朝灯]]完成测试。")
+    dehydrator, create = _dehydrator(config, ambiguous, clean_digest)
+    sink = []
+
+    items = await dehydrator.digest(
+        "朝灯和小卷都参加了测试，她完成了测试。",
+        fail_open=True,
+        unresolved_sink=sink,
+    )
+
+    assert items[0]["content"] == "[[朝灯]]完成测试。"
+    assert any("无法唯一确认" in reason for reason in sink)
+    assert create.calls[1]["extra_body"] == {
+        "thinking": {"type": "disabled"},
+    }
+
+
+def test_parse_digest_fail_open_keeps_entries_and_records_unresolved(test_config):
+    dehydrator, _create = _dehydrator(test_config, "unused")
+    payload = json.dumps(
+        {
+            "unresolved_references": ["她", "那个项目"],
+            "entries": [{
+                "name": "原样保留",
+                "content": "[[朝灯]]记录了原文。",
+                "domain": ["生活"],
+                "tags": [],
+                "importance": 5,
+            }],
+        },
+        ensure_ascii=False,
+    )
+    sink = []
+
+    items = dehydrator._parse_digest(
+        payload,
+        fail_open=True,
+        unresolved_sink=sink,
+    )
+
+    assert items[0]["content"] == "[[朝灯]]记录了原文。"
+    assert sink == ["日记来源仍有无法唯一确认的指代：她, 那个项目"]
 
 
 @pytest.mark.asyncio
@@ -805,8 +903,9 @@ async def test_thirty_character_grow_uses_digest_path(monkeypatch):
         def __init__(self):
             self.digested = []
 
-        async def digest(self, raw):
+        async def digest(self, raw, **kwargs):
             self.digested.append(raw)
+            self.digest_kwargs = kwargs
             return [{
                 "name": "边界",
                 "content": "[[朝灯]]完成三十字边界测试",
@@ -837,5 +936,7 @@ async def test_thirty_character_grow_uses_digest_path(monkeypatch):
     result = await server.grow(content)
 
     assert result.startswith("1条|新1合0")
+    assert fake.digest_kwargs["fail_open"] is True
+    assert fake.digest_kwargs["unresolved_sink"] == []
     assert fake.digested == [content]
     assert captured[0]["require_self_contained"] is True

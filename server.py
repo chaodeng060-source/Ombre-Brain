@@ -92,6 +92,7 @@ from fact_slots import (
 )
 from query_expand import expand_query
 from lmc5_recall_adapter import fuse_ranked_channels as lmc5_fuse_ranked_channels
+from vendor.anchor_memory.recall_v2 import POLICIES as ANCHOR_RECALL_POLICIES
 from recall_support import (
     expand_relation_graph,
     rank_within_relevance_bands,
@@ -1184,18 +1185,28 @@ def _ds_gate_timeout() -> float:
         return 8.0
 
 
-def _parse_ds_keep_indices(raw: str, n: int) -> list[int]:
-    """解析 DeepSeek 返回的 {"keep":[...]}；失败返回 []（调用方据此保守保留全部）。"""
+def _normalize_anchor_recall_policy(value: str) -> str:
+    policy = str(value or "search").strip().lower()
+    return policy if policy in ANCHOR_RECALL_POLICIES else "search"
+
+
+def _parse_ds_keep_indices(raw: str, n: int) -> list[int] | None:
+    """解析 DeepSeek 返回的 ``keep``。
+
+    ``[]`` 是模型明确给出的合法判空；``None`` 才表示协议/解析失败。
+    这一区分复用 Anchor ``allow_empty`` 合同：对话召回可以安静，模型
+    故障仍必须回退既有候选，不能把故障冒充成“没有记忆”。
+    """
     cleaned = (raw or "").strip()
     if cleaned.startswith("```"):
         cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
     try:
         data = json.loads(cleaned)
     except (json.JSONDecodeError, ValueError, IndexError):
-        return []
+        return None
     arr = data.get("keep") if isinstance(data, dict) else data
     if not isinstance(arr, list):
-        return []
+        return None
     out: list[int] = []
     for x in arr:
         try:
@@ -1204,6 +1215,9 @@ def _parse_ds_keep_indices(raw: str, n: int) -> list[int]:
             continue
         if 0 <= i < n:
             out.append(i)
+    if arr and not out:
+        # 只有字面上的空数组才是“合法判空”；非空但全越界/非法属于坏协议。
+        return None
     return out
 
 
@@ -1240,9 +1254,8 @@ async def _ds_semantic_select(
     )
     raw = resp.choices[0].message.content if resp.choices else ""
     idxs = _parse_ds_keep_indices(raw, len(buckets))
-    if not idxs:
-        # 解析不到可信结果 → 保守保留全部（绝不因模型抽风清空召回）
-        return buckets
+    if idxs is None:
+        raise ValueError("invalid DeepSeek recall selection payload")
     keep_idx = set(idxs)
     selected = [
         b for i, b in enumerate(buckets)
@@ -1258,13 +1271,16 @@ async def _ds_filter_candidates(
     mode: str,
     max_results: int,
     force_keep_ids: set[str] = None,
+    allow_empty: bool = False,
 ) -> list[dict]:
     """
     召回候选的注入裁剪 + 可选 DeepSeek 语义门控。
 
     默认行为（门控关，PR-1 语义）：保序 + 保留 forced IDs + 限到 max_results，不调 LLM。
     门控开（OMBRE_DS_FILTER_ENABLED 且 mode 命中且 query 非空）：在已裁剪集合上跑 DeepSeek
-    相关性过滤，纯减法剔噪；超时/出错/解析失败一律回退裁剪集合，绝不清空召回。
+    相关性过滤，纯减法剔噪。超时/出错/解析失败一律回退裁剪集合；只有调用方
+    明确采用 Anchor 对话策略并传入 ``allow_empty=True`` 时，合法 ``keep: []``
+    才会安静返回空。
     """
     if max_results <= 0:
         return []
@@ -1297,7 +1313,7 @@ async def _ds_filter_candidates(
         )
         return capped
 
-    result = kept if kept else capped
+    result = kept if kept or allow_empty else capped
     logger.info(
         "DS filter mode=%s query=%r input=%d capped=%d kept=%d",
         mode, query[:80], len(candidates), len(capped), len(result),
@@ -2771,6 +2787,7 @@ async def breath(
     since: str = "",
     until: str = "",
     session_id: str = "",
+    policy: str = "search",
     include_images: bool = True,
     include_body_state: bool = True,
     reset_body_state: bool = False,
@@ -2783,6 +2800,13 @@ async def breath(
     max_results = max(1, min(max_results, 50))
     max_tokens = max(1000, min(max_tokens, 20000))
     recall_limit = max(BREATH_RECALL_POOL_SIZE, max_results)
+    # Anchor 原生区分 conversation/reflex 与主动 search。Ombre 只复用这份
+    # 策略合同，不照搬两边不可比较的绝对分数；未知值安全回到既有 search。
+    requested_policy = str(policy or "search").strip().lower()
+    recall_policy = _normalize_anchor_recall_policy(requested_policy)
+    if recall_policy != requested_policy:
+        logger.warning("Unknown recall policy %r; using search", requested_policy)
+    allow_empty_recall = recall_policy in {"conversation", "reflex"}
 
     # --- Resolve world filter once (used by all modes) ---
     # --- 解析 world filter：显式参数 > current_world ---
@@ -3338,6 +3362,7 @@ async def breath(
         matches,
         mode="search",
         max_results=max_results,
+        allow_empty=allow_empty_recall,
     )
 
     results = []
@@ -3605,7 +3630,12 @@ async def breath(
         random_chance = float(random_cfg.get("search_underflow_chance", 0.0) or 0.0)
     except (TypeError, ValueError):
         random_chance = 0.0
-    if len(matches) < 3 and random_chance > 0 and random.random() < random_chance:
+    if (
+        recall_policy == "search"
+        and len(matches) < 3
+        and random_chance > 0
+        and random.random() < random_chance
+    ):
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
             all_buckets = [
@@ -3933,7 +3963,17 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
     # --- Step 1: let API split and organize / 让 API 拆分整理 ---
     try:
         _t_d = time.perf_counter()
-        items = await dehydrator.digest(content)
+        # Long-form grow must not discard the incoming memory merely because
+        # self-containment arbitration is unavailable or inconclusive.  The
+        # dehydrator keeps empty content and credentials fail-closed.
+        _unresolved_sink: list = []
+        items = await dehydrator.digest(
+            content,
+            fail_open=True,
+            unresolved_sink=_unresolved_sink,
+        )
+        if _unresolved_sink:
+            logger.info("grow digest fail-open: %s", _unresolved_sink[:5])
         _ela_d = time.perf_counter() - _t_d
     except SelfContainmentError as e:
         logger.warning(f"Diary digest self-containment failed / 指代消解失败: {e}")
@@ -6648,6 +6688,8 @@ async def api_breath(request):
         except (TypeError, ValueError):
             return default
 
+    requested_policy = str(body.get("policy") or "search").strip().lower()
+    recall_policy = _normalize_anchor_recall_policy(requested_policy)
     try:
         result = await breath(
             query=query,
@@ -6661,6 +6703,7 @@ async def api_breath(request):
             since=str(body.get("since") or ""),
             until=str(body.get("until") or ""),
             session_id=str(body.get("session_id") or ""),
+            policy=recall_policy,
             include_images=False,
             include_body_state=False,
             reset_body_state=False,
@@ -6678,7 +6721,10 @@ async def api_breath(request):
         )
     else:
         text = str(result)
-    return JSONResponse({"raw": text})
+    return JSONResponse({
+        "raw": text,
+        "policy": recall_policy,
+    })
 
 
 @mcp.custom_route("/api/recall-receipt", methods=["POST"])

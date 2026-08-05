@@ -226,9 +226,8 @@ def test_exclusive_acceptance_fences_read_side_writes_without_breaking_read(
         )
         assert body_path.read_bytes() != before
         server._remember_session_seen_ids("acceptance", ["hot"])
-        assert json.loads(
-            (tmp_path / ".session_surface" / "acceptance.json").read_text()
-        ) == ["hot"]
+        key = server._session_bucket_key("hot")
+        assert server._session_recall_history().seen("acceptance", [key]) == {key}
     finally:
         lock_path.unlink(missing_ok=True)
 

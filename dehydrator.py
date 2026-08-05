@@ -1094,19 +1094,37 @@ class Dehydrator:
         source_context: str = "",
         *,
         require_subject: bool = True,
+        fail_open: bool = False,
+        unresolved_sink: list | None = None,
     ) -> str:
-        """Resolve references by local substitution, or fail closed."""
+        """Resolve references by local substitution.
+
+        ``fail_open=False`` preserves the strict historical behavior.  Grow's
+        long-form digest can opt in to ``fail_open=True`` so an ambiguous
+        reference is preserved verbatim and reported through ``unresolved_sink``
+        instead of dropping the whole incoming memory.
+
+        Empty content and sensitive credentials stay fail-closed in both modes.
+        """
+        def _bail(reason: str) -> str:
+            if not fail_open:
+                raise SelfContainmentError(reason)
+            logger.info("self-containment fail-open: %s", reason)
+            if unresolved_sink is not None:
+                unresolved_sink.append(reason)
+            return draft
+
         draft = str(content or "").strip()
         if not draft:
             raise SelfContainmentError("待写入事实为空")
         if _PLACEHOLDER_REFERENCE_RE.search(draft):
-            raise SelfContainmentError("待写入事实含某人/某地等占位指代")
+            return _bail("待写入事实含某人/某地等占位指代")
         if _has_unbalanced_verbatim_quote(draft):
-            raise SelfContainmentError("待写入事实含未闭合的逐字引语")
+            return _bail("待写入事实含未闭合的逐字引语")
         occurrences = _reference_occurrences(draft)
         risks = list(dict.fromkeys(item["text"] for item in occurrences))
         if any(item["inside_quote"] for item in occurrences):
-            raise SelfContainmentError("逐字引语内含无法安全改写的指代")
+            return _bail("逐字引语内含无法安全改写的指代")
         if not occurrences and (not require_subject or _explicit_subject_anchor(draft)):
             return draft
 
@@ -1118,11 +1136,11 @@ class Dehydrator:
                 "待消解内容含敏感凭据，拒绝把外部模型的脱敏结果写回记忆"
             )
         if not self.api_available or self.client is None:
-            raise SelfContainmentError("自包含审计 API 不可用，已拒绝写入")
+            return _bail("自包含审计 API 不可用")
         source_for_api = redacted_source[:5000]
         draft_for_api = redacted_draft[:3000]
         if len(source) > len(source_for_api) or len(draft) > len(draft_for_api):
-            raise SelfContainmentError("内容超出指代消解安全上限，已拒绝写入")
+            return _bail("内容超出指代消解安全上限")
         occurrence_payload = [
             {
                 "id": item["id"],
@@ -1199,7 +1217,7 @@ class Dehydrator:
                 response.choices[0].message.content or ""
             )
             if payload.get("status") == "ambiguous":
-                raise SelfContainmentError(
+                return _bail(
                     f"无法唯一确认指代或事实缺少主体：{', '.join(risks) or '无主体'}"
                 )
             candidate, last_error = self._apply_self_containment_mapping(
@@ -1215,13 +1233,12 @@ class Dehydrator:
             return candidate
 
         logger.warning(
-            "Self-containment mapping failed closed: risks=%s reason=%s",
+            "Self-containment mapping failed: risks=%s reason=%s fail_open=%s",
             risks,
             last_error,
+            fail_open,
         )
-        raise SelfContainmentError(
-            f"自包含映射未通过校验：{', '.join(risks) or '无主体'}"
-        )
+        return _bail(f"自包含映射未通过校验：{', '.join(risks) or '无主体'}")
 
     # ---------------------------------------------------------
     # Dehydrate: compress raw content into concise summary
@@ -1562,7 +1579,13 @@ class Dehydrator:
     # For the "grow" tool — "dump a day's content and it gets organized"
     # 给 grow 工具用，"一天结束发一坨内容"靠这个
     # ---------------------------------------------------------
-    async def digest(self, content: str) -> list[dict]:
+    async def digest(
+        self,
+        content: str,
+        *,
+        fail_open: bool = False,
+        unresolved_sink: list | None = None,
+    ) -> list[dict]:
         """
         Split a large chunk of daily content into independent memory entries.
         将一大段日常内容拆分成多个独立记忆条目。
@@ -1584,9 +1607,15 @@ class Dehydrator:
                 content.strip(),
                 source_context=content.strip(),
                 require_subject=False,
+                fail_open=fail_open,
+                unresolved_sink=unresolved_sink,
             )
             content = redact_embedding_input(content)
-            result = await self._api_digest(content)
+            result = await self._api_digest(
+                content,
+                fail_open=fail_open,
+                unresolved_sink=unresolved_sink,
+            )
             if result:
                 return result
             raise RuntimeError("API 日记整理返回空结果")
@@ -1599,7 +1628,13 @@ class Dehydrator:
     # API call: diary digest
     # API 调用：日记整理
     # ---------------------------------------------------------
-    async def _api_digest(self, content: str) -> list[dict]:
+    async def _api_digest(
+        self,
+        content: str,
+        *,
+        fail_open: bool = False,
+        unresolved_sink: list | None = None,
+    ) -> list[dict]:
         """
         Call LLM API for diary organization.
         调用 LLM API 执行日记整理。
@@ -1620,16 +1655,22 @@ class Dehydrator:
             if attempt > 0:
                 await asyncio.sleep(2 ** attempt)
             try:
-                response = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
+                digest_request = {
+                    "model": self.model,
+                    "messages": [
                         {"role": "system", "content": DIGEST_PROMPT},
                         {"role": "user", "content": content[:5000]},
                     ],
-                    max_tokens=4096,
-                    temperature=0.0,
-                    response_format={"type": "json_object"},
-                )
+                    "max_tokens": 4096,
+                    "temperature": 0.0,
+                    "response_format": {"type": "json_object"},
+                }
+                # DeepSeek reasoning shares the response budget; long diary
+                # inputs can otherwise spend all 4096 tokens on hidden thought
+                # and return an empty body.
+                if self.self_containment_disable_thinking:
+                    digest_request["extra_body"] = {"thinking": {"type": "disabled"}}
+                response = await self.client.chat.completions.create(**digest_request)
             except Exception as e:
                 logger.warning(f"Diary digest API error, retrying / API 异常重试 (attempt {attempt + 1}/3): {e}")
                 continue
@@ -1643,7 +1684,11 @@ class Dehydrator:
             last_raw = raw
 
             try:
-                items = self._parse_digest(raw)
+                items = self._parse_digest(
+                    raw,
+                    fail_open=fail_open,
+                    unresolved_sink=unresolved_sink,
+                )
             except SelfContainmentError as exc:
                 last_self_containment_error = exc
                 logger.warning(
@@ -1665,6 +1710,8 @@ class Dehydrator:
                         checked["content"] = await self.ensure_self_contained(
                             checked.get("content", ""),
                             source_context=content,
+                            fail_open=fail_open,
+                            unresolved_sink=unresolved_sink,
                         )
                         checked["entities"] = self._validated_entity_mentions(
                             checked.get("entities"), checked["content"]
@@ -1693,7 +1740,13 @@ class Dehydrator:
     # Parse diary digest result with safety checks
     # 解析日记整理结果，做安全校验
     # ---------------------------------------------------------
-    def _parse_digest(self, raw: str) -> list[dict]:
+    def _parse_digest(
+        self,
+        raw: str,
+        *,
+        fail_open: bool = False,
+        unresolved_sink: list | None = None,
+    ) -> list[dict]:
         """
         Parse and validate API diary digest result.
         解析并校验 API 返回的日记整理结果。
@@ -1724,9 +1777,12 @@ class Dehydrator:
             else:
                 unresolved = []
             if unresolved:
-                raise SelfContainmentError(
-                    f"日记来源仍有无法唯一确认的指代：{', '.join(unresolved[:5])}"
-                )
+                reason = f"日记来源仍有无法唯一确认的指代：{', '.join(unresolved[:5])}"
+                if not fail_open:
+                    raise SelfContainmentError(reason)
+                logger.info("digest fail-open: %s", reason)
+                if unresolved_sink is not None:
+                    unresolved_sink.append(reason)
             items = parsed.get("entries")
         else:
             items = parsed

@@ -189,7 +189,14 @@ async def test_entity_only_channel_reuses_all_authority_filters(tmp_path, monkey
     def z_filter(values, *, query, intent):
         return [bucket for bucket in values if bucket["id"] != "z-bad"]
 
-    async def ds_filter(query, values, *, mode, max_results):
+    async def ds_filter(
+        query,
+        values,
+        *,
+        mode,
+        max_results,
+        allow_empty=False,
+    ):
         return [bucket for bucket in values if bucket["id"] != "nsfw-bad"][:max_results]
 
     monkeypatch.setattr(server, "_filter_z_fact_candidates", z_filter)

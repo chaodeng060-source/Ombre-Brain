@@ -204,6 +204,53 @@ async def test_api_breath_search_does_not_touch_returned_buckets(tmp_path, monke
     assert fake_mgr.touched == []
 
 
+def test_ds_keep_parser_distinguishes_valid_empty_from_bad_payload():
+    assert server._parse_ds_keep_indices('{"keep": []}', 3) == []
+    assert server._parse_ds_keep_indices('{"keep": [0, 2]}', 3) == [0, 2]
+    assert server._parse_ds_keep_indices('not-json', 3) is None
+    assert server._parse_ds_keep_indices('{"keep": [99]}', 3) is None
+    assert server._normalize_anchor_recall_policy("conversation") == "conversation"
+    assert server._normalize_anchor_recall_policy("made-up") == "search"
+
+
+@pytest.mark.asyncio
+async def test_anchor_conversation_policy_allows_valid_empty(monkeypatch):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+
+    async def _create(**_kw):
+        msg = types.SimpleNamespace(content='{"keep": []}')
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+
+    monkeypatch.setattr(server, "dehydrator", _fake_dehydrator_with_response(_create))
+    buckets = [_bucket("a", "A"), _bucket("b", "B")]
+
+    assert await server._ds_filter_candidates(
+        "无关查询", buckets, mode="search", max_results=2, allow_empty=True
+    ) == []
+    assert [b["id"] for b in await server._ds_filter_candidates(
+        "主动搜索", buckets, mode="search", max_results=2, allow_empty=False
+    )] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_api_breath_forwards_anchor_policy(monkeypatch):
+    observed = {}
+
+    async def fake_breath(**kwargs):
+        observed.update(kwargs)
+        return "未找到相关记忆。"
+
+    monkeypatch.setattr(server, "breath", fake_breath)
+    response = await server.api_breath(
+        _JsonRequest({"query": "随便问问", "policy": "conversation"})
+    )
+
+    payload = json.loads(response.body)
+    assert observed["policy"] == "conversation"
+    assert payload["policy"] == "conversation"
+
+
 @pytest.mark.asyncio
 async def test_breath_applies_intent_recall_channel_budgets(tmp_path, monkeypatch):
     buckets = [
