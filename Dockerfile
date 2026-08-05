@@ -18,8 +18,10 @@ RUN python -c "from mcp.server.fastmcp import FastMCP"
 
 # Copy project files / 复制项目文件
 COPY *.py .
+COPY vendor ./vendor
 COPY dashboard.html .
 COPY config.example.yaml ./config.yaml
+RUN python -c "from vendor.anchor_memory.recall_v2 import POLICIES; assert 'conversation' in POLICIES"
 
 # Persistent mount point: bucket data
 # 持久化挂载点：记忆数据
