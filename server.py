@@ -3745,12 +3745,13 @@ async def breath(
             state_link_candidates,
             recall_policy,
         )[:state_link_budget]
-    set_recall_partial_result(_local_partial_recall_text(
-        matches,
-        max_results=max(0, max_results - len(state_link_candidates)),
-        max_tokens=max_tokens,
-        state_profile=state_profile,
-    ))
+    with recall_stage("assembly"):
+        set_recall_partial_result(_local_partial_recall_text(
+            matches,
+            max_results=max(0, max_results - len(state_link_candidates)),
+            max_tokens=max_tokens,
+            state_profile=state_profile,
+        ))
     with recall_stage("ds_filter"):
         matches = await _ds_filter_candidates(
             recall_query,
@@ -3759,12 +3760,13 @@ async def breath(
             max_results=max(0, max_results - len(state_link_candidates)),
             allow_empty=allow_empty_recall,
         )
-    set_recall_partial_result(_local_partial_recall_text(
-        matches,
-        max_results=max(0, max_results - len(state_link_candidates)),
-        max_tokens=max_tokens,
-        state_profile=state_profile,
-    ))
+    with recall_stage("assembly"):
+        set_recall_partial_result(_local_partial_recall_text(
+            matches,
+            max_results=max(0, max_results - len(state_link_candidates)),
+            max_tokens=max_tokens,
+            state_profile=state_profile,
+        ))
 
     start_recall_stage("assembly")
     results = []
