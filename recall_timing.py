@@ -33,6 +33,20 @@ def reset_recall_timing(token: contextvars.Token) -> None:
     _recall_timing.reset(token)
 
 
+def set_recall_partial_result(value: str) -> None:
+    state = _recall_timing.get()
+    if isinstance(state, dict):
+        state["partial_result"] = str(value or "")
+
+
+def get_recall_partial_result() -> str:
+    state = _recall_timing.get()
+    if not isinstance(state, dict):
+        return ""
+    value = state.get("partial_result")
+    return value if isinstance(value, str) else ""
+
+
 def record_recall_stage(name: str, elapsed_seconds: float) -> None:
     state = _recall_timing.get()
     if not isinstance(state, dict):

@@ -169,9 +169,11 @@ from recall_history import (
 from recall_timing import (
     begin_recall_timing,
     finish_recall_timing,
+    get_recall_partial_result,
     recall_stage,
     record_recall_stage,
     reset_recall_timing,
+    set_recall_partial_result,
 )
 from lmc5_ledger import (
     LMC5Ledger,
@@ -1728,6 +1730,59 @@ async def _dehydrate_for_recall(content: str, metadata: dict) -> str:
         metadata,
         write_cache=False,
     )
+
+
+def _local_partial_recall_text(
+    candidates: list[dict],
+    *,
+    max_results: int,
+    max_tokens: int,
+    state_profile: dict,
+) -> str:
+    """Render already-approved candidates without another external API call."""
+    rendered: list[str] = []
+    token_used = 0
+    for bucket in candidates[:max_results]:
+        bucket_id = str(bucket.get("id") or "")
+        if not bucket_id:
+            continue
+        content = strip_wikilinks(str(bucket.get("content") or "")).strip()
+        excerpt = ""
+        try:
+            payload = json.loads(content)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            summary = payload.get("summary")
+            if isinstance(summary, str) and summary.strip():
+                excerpt = summary.strip()
+            else:
+                facts = payload.get("core_facts")
+                if isinstance(facts, list):
+                    excerpt = "；".join(
+                        str(item).strip()
+                        for item in facts[:2]
+                        if str(item).strip()
+                    )
+        if not excerpt:
+            excerpt = re.sub(r"\s+", " ", content)[:800].strip()
+        excerpt = redact_text(excerpt)
+        if not excerpt:
+            continue
+        prefix = _recall_prefix(
+            bucket_id,
+            "main",
+            "curated_rrf_partial",
+            bucket=bucket,
+            state_profile=state_profile,
+        )
+        line = f"{prefix} {excerpt}"
+        line_tokens = count_tokens_approx(line)
+        if token_used + line_tokens > max_tokens:
+            break
+        rendered.append(line)
+        token_used += line_tokens
+    return "\n---\n".join(rendered)
 
 
 # =============================================================
@@ -3688,6 +3743,12 @@ async def breath(
             state_link_candidates,
             recall_policy,
         )[:state_link_budget]
+    set_recall_partial_result(_local_partial_recall_text(
+        matches,
+        max_results=max(0, max_results - len(state_link_candidates)),
+        max_tokens=max_tokens,
+        state_profile=state_profile,
+    ))
     with recall_stage("ds_filter"):
         matches = await _ds_filter_candidates(
             recall_query,
@@ -3696,6 +3757,12 @@ async def breath(
             max_results=max(0, max_results - len(state_link_candidates)),
             allow_empty=allow_empty_recall,
         )
+    set_recall_partial_result(_local_partial_recall_text(
+        matches,
+        max_results=max(0, max_results - len(state_link_candidates)),
+        max_tokens=max_tokens,
+        state_profile=state_profile,
+    ))
 
     assembly_started_at = time.perf_counter()
     results = []
@@ -3755,6 +3822,7 @@ async def breath(
                 )
                 summary = f"{prefix} {summary}"
             results.append(summary)
+            set_recall_partial_result("\n---\n".join(results))
             result_buckets.append(bucket)
             result_ids.append(bucket["id"])
             fingerprint = default_content_fingerprint(str(bucket.get("content") or ""))
@@ -7066,6 +7134,18 @@ async def api_import_review(request):
 # Twin REST endpoints — bridge for Telegram bot (and other thin frontends)
 # Twin REST 接口 —— 给 Telegram bot（及其他薄前端）用的桥接
 # =============================================================
+def _breath_deadline_sec() -> float:
+    raw = os.getenv(
+        "OMBRE_BREATH_DEADLINE_SEC",
+        str(config.get("breath_deadline_sec", 11.0)),
+    )
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 11.0
+    return max(0.1, min(value, 13.0))
+
+
 @mcp.custom_route("/api/breath", methods=["POST"])
 async def api_breath(request):
     """HTTP bridge to the read-only ``breath`` tool.
@@ -7104,9 +7184,11 @@ async def api_breath(request):
     requested_policy = str(body.get("policy") or "search").strip().lower()
     recall_policy = _normalize_anchor_recall_policy(requested_policy)
     timing_token = begin_recall_timing()
+    breath_task = None
+    partial = False
     try:
         try:
-            result = await breath(
+            breath_task = asyncio.create_task(breath(
                 query=query,
                 max_tokens=_int_arg("max_tokens", BREATH_DEFAULT_MAX_TOKENS),
                 domain=str(body.get("domain") or ""),
@@ -7122,8 +7204,28 @@ async def api_breath(request):
                 include_images=False,
                 include_body_state=False,
                 reset_body_state=False,
+            ))
+            done, _pending = await asyncio.wait(
+                {breath_task},
+                timeout=_breath_deadline_sec(),
             )
+            if done:
+                result = breath_task.result()
+            else:
+                partial = True
+                result = get_recall_partial_result().strip() or "未找到相关记忆。"
+                breath_task.cancel()
+                try:
+                    await breath_task
+                except asyncio.CancelledError:
+                    pass
         except asyncio.CancelledError:
+            if breath_task is not None and not breath_task.done():
+                breath_task.cancel()
+                try:
+                    await breath_task
+                except asyncio.CancelledError:
+                    pass
             timing = finish_recall_timing(status="cancelled", partial=True)
             logger.info("breath_timing=%s", json.dumps(timing, sort_keys=True))
             raise
@@ -7136,7 +7238,10 @@ async def api_breath(request):
                 status_code=500,
             )
 
-        timing = finish_recall_timing(status="ok", partial=False)
+        timing = finish_recall_timing(
+            status="deadline" if partial else "ok",
+            partial=partial,
+        )
         logger.info("breath_timing=%s", json.dumps(timing, sort_keys=True))
     finally:
         reset_recall_timing(timing_token)
@@ -7153,7 +7258,7 @@ async def api_breath(request):
     return JSONResponse({
         "raw": text,
         "policy": recall_policy,
-        "partial": False,
+        "partial": partial,
         "timing": timing,
     })
 

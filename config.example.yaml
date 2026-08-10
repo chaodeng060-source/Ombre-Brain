@@ -298,6 +298,10 @@ query_expansion:
   # 可选扩写必须先于调用方总闸回退原查询；0/负值会钳到 0.1 秒。
   timeout_sec: 3.0
 
+# Twin 的外层总闸是 14 秒。2026-08-10 真实 auto-breath 分段显示完整请求
+# 需 26.5~89.1 秒；11 秒给传输留 3 秒，并在到点时返回已形成的候选。
+breath_deadline_sec: 11.0
+
 # --- Recall evidence roles / 召回证据角色 ---
 # 主结果角色标记默认关闭以兼容旧客户端；Y 轴 association 无论此开关如何都会显式标成
 # supporting_only，避免关系旁证看起来像主事实依据。

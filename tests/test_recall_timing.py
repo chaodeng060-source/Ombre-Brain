@@ -11,6 +11,7 @@ from recall_timing import (
     finish_recall_timing,
     record_recall_stage,
     reset_recall_timing,
+    set_recall_partial_result,
 )
 
 
@@ -128,3 +129,79 @@ async def test_api_breath_logs_timing_before_propagating_cancellation(monkeypatc
     assert '"partial": true' in caplog.text
     assert '"elapsed_ms": 3.0' in caplog.text
     assert "private cancellation" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_api_breath_deadline_returns_available_partial(monkeypatch):
+    cancelled = False
+
+    async def hanging_breath(**_kwargs):
+        nonlocal cancelled
+        set_recall_partial_result("[bucket_id:abc123] available candidate")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    monkeypatch.setattr(server, "breath", hanging_breath)
+    monkeypatch.setattr(server, "_breath_deadline_sec", lambda: 0.01)
+    response = await server.api_breath(_JsonRequest({"query": "deadline query"}))
+
+    payload = json.loads(response.body)
+    assert response.status_code == 200
+    assert payload["raw"] == "[bucket_id:abc123] available candidate"
+    assert payload["partial"] is True
+    assert payload["timing"]["status"] == "deadline"
+    assert payload["timing"]["partial"] is True
+    assert cancelled is True
+
+
+@pytest.mark.asyncio
+async def test_api_breath_deadline_without_candidate_returns_empty(monkeypatch):
+    async def hanging_breath(**_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(server, "breath", hanging_breath)
+    monkeypatch.setattr(server, "_breath_deadline_sec", lambda: 0.01)
+    response = await server.api_breath(_JsonRequest({"query": "deadline query"}))
+
+    payload = json.loads(response.body)
+    assert response.status_code == 200
+    assert payload["raw"] == "未找到相关记忆。"
+    assert payload["partial"] is True
+    assert payload["timing"]["status"] == "deadline"
+
+
+def test_breath_deadline_is_bounded(monkeypatch):
+    monkeypatch.setenv("OMBRE_BREATH_DEADLINE_SEC", "99")
+    assert server._breath_deadline_sec() == 13.0
+    monkeypatch.setenv("OMBRE_BREATH_DEADLINE_SEC", "bad")
+    assert server._breath_deadline_sec() == 11.0
+
+
+def test_local_partial_renderer_keeps_order_limit_and_redacts_secrets():
+    candidates = [
+        {
+            "id": "aaa111",
+            "content": json.dumps({"summary": "first api_key=sk-secret123456789"}),
+            "metadata": {"name": "first", "domain": []},
+        },
+        {
+            "id": "bbb222",
+            "content": json.dumps({"summary": "second"}),
+            "metadata": {"name": "second", "domain": []},
+        },
+    ]
+
+    text = server._local_partial_recall_text(
+        candidates,
+        max_results=1,
+        max_tokens=1000,
+        state_profile={},
+    )
+
+    assert "[bucket_id:aaa111]" in text
+    assert "[bucket_id:bbb222]" not in text
+    assert "sk-secret123456789" not in text
+    assert "[REDACTED]" in text
