@@ -6,6 +6,7 @@ from status_validity import (
     VIEW_HISTORICAL,
     VIEW_NEUTRAL,
     bucket_is_operational_status,
+    is_operational_status_fact,
     operational_status_query_view,
     validity_label,
 )
@@ -34,6 +35,18 @@ def test_operational_classifier_excludes_protected_narrative_memory():
     assert bucket_is_operational_status(_bucket("a", "服务已经部署完成"))
     protected = _bucket("b", "纪念日安排已经完成", ["纪念日"])
     assert not bucket_is_operational_status(protected)
+    protected_engineering = _bucket(
+        "c",
+        "旧工程已经部署完成，commit 已推送",
+        ["恋爱"],
+    )
+    protected_engineering["metadata"]["type"] = "feel"
+    assert not is_operational_status_fact(
+        protected_engineering["content"],
+        protected_engineering["metadata"]["domain"],
+        bucket_type="feel",
+    )
+    assert bucket_is_operational_status(protected_engineering)
 
 
 def test_reading_absent_sidecar_does_not_create_it(tmp_path):

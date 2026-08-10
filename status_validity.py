@@ -137,18 +137,30 @@ def is_operational_status_fact(
 
 
 def bucket_is_operational_status(bucket: Mapping | None) -> bool:
+    """Recognize status evidence for rendering, including protected history.
+
+    Narrative/protected buckets remain ineligible for automatic supersession,
+    but a current-status query must still label their embedded engineering
+    snapshot as unknown rather than silently presenting it as current.
+    """
     if not isinstance(bucket, Mapping):
         return False
     metadata = bucket.get("metadata", {})
     metadata = metadata if isinstance(metadata, Mapping) else {}
     if metadata.get("validity_kind") == VALIDITY_KIND:
         return True
-    return is_operational_status_fact(
-        str(bucket.get("content") or ""),
-        metadata.get("domain"),
-        bucket_type=str(metadata.get("type") or "dynamic"),
-        pinned=bool(metadata.get("pinned")),
-        protected=bool(metadata.get("protected")),
+    text = str(bucket.get("content") or "")
+    domains = {item.strip().lower() for item in _metadata_list(metadata.get("domain"))}
+    return bool(
+        _STATUS_RE.search(text)
+        and (
+            any(
+                hint in domain
+                for domain in domains
+                for hint in _ENGINEERING_DOMAIN_HINTS
+            )
+            or any(hint.lower() in text.lower() for hint in _TECHNICAL_CONTENT_HINTS)
+        )
     )
 
 
