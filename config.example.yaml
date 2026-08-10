@@ -302,6 +302,14 @@ query_expansion:
 recall_evidence_roles:
   enabled: false
 
+# --- State-aware fact recall / 状态感知事实召回 ---
+# 只读取 Z 轴人工批准后写下的 current/historical 双向链；不建新向量库、不调用模型，
+# 也不让状态链进入 RRF 主排序。enabled=false 精确回到原 Z 轴过滤行为。
+state_aware_recall:
+  enabled: true
+  evidence_labels: true
+  state_link_limit: 2             # 每次最多补几条已验证的状态链证据（硬上限 3）
+
 # --- Typed relation recall / 类型化关系召回 ---
 # propagation_only=false 是上线前的精确旧行为/紧急回滚；打开后仅
 # causes/contributes/improves/explains 可传播，kin/updates 只记录关系。

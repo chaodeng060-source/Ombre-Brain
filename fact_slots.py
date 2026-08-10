@@ -21,6 +21,34 @@ FACT_STATUSES = frozenset({
     FACT_STATUS_CONTESTED,
 })
 
+STATE_VIEW_CURRENT = "current"
+STATE_VIEW_HISTORICAL = "historical"
+STATE_VIEW_TRANSITION = "transition"
+STATE_VIEW_NEUTRAL = "neutral"
+STATE_VIEWS = frozenset({
+    STATE_VIEW_CURRENT,
+    STATE_VIEW_HISTORICAL,
+    STATE_VIEW_TRANSITION,
+    STATE_VIEW_NEUTRAL,
+})
+
+_HISTORICAL_STATE_HINTS = (
+    "以前", "过去", "上次", "历史", "当时", "之前", "曾经", "原来", "最初",
+    "old", "previous", "historical", "before", "back then", "used to",
+)
+_CURRENT_STATE_HINTS = (
+    "现在", "当前", "目前", "如今", "最新", "现用", "现行", "此刻",
+    "now", "current", "currently", "latest", "at present",
+)
+_TRANSITION_STATE_HINTS = (
+    "变化", "变成", "改成", "换成", "更新为", "取代", "替代", "搬到",
+    "不再", "而是", "怎么变", "如何变", "演变", "change", "changed",
+    "evolve", "evolved", "update", "updated", "replace", "replaced",
+    "no longer",
+)
+_NEGATION_HINTS = ("不再", "不是", "并非", "没有", "never", "no longer", "not")
+_SCOPE_HINTS = ("只在", "仅在", "除非", "例外", "except", "only when", "under")
+
 # Emotional/narrative memory is not a mutable fact table.
 PROTECTED_FACT_DOMAINS = frozenset({"恋爱", "纪念日", "约定", "家庭", "自省", "feel"})
 NARRATIVE_FACT_TYPES = frozenset({"feel", "episode", "saga"})
@@ -101,9 +129,46 @@ def registered_fact_query_matches(
     if not normalized_query:
         return frozenset()
 
+    matched_keys, matched_labels = _registered_fact_slot_mentions(
+        normalized_query,
+        registry,
+    )
+
+    if not matched_keys:
+        return frozenset()
+
+    exact_alias_query = normalized_query in matched_labels
+    has_fact_cue = any(cue in normalized_query for cue in _FACT_QUERY_CUES)
+    has_narrative_cue = any(cue in normalized_query for cue in _NARRATIVE_QUERY_CUES)
+    if not exact_alias_query and (not has_fact_cue or has_narrative_cue):
+        return frozenset()
+    return frozenset(matched_keys)
+
+
+def registered_fact_slot_mentions(
+    query: str,
+    registry: Mapping | None,
+) -> frozenset[str]:
+    """Return unambiguous registered slots mentioned by any query shape.
+
+    Unlike :func:`registered_fact_query_matches`, this does not require an
+    exact-fact question.  It is used by the state overlay for historical and
+    transition questions such as ``主色从以前到现在怎么变了``.
+    """
+    normalized_query = " ".join(str(query or "").strip().lower().split())
+    if not normalized_query:
+        return frozenset()
+    matched_keys, _ = _registered_fact_slot_mentions(normalized_query, registry)
+    return frozenset(matched_keys)
+
+
+def _registered_fact_slot_mentions(
+    normalized_query: str,
+    registry: Mapping | None,
+) -> tuple[set[str], set[str]]:
     slots = normalize_fact_slot_registry(registry)
     if not slots:
-        return frozenset()
+        return set(), set()
 
     label_to_keys: defaultdict[str, set[str]] = defaultdict(set)
     for key, labels in slots.items():
@@ -119,16 +184,57 @@ def registered_fact_query_matches(
             continue
         matched_labels.add(label)
         matched_keys.update(keys)
+    return matched_keys, matched_labels
 
-    if not matched_keys:
-        return frozenset()
 
-    exact_alias_query = normalized_query in matched_labels
-    has_fact_cue = any(cue in normalized_query for cue in _FACT_QUERY_CUES)
-    has_narrative_cue = any(cue in normalized_query for cue in _NARRATIVE_QUERY_CUES)
-    if not exact_alias_query and (not has_fact_cue or has_narrative_cue):
-        return frozenset()
-    return frozenset(matched_keys)
+def profile_fact_state_query(
+    query: str,
+    registry: Mapping | None,
+) -> dict:
+    """Infer the requested state view with deterministic lexical rules.
+
+    This is the lightweight A-TMA query-profiler shape: it never calls a
+    model, and it activates only when the query unambiguously mentions a
+    registered fact slot.  Plain exact-fact questions keep Ombre's established
+    current-state default; narrative mentions without a state cue stay neutral.
+    """
+    normalized = " ".join(str(query or "").strip().lower().split())
+    fact_keys = registered_fact_slot_mentions(normalized, registry)
+    historical = tuple(hint for hint in _HISTORICAL_STATE_HINTS if hint in normalized)
+    current = tuple(hint for hint in _CURRENT_STATE_HINTS if hint in normalized)
+    transition = tuple(hint for hint in _TRANSITION_STATE_HINTS if hint in normalized)
+    from_to = bool(
+        re.search(r"从.{1,120}(?:到|变成|改成|换成)", normalized)
+        or re.search(r"\bfrom\b.{1,160}\b(?:to|into)\b", normalized)
+    )
+    transition_count = len(transition) + int(from_to)
+
+    view = STATE_VIEW_NEUTRAL
+    if fact_keys:
+        if transition_count and (
+            transition_count >= max(len(historical), len(current))
+            or (historical and current)
+        ):
+            view = STATE_VIEW_TRANSITION
+        elif historical and current:
+            view = STATE_VIEW_TRANSITION
+        elif len(historical) > len(current):
+            view = STATE_VIEW_HISTORICAL
+        elif len(current) > len(historical):
+            view = STATE_VIEW_CURRENT
+        elif registered_fact_query_matches(normalized, registry):
+            view = STATE_VIEW_CURRENT
+
+    return {
+        "view": view,
+        "fact_keys": tuple(sorted(fact_keys)),
+        "historical_hints": historical,
+        "current_hints": current,
+        "transition_hints": transition + (("from_to",) if from_to else ()),
+        "negation": any(hint in normalized for hint in _NEGATION_HINTS),
+        "scope": any(hint in normalized for hint in _SCOPE_HINTS),
+        "update_wording": bool(transition_count),
+    }
 
 
 def _query_contains_label(query: str, label: str) -> bool:
@@ -344,3 +450,92 @@ def filter_fact_slot_candidates(
             continue
         kept.append(bucket)
     return kept
+
+
+def fact_state_label(bucket: dict, registry: Mapping | None) -> str:
+    """Return one explicit, registered state label or an empty string."""
+    if is_fact_slot_exempt(bucket):
+        return ""
+    meta = _metadata(bucket)
+    canonical = registered_fact_key(meta.get("fact_key"), registry)
+    if not fact_slot_applies_to_bucket(canonical, bucket, registry):
+        return ""
+    status = str(meta.get("fact_status") or "").strip().lower()
+    return status if status in FACT_STATUSES else ""
+
+
+def align_fact_state_candidates(
+    buckets: Iterable[dict],
+    *,
+    profile: Mapping | None,
+    registry: Mapping | None,
+) -> list[dict]:
+    """Stable-partition candidates so the requested fact state is foregrounded.
+
+    Generic semantic order is preserved inside every partition.  Only buckets
+    belonging to an explicitly mentioned registered slot can move.
+    """
+    candidates = list(buckets)
+    profile = profile if isinstance(profile, Mapping) else {}
+    view = str(profile.get("view") or STATE_VIEW_NEUTRAL)
+    requested = {
+        key
+        for raw_key in _metadata_list(profile.get("fact_keys"))
+        if (key := registered_fact_key(raw_key, registry)) is not None
+    }
+    if not requested or view == STATE_VIEW_NEUTRAL:
+        return candidates
+
+    def partition(bucket: dict) -> int:
+        meta = _metadata(bucket)
+        canonical = registered_fact_key(meta.get("fact_key"), registry)
+        if canonical not in requested or not fact_slot_applies_to_bucket(
+            canonical,
+            bucket,
+            registry,
+        ):
+            return 3
+        status = fact_state_label(bucket, registry)
+        if view == STATE_VIEW_CURRENT:
+            return {
+                FACT_STATUS_CURRENT: 0,
+                FACT_STATUS_CONTESTED: 1,
+                FACT_STATUS_HISTORICAL: 2,
+            }.get(status, 3)
+        if view == STATE_VIEW_HISTORICAL:
+            return {
+                FACT_STATUS_HISTORICAL: 0,
+                FACT_STATUS_CURRENT: 1,
+                FACT_STATUS_CONTESTED: 2,
+            }.get(status, 3)
+        if view == STATE_VIEW_TRANSITION:
+            return 0 if status in {
+                FACT_STATUS_CURRENT,
+                FACT_STATUS_HISTORICAL,
+            } else (1 if status == FACT_STATUS_CONTESTED else 3)
+        return 3
+
+    return sorted(candidates, key=partition)
+
+
+def state_link_target_ids(
+    bucket: dict,
+    *,
+    view: str,
+    registry: Mapping | None,
+) -> tuple[str, ...]:
+    """Return explicit Z lifecycle counterparts relevant to one state view."""
+    status = fact_state_label(bucket, registry)
+    meta = _metadata(bucket)
+    values: list[str] = []
+    if status == FACT_STATUS_HISTORICAL and view in {
+        STATE_VIEW_CURRENT,
+        STATE_VIEW_TRANSITION,
+    }:
+        values.extend(_metadata_list(meta.get("superseded_by_bucket_id")))
+    if status == FACT_STATUS_CURRENT and view in {
+        STATE_VIEW_HISTORICAL,
+        STATE_VIEW_TRANSITION,
+    }:
+        values.extend(_metadata_list(meta.get("supersedes_bucket_ids")))
+    return tuple(dict.fromkeys(value.strip() for value in values if value.strip()))

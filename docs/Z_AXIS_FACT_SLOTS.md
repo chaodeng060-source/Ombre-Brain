@@ -20,6 +20,23 @@ status 和多槽候选都 fail-open，只报告，不隐藏记忆。
 
 精确事实意图只隐藏已登记槽的 `historical` 版本；`current` 和 `contested` 都保留，避免争议事实被静默裁决。时间线、回忆和关系意图保留历史版本。
 
+### 状态感知薄层
+
+生产召回在已有 Z lifecycle 元数据上增加一层确定性视图，设计取自
+[A-TMA (arXiv:2607.01935)](https://arxiv.org/abs/2607.01935) 的状态/查询分层，
+但不另建论文里的完整 bank，也不引入新的模型裁判或排序器。论文未发布作者实现仓库，
+这里依据论文正文和伪代码适配到 Ombre 已有接口。
+
+- 只有查询明确命中已登记 `fact_key` 时才启用；普通回忆保持原排序与原输出。
+- `current` 视图默认回答现状，过滤该槽旧版本；`historical` 视图稳定前置旧版本；
+  `transition` 视图保留新旧两端；无明确槽时为 `neutral`。
+- 只沿 `apply-lifecycle` 已写入且双向一致的 `superseded_by_bucket_id` /
+  `supersedes_bucket_ids` 补最多两条状态证据。generic Y 关系边不能充当状态链。
+- 状态桶在注入文本中显式带 `memory_state` 和 `query_state_view`；补链证据带
+  `authority:state_evidence`，不混进 RRF 主排序，也不标成 supporting-only。
+- `state_aware_recall.enabled=false` 是精确回滚：恢复上线前的 Z 过滤；
+  `evidence_labels=false` 只关标签；`state_link_limit=0` 只关状态补链。
+
 ## 红线
 
 pinned/protected、保护域（恋爱、纪念日、约定、家庭、自省、feel）以及 `feel`、`episode`、`saga` 类型不进入 Z 轴审计或过滤。

@@ -85,10 +85,20 @@ from import_memory import ImportEngine
 from intent_recall import bucket_intent_score_multiplier, resolve_intent_recall_policy
 from fact_conflicts import build_supersedes_audit
 from fact_slots import (
+    FACT_STATUS_CURRENT,
+    FACT_STATUS_HISTORICAL,
+    STATE_VIEW_CURRENT,
+    STATE_VIEW_HISTORICAL,
+    STATE_VIEW_NEUTRAL,
+    STATE_VIEW_TRANSITION,
+    align_fact_state_candidates,
+    fact_state_label,
     fact_slot_applies_to_bucket,
     filter_fact_slot_candidates,
+    profile_fact_state_query,
     registered_fact_query_matches,
     registered_fact_key,
+    state_link_target_ids,
 )
 from query_expand import expand_query
 from lmc5_recall_adapter import fuse_ranked_channels as lmc5_fuse_ranked_channels
@@ -138,7 +148,8 @@ from review_queue import (
     ReviewQueue, make_relation_entry, make_z_pair_entry,
     render_md as _render_review_md,
     KIND_RELATION, KIND_Z_CONFLICT, KIND_METABOLISM,
-    query_requests_history, rest_resolve_status_allowed,
+    query_requests_history,
+    rest_resolve_status_allowed,
 )
 from z_lifecycle import (
     ZLifecycleNotFound,
@@ -666,12 +677,46 @@ def _fact_slot_registry() -> dict:
     return registry if isinstance(registry, dict) else {}
 
 
+def _state_recall_profile(query: str) -> dict:
+    """Return the deterministic query-state profile and rollout switches."""
+    profile = profile_fact_state_query(query, _fact_slot_registry())
+    state_cfg = config.get("state_aware_recall", {}) or {}
+    profile["enabled"] = state_cfg.get("enabled", True) is True
+    profile["evidence_labels"] = state_cfg.get("evidence_labels", True) is True
+    try:
+        link_limit = int(state_cfg.get("state_link_limit", 2))
+    except (TypeError, ValueError):
+        link_limit = 2
+    profile["state_link_limit"] = min(3, max(0, link_limit))
+    return profile
+
+
 def _filter_z_fact_candidates(buckets, *, query: str, intent: str):
     """Apply the canonical Z gate only to exact-current fact questions."""
     candidates = list(buckets)
-    if query_requests_history(query):
+    profile = _state_recall_profile(query)
+    if not profile["enabled"]:
+        if query_requests_history(query):
+            return candidates
+        requested_keys = registered_fact_query_matches(
+            query,
+            _fact_slot_registry(),
+        )
+        return filter_fact_slot_candidates(
+            candidates,
+            intent=intent,
+            registry=_fact_slot_registry(),
+            fact_keys=requested_keys,
+        )
+    if (
+        profile["view"] in {STATE_VIEW_HISTORICAL, STATE_VIEW_TRANSITION}
+        or profile["historical_hints"]
+    ):
         return candidates
-    requested_keys = registered_fact_query_matches(query, _fact_slot_registry())
+    requested_keys = profile["fact_keys"] or registered_fact_query_matches(
+        query,
+        _fact_slot_registry(),
+    )
     return filter_fact_slot_candidates(
         candidates,
         intent=intent,
@@ -752,6 +797,118 @@ def _passes_nonkeyword_recall_filters(
         if not ({str(value).lower() for value in bucket_domains} & requested):
             return False
     return True
+
+
+async def _state_link_recall_candidates(
+    seed_buckets,
+    *,
+    profile: dict,
+    world_filter_set: set | None,
+    domain_filter: list[str] | None,
+    created_after,
+    created_before,
+    excluded_ids,
+    limit: int,
+) -> list[dict]:
+    """Expand only explicit, reciprocal Z lifecycle links for the asked view."""
+    if (
+        not profile.get("enabled")
+        or profile.get("view") == STATE_VIEW_NEUTRAL
+        or not profile.get("fact_keys")
+        or limit <= 0
+    ):
+        return []
+
+    registry = _fact_slot_registry()
+    requested_keys = set(profile["fact_keys"])
+    excluded = {str(value) for value in (excluded_ids or []) if str(value)}
+    seen_sources: set[str] = set()
+    results: list[dict] = []
+
+    for source in seed_buckets:
+        if len(results) >= limit or not isinstance(source, dict):
+            break
+        source_id = str(source.get("id") or "")
+        if not source_id or source_id in seen_sources:
+            continue
+        seen_sources.add(source_id)
+        source_meta = source.get("metadata", {}) or {}
+        source_key = registered_fact_key(source_meta.get("fact_key"), registry)
+        source_status = fact_state_label(source, registry)
+        if source_key not in requested_keys or not source_status:
+            continue
+
+        for target_id in state_link_target_ids(
+            source,
+            view=str(profile["view"]),
+            registry=registry,
+        ):
+            if len(results) >= limit:
+                break
+            if target_id in excluded:
+                continue
+            target = await bucket_mgr.get(target_id)
+            if not target or not _passes_nonkeyword_recall_filters(
+                target,
+                world_filter_set=world_filter_set,
+                domain_filter=domain_filter,
+                created_after=created_after,
+                created_before=created_before,
+            ):
+                continue
+            target_meta = target.get("metadata", {}) or {}
+            target_key = registered_fact_key(target_meta.get("fact_key"), registry)
+            target_status = fact_state_label(target, registry)
+            if target_key != source_key:
+                continue
+            if profile["view"] == STATE_VIEW_CURRENT and target_status != FACT_STATUS_CURRENT:
+                continue
+            if (
+                profile["view"] == STATE_VIEW_HISTORICAL
+                and target_status != FACT_STATUS_HISTORICAL
+            ):
+                continue
+            if profile["view"] == STATE_VIEW_TRANSITION and target_status not in {
+                FACT_STATUS_CURRENT,
+                FACT_STATUS_HISTORICAL,
+            }:
+                continue
+
+            target_supersedes = {
+                str(value)
+                for value in _metadata_list(target_meta.get("supersedes_bucket_ids"))
+                if str(value)
+            }
+            source_supersedes = {
+                str(value)
+                for value in _metadata_list(source_meta.get("supersedes_bucket_ids"))
+                if str(value)
+            }
+            reciprocal = (
+                source_status == FACT_STATUS_HISTORICAL
+                and target_status == FACT_STATUS_CURRENT
+                and str(source_meta.get("superseded_by_bucket_id") or "") == target_id
+                and source_id in target_supersedes
+            ) or (
+                source_status == FACT_STATUS_CURRENT
+                and target_status == FACT_STATUS_HISTORICAL
+                and str(target_meta.get("superseded_by_bucket_id") or "") == source_id
+                and target_id in source_supersedes
+            )
+            if not reciprocal:
+                continue
+
+            candidate = dict(target)
+            candidate["metadata"] = dict(target_meta)
+            candidate["_z_state_relation"] = (
+                f"supersedes:{source_id}"
+                if target_status == FACT_STATUS_CURRENT
+                else f"superseded_by:{source_id}"
+            )
+            candidate["_z_state_via"] = source_id
+            results.append(candidate)
+            excluded.add(target_id)
+    return results
 
 
 def _z_pair_validation_error(current: dict, historical: dict, fact_key: str) -> str:
@@ -888,13 +1045,32 @@ def _recall_prefix(
     *,
     marker: str = "",
     relation: str = "",
+    bucket: dict | None = None,
+    state_profile: dict | None = None,
 ) -> str:
     """Prefix recall snippets; association is always explicit supporting evidence."""
     roles_enabled = (config.get("recall_evidence_roles", {}) or {}).get("enabled", False)
-    if roles_enabled or role != "main":
+    state_label = ""
+    if (
+        state_profile
+        and state_profile.get("enabled")
+        and state_profile.get("evidence_labels")
+        and state_profile.get("view") != STATE_VIEW_NEUTRAL
+        and state_profile.get("fact_keys")
+        and bucket
+    ):
+        state_label = fact_state_label(bucket, _fact_slot_registry())
+    if roles_enabled or role != "main" or state_label:
         parts = [f"[role:{role}]", f"[layer:{layer}]"]
-        if role != "main":
+        if role == "state":
+            parts.append("[authority:state_evidence]")
+        elif role != "main":
             parts.append("[authority:supporting_only]")
+        if state_label:
+            parts.extend((
+                f"[memory_state:{state_label}]",
+                f"[query_state_view:{state_profile['view']}]",
+            ))
         if relation:
             parts.append(f"[relation:{relation}]")
         parts.append(f"[bucket_id:{bucket_id}]")
@@ -3155,6 +3331,8 @@ async def breath(
         e_query_emotion = None
         e_rows_by_bucket = {}
     recall_query, raw_entity_ranked = _resolve_entity_recall(query)
+    state_profile = _state_recall_profile(recall_query)
+    state_seed_by_id: dict[str, dict] = {}
     intent_policy = _resolve_recall_policy(
         recall_query,
         base_recall_limit=recall_limit,
@@ -3208,6 +3386,11 @@ async def breath(
                 existing = keyword_by_id.get(bucket["id"])
                 if existing is None or bucket.get("score", 0) > existing.get("score", 0):
                     keyword_by_id[bucket["id"]] = bucket
+        state_seed_by_id.update({
+            str(bucket["id"]): bucket
+            for bucket in keyword_by_id.values()
+            if bucket.get("id") and _is_main_recall_bucket(bucket)
+        })
         keyword_matches = _filter_z_fact_candidates(
             (
                 bucket
@@ -3266,6 +3449,7 @@ async def breath(
                 bid, bucket.get("content", "")
             ):
                 continue
+            state_seed_by_id[str(bid)] = bucket
             if not _filter_z_fact_candidates(
                 [bucket],
                 query=recall_query,
@@ -3334,6 +3518,7 @@ async def breath(
         b.pop("entity_match", None)
         if bid in entity_bucket_cache:
             b["entity_match"] = True
+        state_seed_by_id[str(bid)] = b
         if not _filter_z_fact_candidates(
             [b],
             query=recall_query,
@@ -3459,11 +3644,39 @@ async def breath(
         )
     matches = _filter_session_seen(matches, session_id)
     matches = _filter_anchor_policy_candidates(matches, recall_policy)
+    matches = align_fact_state_candidates(
+        matches,
+        profile=state_profile,
+        registry=_fact_slot_registry(),
+    )
+    state_link_budget = min(
+        int(state_profile.get("state_link_limit", 0) or 0),
+        max(0, max_results - (1 if matches else 0)),
+    )
+    state_link_candidates = await _state_link_recall_candidates(
+        state_seed_by_id.values(),
+        profile=state_profile,
+        world_filter_set=wf_set,
+        domain_filter=domain_filter,
+        created_after=created_after,
+        created_before=created_before,
+        excluded_ids=(
+            {str(bucket.get("id")) for bucket in matches if bucket.get("id")}
+            | _session_seen_bucket_ids(list(state_seed_by_id.values()), session_id)
+            | _load_session_seen_ids(session_id)
+        ),
+        limit=state_link_budget,
+    )
+    state_link_candidates = _filter_session_seen(state_link_candidates, session_id)
+    state_link_candidates = _filter_anchor_policy_candidates(
+        state_link_candidates,
+        recall_policy,
+    )[:state_link_budget]
     matches = await _ds_filter_candidates(
         recall_query,
         matches,
         mode="search",
-        max_results=max_results,
+        max_results=max(0, max_results - len(state_link_candidates)),
         allow_empty=allow_empty_recall,
     )
 
@@ -3500,6 +3713,8 @@ async def breath(
                     "main",
                     "curated_rrf",
                     marker="[实体关联]",
+                    bucket=bucket,
+                    state_profile=state_profile,
                 )
                 summary = f"{prefix} {summary}"
             elif bucket.get("vector_match"):
@@ -3508,10 +3723,18 @@ async def breath(
                     "main",
                     "curated_rrf",
                     marker="[语义关联]",
+                    bucket=bucket,
+                    state_profile=state_profile,
                 )
                 summary = f"{prefix} {summary}"
             else:
-                prefix = _recall_prefix(bucket["id"], "main", "curated_rrf")
+                prefix = _recall_prefix(
+                    bucket["id"],
+                    "main",
+                    "curated_rrf",
+                    bucket=bucket,
+                    state_profile=state_profile,
+                )
                 summary = f"{prefix} {summary}"
             results.append(summary)
             result_buckets.append(bucket)
@@ -3528,6 +3751,63 @@ async def breath(
         except Exception as e:
             logger.warning(f"Failed to dehydrate search result / 检索结果脱水失败: {e}")
             continue
+
+    # --- Z lifecycle state links: explicit current/history transition evidence ---
+    # This is a bounded overlay over reviewed reciprocal links.  It does not
+    # enter RRF, touch generic Y edges, or alter the underlying vector index.
+    state_messages = []
+    for state_bucket in state_link_candidates:
+        if token_used >= max_tokens or len(result_ids) >= max_results:
+            break
+        state_bucket_id = str(state_bucket.get("id") or "")
+        if not state_bucket_id or state_bucket_id in result_ids:
+            continue
+        try:
+            fingerprint = default_content_fingerprint(
+                str(state_bucket.get("content") or "")
+            )
+            if fingerprint and fingerprint in selected_content_fingerprints:
+                continue
+            clean_meta = {
+                key: value
+                for key, value in state_bucket["metadata"].items()
+                if key != "tags"
+            }
+            summary = await _dehydrate_for_recall(
+                strip_wikilinks(state_bucket["content"]),
+                clean_meta,
+            )
+            summary_tokens = count_tokens_approx(summary)
+            if token_used + summary_tokens > max_tokens:
+                break
+            prefix = _recall_prefix(
+                state_bucket_id,
+                "state",
+                "z_lifecycle",
+                relation=str(state_bucket.get("_z_state_relation") or ""),
+                bucket=state_bucket,
+                state_profile=state_profile,
+            )
+            state_messages.append(f"{prefix} {summary}")
+            token_used += summary_tokens
+            result_buckets.append(state_bucket)
+            result_ids.append(state_bucket_id)
+            if fingerprint:
+                selected_content_fingerprints.add(fingerprint)
+            capture = _breath_candidate_capture.get()
+            if isinstance(capture, list) and len(capture) < max_results:
+                capture.append({"id": state_bucket_id, "summary": summary})
+        except Exception as exc:
+            logger.warning(
+                "Failed to render Z state-link evidence: %s",
+                type(exc).__name__,
+            )
+            continue
+    if state_messages:
+        results.append(
+            "--- 状态链证据（按问题所问的现在/过去/变化使用） ---\n"
+            + "\n---\n".join(state_messages)
+        )
 
     # --- Typed relation expansion: bounded, bidirectional, at most 2 hops ---
     # --- Y 轴关系召回：只从实际展示的主结果出发，关联证据不进主排序 ---
@@ -3608,6 +3888,8 @@ async def breath(
                         f"d{relation_neighbor.depth}"
                         f"←{relation_neighbor.via_id}"
                     ),
+                    bucket=neighbor,
+                    state_profile=state_profile,
                 )
                 neighbor_msgs.append(f"{prefix} {summary}")
                 token_used += summary_tokens
@@ -3701,6 +3983,8 @@ async def breath(
                     "side_channel",
                     "e_emotion",
                     marker="[情绪共鸣]",
+                    bucket=e_bucket,
+                    state_profile=state_profile,
                 )
                 e_side_messages.append(
                     f"{prefix} [resonance:{e_resonance:.3f}] {summary}"
@@ -3769,7 +4053,14 @@ async def breath(
                 for b in drifted:
                     clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                     summary = await _dehydrate_for_recall(strip_wikilinks(b["content"]), clean_meta)
-                    drift_results.append(f"[surface_type: random]\n{summary}")
+                    prefix = _recall_prefix(
+                        b["id"],
+                        "side_channel",
+                        "random_surface",
+                        bucket=b,
+                        state_profile=state_profile,
+                    )
+                    drift_results.append(f"[surface_type: random] {prefix}\n{summary}")
                     result_buckets.append(b)
                     result_ids.append(b["id"])
                 if drift_results:

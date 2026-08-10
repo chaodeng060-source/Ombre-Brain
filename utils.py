@@ -211,6 +211,13 @@ def load_config(config_path: str = None) -> dict:
         "recall_evidence_roles": {
             "enabled": False,
         },
+        "state_aware_recall": {
+            # Thin A-TMA-style overlay over human-reviewed Z lifecycle links.
+            # Disable for the exact pre-overlay Z filtering behavior.
+            "enabled": True,
+            "evidence_labels": True,
+            "state_link_limit": 2,
+        },
         "relation_recall": {
             # False is the exact pre-classification behavior and therefore the
             # emergency rollback.  When enabled, propagation_types replaces
