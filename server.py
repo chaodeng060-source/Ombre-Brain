@@ -73,11 +73,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 
 from bucket_manager import BucketManager, bucket_revision_hash
-from dehydrator import (
-    RECALL_DS_FILTER_CACHE_SCHEMA,
-    Dehydrator,
-    SelfContainmentError,
-)
+from dehydrator import Dehydrator, SelfContainmentError
 from decay_engine import DecayEngine
 from consolidation_engine import ConsolidationEngine
 from episode_engine import EpisodeEngine
@@ -1511,8 +1507,16 @@ def _parse_ds_keep_indices(raw: str, n: int) -> list[int] | None:
     return out
 
 
-def _ds_semantic_prompts(query: str, buckets: list[dict]) -> tuple[str, str]:
-    """Build the exact redacted prompt used by the recall relevance gate."""
+async def _ds_semantic_select(
+    query: str,
+    buckets: list[dict],
+    keep: set[str],
+    max_results: int,
+) -> list[dict]:
+    """用 DeepSeek 判断每条候选是否与 query 语义相关；纯减法（只剔噪、不重排不外拉），forced 恒留。"""
+    client = getattr(dehydrator, "client", None)
+    if client is None:
+        raise RuntimeError("no DeepSeek client configured")
     lines = []
     for i, b in enumerate(buckets):
         name = redact_embedding_input((b.get("metadata", {}) or {}).get("name") or b.get("id", ""))
@@ -1525,72 +1529,6 @@ def _ds_semantic_prompts(query: str, buckets: list[dict]) -> tuple[str, str]:
         "宁可多留也别漏掉明显相关的；只剔除与查询确实无关的。"
     )
     user_prompt = f"查询：{redact_embedding_input(query)}\n\n候选：\n" + "\n".join(lines)
-    return sys_prompt, user_prompt
-
-
-def _ds_filter_cache_key(
-    query: str,
-    buckets: list[dict],
-    *,
-    mode: str,
-    keep: set[str],
-    max_results: int,
-    allow_empty: bool,
-) -> str:
-    """Hash the full successful-decision contract without storing its input."""
-    sys_prompt, user_prompt = _ds_semantic_prompts(query, buckets)
-    candidate_fingerprints = []
-    for bucket in buckets:
-        metadata = bucket.get("metadata", {}) or {}
-        redacted_name = redact_embedding_input(
-            metadata.get("name") or bucket.get("id", "")
-        )
-        redacted_content = redact_embedding_input(
-            (bucket.get("content") or "").strip().replace("\n", " ")
-        )
-        candidate_fingerprints.append({
-            "id": str(bucket.get("id") or ""),
-            "name": redacted_name,
-            "content_sha256": hashlib.sha256(
-                redacted_content.encode("utf-8")
-            ).hexdigest(),
-        })
-    contract = {
-        "schema": RECALL_DS_FILTER_CACHE_SCHEMA,
-        "model": getattr(dehydrator, "model", "deepseek-chat"),
-        "base_url": str(getattr(dehydrator, "base_url", "")),
-        "mode": mode,
-        "force_keep_ids": sorted(keep),
-        "max_results": max_results,
-        "allow_empty": allow_empty,
-        "max_tokens": 200,
-        "temperature": 0.0,
-        "system_prompt": sys_prompt,
-        "user_prompt": user_prompt,
-        # The model sees 200-char snippets, but task acceptance requires any
-        # source-body or identity change to invalidate the derived decision.
-        "ordered_candidate_fingerprints": candidate_fingerprints,
-    }
-    payload = json.dumps(
-        contract,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-async def _ds_semantic_select(
-    query: str,
-    buckets: list[dict],
-    keep: set[str],
-    max_results: int,
-) -> list[dict]:
-    """用 DeepSeek 判断每条候选是否与 query 语义相关；纯减法（只剔噪、不重排不外拉），forced 恒留。"""
-    client = getattr(dehydrator, "client", None)
-    if client is None:
-        raise RuntimeError("no DeepSeek client configured")
-    sys_prompt, user_prompt = _ds_semantic_prompts(query, buckets)
     resp = await client.chat.completions.create(
         model=getattr(dehydrator, "model", "deepseek-chat"),
         messages=[
@@ -1649,31 +1587,6 @@ async def _ds_filter_candidates(
         )
         return capped
 
-    cache_key = _ds_filter_cache_key(
-        query,
-        capped,
-        mode=mode,
-        keep=keep,
-        max_results=max_results,
-        allow_empty=allow_empty,
-    )
-    cache_get = getattr(dehydrator, "get_recall_ds_filter_decision", None)
-    try:
-        cached_indices = cache_get(cache_key) if callable(cache_get) else None
-    except Exception as exc:
-        logger.warning("Ignoring unreadable recall DS decision: %s", exc)
-        cached_indices = None
-    if cached_indices is not None and (
-        len(cached_indices) == len(set(cached_indices))
-        and all(0 <= index < len(capped) for index in cached_indices)
-    ):
-        result = [capped[index] for index in cached_indices]
-        logger.info(
-            "DS filter derived-cache hit mode=%s input=%d capped=%d kept=%d",
-            mode, len(candidates), len(capped), len(result),
-        )
-        return result
-
     try:
         kept = await asyncio.wait_for(
             _ds_semantic_select(query, capped, keep, max_results),
@@ -1687,17 +1600,6 @@ async def _ds_filter_candidates(
         return capped
 
     result = kept if kept or allow_empty else capped
-    selected_ids = {id(bucket) for bucket in result}
-    selected_indices = [
-        index for index, bucket in enumerate(capped)
-        if id(bucket) in selected_ids
-    ]
-    cache_set = getattr(dehydrator, "set_recall_ds_filter_decision", None)
-    if callable(cache_set):
-        try:
-            cache_set(cache_key, selected_indices)
-        except Exception as exc:
-            logger.warning("Unable to persist recall DS decision: %s", exc)
     logger.info(
         "DS filter mode=%s query=%r input=%d capped=%d kept=%d",
         mode, query[:80], len(candidates), len(capped), len(result),

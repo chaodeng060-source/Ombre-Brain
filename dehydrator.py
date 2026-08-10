@@ -43,10 +43,8 @@ logger = logging.getLogger("ombre_brain.dehydrator")
 MIN_DEHYDRATION_SUMMARY_CHARS = 10
 READ_ONLY_DEHYDRATION_CACHE_LIMIT = 256
 RECALL_DEHYDRATION_CACHE_LIMIT = 8192
-RECALL_DS_FILTER_CACHE_LIMIT = 8192
 RECALL_DEHYDRATION_CACHE_SCHEMA_V1 = "ombre.recall-dehydration/v1"
 RECALL_DEHYDRATION_CACHE_SCHEMA = "ombre.recall-dehydration/v2"
-RECALL_DS_FILTER_CACHE_SCHEMA = "ombre.recall-ds-filter/v1"
 RECALL_REDACTION_CONTRACT = "redact_embedding_input/v1"
 RECALL_OUTPUT_CONTRACT = "normalized-summary/v1"
 RECALL_LEGACY_PROMPT_SHA256 = (
@@ -864,14 +862,6 @@ class Dehydrator:
                     "idx_recall_dehydration_content_hash "
                     "ON recall_dehydration_cache (content_hash)"
                 )
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS recall_ds_filter_cache (
-                        cache_key TEXT PRIMARY KEY,
-                        selected_indices TEXT NOT NULL,
-                        cache_schema TEXT NOT NULL,
-                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
-                    )
-                """)
                 conn.commit()
             os.chmod(self.recall_cache_db_path, 0o600)
         except (OSError, sqlite3.Error) as exc:
@@ -1165,84 +1155,6 @@ class Dehydrator:
                 "returning the generated summary: %s",
                 exc,
             )
-            return False
-        return True
-
-    def get_recall_ds_filter_decision(
-        self,
-        cache_key: str,
-    ) -> list[int] | None:
-        """Read an exact-input DS decision from the disposable sidecar."""
-        cache_path = Path(self.recall_cache_db_path).absolute()
-        if not cache_path.is_file():
-            return None
-        try:
-            self._validate_recall_cache_path()
-            with closing(sqlite3.connect(
-                f"{cache_path.as_uri()}?mode=ro",
-                uri=True,
-                timeout=0.0,
-            )) as conn:
-                row = conn.execute(
-                    "SELECT selected_indices FROM recall_ds_filter_cache "
-                    "WHERE cache_key = ? AND cache_schema = ?",
-                    (cache_key, RECALL_DS_FILTER_CACHE_SCHEMA),
-                ).fetchone()
-        except (OSError, sqlite3.Error):
-            return None
-        if not row:
-            return None
-        try:
-            value = json.loads(row[0])
-        except (json.JSONDecodeError, TypeError):
-            return None
-        if not isinstance(value, list) or any(
-            not isinstance(index, int) or isinstance(index, bool)
-            for index in value
-        ):
-            return None
-        return value
-
-    def set_recall_ds_filter_decision(
-        self,
-        cache_key: str,
-        selected_indices: list[int],
-    ) -> bool:
-        """Persist a successful DS decision without storing query or content."""
-        if not cache_key or any(
-            not isinstance(index, int) or isinstance(index, bool)
-            for index in selected_indices
-        ):
-            return False
-        try:
-            self._validate_recall_cache_path()
-            with closing(sqlite3.connect(
-                self.recall_cache_db_path,
-                timeout=0.0,
-            )) as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO recall_ds_filter_cache "
-                    "(cache_key, selected_indices, cache_schema) "
-                    "VALUES (?, ?, ?)",
-                    (
-                        cache_key,
-                        json.dumps(selected_indices, separators=(",", ":")),
-                        RECALL_DS_FILTER_CACHE_SCHEMA,
-                    ),
-                )
-                row_count = conn.execute(
-                    "SELECT count(*) FROM recall_ds_filter_cache"
-                ).fetchone()[0]
-                overflow = row_count - RECALL_DS_FILTER_CACHE_LIMIT
-                if overflow > 0:
-                    conn.execute(
-                        "DELETE FROM recall_ds_filter_cache WHERE cache_key IN ("
-                        "SELECT cache_key FROM recall_ds_filter_cache "
-                        "ORDER BY created_at, cache_key LIMIT ?)",
-                        (overflow,),
-                    )
-                conn.commit()
-        except (OSError, sqlite3.Error):
             return False
         return True
 
