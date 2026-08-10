@@ -43,7 +43,8 @@ logger = logging.getLogger("ombre_brain.dehydrator")
 MIN_DEHYDRATION_SUMMARY_CHARS = 10
 READ_ONLY_DEHYDRATION_CACHE_LIMIT = 256
 RECALL_DEHYDRATION_CACHE_LIMIT = 8192
-RECALL_DEHYDRATION_CACHE_SCHEMA = "ombre.recall-dehydration/v1"
+RECALL_DEHYDRATION_CACHE_SCHEMA_V1 = "ombre.recall-dehydration/v1"
+RECALL_DEHYDRATION_CACHE_SCHEMA = "ombre.recall-dehydration/v2"
 RECALL_REDACTION_CONTRACT = "redact_embedding_input/v1"
 RECALL_OUTPUT_CONTRACT = "normalized-summary/v1"
 RECALL_LEGACY_PROMPT_SHA256 = (
@@ -737,6 +738,17 @@ class Dehydrator:
         self.base_url = dehy_cfg.get("base_url", "https://api.deepseek.com/v1")
         self.max_tokens = dehy_cfg.get("max_tokens", 1024)
         self.temperature = dehy_cfg.get("temperature", 0.1)
+        # DeepSeek's hidden reasoning can consume the entire output budget for
+        # long recall-only dehydration requests, leaving message.content empty.
+        # Keep this provider extension scoped to recall so grow/merge retain
+        # their established write-path behavior.
+        self.recall_dehydration_disable_thinking = (
+            dehy_cfg.get("recall_dehydration_disable_thinking") is True
+            or (
+                "recall_dehydration_disable_thinking" not in dehy_cfg
+                and str(self.base_url).lower().startswith("https://api.deepseek.com")
+            )
+        )
         # DeepSeek reasoning models count hidden reasoning against max_tokens.
         # The self-containment pass needs strict JSON rather than chain-of-thought;
         # keep the provider extension scoped to that pass so generic OpenAI-
@@ -967,6 +979,28 @@ class Dehydrator:
         """Share the exact persistent recall-cache contract in memory."""
         return self._recall_cache_key(content)
 
+    def _recall_cache_key_v1(self, content: str) -> str:
+        """Reproduce the deployed v1 key for one-way sidecar migration."""
+        contract = {
+            "schema": RECALL_DEHYDRATION_CACHE_SCHEMA_V1,
+            "redaction": RECALL_REDACTION_CONTRACT,
+            "output": RECALL_OUTPUT_CONTRACT,
+            "model": self.model,
+            "base_url": self.base_url,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "prompt": DEHYDRATE_PROMPT,
+        }
+        serialized = json.dumps(
+            contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(
+            f"{serialized}\x00{content}".encode()
+        ).hexdigest()
+
     def _recall_cache_key(self, content: str) -> str:
         """Bind a recall summary to the exact model, prompt, config and text."""
         contract = {
@@ -978,6 +1012,7 @@ class Dehydrator:
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "prompt": DEHYDRATE_PROMPT,
+            "disable_thinking": self.recall_dehydration_disable_thinking,
         }
         serialized = json.dumps(
             contract,
@@ -1022,6 +1057,35 @@ class Dehydrator:
                 self._recall_cache_key(content)[:12],
                 len(summary),
             )
+            return None
+        return summary
+
+    def _get_v1_recall_cached_summary(self, content: str) -> str | None:
+        """Read only the exact deployed v1 row before binding it to v2."""
+        cache_path = Path(self.recall_cache_db_path).absolute()
+        if not cache_path.is_file():
+            return None
+        try:
+            self._validate_recall_cache_path()
+            with closing(sqlite3.connect(
+                f"{cache_path.as_uri()}?mode=ro",
+                uri=True,
+                timeout=0.0,
+            )) as conn:
+                row = conn.execute(
+                    "SELECT summary FROM recall_dehydration_cache "
+                    "WHERE cache_key = ? AND cache_schema = ?",
+                    (
+                        self._recall_cache_key_v1(content),
+                        RECALL_DEHYDRATION_CACHE_SCHEMA_V1,
+                    ),
+                ).fetchone()
+        except (OSError, sqlite3.Error):
+            return None
+        if not row:
+            return None
+        summary = self._normalize_dehydration_summary(row[0])
+        if not self._is_usable_dehydration_summary(summary):
             return None
         return summary
 
@@ -1529,6 +1593,11 @@ class Dehydrator:
             if cached:
                 self._set_read_only_memory_summary(content, cached)
                 return self._format_output(cached, metadata)
+            cached = self._get_v1_recall_cached_summary(content)
+            if cached:
+                self._set_recall_cached_summary(content, cached)
+                self._set_read_only_memory_summary(content, cached)
+                return self._format_output(cached, metadata)
 
         cached = None
         if write_cache:
@@ -1558,7 +1627,13 @@ class Dehydrator:
             raise RuntimeError("脱水 API 不可用，请配置 OMBRE_API_KEY")
 
         try:
-            result = await self._api_dehydrate(content)
+            result = await self._api_dehydrate(
+                content,
+                disable_thinking=(
+                    not write_cache
+                    and self.recall_dehydration_disable_thinking
+                ),
+            )
         except Exception as exc:
             logger.warning(
                 "Dehydration API call failed / 脱水 API 调用失败: "
@@ -1624,21 +1699,29 @@ class Dehydrator:
     # API call: dehydration
     # API 调用：脱水压缩
     # ---------------------------------------------------------
-    async def _api_dehydrate(self, content: str) -> str:
+    async def _api_dehydrate(
+        self,
+        content: str,
+        *,
+        disable_thinking: bool = False,
+    ) -> str:
         """
         Call LLM API for intelligent dehydration (via OpenAI-compatible client).
         调用 LLM API 执行智能脱水。
         """
         content = redact_embedding_input(content)
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[
+        request = {
+            "model": self.model,
+            "messages": [
                 {"role": "system", "content": DEHYDRATE_PROMPT},
                 {"role": "user", "content": content[:3000]},
             ],
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-        )
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+        }
+        if disable_thinking:
+            request["extra_body"] = {"thinking": {"type": "disabled"}}
+        response = await self.client.chat.completions.create(**request)
 
         if not response.choices:
             return ""

@@ -10,6 +10,7 @@ from dehydrator import (
     Dehydrator,
     INFER_RELATIONS_PROMPT,
     RECALL_DEHYDRATION_CACHE_SCHEMA,
+    RECALL_DEHYDRATION_CACHE_SCHEMA_V1,
 )
 
 
@@ -105,6 +106,67 @@ async def test_recall_cache_miss_writes_only_disposable_derived_cache(
     )
     assert restarted_output == output
     assert restarted_completions.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_recall_dehydration_disables_deepseek_thinking_only_on_read_path(
+    test_config,
+):
+    valid = '{"core_facts":["长正文仍返回摘要"],"summary":"关闭隐藏思考"}'
+    deepseek_config = {
+        **test_config,
+        "dehydration": {
+            **test_config.get("dehydration", {}),
+            "base_url": "https://api.deepseek.com/v1",
+        },
+    }
+    recall, recall_completions = _dehydrator(deepseek_config, valid)
+
+    await recall.dehydrate(_long_content(), write_cache=False)
+
+    assert recall_completions.requests[0]["extra_body"] == {
+        "thinking": {"type": "disabled"}
+    }
+
+    write_content = _long_content() + "写链保持原调用合同。"
+    writer, writer_completions = _dehydrator(deepseek_config, valid)
+    await writer.dehydrate(write_content, write_cache=True)
+    assert "extra_body" not in writer_completions.requests[0]
+
+
+@pytest.mark.asyncio
+async def test_deployed_v1_recall_summary_migrates_without_api_call(test_config):
+    content = _long_content()
+    summary = '{"core_facts":["v1成功摘要"],"summary":"迁移到v2"}'
+    current, completions = _dehydrator(test_config, "must not be called")
+    with sqlite3.connect(current.recall_cache_db_path) as conn:
+        conn.execute(
+            "INSERT INTO recall_dehydration_cache "
+            "(cache_key, content_hash, summary, model, cache_schema) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                current._recall_cache_key_v1(content),
+                hashlib.sha256(content.encode()).hexdigest(),
+                summary,
+                current.model,
+                RECALL_DEHYDRATION_CACHE_SCHEMA_V1,
+            ),
+        )
+        conn.commit()
+
+    output = await current.dehydrate(content, write_cache=False)
+
+    assert completions.calls == 0
+    assert "v1成功摘要" in output
+    with sqlite3.connect(current.recall_cache_db_path) as conn:
+        rows = conn.execute(
+            "SELECT cache_key, cache_schema FROM recall_dehydration_cache "
+            "ORDER BY cache_schema"
+        ).fetchall()
+    assert rows == [
+        (current._recall_cache_key_v1(content), RECALL_DEHYDRATION_CACHE_SCHEMA_V1),
+        (current._recall_cache_key(content), RECALL_DEHYDRATION_CACHE_SCHEMA),
+    ]
 
 
 @pytest.mark.asyncio
