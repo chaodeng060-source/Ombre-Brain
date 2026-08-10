@@ -25,6 +25,7 @@ def begin_recall_timing() -> contextvars.Token:
         "request_id": uuid4().hex,
         "started_at": time.perf_counter(),
         "stages": {},
+        "active_stages": {},
     }
     return _recall_timing.set(state)
 
@@ -60,6 +61,27 @@ def record_recall_stage(name: str, elapsed_seconds: float) -> None:
     entry["calls"] = int(entry["calls"]) + 1
 
 
+def start_recall_stage(name: str) -> None:
+    state = _recall_timing.get()
+    if not isinstance(state, dict):
+        return
+    active = state.get("active_stages")
+    if isinstance(active, dict):
+        active[name] = time.perf_counter()
+
+
+def finish_recall_stage(name: str) -> None:
+    state = _recall_timing.get()
+    if not isinstance(state, dict):
+        return
+    active = state.get("active_stages")
+    if not isinstance(active, dict):
+        return
+    started_at = active.pop(name, None)
+    if isinstance(started_at, (int, float)):
+        record_recall_stage(name, time.perf_counter() - started_at)
+
+
 @contextmanager
 def recall_stage(name: str) -> Iterator[None]:
     started_at = time.perf_counter()
@@ -90,6 +112,18 @@ def finish_recall_timing(*, status: str, partial: bool) -> dict:
         }
         for name, entry in state["stages"].items()
     }
+    active = state.get("active_stages")
+    if isinstance(active, dict) and active:
+        now = time.perf_counter()
+        for name, started_at in active.items():
+            if not isinstance(started_at, (int, float)):
+                continue
+            entry = stages.setdefault(name, {"elapsed_ms": 0.0, "calls": 0})
+            entry["elapsed_ms"] = round(
+                float(entry["elapsed_ms"]) + max(0.0, now - started_at) * 1000.0,
+                3,
+            )
+            entry["calls"] = int(entry["calls"]) + 1
     attributed_ms = sum(entry["elapsed_ms"] for entry in stages.values())
     return {
         "schema_version": SCHEMA_VERSION,

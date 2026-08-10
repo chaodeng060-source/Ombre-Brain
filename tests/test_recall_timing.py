@@ -9,9 +9,11 @@ from embedding_engine import EmbeddingEngine
 from recall_timing import (
     begin_recall_timing,
     finish_recall_timing,
+    finish_recall_stage,
     record_recall_stage,
     reset_recall_timing,
     set_recall_partial_result,
+    start_recall_stage,
 )
 
 
@@ -205,3 +207,38 @@ def test_local_partial_renderer_keeps_order_limit_and_redacts_secrets():
     assert "[bucket_id:bbb222]" not in text
     assert "sk-secret123456789" not in text
     assert "[REDACTED]" in text
+
+
+def test_open_stage_is_included_when_deadline_receipt_finishes(monkeypatch):
+    ticks = iter((10.0, 11.0, 13.5, 13.5))
+    monkeypatch.setattr("recall_timing.time.perf_counter", lambda: next(ticks))
+    token = begin_recall_timing()
+    try:
+        start_recall_stage("assembly")
+        receipt = finish_recall_timing(status="deadline", partial=True)
+    finally:
+        reset_recall_timing(token)
+
+    assert receipt["total_ms"] == 3500.0
+    assert receipt["stages"]["assembly"] == {
+        "elapsed_ms": 2500.0,
+        "calls": 1,
+    }
+    assert receipt["unattributed_ms"] == 1000.0
+
+
+def test_finished_stage_is_not_double_counted(monkeypatch):
+    ticks = iter((20.0, 21.0, 22.5, 24.0))
+    monkeypatch.setattr("recall_timing.time.perf_counter", lambda: next(ticks))
+    token = begin_recall_timing()
+    try:
+        start_recall_stage("assembly")
+        finish_recall_stage("assembly")
+        receipt = finish_recall_timing(status="ok", partial=False)
+    finally:
+        reset_recall_timing(token)
+
+    assert receipt["stages"]["assembly"] == {
+        "elapsed_ms": 1500.0,
+        "calls": 1,
+    }

@@ -170,10 +170,12 @@ from recall_timing import (
     begin_recall_timing,
     finish_recall_timing,
     get_recall_partial_result,
+    finish_recall_stage,
     recall_stage,
     record_recall_stage,
     reset_recall_timing,
     set_recall_partial_result,
+    start_recall_stage,
 )
 from lmc5_ledger import (
     LMC5Ledger,
@@ -3764,7 +3766,7 @@ async def breath(
         state_profile=state_profile,
     ))
 
-    assembly_started_at = time.perf_counter()
+    start_recall_stage("assembly")
     results = []
     token_used = 0
     result_buckets = []
@@ -4155,7 +4157,7 @@ async def breath(
             logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")
 
     if not results:
-        record_recall_stage("assembly", time.perf_counter() - assembly_started_at)
+        finish_recall_stage("assembly")
         return _append_body_state_block(
             "未找到相关记忆。",
             [],
@@ -4184,7 +4186,7 @@ async def breath(
         reset_body_state,
     )
     _remember_session_seen_ids(session_id, result_ids)
-    record_recall_stage("assembly", time.perf_counter() - assembly_started_at)
+    finish_recall_stage("assembly")
     return await _tool_result_with_optional_images(text, result_buckets, include_images)
 
 
