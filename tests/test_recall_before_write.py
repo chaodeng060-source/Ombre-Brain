@@ -18,6 +18,7 @@ class _Barrier:
 class _Manager:
     def __init__(self, target=None):
         self.target = target
+        self.buckets = {target["id"]: target} if target else {}
         self.created = []
         self.updated = []
         self.expected_hashes = []
@@ -25,12 +26,22 @@ class _Manager:
         self._maintenance_barrier = _Barrier()
 
     async def get(self, bucket_id):
-        if self.target and bucket_id == self.target["id"]:
-            return self.target
-        return None
+        return self.buckets.get(bucket_id)
 
     async def create(self, **kwargs):
         self.created.append(kwargs)
+        self.buckets["new-bucket"] = {
+            "id": "new-bucket",
+            "content": kwargs["content"],
+            "metadata": {
+                "id": "new-bucket",
+                "name": kwargs.get("name") or "new-bucket",
+                "domain": kwargs.get("domain") or ["未分类"],
+                "world": kwargs.get("world") or "",
+                "type": "dynamic",
+                "event_at": "2026-08-11T07:00:00+00:00",
+            },
+        }
         return "new-bucket"
 
     async def update(
@@ -83,6 +94,18 @@ class _Dehydrator:
         return None
 
 
+class _ValidityStore:
+    def __init__(self):
+        self.calls = []
+
+    def mark_supersession(self, **kwargs):
+        self.calls.append(kwargs)
+        return {
+            "status_key": f"status.{kwargs['old_bucket_id']}",
+            "current_bucket_id": kwargs["new_bucket_id"],
+        }
+
+
 def _target(bucket_id="abc123abc123"):
     return {
         "id": bucket_id,
@@ -97,6 +120,7 @@ def _target(bucket_id="abc123abc123"):
             "valence": 0.5,
             "arousal": 0.3,
             "tags": [],
+            "event_at": "2026-08-10T07:00:00+00:00",
         },
     }
 
@@ -122,6 +146,12 @@ async def _run_write(monkeypatch, decision, manager, dehydrator, embedding):
     monkeypatch.setattr(server, "embedding_engine", embedding)
     monkeypatch.setattr(server, "_synchronize_bucket_entities", _no_entity_sync)
     monkeypatch.setattr(server, "_find_merge_candidates", _forbid_legacy_merge_search)
+    validity_store = _ValidityStore()
+    monkeypatch.setattr(
+        server,
+        "_get_operational_status_validity_store",
+        lambda: validity_store,
+    )
 
     result = await server._merge_or_create(
         content="朝灯完成了新版部署。",
@@ -136,6 +166,7 @@ async def _run_write(monkeypatch, decision, manager, dehydrator, embedding):
         recall_before_write=True,
     )
     assert calls == [("朝灯完成了新版部署。", "", ["工程"])]
+    manager.validity_calls = validity_store.calls
     return result
 
 
@@ -273,55 +304,31 @@ async def test_merge_updates_selected_bucket_with_merged_body(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_supersede_replaces_selected_bucket_without_merge(monkeypatch):
+async def test_operational_supersede_preserves_history_and_marks_validity(monkeypatch):
     target = _target()
     manager = _Manager(target=target)
     dehydrator = _Dehydrator()
     embedding = _Embedding()
-    updates = []
 
-    async def _update(
-        bucket_id,
-        changes,
-        *,
-        entities=None,
-        actor="system",
-        expected_content_hash="",
-        expected_revision_hash="",
-    ):
-        updates.append(
-            (bucket_id, changes, entities, actor, expected_revision_hash)
-        )
-        return True
-
-    monkeypatch.setattr(server, "_apply_bucket_update", _update)
     result = await _run_write(
         monkeypatch, f"supersede:{target['id']}", manager, dehydrator, embedding
     )
 
-    assert result == (target["id"], "新版部署", True)
-    assert manager.created == []
+    assert result == ("new-bucket", "新版部署", False)
+    assert len(manager.created) == 1
+    assert manager.created[0]["content"] == "朝灯完成了新版部署。"
+    assert manager.created[0]["actor"] == "grow:recall-before-write:status-successor"
     assert dehydrator.merge_calls == []
     assert dehydrator.self_contained_calls == []
-    assert len(updates) == 1
-    bucket_id, changes, entities, actor, expected_hash = updates[0]
-    assert bucket_id == target["id"]
-    assert entities is None
-    assert actor == "grow:recall-before-write:supersede"
-    assert expected_hash == bucket_revision_hash(
-        "朝灯完成了旧版部署。",
-        target["metadata"],
-    )
-    assert changes == {
-        "content": "朝灯完成了新版部署。",
-        "tags": ["部署"],
-        "importance": 6,
-        "domain": ["工程"],
-        "valence": 0.6,
-        "arousal": 0.4,
-        "sense": [],
-        "name": "新版部署",
-    }
+    assert target["content"] == "朝灯完成了旧版部署。"
+    assert embedding.calls == [("new-bucket", "朝灯完成了新版部署。")]
+    assert manager.validity_calls == [{
+        "old_bucket_id": target["id"],
+        "new_bucket_id": "new-bucket",
+        "old_valid_at": "2026-08-10T07:00:00+00:00",
+        "new_valid_at": "2026-08-11T07:00:00+00:00",
+        "source_ref": "grow:recall-before-write:supersede",
+    }]
 
 
 @pytest.mark.asyncio
@@ -363,13 +370,13 @@ async def test_failed_selected_update_falls_back_to_one_new_bucket(monkeypatch):
 
     monkeypatch.setattr(server, "_apply_bucket_update", _update)
     result = await _run_write(
-        monkeypatch, f"supersede:{target['id']}", manager, dehydrator, embedding
+        monkeypatch, f"merge:{target['id']}", manager, dehydrator, embedding
     )
 
     assert result == ("new-bucket", "新版部署", False)
     assert len(updates) == 1
     assert updates[0][0] == target["id"]
-    assert updates[0][1]["content"] == "朝灯完成了新版部署。"
+    assert updates[0][1]["content"] == "merged body"
     assert len(manager.created) == 1
     assert embedding.calls == [("new-bucket", "朝灯完成了新版部署。")]
 
@@ -430,7 +437,7 @@ async def test_adapter_cannot_return_bucket_outside_recalled_allowlist(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_embedding_failure_after_successful_update_never_creates_duplicate(
+async def test_embedding_failure_after_status_successor_keeps_both_buckets(
     monkeypatch,
 ):
     target = _target()
@@ -442,30 +449,12 @@ async def test_embedding_failure_after_successful_update_never_creates_duplicate
         monkeypatch, f"supersede:{target['id']}", manager, dehydrator, embedding
     )
 
-    assert result == (target["id"], "新版部署", True)
-    assert manager.updated == [
-        (
-            target["id"],
-            "grow:recall-before-write:supersede",
-            {
-                "content": "朝灯完成了新版部署。",
-                "tags": ["部署"],
-                "importance": 6,
-                "domain": ["工程"],
-                "valence": 0.6,
-                "arousal": 0.4,
-                "sense": [],
-                "name": "新版部署",
-            },
-        )
-    ]
-    assert embedding.calls == [(target["id"], "朝灯完成了新版部署。")]
-    assert manager.created == []
-    assert target["content"] == "朝灯完成了新版部署。"
-    assert manager.expected_hashes == [""]
-    assert manager.expected_revision_hashes == [
-        bucket_revision_hash("朝灯完成了旧版部署。", _target()["metadata"])
-    ]
+    assert result == ("new-bucket", "新版部署", False)
+    assert manager.updated == []
+    assert embedding.calls == [("new-bucket", "朝灯完成了新版部署。")]
+    assert len(manager.created) == 1
+    assert target["content"] == "朝灯完成了旧版部署。"
+    assert len(manager.validity_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -532,15 +521,15 @@ async def test_post_write_failure_signal_does_not_create_duplicate(monkeypatch):
     manager = _PostWriteFalseManager(target=target)
     result = await _run_write(
         monkeypatch,
-        f"supersede:{target['id']}",
+        f"merge:{target['id']}",
         manager,
         _Dehydrator(),
         _Embedding(),
     )
 
-    assert result == (target["id"], "新版部署", True)
+    assert result == (target["id"], "旧部署", True)
     assert manager.created == []
-    assert target["content"] == "朝灯完成了新版部署。"
+    assert target["content"] == "merged body"
 
 
 @pytest.mark.asyncio

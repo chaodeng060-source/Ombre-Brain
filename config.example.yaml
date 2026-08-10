@@ -308,6 +308,12 @@ breath_deadline_sec: 11.0
 recall_evidence_roles:
   enabled: false
 
+# --- Operational status validity / 工程状态有效期 ---
+# 只覆盖部署/完成/进度事实。原 Markdown 不迁移、不删除；有效期写在
+# <buckets_dir>/.validity/operational_status.sqlite3。关闭后读写链均回到旧行为。
+status_validity:
+  enabled: true
+
 # --- State-aware fact recall / 状态感知事实召回 ---
 # 只读取 Z 轴人工批准后写下的 current/historical 双向链；不建新向量库、不调用模型，
 # 也不让状态链进入 RRF 主排序。enabled=false 精确回到原 Z 轴过滤行为。

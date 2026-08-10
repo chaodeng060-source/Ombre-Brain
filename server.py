@@ -100,6 +100,15 @@ from fact_slots import (
     registered_fact_key,
     state_link_target_ids,
 )
+from status_validity import (
+    OperationalStatusValidityStore,
+    STATE_HISTORICAL as OPERATIONAL_STATE_HISTORICAL,
+    VIEW_CURRENT as OPERATIONAL_VIEW_CURRENT,
+    VIEW_NEUTRAL as OPERATIONAL_VIEW_NEUTRAL,
+    is_operational_status_fact,
+    operational_status_query_view,
+    validity_label as operational_validity_label,
+)
 from query_expand import expand_query
 from lmc5_recall_adapter import fuse_ranked_channels as lmc5_fuse_ranked_channels
 from vendor.anchor_memory.recall_v2 import POLICIES as ANCHOR_RECALL_POLICIES
@@ -226,6 +235,7 @@ _lmc5_ledger = None
 _entity_store = None
 _entity_store_key = None
 _entity_store_initialized = False
+_operational_status_validity_store = None
 _entity_sync_locks: dict[tuple[str, str], object] = {}
 _entity_sync_locks_guard = threading.Lock()
 _recall_receipt_store = None
@@ -688,12 +698,38 @@ def _fact_slot_registry() -> dict:
     return registry if isinstance(registry, dict) else {}
 
 
+def _operational_status_validity_enabled() -> bool:
+    cfg = config.get("status_validity", {}) or {}
+    return cfg.get("enabled", True) is True
+
+
+def _get_operational_status_validity_store() -> OperationalStatusValidityStore:
+    """Bind the additive validity sidecar to the active test/prod vault."""
+    global _operational_status_validity_store
+    path = os.path.abspath(os.path.join(
+        config["buckets_dir"],
+        ".validity",
+        "operational_status.sqlite3",
+    ))
+    if (
+        _operational_status_validity_store is None
+        or _operational_status_validity_store.path != path
+    ):
+        _operational_status_validity_store = OperationalStatusValidityStore(path)
+    return _operational_status_validity_store
+
+
 def _state_recall_profile(query: str) -> dict:
     """Return the deterministic query-state profile and rollout switches."""
     profile = profile_fact_state_query(query, _fact_slot_registry())
     state_cfg = config.get("state_aware_recall", {}) or {}
     profile["enabled"] = state_cfg.get("enabled", True) is True
     profile["evidence_labels"] = state_cfg.get("evidence_labels", True) is True
+    profile["operational_view"] = (
+        operational_status_query_view(query)
+        if _operational_status_validity_enabled()
+        else OPERATIONAL_VIEW_NEUTRAL
+    )
     try:
         link_limit = int(state_cfg.get("state_link_limit", 2))
     except (TypeError, ValueError):
@@ -706,6 +742,26 @@ def _filter_z_fact_candidates(buckets, *, query: str, intent: str):
     """Apply the canonical Z gate only to exact-current fact questions."""
     candidates = list(buckets)
     profile = _state_recall_profile(query)
+    if (
+        _operational_status_validity_enabled()
+        and profile["operational_view"] != OPERATIONAL_VIEW_NEUTRAL
+    ):
+        try:
+            candidates = _get_operational_status_validity_store().attach(candidates)
+        except Exception as exc:
+            logger.warning(
+                "Operational status validity lookup failed open: %s",
+                type(exc).__name__,
+            )
+        if profile["operational_view"] == OPERATIONAL_VIEW_CURRENT:
+            candidates = [
+                bucket
+                for bucket in candidates
+                if operational_validity_label(
+                    bucket,
+                    view=profile["operational_view"],
+                ).get("state") != OPERATIONAL_STATE_HISTORICAL
+            ]
     if not profile["enabled"]:
         if query_requests_history(query):
             return candidates
@@ -1062,6 +1118,7 @@ def _recall_prefix(
     """Prefix recall snippets; association is always explicit supporting evidence."""
     roles_enabled = (config.get("recall_evidence_roles", {}) or {}).get("enabled", False)
     state_label = ""
+    operational_label = {}
     if (
         state_profile
         and state_profile.get("enabled")
@@ -1071,7 +1128,15 @@ def _recall_prefix(
         and bucket
     ):
         state_label = fact_state_label(bucket, _fact_slot_registry())
-    if roles_enabled or role != "main" or state_label:
+    if state_profile and bucket:
+        operational_label = operational_validity_label(
+            bucket,
+            view=str(
+                state_profile.get("operational_view")
+                or OPERATIONAL_VIEW_NEUTRAL
+            ),
+        )
+    if roles_enabled or role != "main" or state_label or operational_label:
         parts = [f"[role:{role}]", f"[layer:{layer}]"]
         if role == "state":
             parts.append("[authority:state_evidence]")
@@ -1082,6 +1147,19 @@ def _recall_prefix(
                 f"[memory_state:{state_label}]",
                 f"[query_state_view:{state_profile['view']}]",
             ))
+        if operational_label:
+            validity_state = str(operational_label.get("state") or "unknown")
+            parts.append(f"[validity:{validity_state}]")
+            if validity_state == "current":
+                parts.append("[authority:current_status]")
+            elif validity_state == "historical":
+                parts.append("[authority:historical_status]")
+            else:
+                parts.append("[authority:not_current_status]")
+            for field in ("valid_at", "invalid_at", "expired_at"):
+                value = str(operational_label.get(field) or "").strip()
+                if value:
+                    parts.append(f"[{field}:{value.replace(' ', 'T')}]")
         if relation:
             parts.append(f"[relation:{relation}]")
         parts.append(f"[bucket_id:{bucket_id}]")
@@ -2634,6 +2712,87 @@ async def _recall_before_write_decision(
         _breath_candidate_capture.reset(capture_token)
 
 
+async def _create_operational_status_successor(
+    *,
+    target: dict,
+    content: str,
+    tags: list,
+    importance: int,
+    domain: list,
+    valence: float,
+    arousal: float,
+    name: str,
+    world: str,
+    chord_tag: str,
+    detected_senses: list,
+    entities: list[dict] | None,
+) -> tuple[str, str, bool]:
+    """Preserve both status snapshots and atomically mark their validity.
+
+    Markdown remains the source text store.  If the additive sidecar fails,
+    both buckets still exist and recall fails open to ``validity:unknown``.
+    """
+    async with bucket_mgr._maintenance_barrier.shared_async():
+        new_bucket_id = await bucket_mgr.create(
+            content=content,
+            tags=tags,
+            importance=importance,
+            domain=domain,
+            valence=valence,
+            arousal=arousal,
+            name=name or None,
+            world=world,
+            chord_tag=chord_tag,
+            sense=detected_senses or None,
+            actor="grow:recall-before-write:status-successor",
+        )
+        try:
+            await embedding_engine.generate_and_store(new_bucket_id, content)
+        except Exception as exc:
+            logger.warning(
+                "Embedding for operational status successor failed: %s: %s",
+                new_bucket_id,
+                type(exc).__name__,
+            )
+
+    try:
+        new_bucket = await bucket_mgr.get(new_bucket_id)
+        if not new_bucket:
+            raise RuntimeError("new operational status bucket is not readable")
+        target_meta = target.get("metadata", {}) or {}
+        new_meta = new_bucket.get("metadata", {}) or {}
+        marker = _get_operational_status_validity_store().mark_supersession(
+            old_bucket_id=str(target.get("id") or target_meta.get("id") or ""),
+            new_bucket_id=new_bucket_id,
+            old_valid_at=str(
+                target_meta.get("event_at")
+                or target_meta.get("created")
+                or target_meta.get("recorded_at")
+                or now_iso()
+            ),
+            new_valid_at=str(
+                new_meta.get("event_at")
+                or new_meta.get("created")
+                or new_meta.get("recorded_at")
+                or now_iso()
+            ),
+            source_ref="grow:recall-before-write:supersede",
+        )
+        logger.info(
+            "Operational status supersession recorded old=%s new=%s key=%s",
+            target.get("id"),
+            new_bucket_id,
+            marker["status_key"],
+        )
+    except Exception as exc:
+        logger.warning(
+            "Operational status marker failed open after durable create: %s",
+            type(exc).__name__,
+        )
+    await _synchronize_bucket_entities(new_bucket_id, content, entities)
+    return new_bucket_id, (name or new_bucket_id), False
+
+
 # =============================================================
 # Internal helper: merge-or-create
 # 内部辅助：检查是否可合并，可以则合并，否则新建
@@ -2689,6 +2848,33 @@ async def _merge_or_create(
                 if build_supersedes_audit(target, content):
                     raise RuntimeError(
                         "selected recall candidate requires explicit Z review"
+                    )
+
+                if (
+                    action == "supersede"
+                    and _operational_status_validity_enabled()
+                    and is_operational_status_fact(
+                        str(target.get("content") or ""),
+                        target_meta.get("domain"),
+                        bucket_type=str(target_meta.get("type") or "dynamic"),
+                        pinned=bool(target_meta.get("pinned")),
+                        protected=bool(target_meta.get("protected")),
+                    )
+                    and is_operational_status_fact(content, domain)
+                ):
+                    return await _create_operational_status_successor(
+                        target=target,
+                        content=content,
+                        tags=tags,
+                        importance=importance,
+                        domain=domain,
+                        valence=valence,
+                        arousal=arousal,
+                        name=name,
+                        world=world,
+                        chord_tag=chord_tag,
+                        detected_senses=detected_senses,
+                        entities=entities,
                     )
 
                 replacement = content
