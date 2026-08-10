@@ -7123,6 +7123,10 @@ async def api_breath(request):
                 include_body_state=False,
                 reset_body_state=False,
             )
+        except asyncio.CancelledError:
+            timing = finish_recall_timing(status="cancelled", partial=True)
+            logger.info("breath_timing=%s", json.dumps(timing, sort_keys=True))
+            raise
         except Exception:
             timing = finish_recall_timing(status="error", partial=False)
             logger.exception("HTTP breath bridge failed")

@@ -103,3 +103,28 @@ async def test_api_breath_returns_and_logs_structured_timing(monkeypatch, caplog
     }
     assert "breath_timing=" in caplog.text
     assert "private words" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_api_breath_logs_timing_before_propagating_cancellation(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="ombre_brain")
+    entered = asyncio.Event()
+
+    async def hanging_breath(**_kwargs):
+        record_recall_stage("expansion", 0.003)
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(server, "breath", hanging_breath)
+    task = asyncio.create_task(
+        server.api_breath(_JsonRequest({"query": "private cancellation"}))
+    )
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert '"status": "cancelled"' in caplog.text
+    assert '"partial": true' in caplog.text
+    assert '"elapsed_ms": 3.0' in caplog.text
+    assert "private cancellation" not in caplog.text
