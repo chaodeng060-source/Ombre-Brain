@@ -1734,25 +1734,6 @@ async def _dehydrate_for_recall(content: str, metadata: dict) -> str:
     )
 
 
-async def _dehydrate_recall_batch(
-    items: list[tuple[str, dict]],
-) -> list[str | Exception]:
-    """Render independent recall candidates concurrently, preserving order."""
-    concurrency = asyncio.Semaphore(3)
-
-    async def _render(content: str, metadata: dict) -> str | Exception:
-        try:
-            async with concurrency:
-                return await _dehydrate_for_recall(content, metadata)
-        except Exception as exc:
-            return exc
-
-    return await asyncio.gather(*(
-        _render(content, metadata)
-        for content, metadata in items
-    ))
-
-
 def _local_partial_recall_text(
     candidates: list[dict],
     *,
@@ -3803,8 +3784,9 @@ async def breath(
     result_ids = []
     selected_content_fingerprints: set[str] = set()
     selected_e_evidence = []
-    prepared_matches = []
     for bucket in matches:
+        if token_used >= max_tokens:
+            break
         try:
             clean_meta = {k: v for k, v in bucket["metadata"].items() if k != "tags"}
             # --- Memory reconstruction: shift displayed valence by current mood ---
@@ -3813,31 +3795,7 @@ async def breath(
                 original_v = float(clean_meta.get("valence", 0.5))
                 shift = (q_valence - 0.5) * 0.2  # ±0.1 max shift
                 clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
-            prepared_matches.append((bucket, clean_meta))
-        except Exception as exc:
-            logger.warning(
-                "Failed to dehydrate search result / 检索结果脱水失败: %s",
-                exc,
-            )
-
-    dehydrated_matches = await _dehydrate_recall_batch([
-        (strip_wikilinks(bucket["content"]), clean_meta)
-        for bucket, clean_meta in prepared_matches
-    ])
-    for (bucket, _clean_meta), rendered in zip(
-        prepared_matches,
-        dehydrated_matches,
-    ):
-        if token_used >= max_tokens:
-            break
-        if isinstance(rendered, Exception):
-            logger.warning(
-                "Failed to dehydrate search result / 检索结果脱水失败: %s",
-                rendered,
-            )
-            continue
-        try:
-            summary = rendered
+            summary = await _dehydrate_for_recall(strip_wikilinks(bucket["content"]), clean_meta)
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
                 break
