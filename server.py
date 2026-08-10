@@ -3132,10 +3132,11 @@ async def breath(
     reset_body_state: bool = False,
 ) -> str | list[TextContent | ImageContent]:
     """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认6000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制注入数量上限(默认8,最大50; 内部仍先召回20条给过滤器)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿安全关系边双向召回邻居的跳数(默认1,0=关闭,最大2)，关联证据单独列出且不改变主排序。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。session_id=同一会话内对已浮现动态桶去重。include_images=True时,白名单图桶会随文本返回 MCP image content。include_body_state=False时只关闭外部身体状态块,不改变记忆检索。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。"""
-    await _ensure_decay_background()
-    await _ensure_consolidation_background()
-    await episode_engine.ensure_started()
-    _maybe_start_backfill()
+    with recall_stage("setup"):
+        await _ensure_decay_background()
+        await _ensure_consolidation_background()
+        await episode_engine.ensure_started()
+        _maybe_start_backfill()
     max_results = max(1, min(max_results, 50))
     max_tokens = max(1000, min(max_tokens, 20000))
     recall_limit = max(BREATH_RECALL_POOL_SIZE, max_results)
