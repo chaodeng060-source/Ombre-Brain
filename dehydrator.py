@@ -884,8 +884,9 @@ class Dehydrator:
         content: str,
         *,
         read_only: bool = False,
+        match_model: bool = True,
     ) -> str | None:
-        """Look up cached dehydration result by content hash."""
+        """Look up a legacy dehydration result by content hash."""
         content_hash = hashlib.sha256(content.encode()).hexdigest()
         if read_only:
             cache_path = Path(self.cache_db_path).resolve()
@@ -898,11 +899,18 @@ class Dehydrator:
         else:
             connection = sqlite3.connect(self.cache_db_path)
         with closing(connection) as conn:
-            row = conn.execute(
-                "SELECT summary FROM dehydration_cache "
-                "WHERE content_hash = ? AND model = ?",
-                (content_hash, self.model),
-            ).fetchone()
+            if match_model:
+                row = conn.execute(
+                    "SELECT summary FROM dehydration_cache "
+                    "WHERE content_hash = ? AND model = ?",
+                    (content_hash, self.model),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT summary FROM dehydration_cache "
+                    "WHERE content_hash = ?",
+                    (content_hash,),
+                ).fetchone()
         if not row:
             return None
         summary = self._normalize_dehydration_summary(row[0])
@@ -1016,6 +1024,27 @@ class Dehydrator:
             )
             return None
         return summary
+
+    def _recall_cache_has_content(self, content: str) -> bool:
+        """Return whether this content was already bound to any new contract."""
+        cache_path = Path(self.recall_cache_db_path).absolute()
+        if not cache_path.is_file():
+            return False
+        try:
+            self._validate_recall_cache_path()
+            with closing(sqlite3.connect(
+                f"{cache_path.as_uri()}?mode=ro",
+                uri=True,
+                timeout=0.0,
+            )) as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM recall_dehydration_cache "
+                    "WHERE content_hash = ? LIMIT 1",
+                    (hashlib.sha256(content.encode()).hexdigest(),),
+                ).fetchone()
+        except (OSError, sqlite3.Error):
+            return False
+        return row is not None
 
     def _set_recall_cached_summary(self, content: str, summary: str) -> bool:
         """Persist a derived recall summary; cache failures never fail recall."""
@@ -1502,8 +1531,22 @@ class Dehydrator:
                 return self._format_output(cached, metadata)
 
         cached = None
-        if write_cache or self._legacy_recall_cache_is_compatible():
-            cached = self._get_cached_summary(content, read_only=not write_cache)
+        if write_cache:
+            cached = self._get_cached_summary(content)
+        elif (
+            self._legacy_recall_cache_is_compatible()
+            and not self._recall_cache_has_content(content)
+        ):
+            # Before the recall cache existed, production deliberately reused
+            # legacy summaries across dehydration-model changes.  Preserve that
+            # result exactly once, then bind it to the complete new contract.
+            # If any new-contract row already exists for this content, a model
+            # or prompt change must miss rather than falling back to legacy.
+            cached = self._get_cached_summary(
+                content,
+                read_only=True,
+                match_model=False,
+            )
         if cached:
             if not write_cache:
                 self._set_recall_cached_summary(content, cached)

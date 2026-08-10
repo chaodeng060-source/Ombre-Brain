@@ -226,6 +226,49 @@ async def test_read_only_dehydrate_cache_hit_keeps_database_byte_identical(
 
 
 @pytest.mark.asyncio
+async def test_legacy_cross_model_summary_is_migrated_only_once(test_config):
+    cached_summary = (
+        '{"core_facts":["旧模型摘要仍是既有生产结果"],'
+        '"summary":"兼容迁移后绑定新合同"}'
+    )
+    content = _long_content()
+    current, current_completions = _dehydrator(
+        test_config,
+        "must not be called",
+    )
+    with sqlite3.connect(current.cache_db_path) as conn:
+        conn.execute(
+            "INSERT INTO dehydration_cache "
+            "(content_hash, summary, model) VALUES (?, ?, ?)",
+            (
+                hashlib.sha256(content.encode()).hexdigest(),
+                cached_summary,
+                "historical-dehydration-model",
+            ),
+        )
+        conn.commit()
+
+    migrated_output = await current.dehydrate(content, write_cache=False)
+    assert current_completions.calls == 0
+    assert "旧模型摘要仍是既有生产结果" in migrated_output
+
+    changed_config = {
+        **test_config,
+        "dehydration": {
+            **test_config.get("dehydration", {}),
+            "model": "future-dehydration-model",
+        },
+    }
+    future, future_completions = _dehydrator(
+        changed_config,
+        '{"core_facts":["新模型重新生成"],"summary":"不能二次回落旧库"}',
+    )
+    future_output = await future.dehydrate(content, write_cache=False)
+    assert future_completions.calls == 1
+    assert "新模型重新生成" in future_output
+
+
+@pytest.mark.asyncio
 async def test_recall_cache_damage_fails_open_and_can_be_rebuilt(
     test_config,
     caplog,
