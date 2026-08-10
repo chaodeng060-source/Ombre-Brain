@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ast
 from pathlib import Path
 import sqlite3
@@ -35,6 +36,68 @@ def test_breath_paths_use_the_read_only_dehydration_helper():
     assert "dehydrator.dehydrate" not in hook
     assert "_dehydrate_for_recall" in breath
     assert "_dehydrate_for_recall" in hook
+
+
+@pytest.mark.asyncio
+async def test_recall_dehydration_batch_is_concurrent_and_ordered(monkeypatch):
+    started: list[str] = []
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_dehydrate(content: str, metadata: dict) -> str:
+        started.append(content)
+        if len(started) == 2:
+            both_started.set()
+        await release.wait()
+        return f"summary:{content}:{metadata['order']}"
+
+    monkeypatch.setattr(server, "_dehydrate_for_recall", fake_dehydrate)
+    task = asyncio.create_task(server._dehydrate_recall_batch([
+        ("first", {"order": 1}),
+        ("second", {"order": 2}),
+    ]))
+    await asyncio.wait_for(both_started.wait(), timeout=1.0)
+    release.set()
+
+    assert await task == ["summary:first:1", "summary:second:2"]
+
+
+@pytest.mark.asyncio
+async def test_recall_dehydration_batch_isolates_errors(monkeypatch):
+    async def fake_dehydrate(content: str, metadata: dict) -> str:
+        if content == "bad":
+            raise ValueError("bad candidate")
+        return content
+
+    monkeypatch.setattr(server, "_dehydrate_for_recall", fake_dehydrate)
+    rendered = await server._dehydrate_recall_batch([
+        ("good", {}),
+        ("bad", {}),
+        ("later", {}),
+    ])
+
+    assert rendered[0] == "good"
+    assert isinstance(rendered[1], ValueError)
+    assert rendered[2] == "later"
+
+
+@pytest.mark.asyncio
+async def test_recall_dehydration_batch_propagates_cancellation(monkeypatch):
+    started = asyncio.Event()
+    blocker = asyncio.Event()
+
+    async def fake_dehydrate(content: str, metadata: dict) -> str:
+        started.set()
+        await blocker.wait()
+        return content
+
+    monkeypatch.setattr(server, "_dehydrate_for_recall", fake_dehydrate)
+    task = asyncio.create_task(server._dehydrate_recall_batch([("slow", {})]))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 class _Message:
