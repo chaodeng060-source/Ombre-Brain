@@ -1,6 +1,8 @@
 import asyncio
 import json
 import logging
+import time
+from pathlib import Path
 
 import pytest
 
@@ -79,6 +81,118 @@ async def test_embedding_engine_splits_remote_and_local_timing(tmp_path, monkeyp
     assert receipt["stages"]["embedding"]["calls"] == 1
     assert receipt["stages"]["vector_retrieval"]["calls"] == 1
     assert "secret query" not in json.dumps(receipt)
+
+
+@pytest.mark.asyncio
+async def test_vector_full_scan_yields_to_request_deadline(tmp_path, monkeypatch):
+    engine = object.__new__(EmbeddingEngine)
+    engine.enabled = True
+    engine.db_path = str(tmp_path / "embeddings.db")
+
+    import sqlite3
+
+    with sqlite3.connect(engine.db_path) as conn:
+        conn.execute(
+            "CREATE TABLE embeddings (bucket_id TEXT PRIMARY KEY, embedding TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO embeddings(bucket_id, embedding) VALUES (?, ?)",
+            [(f"bucket-{index}", "[1.0, 0.0]") for index in range(200)],
+        )
+
+    async def fake_embedding(_query):
+        return [1.0, 0.0], "ok"
+
+    scanned = 0
+
+    def slow_similarity(_query_embedding, _stored):
+        nonlocal scanned
+        scanned += 1
+        time.sleep(0.002)
+        return 1.0
+
+    monkeypatch.setattr(engine, "_generate_embedding_with_status", fake_embedding)
+    monkeypatch.setattr(engine, "_max_similarity", slow_similarity)
+
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            engine.search_similar_with_status("deadline query", top_k=10),
+            timeout=0.02,
+        )
+
+    assert asyncio.get_running_loop().time() - started < 0.2
+    assert scanned < 200
+
+
+@pytest.mark.asyncio
+async def test_keyword_bucket_load_yields_to_request_deadline(
+    bucket_mgr,
+    monkeypatch,
+):
+    for index in range(200):
+        (Path(bucket_mgr.dynamic_dir) / f"bucket-{index}.md").touch()
+
+    loaded = 0
+
+    def slow_load(_path):
+        nonlocal loaded
+        loaded += 1
+        time.sleep(0.002)
+        return None
+
+    monkeypatch.setattr(bucket_mgr, "_load_bucket", slow_load)
+
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            bucket_mgr.list_all(include_archive=False),
+            timeout=0.02,
+        )
+
+    assert asyncio.get_running_loop().time() - started < 0.2
+    assert loaded < 200
+
+
+@pytest.mark.asyncio
+async def test_keyword_scoring_yields_to_request_deadline(bucket_mgr, monkeypatch):
+    rows = [
+        {
+            "id": f"bucket-{index}",
+            "metadata": {"importance": 5},
+            "content": "memory",
+        }
+        for index in range(200)
+    ]
+
+    async def fake_list_all(*, include_archive=False):
+        assert include_archive is False
+        return rows
+
+    scored = 0
+
+    def slow_score(_query, _bucket):
+        nonlocal scored
+        scored += 1
+        time.sleep(0.002)
+        return 0.5
+
+    monkeypatch.setattr(bucket_mgr, "list_all", fake_list_all)
+    monkeypatch.setattr(bucket_mgr, "_calc_topic_score", slow_score)
+
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            bucket_mgr.search(
+                "deadline query",
+                relevance_first=True,
+                relevance_candidate_floor=0.0,
+            ),
+            timeout=0.02,
+        )
+
+    assert asyncio.get_running_loop().time() - started < 0.2
+    assert scored < 200
 
 
 @pytest.mark.asyncio

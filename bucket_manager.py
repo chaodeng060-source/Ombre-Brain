@@ -55,6 +55,12 @@ from x_provenance import normalize_x_provenance, validate_x_provenance_update
 
 logger = logging.getLogger("ombre_brain.bucket")
 
+# Recall scans are intentionally exact, but they must not monopolize the
+# request event loop long enough to defeat /api/breath's wall-clock deadline.
+# Yielding every small batch keeps the existing full-scan ranking unchanged
+# while making cancellation observable within a bounded number of buckets.
+_RECALL_CANCEL_CHECK_EVERY = 16
+
 
 def bucket_revision_hash(content: str, metadata: dict) -> str:
     """Stable optimistic-concurrency token for one complete bucket snapshot."""
@@ -913,7 +919,9 @@ class BucketManager:
             ]
 
         scored = []
-        for bucket in candidates:
+        for candidate_index, bucket in enumerate(candidates, start=1):
+            if candidate_index % _RECALL_CANCEL_CHECK_EVERY == 0:
+                await asyncio.sleep(0)
             meta = bucket.get("metadata", {})
 
             try:
@@ -1118,6 +1126,7 @@ class BucketManager:
         if include_nsfw:
             dirs.append(self.nsfw_dir)  # 涩涩独立目录：日常默认不扫，涩涩 world 或显式 True 才加载
 
+        scanned = 0
         for dir_path in dirs:
             if not os.path.exists(dir_path):
                 continue
@@ -1125,6 +1134,9 @@ class BucketManager:
                 for filename in files:
                     if not filename.endswith(".md"):
                         continue
+                    scanned += 1
+                    if scanned % _RECALL_CANCEL_CHECK_EVERY == 0:
+                        await asyncio.sleep(0)
                     file_path = os.path.join(root, filename)
                     bucket = self._load_bucket(file_path)
                     if bucket:

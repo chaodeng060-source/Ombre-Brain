@@ -286,7 +286,12 @@ class EmbeddingEngine:
                 return [], "ok"
 
             results = []
-            for bucket_id, emb_json in rows:
+            for row_index, (bucket_id, emb_json) in enumerate(rows, start=1):
+                # SQLite fetch and cosine ranking remain exact.  The checkpoint
+                # only lets the request deadline cancel a long local full scan
+                # instead of waiting for every stored vector to be scored.
+                if row_index % 16 == 0:
+                    await asyncio.sleep(0)
                 try:
                     stored = json.loads(emb_json)
                     sim = self._max_similarity(query_embedding, stored)
