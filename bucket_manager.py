@@ -26,6 +26,7 @@
 # ============================================================
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -60,6 +61,15 @@ logger = logging.getLogger("ombre_brain.bucket")
 # Yielding every small batch keeps the existing full-scan ranking unchanged
 # while making cancellation observable within a bounded number of buckets.
 _RECALL_CANCEL_CHECK_EVERY = 16
+_BucketFileRevision = tuple[
+    str,
+    int | None,
+    int | None,
+    int | None,
+    int | None,
+    int | None,
+]
+_BucketTreeSnapshot = tuple[_BucketFileRevision, ...]
 
 
 def bucket_revision_hash(content: str, metadata: dict) -> str:
@@ -136,6 +146,23 @@ class BucketManager:
         # 自动失效回退全扫，外部手动建的新文件走 miss 全扫也能找到——不需要主动失效钩子。
         self._bucket_path_cache: dict[str, str] = {}
 
+        # list_all is the hot read path for recall.  Keep parsed frontmatter in
+        # process, but validate every hit against a cheap path/mtime/size tree
+        # snapshot so direct NAS/Obsidian edits remain visible without a TTL.
+        # All in-process mutations explicitly clear this cache after the
+        # durable file operation succeeds.
+        self._list_all_cache: dict[
+            tuple[bool, bool],
+            tuple[_BucketTreeSnapshot, list[dict]],
+        ] = {}
+        self._list_all_cache_generation = 0
+        self._list_all_cache_lock = asyncio.Lock()
+
+        # _calc_topic_score used to run jieba for the identical query once per
+        # bucket.  Cache only the deterministic tokenization, not any score or
+        # candidate, so ranking semantics stay byte-for-byte unchanged.
+        self._query_parts_cache: dict[str, tuple[str, ...]] = {}
+
         # --- Wikilink config / 双链配置 ---
         wikilink_cfg = config.get("wikilink", {})
         self.wikilink_enabled = wikilink_cfg.get("enabled", True)
@@ -201,6 +228,12 @@ class BucketManager:
 
     def _atomic_write_post(self, file_path: str, post) -> None:
         atomic_write_post(file_path, post)
+        self.invalidate_list_all_cache()
+
+    def invalidate_list_all_cache(self) -> None:
+        """Drop parsed bucket snapshots after a durable in-process mutation."""
+        self._list_all_cache_generation += 1
+        self._list_all_cache.clear()
 
     # ---------------------------------------------------------
     # Create a new bucket
@@ -735,6 +768,7 @@ class BucketManager:
                 )
                 os.remove(file_path)
                 self._bucket_path_cache.pop(bucket_id, None)
+                self.invalidate_list_all_cache()
                 self.audit_log.commit(event_id)
             except Exception as e:
                 self.audit_log.fail(event_id, e)
@@ -868,12 +902,17 @@ class BucketManager:
         created_before: datetime = None,
         relevance_first: bool = False,
         relevance_candidate_floor: float = None,
+        preloaded_buckets: list[dict] | None = None,
     ) -> list[dict]:
         if not query or not query.strip():
             return []
 
         limit = limit or self.max_results
-        all_buckets = await self.list_all(include_archive=False)
+        all_buckets = (
+            preloaded_buckets
+            if preloaded_buckets is not None
+            else await self.list_all(include_archive=False)
+        )
 
         if not all_buckets:
             return []
@@ -978,13 +1017,14 @@ class BucketManager:
                         normalized *= 0.3
                     elif meta.get("resolved", False):
                         tie_break_score *= 0.3
-                    bucket["score"] = round(normalized, 2)
+                    scored_bucket = dict(bucket)
+                    scored_bucket["score"] = round(normalized, 2)
                     if relevance_first:
-                        bucket["_keyword_tie_break_score"] = round(
+                        scored_bucket["_keyword_tie_break_score"] = round(
                             tie_break_score,
                             4,
                         )
-                    scored.append(bucket)
+                    scored.append(scored_bucket)
             except Exception as e:
                 logger.warning(
                     f"Scoring failed for bucket {bucket.get('id', '?')} / "
@@ -1040,17 +1080,7 @@ class BucketManager:
                 return 1.0
 
         # --- 1. 核心词短路机制（Jieba 分词检测） ---
-        try:
-            words = list(jieba.cut(query_lower))
-        except Exception:
-            words = query_lower.split()
-
-        query_parts = [
-            p.strip() for p in words 
-            if p.strip() and p.strip() not in self.wikilink_stopwords
-        ]
-        if not query_parts:
-            query_parts = [query_lower]
+        query_parts = self._query_parts_for_search(query_lower)
 
         # 单 part 命中按比例打分，避免任一词命中就硬返 1.0 导致桶被合并吸入黑洞
         hit_count = 0
@@ -1080,6 +1110,24 @@ class BucketManager:
         )
 
         return final_score
+
+    def _query_parts_for_search(self, query_lower: str) -> tuple[str, ...]:
+        cached = self._query_parts_cache.get(query_lower)
+        if cached is not None:
+            return cached
+        try:
+            words = list(jieba.cut(query_lower))
+        except Exception:
+            words = query_lower.split()
+        query_parts = tuple(
+            p.strip()
+            for p in words
+            if p.strip() and p.strip() not in self.wikilink_stopwords
+        ) or (query_lower,)
+        if len(self._query_parts_cache) >= 128:
+            self._query_parts_cache.pop(next(iter(self._query_parts_cache)))
+        self._query_parts_cache[query_lower] = query_parts
+        return query_parts
 
     # ---------------------------------------------------------
     # Emotion resonance sub-score
@@ -1119,13 +1167,50 @@ class BucketManager:
         # 显式 True/False 可覆盖（如 dashboard 管理界面传 True 看全部）。
         if include_nsfw is None:
             include_nsfw = getattr(self, "nsfw_active", False)
-        buckets = []
         dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir]
         if include_archive:
             dirs.append(self.archive_dir)
         if include_nsfw:
             dirs.append(self.nsfw_dir)  # 涩涩独立目录：日常默认不扫，涩涩 world 或显式 True 才加载
 
+        cache_key = (bool(include_archive), bool(include_nsfw))
+        paths, snapshot = await self._bucket_tree_snapshot(dirs)
+        cached = self._list_all_cache.get(cache_key)
+        if cached is not None and cached[0] == snapshot:
+            return copy.deepcopy(cached[1])
+
+        async with self._list_all_cache_lock:
+            # Another request may have populated the same snapshot while this
+            # one waited.  Reuse it instead of parsing thousands of files twice.
+            cached = self._list_all_cache.get(cache_key)
+            if cached is not None and cached[0] == snapshot:
+                return copy.deepcopy(cached[1])
+
+            generation = self._list_all_cache_generation
+            buckets = []
+            for loaded, file_path in enumerate(paths, start=1):
+                if loaded % _RECALL_CANCEL_CHECK_EVERY == 0:
+                    await asyncio.sleep(0)
+                bucket = self._load_bucket(file_path)
+                if bucket:
+                    buckets.append(bucket)
+
+            after_paths, after_snapshot = await self._bucket_tree_snapshot(dirs)
+            if (
+                generation == self._list_all_cache_generation
+                and after_paths == paths
+                and after_snapshot == snapshot
+            ):
+                self._list_all_cache[cache_key] = (snapshot, buckets)
+            return copy.deepcopy(buckets)
+
+    async def _bucket_tree_snapshot(
+        self,
+        dirs: list[str],
+    ) -> tuple[list[str], _BucketTreeSnapshot]:
+        """Enumerate visible Markdown files and their cheap change tokens."""
+        paths: list[str] = []
+        snapshot: list[_BucketFileRevision] = []
         scanned = 0
         for dir_path in dirs:
             if not os.path.exists(dir_path):
@@ -1138,11 +1223,27 @@ class BucketManager:
                     if scanned % _RECALL_CANCEL_CHECK_EVERY == 0:
                         await asyncio.sleep(0)
                     file_path = os.path.join(root, filename)
-                    bucket = self._load_bucket(file_path)
-                    if bucket:
-                        buckets.append(bucket)
-
-        return buckets
+                    paths.append(file_path)
+                    try:
+                        info = os.stat(file_path)
+                        snapshot.append(
+                            (
+                                file_path,
+                                int(info.st_dev),
+                                int(info.st_ino),
+                                int(info.st_size),
+                                int(info.st_mtime_ns),
+                                int(info.st_ctime_ns),
+                            )
+                        )
+                    except OSError:
+                        # Preserve list_all's historical best-effort load.  A
+                        # missing stat token also prevents a false cache match
+                        # once the file becomes readable again.
+                        snapshot.append(
+                            (file_path, None, None, None, None, None)
+                        )
+        return paths, tuple(snapshot)
 
     # ---------------------------------------------------------
     # Statistics
@@ -1288,6 +1389,7 @@ class BucketManager:
                 )
                 os.replace(file_path, str(destination))
                 self._bucket_path_cache[bucket_id] = str(destination)
+                self.invalidate_list_all_cache()
                 self.audit_log.commit(event_id)
                 return True
             except Exception as e:

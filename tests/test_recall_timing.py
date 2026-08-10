@@ -112,7 +112,7 @@ async def test_vector_full_scan_yields_to_request_deadline(tmp_path, monkeypatch
         return 1.0
 
     monkeypatch.setattr(engine, "_generate_embedding_with_status", fake_embedding)
-    monkeypatch.setattr(engine, "_max_similarity", slow_similarity)
+    monkeypatch.setattr(engine, "_max_prepared_similarity", slow_similarity)
 
     started = asyncio.get_running_loop().time()
     with pytest.raises(TimeoutError):

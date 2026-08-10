@@ -15,6 +15,7 @@ import time
 import sqlite3
 import logging
 import asyncio
+from array import array
 from contextlib import closing
 from pathlib import Path
 
@@ -72,6 +73,12 @@ class EmbeddingEngine:
         db_path = os.path.join(config["buckets_dir"], "embeddings.db")
         self.db_path = db_path
         self._maintenance_barrier = MaintenanceBarrier(config["buckets_dir"])
+        self._vector_cache_signature = None
+        self._vector_cache_entries = None
+        self._vector_cache_generation = 0
+        self._vector_cache_lock = asyncio.Lock()
+        self._vector_cache_observer = None
+        self._vector_cache_observer_identity = None
 
         # --- Optional dedicated proxy ONLY for embedding traffic ---
         # --- 仅给 embedding 流量挂的专用代理（不碰 DeepSeek/R2 直连）---
@@ -235,6 +242,7 @@ class EmbeddingEngine:
                     (bucket_id, json.dumps(embedding), now_iso()),
                 )
                 conn.commit()
+        self._invalidate_vector_cache()
 
     def delete_embedding(self, bucket_id: str):
         with self._maintenance_barrier.shared():
@@ -244,6 +252,7 @@ class EmbeddingEngine:
                     (bucket_id,),
                 )
                 conn.commit()
+        self._invalidate_vector_cache()
 
     async def get_embedding(self, bucket_id: str) -> list[float] | None:
         with closing(sqlite3.connect(self.db_path)) as conn:
@@ -279,28 +288,178 @@ class EmbeddingEngine:
             return [], "error"
 
         with recall_stage("vector_retrieval"):
-            with closing(sqlite3.connect(self.db_path)) as conn:
-                rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
+            entries = await self._get_cached_vectors()
+            if not entries:
+                return [], "ok"
 
-            if not rows:
+            try:
+                prepared_query = self._prepare_embedding_record(query_embedding)
+            except Exception:
                 return [], "ok"
 
             results = []
-            for row_index, (bucket_id, emb_json) in enumerate(rows, start=1):
-                # SQLite fetch and cosine ranking remain exact.  The checkpoint
-                # only lets the request deadline cancel a long local full scan
-                # instead of waiting for every stored vector to be scored.
+            for row_index, (bucket_id, stored) in enumerate(entries, start=1):
                 if row_index % 16 == 0:
                     await asyncio.sleep(0)
                 try:
-                    stored = json.loads(emb_json)
-                    sim = self._max_similarity(query_embedding, stored)
+                    sim = self._max_prepared_similarity(prepared_query, stored)
                     results.append((bucket_id, sim))
-                except (json.JSONDecodeError, Exception):
+                except Exception:
                     continue
 
             results.sort(key=lambda x: x[1], reverse=True)
             return results[:top_k], "ok"
+
+    def _ensure_vector_cache_state(self) -> None:
+        """Initialize cache fields for legacy tests that bypass __init__."""
+        if not hasattr(self, "_vector_cache_signature"):
+            self._vector_cache_signature = None
+            self._vector_cache_entries = None
+            self._vector_cache_generation = 0
+            self._vector_cache_lock = asyncio.Lock()
+            self._vector_cache_observer = None
+            self._vector_cache_observer_identity = None
+
+    def _invalidate_vector_cache(self) -> None:
+        self._ensure_vector_cache_state()
+        self._vector_cache_generation += 1
+        self._vector_cache_signature = None
+        self._vector_cache_entries = None
+
+    def _vector_store_signature(self):
+        signature = []
+        database_identity = None
+        for path in (
+            self.db_path,
+            f"{self.db_path}-wal",
+            f"{self.db_path}-shm",
+            f"{self.db_path}-journal",
+        ):
+            try:
+                info = os.stat(path)
+                signature.append(
+                    (
+                        path,
+                        int(info.st_dev),
+                        int(info.st_ino),
+                        int(info.st_size),
+                        int(info.st_mtime_ns),
+                        int(info.st_ctime_ns),
+                    )
+                )
+                if path == self.db_path:
+                    database_identity = (int(info.st_dev), int(info.st_ino))
+            except OSError:
+                signature.append((path, None, None, None, None, None))
+        signature.append(
+            (
+                f"{self.db_path}#data_version",
+                self._sqlite_data_version(database_identity),
+                None,
+                None,
+                None,
+                None,
+            )
+        )
+        return tuple(signature)
+
+    def _sqlite_data_version(self, database_identity):
+        """Observe commits even on filesystems with coarse mtime resolution."""
+        if database_identity is None:
+            return None
+        observer = self._vector_cache_observer
+        if self._vector_cache_observer_identity != database_identity:
+            if observer is not None:
+                observer.close()
+            observer = None
+        try:
+            if observer is None:
+                observer = sqlite3.connect(
+                    Path(self.db_path).resolve().as_uri() + "?mode=ro",
+                    uri=True,
+                )
+                self._vector_cache_observer = observer
+                self._vector_cache_observer_identity = database_identity
+            row = observer.execute("PRAGMA data_version").fetchone()
+            return int(row[0]) if row else None
+        except sqlite3.Error:
+            if observer is not None:
+                observer.close()
+            self._vector_cache_observer = None
+            self._vector_cache_observer_identity = None
+            return None
+
+    async def _get_cached_vectors(self):
+        """Return parsed vectors, reloading when the SQLite image changes."""
+        self._ensure_vector_cache_state()
+        signature = self._vector_store_signature()
+        if (
+            self._vector_cache_entries is not None
+            and self._vector_cache_signature == signature
+        ):
+            return self._vector_cache_entries
+
+        async with self._vector_cache_lock:
+            signature = self._vector_store_signature()
+            if (
+                self._vector_cache_entries is not None
+                and self._vector_cache_signature == signature
+            ):
+                return self._vector_cache_entries
+
+            generation = self._vector_cache_generation
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                rows = conn.execute(
+                    "SELECT bucket_id, embedding FROM embeddings"
+                ).fetchall()
+
+            entries = []
+            for row_index, (bucket_id, emb_json) in enumerate(rows, start=1):
+                if row_index % 16 == 0:
+                    await asyncio.sleep(0)
+                try:
+                    entries.append(
+                        (bucket_id, self._prepare_embedding_record(json.loads(emb_json)))
+                    )
+                except Exception:
+                    continue
+
+            after_signature = self._vector_store_signature()
+            frozen_entries = tuple(entries)
+            if (
+                generation == self._vector_cache_generation
+                and after_signature == signature
+            ):
+                self._vector_cache_signature = signature
+                self._vector_cache_entries = frozen_entries
+            return frozen_entries
+
+    def _prepare_embedding_record(self, value):
+        prepared = []
+        for segment in self._embedding_segments(value):
+            values = array("d", segment)
+            norm = math.sqrt(sum(item * item for item in values))
+            prepared.append((values, norm))
+        return tuple(prepared)
+
+    @staticmethod
+    def _max_prepared_similarity(left, right) -> float:
+        if len(left[0][0]) != len(right[0][0]):
+            raise TypeError("embedding dimensions do not match")
+        best = 0.0
+        for left_segment, left_norm in left:
+            for right_segment, right_norm in right:
+                if left_norm == 0 or right_norm == 0:
+                    similarity = 0.0
+                else:
+                    dot = sum(
+                        x * y for x, y in zip(left_segment, right_segment)
+                    )
+                    similarity = dot / (left_norm * right_norm)
+                if not math.isfinite(float(similarity)):
+                    raise TypeError("cosine similarity must be finite")
+                best = max(best, float(similarity))
+        return best
 
     def _max_similarity(self, query_emb: list[float], stored) -> float:
         """对一个桶的 stored 向量取与 query 的最高余弦相似度。

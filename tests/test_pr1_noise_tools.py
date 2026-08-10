@@ -69,7 +69,10 @@ class FakeBucketMgr:
     def __init__(self, buckets):
         self.buckets = list(buckets)
         self.search_limits = []
+        self.search_queries = []
+        self.preloaded_candidates = []
         self.touched = []
+        self.list_all_calls = 0
 
     async def get_stats(self):
         return {
@@ -80,10 +83,13 @@ class FakeBucketMgr:
         }
 
     async def list_all(self, include_archive=False):
+        self.list_all_calls += 1
         return list(self.buckets)
 
     async def search(self, query, limit=20, **kwargs):
         self.search_limits.append(limit)
+        self.search_queries.append(query)
+        self.preloaded_candidates.append(kwargs.get("preloaded_buckets"))
         return list(self.buckets)[:limit]
 
     async def get(self, bucket_id):
@@ -164,6 +170,7 @@ async def test_breath_uses_recall_pool_caps_output_and_dedups_session(tmp_path, 
     assert "[bucket_id:b]" in first
     assert "[bucket_id:c]" not in first
     assert fake_mgr.search_limits[-1] == server.BREATH_RECALL_POOL_SIZE
+    assert fake_mgr.list_all_calls == 1
 
     second = await server.breath(
         query="工程",
@@ -176,6 +183,42 @@ async def test_breath_uses_recall_pool_caps_output_and_dedups_session(tmp_path, 
     assert "[bucket_id:b]" not in second
     assert "[bucket_id:c]" in second
     assert fake_mgr.touched == []
+
+
+@pytest.mark.asyncio
+async def test_breath_reuses_one_bucket_snapshot_across_query_angles(
+    tmp_path,
+    monkeypatch,
+):
+    fake_mgr = FakeBucketMgr([_bucket("a", "alpha")])
+    monkeypatch.setitem(server.config, "buckets_dir", str(tmp_path))
+    monkeypatch.setitem(server.config, "random_surfacing", {})
+    monkeypatch.setitem(
+        server.config,
+        "query_expansion",
+        {"enabled": True, "allowed_intents": ["recall"]},
+    )
+    monkeypatch.setattr(server, "bucket_mgr", fake_mgr)
+    monkeypatch.setattr(server, "decay_engine", FakeDecay())
+    monkeypatch.setattr(server, "dehydrator", FakeDehydrator())
+    monkeypatch.setattr(server, "embedding_engine", FakeEmbedding())
+    monkeypatch.setattr(server, "_backfill_started", True)
+
+    async def fake_expand(query, *_args, **_kwargs):
+        return [query, "第二角度", "第三角度"]
+
+    monkeypatch.setattr(server, "expand_query", fake_expand)
+
+    await server.breath(
+        query="你还记得吗",
+        max_results=1,
+        relation_depth=0,
+        include_images=False,
+    )
+
+    assert fake_mgr.list_all_calls == 1
+    assert fake_mgr.search_queries == ["你还记得吗", "第二角度", "第三角度"]
+    assert len({id(rows) for rows in fake_mgr.preloaded_candidates}) == 1
 
 
 @pytest.mark.asyncio

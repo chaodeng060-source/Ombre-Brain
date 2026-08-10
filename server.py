@@ -3436,6 +3436,7 @@ async def breath(
     keyword_by_id: dict[str, dict] = {}
     try:
         with recall_stage("keyword_retrieval"):
+            keyword_candidates = await bucket_mgr.list_all(include_archive=False)
             for angle in query_angles:
                 for bucket in await bucket_mgr.search(
                     angle,
@@ -3451,6 +3452,7 @@ async def breath(
                     # original-query literal/vector evidence gate below decides
                     # eligibility after both channels are available.
                     relevance_candidate_floor=0.0,
+                    preloaded_buckets=keyword_candidates,
                 ):
                     existing = keyword_by_id.get(bucket["id"])
                     if existing is None or bucket.get("score", 0) > existing.get("score", 0):
@@ -4911,6 +4913,7 @@ async def switch_world(world: str = "") -> str:
     # 同步涩涩目录加载开关：切进"涩涩"才扫那个文件夹，切出即物理隔离
     try:
         bucket_mgr.nsfw_active = (target == "涩涩")
+        bucket_mgr.invalidate_list_all_cache()
     except Exception:
         pass
     label = target if target else "日常模式 (空)"
