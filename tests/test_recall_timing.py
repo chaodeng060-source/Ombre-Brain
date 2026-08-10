@@ -13,6 +13,7 @@ from recall_timing import (
     finish_recall_timing,
     finish_recall_stage,
     record_recall_stage,
+    record_recall_dehydration,
     reset_recall_timing,
     set_recall_partial_result,
     start_recall_stage,
@@ -32,6 +33,8 @@ def test_timing_receipt_accumulates_calls_without_content():
     try:
         record_recall_stage("embedding", 0.012)
         record_recall_stage("embedding", 0.003)
+        record_recall_dehydration("frontmatter_hits", 2)
+        record_recall_dehydration("computed")
         receipt = finish_recall_timing(status="ok", partial=False)
     finally:
         reset_recall_timing(token)
@@ -42,6 +45,10 @@ def test_timing_receipt_accumulates_calls_without_content():
     assert receipt["stages"]["embedding"] == {
         "elapsed_ms": 15.0,
         "calls": 2,
+    }
+    assert receipt["dehydration"] == {
+        "frontmatter_hits": 2,
+        "computed": 1,
     }
     assert "query" not in json.dumps(receipt)
 

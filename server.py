@@ -181,6 +181,7 @@ from recall_timing import (
     get_recall_partial_result,
     finish_recall_stage,
     recall_stage,
+    record_recall_dehydration,
     record_recall_stage,
     reset_recall_timing,
     set_recall_partial_result,
@@ -1803,13 +1804,94 @@ async def _tool_result_with_optional_images(
     return [TextContent(type="text", text=text), *images]
 
 
-async def _dehydrate_for_recall(content: str, metadata: dict) -> str:
-    """Render recall text without mutating the persistent dehydration cache."""
-    return await dehydrator.dehydrate(
-        content,
-        metadata,
-        write_cache=False,
+def _frontmatter_dehydration_cache_enabled() -> bool:
+    cfg = config.get("dehydration", {}) or {}
+    return cfg.get("recall_frontmatter_cache_enabled", True) is not False
+
+
+async def _dehydrate_for_recall(
+    content: str,
+    metadata: dict,
+    *,
+    bucket: dict | None = None,
+) -> str:
+    """Render recall text and persist only its derived bucket summary.
+
+    ``dehydrated_summary`` is valid while the exact Markdown body hash is
+    unchanged.  The write path is isolated from ``last_active`` and other
+    factual metadata, so caching cannot heat a bucket or alter ranking.
+    """
+    cache_enabled = _frontmatter_dehydration_cache_enabled()
+    bucket_metadata = (
+        bucket.get("metadata", {})
+        if isinstance(bucket, dict) and isinstance(bucket.get("metadata"), dict)
+        else {}
     )
+    raw_body = str(bucket.get("content") or "") if isinstance(bucket, dict) else ""
+    body_hash = hashlib.sha256(raw_body.encode("utf-8")).hexdigest() if bucket else ""
+    stored_summary = bucket_metadata.get("dehydrated_summary")
+    if (
+        cache_enabled
+        and isinstance(stored_summary, str)
+        and len(stored_summary.strip()) >= 10
+        and bucket_metadata.get("dehydrated_content_hash") == body_hash
+    ):
+        record_recall_dehydration("frontmatter_hits")
+        formatter = getattr(dehydrator, "format_dehydration_summary", None)
+        if callable(formatter):
+            return formatter(stored_summary.strip(), metadata)
+        return stored_summary.strip()
+
+    with_source = getattr(dehydrator, "dehydrate_with_source", None)
+    if callable(with_source):
+        raw_summary, source = await with_source(
+            content,
+            None,
+            write_cache=False,
+        )
+        formatter = getattr(dehydrator, "format_dehydration_summary", None)
+        rendered = (
+            formatter(raw_summary, metadata)
+            if callable(formatter)
+            else raw_summary
+        )
+    else:
+        # Test doubles and older rollback implementations keep the original
+        # dehydrate signature.  Production always uses the source-aware path.
+        rendered = await dehydrator.dehydrate(
+            content,
+            metadata,
+            write_cache=False,
+        )
+        raw_summary = rendered
+        source = "computed"
+
+    if source == "cached":
+        record_recall_dehydration("backfilled")
+    elif source == "computed":
+        record_recall_dehydration("computed")
+    else:
+        record_recall_dehydration("passthrough")
+
+    if cache_enabled and bucket and source != "passthrough":
+        writer = getattr(bucket_mgr, "cache_recall_dehydration", None)
+        persisted = False
+        if callable(writer):
+            try:
+                persisted = await writer(
+                    str(bucket.get("id") or ""),
+                    expected_content_hash=body_hash,
+                    summary=raw_summary,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Recall summary frontmatter write failed for %s: %s",
+                    bucket.get("id"),
+                    type(exc).__name__,
+                )
+        if not persisted:
+            record_recall_dehydration("persist_failed")
+    return rendered
 
 
 def _local_partial_recall_text(
@@ -1907,7 +1989,7 @@ async def breath_hook(request):
         parts = []
         token_budget = 10000
         for b in pinned:
-            summary = await _dehydrate_for_recall(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
+            summary = await _dehydrate_for_recall(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"}, bucket=b)
             parts.append(f"📌 [核心准则] {summary}")
             token_budget -= count_tokens_approx(summary)
 
@@ -1915,7 +1997,7 @@ async def breath_hook(request):
         # --- feel 桶:情感沉淀,紧跟核心准则浮现(独立池) ---
         feel_seen = {b["id"] for b in pinned}
         for b in _surface_feel_pool(all_buckets, feel_seen):
-            summary = await _dehydrate_for_recall(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
+            summary = await _dehydrate_for_recall(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"}, bucket=b)
             parts.append(f"💧 [情感沉淀] {summary}")
             token_budget -= count_tokens_approx(summary)
 
@@ -1932,7 +2014,7 @@ async def breath_hook(request):
         for b in candidates:
             if token_budget <= 0:
                 break
-            summary = await _dehydrate_for_recall(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"})
+            summary = await _dehydrate_for_recall(strip_wikilinks(b["content"]), {k: v for k, v in b["metadata"].items() if k != "tags"}, bucket=b)
             summary_tokens = count_tokens_approx(summary)
             if summary_tokens > token_budget:
                 break
@@ -3364,7 +3446,7 @@ async def breath(
         for b in pinned_buckets:
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await _dehydrate_for_recall(strip_wikilinks(b["content"]), clean_meta)
+                summary = await _dehydrate_for_recall(strip_wikilinks(b["content"]), clean_meta, bucket=b)
                 pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
             except Exception as e:
                 logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
@@ -3435,7 +3517,7 @@ async def breath(
         for b in _surface_feel_pool(all_buckets, feel_seen):
             try:
                 fclean = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                fsummary = await _dehydrate_for_recall(strip_wikilinks(b["content"]), fclean)
+                fsummary = await _dehydrate_for_recall(strip_wikilinks(b["content"]), fclean, bucket=b)
                 feel_results.append(f"💧 [情感沉淀] [bucket_id:{b['id']}] {fsummary}")
                 feel_buckets.append(b)
                 token_budget -= count_tokens_approx(fsummary)
@@ -3461,7 +3543,7 @@ async def breath(
                 break
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await _dehydrate_for_recall(strip_wikilinks(b["content"]), clean_meta)
+                summary = await _dehydrate_for_recall(strip_wikilinks(b["content"]), clean_meta, bucket=b)
                 summary_tokens = count_tokens_approx(summary)
                 if summary_tokens > token_budget:
                     break
@@ -3981,7 +4063,7 @@ async def breath(
                 original_v = float(clean_meta.get("valence", 0.5))
                 shift = (q_valence - 0.5) * 0.2  # ±0.1 max shift
                 clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
-            summary = await _dehydrate_for_recall(strip_wikilinks(bucket["content"]), clean_meta)
+            summary = await _dehydrate_for_recall(strip_wikilinks(bucket["content"]), clean_meta, bucket=bucket)
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
                 break
@@ -4061,6 +4143,7 @@ async def breath(
             summary = await _dehydrate_for_recall(
                 strip_wikilinks(state_bucket["content"]),
                 clean_meta,
+                bucket=state_bucket,
             )
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
@@ -4159,6 +4242,7 @@ async def breath(
                 summary = await _dehydrate_for_recall(
                     strip_wikilinks(neighbor["content"]),
                     clean_meta,
+                    bucket=neighbor,
                 )
                 summary_tokens = count_tokens_approx(summary)
                 if token_used + summary_tokens > max_tokens:
@@ -4259,6 +4343,7 @@ async def breath(
                 summary = await _dehydrate_for_recall(
                     strip_wikilinks(e_bucket["content"]),
                     clean_meta,
+                    bucket=e_bucket,
                 )
                 summary_tokens = count_tokens_approx(summary)
                 if token_used + summary_tokens > max_tokens:
@@ -4337,7 +4422,7 @@ async def breath(
                 drift_results = []
                 for b in drifted:
                     clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                    summary = await _dehydrate_for_recall(strip_wikilinks(b["content"]), clean_meta)
+                    summary = await _dehydrate_for_recall(strip_wikilinks(b["content"]), clean_meta, bucket=b)
                     prefix = _recall_prefix(
                         b["id"],
                         "side_channel",

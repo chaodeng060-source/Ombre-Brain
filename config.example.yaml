@@ -73,6 +73,9 @@ dehydration:
   # api_key: ""    # ⚠️ Use env var OMBRE_API_KEY instead / 请使用环境变量 OMBRE_API_KEY
   max_tokens: 1024
   temperature: 0.1
+  # Persist derived recall summaries in bucket frontmatter.  False restores
+  # the prior sidecar-only read path without changing source memory content.
+  recall_frontmatter_cache_enabled: true
   # Strict self-containment JSON should not spend its answer budget on hidden
   # reasoning. Official DeepSeek endpoints enable this automatically; set true
   # for compatible DeepSeek proxies, or false to force the generic contract.

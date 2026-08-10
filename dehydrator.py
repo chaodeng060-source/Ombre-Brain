@@ -1561,7 +1561,8 @@ class Dehydrator:
         metadata: dict = None,
         *,
         write_cache: bool = True,
-    ) -> str:
+        return_source: bool = False,
+    ) -> str | tuple[str, str]:
         """
         Dehydrate/compress memory content.
         Returns formatted summary string ready for Claude context injection.
@@ -1571,8 +1572,11 @@ class Dehydrator:
         返回格式化的摘要字符串，可直接注入 Claude 上下文。
         使用 SQLite 缓存避免重复调用 API。
         """
+        def _result(value: str, source: str) -> str | tuple[str, str]:
+            return (value, source) if return_source else value
+
         if not content or not content.strip():
-            return "（空记忆 / empty memory）"
+            return _result("（空记忆 / empty memory）", "passthrough")
 
         # 出本地脱敏：content 可能进外部 LLM（_api_dehydrate），先抹 secret。dehydrate 产
         # 派生摘要、不写回库正文，脱敏安全（merge 才改 source of truth、绝不脱敏，见 merge）。
@@ -1581,23 +1585,23 @@ class Dehydrator:
         # --- Content is short enough, no compression needed ---
         # --- 内容已经很短，不需要压缩 ---
         if count_tokens_approx(content) < 100:
-            return self._format_output(content, metadata)
+            return _result(self._format_output(content, metadata), "passthrough")
 
         # --- Check cache first ---
         # --- 先查缓存 ---
         if not write_cache:
             cached = self._get_read_only_memory_summary(content)
             if cached:
-                return self._format_output(cached, metadata)
+                return _result(self._format_output(cached, metadata), "cached")
             cached = self._get_recall_cached_summary(content)
             if cached:
                 self._set_read_only_memory_summary(content, cached)
-                return self._format_output(cached, metadata)
+                return _result(self._format_output(cached, metadata), "cached")
             cached = self._get_v1_recall_cached_summary(content)
             if cached:
                 self._set_recall_cached_summary(content, cached)
                 self._set_read_only_memory_summary(content, cached)
-                return self._format_output(cached, metadata)
+                return _result(self._format_output(cached, metadata), "cached")
 
         cached = None
         if write_cache:
@@ -1620,7 +1624,7 @@ class Dehydrator:
             if not write_cache:
                 self._set_recall_cached_summary(content, cached)
                 self._set_read_only_memory_summary(content, cached)
-            return self._format_output(cached, metadata)
+            return _result(self._format_output(cached, metadata), "cached")
         # --- API dehydration (no local fallback) ---
         # --- API 脱水（无本地降级）---
         if not self.api_available:
@@ -1660,7 +1664,32 @@ class Dehydrator:
             self._set_recall_cached_summary(content, result)
             self._set_read_only_memory_summary(content, result)
 
-        return self._format_output(result, metadata)
+        return _result(self._format_output(result, metadata), "computed")
+
+    async def dehydrate_with_source(
+        self,
+        content: str,
+        metadata: dict | None = None,
+        *,
+        write_cache: bool = True,
+    ) -> tuple[str, str]:
+        """Return dehydration output plus ``cached/computed/passthrough``."""
+        result = await self.dehydrate(
+            content,
+            metadata,
+            write_cache=write_cache,
+            return_source=True,
+        )
+        assert isinstance(result, tuple)
+        return result
+
+    def format_dehydration_summary(
+        self,
+        summary: str,
+        metadata: dict | None = None,
+    ) -> str:
+        """Format one already-derived summary with current display metadata."""
+        return self._format_output(str(summary or ""), metadata)
 
     # ---------------------------------------------------------
     # Merge: blend new content into existing bucket

@@ -72,12 +72,23 @@ _BucketFileRevision = tuple[
 _BucketTreeSnapshot = tuple[_BucketFileRevision, ...]
 
 
+RECALL_DERIVED_METADATA_FIELDS = frozenset({
+    "dehydrated_summary",
+    "dehydrated_content_hash",
+})
+
+
 def bucket_revision_hash(content: str, metadata: dict) -> str:
     """Stable optimistic-concurrency token for one complete bucket snapshot."""
+    semantic_metadata = {
+        key: value
+        for key, value in dict(metadata or {}).items()
+        if key not in RECALL_DERIVED_METADATA_FIELDS
+    }
     payload = json.dumps(
         {
             "content": str(content or ""),
-            "metadata": dict(metadata or {}),
+            "metadata": semantic_metadata,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -457,6 +468,78 @@ class BucketManager:
         if not file_path:
             return None
         return self._load_bucket(file_path)
+
+    async def cache_recall_dehydration(
+        self,
+        bucket_id: str,
+        *,
+        expected_content_hash: str,
+        summary: str,
+        actor: str = "system:recall-dehydration-cache",
+    ) -> bool:
+        """Persist a derived recall summary without changing memory activity.
+
+        The cache is valid only for the exact Markdown body hash supplied by
+        the caller.  Unlike ``update()``, this narrow derived-metadata write
+        deliberately does not touch ``last_active`` or move the bucket.
+        """
+        expected_content_hash = str(expected_content_hash or "").strip().lower()
+        summary = str(summary or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_content_hash):
+            raise ValueError("expected_content_hash must be sha256 hex")
+        if len(summary) < 10:
+            raise ValueError("dehydrated summary is empty or too short")
+
+        async with self._write_guard(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return False
+
+            event_id = None
+            try:
+                post = self._safe_load_post(file_path)
+                actual_content_hash = hashlib.sha256(
+                    str(post.content or "").encode("utf-8")
+                ).hexdigest()
+                if actual_content_hash != expected_content_hash:
+                    logger.info(
+                        "Recall dehydration cache skipped after body change: %s",
+                        bucket_id,
+                    )
+                    return False
+                if (
+                    post.get("dehydrated_content_hash") == expected_content_hash
+                    and post.get("dehydrated_summary") == summary
+                ):
+                    return True
+
+                before = self._post_snapshot(post, file_path)
+                post["dehydrated_summary"] = summary
+                post["dehydrated_content_hash"] = expected_content_hash
+                event_id = self.audit_log.begin(
+                    actor=actor,
+                    action="cache_recall_dehydration",
+                    bucket_id=bucket_id,
+                    before=before,
+                    after=self._post_snapshot(post, file_path),
+                    details={
+                        "changed_fields": [
+                            "dehydrated_content_hash",
+                            "dehydrated_summary",
+                        ],
+                    },
+                )
+                self._atomic_write_post(file_path, post)
+                self.audit_log.commit(event_id)
+                return True
+            except Exception as exc:
+                self.audit_log.fail(event_id, exc)
+                logger.warning(
+                    "Failed to persist recall dehydration metadata for %s: %s",
+                    bucket_id,
+                    type(exc).__name__,
+                )
+                return False
 
     def _move_bucket(self, file_path: str, target_type_dir: str, domain: list[str] = None) -> str:
         primary_domain = sanitize_name(domain[0]) if domain else "未分类"

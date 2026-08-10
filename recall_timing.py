@@ -17,6 +17,13 @@ from uuid import uuid4
 SCHEMA_VERSION = 1
 
 _recall_timing = contextvars.ContextVar("ombre_recall_timing", default=None)
+_DEHYDRATION_OUTCOMES = frozenset({
+    "frontmatter_hits",
+    "backfilled",
+    "computed",
+    "passthrough",
+    "persist_failed",
+})
 
 
 def begin_recall_timing() -> contextvars.Token:
@@ -26,6 +33,7 @@ def begin_recall_timing() -> contextvars.Token:
         "started_at": time.perf_counter(),
         "stages": {},
         "active_stages": {},
+        "dehydration": {},
     }
     return _recall_timing.set(state)
 
@@ -59,6 +67,19 @@ def record_recall_stage(name: str, elapsed_seconds: float) -> None:
     entry = stages.setdefault(name, {"elapsed_ms": 0.0, "calls": 0})
     entry["elapsed_ms"] = round(float(entry["elapsed_ms"]) + elapsed_ms, 3)
     entry["calls"] = int(entry["calls"]) + 1
+
+
+def record_recall_dehydration(outcome: str, count: int = 1) -> None:
+    """Count content-free dehydration outcomes for one recall request."""
+    if outcome not in _DEHYDRATION_OUTCOMES:
+        raise ValueError(f"unknown dehydration outcome: {outcome}")
+    state = _recall_timing.get()
+    if not isinstance(state, dict):
+        return
+    counters = state.get("dehydration")
+    if not isinstance(counters, dict):
+        return
+    counters[outcome] = int(counters.get(outcome, 0)) + max(0, int(count))
 
 
 def start_recall_stage(name: str) -> None:
@@ -102,6 +123,7 @@ def finish_recall_timing(*, status: str, partial: bool) -> dict:
             "total_ms": 0.0,
             "unattributed_ms": 0.0,
             "stages": {},
+            "dehydration": {},
         }
 
     total_ms = max(0.0, (time.perf_counter() - state["started_at"]) * 1000.0)
@@ -133,4 +155,9 @@ def finish_recall_timing(*, status: str, partial: bool) -> dict:
         "total_ms": round(total_ms, 3),
         "unattributed_ms": round(max(0.0, total_ms - attributed_ms), 3),
         "stages": stages,
+        "dehydration": {
+            name: int(count)
+            for name, count in state.get("dehydration", {}).items()
+            if name in _DEHYDRATION_OUTCOMES and int(count) > 0
+        },
     }
