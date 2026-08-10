@@ -3366,6 +3366,7 @@ async def breath(
 
     # --- With args: search mode (RRF fusion of keyword + vector) ---
     # --- 有参数：检索模式（关键词 + 向量 RRF 融合）---
+    start_recall_stage("query_prep")
     domain_filter = [d.strip() for d in domain.split(",") if d.strip()] or None
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
@@ -3411,6 +3412,7 @@ async def breath(
             f"keyword_top_k={intent_policy['keyword_top_k']} "
             f"vector_top_k={intent_policy['vector_top_k']}"
         )
+    finish_recall_stage("query_prep")
 
     query_angles = [recall_query]
     qe_cfg = config.get("query_expansion", {}) or {}
