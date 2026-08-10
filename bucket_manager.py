@@ -35,7 +35,7 @@ import logging
 import re
 from collections import Counter
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -97,13 +97,21 @@ def _bucket_in_time_range(bucket: dict, after: datetime = None, before: datetime
     raw = event_at_from_metadata(meta, fallback_last_active=True) or ""
     try:
         created = datetime.fromisoformat(str(raw))
-    except (ValueError, TypeError):
+        local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+
+        def _comparable(value: datetime) -> datetime:
+            if value.tzinfo is None or value.utcoffset() is None:
+                value = value.replace(tzinfo=local_tz)
+            return value.astimezone(timezone.utc)
+
+        created_cmp = _comparable(created)
+        if after is not None and created_cmp < _comparable(after):
+            return False
+        if before is not None and created_cmp > _comparable(before):
+            return False
         return True
-    if after is not None and created < after:
-        return False
-    if before is not None and created > before:
-        return False
-    return True
+    except (AttributeError, ValueError, TypeError, OverflowError):
+        return True
 
 
 class BucketManager:

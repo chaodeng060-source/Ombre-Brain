@@ -3472,7 +3472,11 @@ async def breath(
             intent=intent_policy["intent"],
         )
     except Exception as e:
-        logger.error(f"Keyword search failed / 关键词检索失败: {e}")
+        logger.error(
+            "Keyword search failed / 关键词检索失败: %s",
+            e,
+            exc_info=True,
+        )
         if _strict_recall_errors.get():
             raise RecallOperationalError("keyword_search_failed") from e
         return "检索过程出错，请稍后重试。"

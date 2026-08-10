@@ -6,7 +6,7 @@
 # 纯单元 + bucket_manager 集成,不需要 LLM/embedding。
 # ============================================================
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import pytest_asyncio
@@ -131,6 +131,21 @@ class TestBucketInTimeRange:
         # on broken metadata is worse than including a noisy bucket.
         # 无法解析的时间戳保守保留——丢一个噪音桶比让损坏元数据消失更好。
         assert _bucket_in_time_range(b, after, before) is True
+
+    def test_naive_bucket_with_aware_created_after(self):
+        local_tz = datetime.now().astimezone().tzinfo
+        b = _make_bucket("2026-05-05T10:00:00")
+        after = datetime(2026, 5, 5, 9, 0, tzinfo=local_tz).astimezone(timezone.utc)
+        assert _bucket_in_time_range(b, after=after) is True
+
+    def test_aware_bucket_with_naive_created_after_filters_correctly(self):
+        local_tz = datetime.now().astimezone().tzinfo
+        aware_created = datetime(2026, 5, 5, 10, 0, tzinfo=local_tz).astimezone(
+            timezone.utc
+        )
+        b = _make_bucket(aware_created.isoformat())
+        after = datetime(2026, 5, 5, 11, 0)
+        assert _bucket_in_time_range(b, after=after) is False
 
     def test_falls_back_to_last_active(self):
         b = {"id": "x", "metadata": {"last_active": "2026-05-05T10:00:00"}}
