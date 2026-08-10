@@ -47,6 +47,18 @@ def test_operational_classifier_excludes_protected_narrative_memory():
         bucket_type="feel",
     )
     assert bucket_is_operational_status(protected_engineering)
+    progress_snapshot = _bucket(
+        "d",
+        "当前进度为444/522，剩78条，预计40分钟完成",
+        ["日常小事"],
+    )
+    progress_snapshot["metadata"]["type"] = "feel"
+    assert not is_operational_status_fact(
+        progress_snapshot["content"],
+        progress_snapshot["metadata"]["domain"],
+        bucket_type="feel",
+    )
+    assert bucket_is_operational_status(progress_snapshot)
 
 
 def test_reading_absent_sidecar_does_not_create_it(tmp_path):

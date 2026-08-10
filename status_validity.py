@@ -45,6 +45,12 @@ _STATUS_RE = re.compile(
     r"|(?:进行中|进度|跑了|回滚|撤回|结案|暂停|停滞|失败|全绿|验收)",
     re.IGNORECASE,
 )
+_PROGRESS_SNAPSHOT_RE = re.compile(
+    r"\b\d+\s*/\s*\d+\b"
+    r"|(?:剩|余)\s*\d+\s*(?:条|项|个|步)"
+    r"|(?:预计|约)\s*\d+(?:\.\d+)?\s*(?:分钟|小时|天)",
+    re.IGNORECASE,
+)
 _QUESTION_RE = re.compile(
     r"(?:吗|么|没|是否|怎样|怎么样|如何|到哪|进度|状态|现在|当前|目前|最新|[?？])"
     r"|\b(?:done|deployed|released|complete|completed|progress|status|current|latest)\b",
@@ -160,6 +166,7 @@ def bucket_is_operational_status(bucket: Mapping | None) -> bool:
                 for hint in _ENGINEERING_DOMAIN_HINTS
             )
             or any(hint.lower() in text.lower() for hint in _TECHNICAL_CONTENT_HINTS)
+            or bool(_PROGRESS_SNAPSHOT_RE.search(text))
         )
     )
 

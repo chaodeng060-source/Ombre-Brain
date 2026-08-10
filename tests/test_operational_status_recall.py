@@ -56,6 +56,11 @@ def test_status_prefix_never_presents_unmarked_snapshot_as_current():
         "旧项目已经 commit、push 并部署完成",
     )
     protected_history["metadata"]["type"] = "feel"
+    progress_history = _bucket(
+        "feel-progress",
+        "当前进度为444/522，剩78条，预计40分钟完成",
+    )
+    progress_history["metadata"]["type"] = "feel"
 
     current_prefix = server._recall_prefix(
         "current",
@@ -78,6 +83,13 @@ def test_status_prefix_never_presents_unmarked_snapshot_as_current():
         bucket=protected_history,
         state_profile=profile,
     )
+    progress_prefix = server._recall_prefix(
+        "feel-progress",
+        "main",
+        "curated_rrf",
+        bucket=progress_history,
+        state_profile=profile,
+    )
 
     assert "[validity:current]" in current_prefix
     assert "[authority:current_status]" in current_prefix
@@ -86,6 +98,8 @@ def test_status_prefix_never_presents_unmarked_snapshot_as_current():
     assert "[authority:not_current_status]" in unknown_prefix
     assert "[validity:unknown]" in protected_prefix
     assert "[authority:not_current_status]" in protected_prefix
+    assert "[validity:unknown]" in progress_prefix
+    assert "[authority:not_current_status]" in progress_prefix
 
 
 def test_historical_status_query_retains_and_labels_old_snapshot(monkeypatch):
