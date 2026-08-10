@@ -11,6 +11,7 @@ from dehydrator import (
     INFER_RELATIONS_PROMPT,
     RECALL_DEHYDRATION_CACHE_SCHEMA,
     RECALL_DEHYDRATION_CACHE_SCHEMA_V1,
+    RECALL_DS_FILTER_CACHE_SCHEMA,
 )
 
 
@@ -60,6 +61,28 @@ def _dehydrator(test_config, content, *, choices=True):
 
 def _long_content():
     return "朝灯问起4.7的第一晚，我要保留具体事件、时间、感受和后续影响。" * 12
+
+
+def test_ds_filter_decision_persists_only_in_disposable_sidecar(test_config):
+    cache_key = hashlib.sha256(b"exact redacted input contract").hexdigest()
+    first = Dehydrator(test_config)
+
+    assert first.get_recall_ds_filter_decision(cache_key) is None
+    assert first.set_recall_ds_filter_decision(cache_key, [2, 0])
+
+    restarted = Dehydrator(test_config)
+    assert restarted.get_recall_ds_filter_decision(cache_key) == [2, 0]
+    assert restarted.set_recall_ds_filter_decision(cache_key, [])
+    assert restarted.get_recall_ds_filter_decision(cache_key) == []
+
+    with sqlite3.connect(restarted.recall_cache_db_path) as conn:
+        row = conn.execute(
+            "SELECT cache_key, selected_indices, cache_schema "
+            "FROM recall_ds_filter_cache"
+        ).fetchone()
+    assert row == (cache_key, "[]", RECALL_DS_FILTER_CACHE_SCHEMA)
+    raw = Path(restarted.recall_cache_db_path).read_bytes()
+    assert b"exact redacted input contract" not in raw
 
 
 @pytest.mark.asyncio

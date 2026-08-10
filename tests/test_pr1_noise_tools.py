@@ -520,6 +520,20 @@ def _fake_dehydrator_with_response(create_fn):
     )
 
 
+def _fake_dehydrator_with_decision_cache(create_fn):
+    cache = {}
+    fake = _fake_dehydrator_with_response(create_fn)
+    fake.base_url = "https://api.deepseek.com/v1"
+    fake.get_recall_ds_filter_decision = cache.get
+
+    def _set(cache_key, selected_indices):
+        cache[cache_key] = list(selected_indices)
+        return True
+
+    fake.set_recall_ds_filter_decision = _set
+    return fake, cache
+
+
 @pytest.mark.asyncio
 async def test_ds_gate_off_by_default_is_pure_stub(monkeypatch):
     monkeypatch.delenv("OMBRE_DS_FILTER_ENABLED", raising=False)
@@ -549,6 +563,50 @@ async def test_ds_gate_subtractive_when_enabled(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ds_gate_exact_success_cache_reuses_only_same_contract(monkeypatch):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+    calls = 0
+
+    async def _create(**_kw):
+        nonlocal calls
+        calls += 1
+        msg = types.SimpleNamespace(content='{"keep": [0, 2]}')
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+
+    fake, cache = _fake_dehydrator_with_decision_cache(_create)
+    monkeypatch.setattr(server, "dehydrator", fake)
+    buckets = [_bucket("a", "A"), _bucket("b", "B"), _bucket("c", "C")]
+
+    first = await server._ds_filter_candidates(
+        "工程", buckets, mode="search", max_results=3
+    )
+    second = await server._ds_filter_candidates(
+        "工程", buckets, mode="search", max_results=3
+    )
+    assert [b["id"] for b in first] == ["a", "c"]
+    assert [b["id"] for b in second] == ["a", "c"]
+    assert calls == 1
+    assert len(cache) == 1
+
+    changed = [_bucket("a", "A"), _bucket("b", "B changed"), _bucket("c", "C")]
+    await server._ds_filter_candidates(
+        "工程", changed, mode="search", max_results=3
+    )
+    await server._ds_filter_candidates(
+        "工程", buckets, mode="search", max_results=3, allow_empty=True
+    )
+    await server._ds_filter_candidates(
+        "工程", buckets, mode="search", max_results=3, force_keep_ids={"b"}
+    )
+    await server._ds_filter_candidates(
+        "工程", buckets, mode="search", max_results=2
+    )
+    assert calls == 5
+    assert len(cache) == 5
+
+
+@pytest.mark.asyncio
 async def test_ds_gate_falls_back_to_capped_on_error(monkeypatch):
     monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
     monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
@@ -562,6 +620,30 @@ async def test_ds_gate_falls_back_to_capped_on_error(monkeypatch):
         "工程", buckets, mode="search", max_results=2
     )
     assert [b["id"] for b in selected] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_ds_gate_failure_is_never_cached(monkeypatch):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+    calls = 0
+
+    async def _create(**_kw):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("api boom")
+
+    fake, cache = _fake_dehydrator_with_decision_cache(_create)
+    monkeypatch.setattr(server, "dehydrator", fake)
+    buckets = [_bucket("a", "A"), _bucket("b", "B")]
+
+    for _ in range(2):
+        selected = await server._ds_filter_candidates(
+            "工程", buckets, mode="search", max_results=2
+        )
+        assert [b["id"] for b in selected] == ["a", "b"]
+    assert calls == 2
+    assert cache == {}
 
 
 @pytest.mark.asyncio
