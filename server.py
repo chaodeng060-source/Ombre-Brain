@@ -166,6 +166,13 @@ from recall_history import (
     default_content_fingerprint,
     recall_identity,
 )
+from recall_timing import (
+    begin_recall_timing,
+    finish_recall_timing,
+    recall_stage,
+    record_recall_stage,
+    reset_recall_timing,
+)
 from lmc5_ledger import (
     LMC5Ledger,
     LedgerConflictError,
@@ -3350,42 +3357,44 @@ async def breath(
     query_angles = [recall_query]
     qe_cfg = config.get("query_expansion", {}) or {}
     qe_allowed = set(qe_cfg.get("allowed_intents") or ["recall", "relation", "temporal"])
-    if qe_cfg.get("enabled", False) and intent_policy.get("intent") in qe_allowed:
-        try:
-            query_angles = await expand_query(
-                recall_query,
-                getattr(dehydrator, "client", None),
-                getattr(dehydrator, "model", "deepseek-chat"),
-                qe_cfg,
-            ) or [recall_query]
-        except Exception as e:
-            logger.warning(f"Query expansion failed, using original / 查询扩展失败，回退原词: {e}")
-            query_angles = [recall_query]
+    with recall_stage("expansion"):
+        if qe_cfg.get("enabled", False) and intent_policy.get("intent") in qe_allowed:
+            try:
+                query_angles = await expand_query(
+                    recall_query,
+                    getattr(dehydrator, "client", None),
+                    getattr(dehydrator, "model", "deepseek-chat"),
+                    qe_cfg,
+                ) or [recall_query]
+            except Exception as e:
+                logger.warning(f"Query expansion failed, using original / 查询扩展失败，回退原词: {e}")
+                query_angles = [recall_query]
     if query_angles[0] != recall_query:
         query_angles = [recall_query] + [q for q in query_angles if q != recall_query]
 
     # Keyword channel (already filtered by world/domain/threshold inside)
     keyword_by_id: dict[str, dict] = {}
     try:
-        for angle in query_angles:
-            for bucket in await bucket_mgr.search(
-                angle,
-                limit=intent_policy["keyword_top_k"],
-                domain_filter=domain_filter,
-                world_filter=world_filter,
-                query_valence=q_valence,
-                query_arousal=q_arousal,
-                created_after=created_after,
-                created_before=created_before,
-                relevance_first=True,
-                # Keep a broad relevance-ranked keyword pool for RRF. The
-                # original-query literal/vector evidence gate below decides
-                # eligibility after both channels are available.
-                relevance_candidate_floor=0.0,
-            ):
-                existing = keyword_by_id.get(bucket["id"])
-                if existing is None or bucket.get("score", 0) > existing.get("score", 0):
-                    keyword_by_id[bucket["id"]] = bucket
+        with recall_stage("keyword_retrieval"):
+            for angle in query_angles:
+                for bucket in await bucket_mgr.search(
+                    angle,
+                    limit=intent_policy["keyword_top_k"],
+                    domain_filter=domain_filter,
+                    world_filter=world_filter,
+                    query_valence=q_valence,
+                    query_arousal=q_arousal,
+                    created_after=created_after,
+                    created_before=created_before,
+                    relevance_first=True,
+                    # Keep a broad relevance-ranked keyword pool for RRF. The
+                    # original-query literal/vector evidence gate below decides
+                    # eligibility after both channels are available.
+                    relevance_candidate_floor=0.0,
+                ):
+                    existing = keyword_by_id.get(bucket["id"])
+                    if existing is None or bucket.get("score", 0) > existing.get("score", 0):
+                        keyword_by_id[bucket["id"]] = bucket
         state_seed_by_id.update({
             str(bucket["id"]): bucket
             for bucket in keyword_by_id.values()
@@ -3427,6 +3436,8 @@ async def breath(
         if _strict_recall_errors.get():
             raise RecallOperationalError("vector_search_failed") from e
         vector_ranked = []
+
+    candidate_started_at = time.perf_counter()
 
     # Entity channel — linked ids are advisory until their content hash and the
     # same authority filters as vector-only candidates have been revalidated.
@@ -3643,7 +3654,10 @@ async def breath(
             content_fingerprint_errors,
         )
     matches = _filter_session_seen(matches, session_id)
-    matches = _filter_anchor_policy_candidates(matches, recall_policy)
+    record_recall_stage("candidate_processing", time.perf_counter() - candidate_started_at)
+    with recall_stage("anchor_gate"):
+        matches = _filter_anchor_policy_candidates(matches, recall_policy)
+    candidate_started_at = time.perf_counter()
     matches = align_fact_state_candidates(
         matches,
         profile=state_profile,
@@ -3668,18 +3682,22 @@ async def breath(
         limit=state_link_budget,
     )
     state_link_candidates = _filter_session_seen(state_link_candidates, session_id)
-    state_link_candidates = _filter_anchor_policy_candidates(
-        state_link_candidates,
-        recall_policy,
-    )[:state_link_budget]
-    matches = await _ds_filter_candidates(
-        recall_query,
-        matches,
-        mode="search",
-        max_results=max(0, max_results - len(state_link_candidates)),
-        allow_empty=allow_empty_recall,
-    )
+    record_recall_stage("candidate_processing", time.perf_counter() - candidate_started_at)
+    with recall_stage("anchor_gate"):
+        state_link_candidates = _filter_anchor_policy_candidates(
+            state_link_candidates,
+            recall_policy,
+        )[:state_link_budget]
+    with recall_stage("ds_filter"):
+        matches = await _ds_filter_candidates(
+            recall_query,
+            matches,
+            mode="search",
+            max_results=max(0, max_results - len(state_link_candidates)),
+            allow_empty=allow_empty_recall,
+        )
 
+    assembly_started_at = time.perf_counter()
     results = []
     token_used = 0
     result_buckets = []
@@ -4069,6 +4087,7 @@ async def breath(
             logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")
 
     if not results:
+        record_recall_stage("assembly", time.perf_counter() - assembly_started_at)
         return _append_body_state_block(
             "未找到相关记忆。",
             [],
@@ -4097,6 +4116,7 @@ async def breath(
         reset_body_state,
     )
     _remember_session_seen_ids(session_id, result_ids)
+    record_recall_stage("assembly", time.perf_counter() - assembly_started_at)
     return await _tool_result_with_optional_images(text, result_buckets, include_images)
 
 
@@ -7083,27 +7103,39 @@ async def api_breath(request):
 
     requested_policy = str(body.get("policy") or "search").strip().lower()
     recall_policy = _normalize_anchor_recall_policy(requested_policy)
+    timing_token = begin_recall_timing()
     try:
-        result = await breath(
-            query=query,
-            max_tokens=_int_arg("max_tokens", BREATH_DEFAULT_MAX_TOKENS),
-            domain=str(body.get("domain") or ""),
-            valence=_float_arg("valence"),
-            arousal=_float_arg("arousal"),
-            max_results=_int_arg("max_results", BREATH_DEFAULT_MAX_RESULTS),
-            world=str(body.get("world") or ""),
-            relation_depth=_int_arg("relation_depth", 1),
-            since=str(body.get("since") or ""),
-            until=str(body.get("until") or ""),
-            session_id=str(body.get("session_id") or ""),
-            policy=recall_policy,
-            include_images=False,
-            include_body_state=False,
-            reset_body_state=False,
-        )
-    except Exception:
-        logger.exception("HTTP breath bridge failed")
-        return JSONResponse({"error": "breath failed"}, status_code=500)
+        try:
+            result = await breath(
+                query=query,
+                max_tokens=_int_arg("max_tokens", BREATH_DEFAULT_MAX_TOKENS),
+                domain=str(body.get("domain") or ""),
+                valence=_float_arg("valence"),
+                arousal=_float_arg("arousal"),
+                max_results=_int_arg("max_results", BREATH_DEFAULT_MAX_RESULTS),
+                world=str(body.get("world") or ""),
+                relation_depth=_int_arg("relation_depth", 1),
+                since=str(body.get("since") or ""),
+                until=str(body.get("until") or ""),
+                session_id=str(body.get("session_id") or ""),
+                policy=recall_policy,
+                include_images=False,
+                include_body_state=False,
+                reset_body_state=False,
+            )
+        except Exception:
+            timing = finish_recall_timing(status="error", partial=False)
+            logger.exception("HTTP breath bridge failed")
+            logger.info("breath_timing=%s", json.dumps(timing, sort_keys=True))
+            return JSONResponse(
+                {"error": "breath failed", "partial": False, "timing": timing},
+                status_code=500,
+            )
+
+        timing = finish_recall_timing(status="ok", partial=False)
+        logger.info("breath_timing=%s", json.dumps(timing, sort_keys=True))
+    finally:
+        reset_recall_timing(timing_token)
 
     if isinstance(result, str):
         text = result
@@ -7117,6 +7149,8 @@ async def api_breath(request):
     return JSONResponse({
         "raw": text,
         "policy": recall_policy,
+        "partial": False,
+        "timing": timing,
     })
 
 

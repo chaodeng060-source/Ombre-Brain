@@ -22,6 +22,7 @@ import httpx
 from openai import AsyncOpenAI
 
 from maintenance_barrier import MaintenanceBarrier
+from recall_timing import recall_stage
 from redact import redact_embedding_input
 
 logger = logging.getLogger("ombre_brain.embedding")
@@ -269,30 +270,32 @@ class EmbeddingEngine:
             return [], "error"
 
         try:
-            query_embedding, status = await self._generate_embedding_with_status(query)
-            if not query_embedding:
-                return [], status
+            with recall_stage("embedding"):
+                query_embedding, status = await self._generate_embedding_with_status(query)
+                if not query_embedding:
+                    return [], status
         except Exception as e:
             logger.warning(f"Query embedding failed: {e}")
             return [], "error"
 
-        with closing(sqlite3.connect(self.db_path)) as conn:
-            rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
+        with recall_stage("vector_retrieval"):
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
 
-        if not rows:
-            return [], "ok"
+            if not rows:
+                return [], "ok"
 
-        results = []
-        for bucket_id, emb_json in rows:
-            try:
-                stored = json.loads(emb_json)
-                sim = self._max_similarity(query_embedding, stored)
-                results.append((bucket_id, sim))
-            except (json.JSONDecodeError, Exception):
-                continue
+            results = []
+            for bucket_id, emb_json in rows:
+                try:
+                    stored = json.loads(emb_json)
+                    sim = self._max_similarity(query_embedding, stored)
+                    results.append((bucket_id, sim))
+                except (json.JSONDecodeError, Exception):
+                    continue
 
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k], "ok"
+            results.sort(key=lambda x: x[1], reverse=True)
+            return results[:top_k], "ok"
 
     def _max_similarity(self, query_emb: list[float], stored) -> float:
         """对一个桶的 stored 向量取与 query 的最高余弦相似度。
