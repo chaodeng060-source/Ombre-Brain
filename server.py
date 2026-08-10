@@ -1539,6 +1539,22 @@ def _ds_filter_cache_key(
 ) -> str:
     """Hash the full successful-decision contract without storing its input."""
     sys_prompt, user_prompt = _ds_semantic_prompts(query, buckets)
+    candidate_fingerprints = []
+    for bucket in buckets:
+        metadata = bucket.get("metadata", {}) or {}
+        redacted_name = redact_embedding_input(
+            metadata.get("name") or bucket.get("id", "")
+        )
+        redacted_content = redact_embedding_input(
+            (bucket.get("content") or "").strip().replace("\n", " ")
+        )
+        candidate_fingerprints.append({
+            "id": str(bucket.get("id") or ""),
+            "name": redacted_name,
+            "content_sha256": hashlib.sha256(
+                redacted_content.encode("utf-8")
+            ).hexdigest(),
+        })
     contract = {
         "schema": RECALL_DS_FILTER_CACHE_SCHEMA,
         "model": getattr(dehydrator, "model", "deepseek-chat"),
@@ -1551,6 +1567,9 @@ def _ds_filter_cache_key(
         "temperature": 0.0,
         "system_prompt": sys_prompt,
         "user_prompt": user_prompt,
+        # The model sees 200-char snippets, but task acceptance requires any
+        # source-body or identity change to invalidate the derived decision.
+        "ordered_candidate_fingerprints": candidate_fingerprints,
     }
     payload = json.dumps(
         contract,
@@ -1639,7 +1658,11 @@ async def _ds_filter_candidates(
         allow_empty=allow_empty,
     )
     cache_get = getattr(dehydrator, "get_recall_ds_filter_decision", None)
-    cached_indices = cache_get(cache_key) if callable(cache_get) else None
+    try:
+        cached_indices = cache_get(cache_key) if callable(cache_get) else None
+    except Exception as exc:
+        logger.warning("Ignoring unreadable recall DS decision: %s", exc)
+        cached_indices = None
     if cached_indices is not None and (
         len(cached_indices) == len(set(cached_indices))
         and all(0 <= index < len(capped) for index in cached_indices)
@@ -1671,7 +1694,10 @@ async def _ds_filter_candidates(
     ]
     cache_set = getattr(dehydrator, "set_recall_ds_filter_decision", None)
     if callable(cache_set):
-        cache_set(cache_key, selected_indices)
+        try:
+            cache_set(cache_key, selected_indices)
+        except Exception as exc:
+            logger.warning("Unable to persist recall DS decision: %s", exc)
     logger.info(
         "DS filter mode=%s query=%r input=%d capped=%d kept=%d",
         mode, query[:80], len(candidates), len(capped), len(result),

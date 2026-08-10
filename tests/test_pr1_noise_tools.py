@@ -576,7 +576,12 @@ async def test_ds_gate_exact_success_cache_reuses_only_same_contract(monkeypatch
 
     fake, cache = _fake_dehydrator_with_decision_cache(_create)
     monkeypatch.setattr(server, "dehydrator", fake)
-    buckets = [_bucket("a", "A"), _bucket("b", "B"), _bucket("c", "C")]
+    long_prefix = "前" * 200
+    buckets = [
+        _bucket("a", "A", name="first"),
+        _bucket("b", long_prefix + "原始结尾", name="second"),
+        _bucket("c", "C", name="third"),
+    ]
 
     first = await server._ds_filter_candidates(
         "工程", buckets, mode="search", max_results=3
@@ -602,8 +607,24 @@ async def test_ds_gate_exact_success_cache_reuses_only_same_contract(monkeypatch
     await server._ds_filter_candidates(
         "工程", buckets, mode="search", max_results=2
     )
-    assert calls == 5
-    assert len(cache) == 5
+    changed_after_snippet = [
+        buckets[0],
+        _bucket("b", long_prefix + "变更结尾", name="second"),
+        buckets[2],
+    ]
+    await server._ds_filter_candidates(
+        "工程", changed_after_snippet, mode="search", max_results=3
+    )
+    changed_id_only = [
+        _bucket("renamed-a", "A", name="first"),
+        buckets[1],
+        buckets[2],
+    ]
+    await server._ds_filter_candidates(
+        "工程", changed_id_only, mode="search", max_results=3
+    )
+    assert calls == 7
+    assert len(cache) == 7
 
 
 @pytest.mark.asyncio
