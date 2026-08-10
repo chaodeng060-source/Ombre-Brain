@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -48,6 +49,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "temperature": 0.3,
     "min_query_len": 2,   # 单字查询不值得改写
     "max_query_chars": 500,
+    # Stage 0 是可选增益；必须先于外层 breath 总闸回退原查询。
+    "timeout_sec": 3.0,
 }
 
 
@@ -70,19 +73,28 @@ async def expand_query(
 
     safe_q = redact_embedding_input(q)
     try:
-        resp = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": EXPAND_PROMPT},
-                {"role": "user", "content": safe_q[: cfg["max_query_chars"]]},
-            ],
-            max_tokens=cfg["max_tokens"],
-            temperature=cfg["temperature"],
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": EXPAND_PROMPT},
+                    {"role": "user", "content": safe_q[: cfg["max_query_chars"]]},
+                ],
+                max_tokens=cfg["max_tokens"],
+                temperature=cfg["temperature"],
+            ),
+            timeout=max(0.1, float(cfg["timeout_sec"])),
         )
         if not resp.choices:
             return [q]
         raw = (resp.choices[0].message.content or "").strip()
         angles = _parse_angles(raw)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "查询改写超时 %.1fs，回退原词 / query expansion timed out; using original query",
+            max(0.1, float(cfg["timeout_sec"])),
+        )
+        return [q]
     except Exception as e:  # 网络/解析/限流——一律回退，绝不让召回崩
         logger.warning(f"查询改写失败，回退原词 / query expansion failed: {e}")
         return [q]

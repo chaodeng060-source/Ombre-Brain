@@ -25,6 +25,20 @@ class FakeClient:
         return FakeResp(self._content)
 
 
+class HangingClient:
+    """永不自行返回；wait_for 必须取消它并回退原查询。"""
+    def __init__(self):
+        self.cancelled = False
+        self.chat = type("C", (), {"completions": self})()
+
+    async def create(self, **kw):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
 def run(coro):
     return asyncio.get_event_loop().run_until_complete(coro)
 
@@ -65,6 +79,19 @@ def test_llm_failure_returns_original():
     c = FakeClient(raise_exc=True)
     out = run(expand_query("重要查询", c, "m"))
     assert out == ["重要查询"], out  # 崩了也不丢原词
+
+
+def test_llm_timeout_cancels_optional_stage_and_returns_original(caplog):
+    c = HangingClient()
+    out = run(expand_query(
+        "重要查询",
+        c,
+        "m",
+        config={"timeout_sec": 0.01},
+    ))
+    assert out == ["重要查询"]
+    assert c.cancelled is True
+    assert "query expansion timed out" in caplog.text
 
 
 def test_empty_choices():

@@ -295,6 +295,8 @@ query_expansion:
   temperature: 0.3
   min_query_len: 4
   max_query_chars: 500
+  # 可选扩写必须先于调用方总闸回退原查询；0/负值会钳到 0.1 秒。
+  timeout_sec: 3.0
 
 # --- Recall evidence roles / 召回证据角色 ---
 # 主结果角色标记默认关闭以兼容旧客户端；Y 轴 association 无论此开关如何都会显式标成
