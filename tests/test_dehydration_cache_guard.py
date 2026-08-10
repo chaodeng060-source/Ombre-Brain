@@ -5,7 +5,12 @@ import sqlite3
 
 import pytest
 
-from dehydrator import Dehydrator, INFER_RELATIONS_PROMPT
+import dehydrator as dehydrator_module
+from dehydrator import (
+    Dehydrator,
+    INFER_RELATIONS_PROMPT,
+    RECALL_DEHYDRATION_CACHE_SCHEMA,
+)
 
 
 class _Message:
@@ -57,7 +62,7 @@ def _long_content():
 
 
 @pytest.mark.asyncio
-async def test_read_only_dehydrate_cache_miss_keeps_database_byte_identical(
+async def test_recall_cache_miss_writes_only_disposable_derived_cache(
     test_config,
 ):
     valid = '{"core_facts":["4.7的第一晚发生了具体事件"],"summary":"保留正文摘要"}'
@@ -75,6 +80,31 @@ async def test_read_only_dehydrate_cache_miss_keeps_database_byte_identical(
             "SELECT count(*) FROM dehydration_cache"
         ).fetchone()[0]
     assert count == 0
+
+    recall_path = Path(dehydrator.recall_cache_db_path)
+    with sqlite3.connect(recall_path) as conn:
+        rows = conn.execute(
+            "SELECT content_hash, summary, model, cache_schema "
+            "FROM recall_dehydration_cache"
+        ).fetchall()
+    assert rows == [(
+        hashlib.sha256(_long_content().encode()).hexdigest(),
+        valid,
+        dehydrator.model,
+        RECALL_DEHYDRATION_CACHE_SCHEMA,
+    )]
+    assert _long_content().encode() not in recall_path.read_bytes()
+
+    restarted, restarted_completions = _dehydrator(
+        test_config,
+        "must not be called",
+    )
+    restarted_output = await restarted.dehydrate(
+        _long_content(),
+        write_cache=False,
+    )
+    assert restarted_output == output
+    assert restarted_completions.calls == 0
 
 
 @pytest.mark.asyncio
@@ -96,6 +126,65 @@ async def test_read_only_dehydrate_reuses_bounded_process_cache(test_config):
             "SELECT count(*) FROM dehydration_cache"
         ).fetchone()[0]
     assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_recall_cache_key_invalidates_on_content_model_and_prompt_change(
+    test_config,
+    monkeypatch,
+):
+    valid = '{"core_facts":["4.7的第一晚发生了具体事件"],"summary":"保留正文摘要"}'
+    first, first_completions = _dehydrator(test_config, valid)
+    await first.dehydrate(_long_content(), write_cache=False)
+    assert first_completions.calls == 1
+
+    changed_content, changed_content_completions = _dehydrator(test_config, valid)
+    await changed_content.dehydrate(
+        _long_content() + "正文已经更新。",
+        write_cache=False,
+    )
+    assert changed_content_completions.calls == 1
+
+    other_config = {
+        **test_config,
+        "dehydration": {
+            **test_config.get("dehydration", {}),
+            "model": "another-dehydration-model",
+        },
+    }
+    changed_model, changed_model_completions = _dehydrator(other_config, valid)
+    await changed_model.dehydrate(_long_content(), write_cache=False)
+    assert changed_model_completions.calls == 1
+
+    prior_key = first._recall_cache_key(_long_content())
+    monkeypatch.setattr(
+        dehydrator_module,
+        "DEHYDRATE_PROMPT",
+        dehydrator_module.DEHYDRATE_PROMPT + "\n契约版本变化。",
+    )
+    assert first._recall_cache_key(_long_content()) != prior_key
+    legacy_only_content = _long_content() + "旧库未绑定提示词，不能复用。"
+    with sqlite3.connect(first.cache_db_path) as conn:
+        conn.execute(
+            "INSERT INTO dehydration_cache "
+            "(content_hash, summary, model) VALUES (?, ?, ?)",
+            (
+                hashlib.sha256(legacy_only_content.encode()).hexdigest(),
+                valid,
+                first.model,
+            ),
+        )
+        conn.commit()
+    await first.dehydrate(legacy_only_content, write_cache=False)
+    assert first_completions.calls == 2
+
+    with sqlite3.connect(first.recall_cache_db_path) as conn:
+        rows = conn.execute(
+            "SELECT count(*), count(DISTINCT cache_key), "
+            "count(DISTINCT content_hash), count(DISTINCT model) "
+            "FROM recall_dehydration_cache"
+        ).fetchone()
+    assert rows == (4, 4, 3, 2)
 
 
 @pytest.mark.asyncio
@@ -124,6 +213,106 @@ async def test_read_only_dehydrate_cache_hit_keeps_database_byte_identical(
     assert completions.calls == 0
     assert "命中只读缓存" in output
     assert cache_path.read_bytes() == before
+    with sqlite3.connect(dehydrator.recall_cache_db_path) as conn:
+        migrated = conn.execute(
+            "SELECT summary, model, cache_schema "
+            "FROM recall_dehydration_cache"
+        ).fetchall()
+    assert migrated == [(
+        cached_summary,
+        dehydrator.model,
+        RECALL_DEHYDRATION_CACHE_SCHEMA,
+    )]
+
+
+@pytest.mark.asyncio
+async def test_recall_cache_damage_fails_open_and_can_be_rebuilt(
+    test_config,
+    caplog,
+):
+    valid = '{"core_facts":["4.7的第一晚发生了具体事件"],"summary":"保留正文摘要"}'
+    dehydrator, completions = _dehydrator(test_config, valid)
+    recall_path = Path(dehydrator.recall_cache_db_path)
+    recall_path.write_bytes(b"not a sqlite database")
+
+    with caplog.at_level(logging.WARNING, logger="ombre_brain.dehydrator"):
+        output = await dehydrator.dehydrate(_long_content(), write_cache=False)
+
+    assert completions.calls == 1
+    assert "4.7的第一晚发生了具体事件" in output
+    assert "Ignoring unreadable recall dehydration cache" in caplog.text
+
+    # Deleting only the disposable cache is sufficient recovery; the running
+    # process recreates the schema on the next successful miss.
+    recall_path.unlink()
+    replacement_content = _long_content() + "删除派生库后重新生成。"
+    replacement_output = await dehydrator.dehydrate(
+        replacement_content,
+        write_cache=False,
+    )
+    assert completions.calls == 2
+    assert "4.7的第一晚发生了具体事件" in replacement_output
+    with sqlite3.connect(dehydrator.recall_cache_db_path) as conn:
+        count = conn.execute(
+            "SELECT count(*) FROM recall_dehydration_cache"
+        ).fetchone()[0]
+    assert count == 1
+
+    rebuilt, rebuilt_completions = _dehydrator(test_config, "must not be called")
+    rebuilt_output = await rebuilt.dehydrate(
+        replacement_content,
+        write_cache=False,
+    )
+    assert rebuilt_output == replacement_output
+    assert rebuilt_completions.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_recall_cache_lock_fails_open_without_waiting(test_config, caplog):
+    valid = '{"core_facts":["4.7的第一晚发生了具体事件"],"summary":"保留正文摘要"}'
+    dehydrator, completions = _dehydrator(test_config, valid)
+    lock = sqlite3.connect(dehydrator.recall_cache_db_path, timeout=0)
+    lock.execute("BEGIN EXCLUSIVE")
+    try:
+        with caplog.at_level(logging.WARNING, logger="ombre_brain.dehydrator"):
+            output = await dehydrator.dehydrate(
+                _long_content(),
+                write_cache=False,
+            )
+    finally:
+        lock.rollback()
+        lock.close()
+
+    assert completions.calls == 1
+    assert "4.7的第一晚发生了具体事件" in output
+    assert "database is locked" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_recall_cache_refuses_symlink_without_touching_target(
+    test_config,
+    tmp_path,
+    caplog,
+):
+    cache_dir = Path(test_config["buckets_dir"]) / ".recall_cache"
+    cache_dir.mkdir(mode=0o700)
+    outside = tmp_path / "outside.sqlite3"
+    outside.write_bytes(b"do not touch")
+    cache_path = cache_dir / "recall_dehydration_cache.db"
+    try:
+        cache_path.symlink_to(outside)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlinks are unavailable")
+
+    valid = '{"core_facts":["4.7的第一晚发生了具体事件"],"summary":"保留正文摘要"}'
+    with caplog.at_level(logging.WARNING, logger="ombre_brain.dehydrator"):
+        dehydrator, completions = _dehydrator(test_config, valid)
+        output = await dehydrator.dehydrate(_long_content(), write_cache=False)
+
+    assert completions.calls == 1
+    assert "4.7的第一晚发生了具体事件" in output
+    assert outside.read_bytes() == b"do not touch"
+    assert "unsafe recall cache database" in caplog.text
 
 
 @pytest.mark.asyncio

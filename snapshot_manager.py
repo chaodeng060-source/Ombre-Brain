@@ -65,6 +65,7 @@ _EXCLUDED_ROOT_FILES = (
 )
 _EXCLUDED_ROOT_DIRECTORIES = (
     ".session_surface",
+    ".recall_cache",
     "twin",
 )
 _RENAME_NOREPLACE = 1

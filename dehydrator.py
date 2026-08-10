@@ -29,6 +29,7 @@ import hashlib
 import sqlite3
 import logging
 import asyncio
+import stat
 from collections import OrderedDict
 from contextlib import closing
 from pathlib import Path
@@ -41,6 +42,13 @@ logger = logging.getLogger("ombre_brain.dehydrator")
 
 MIN_DEHYDRATION_SUMMARY_CHARS = 10
 READ_ONLY_DEHYDRATION_CACHE_LIMIT = 256
+RECALL_DEHYDRATION_CACHE_LIMIT = 8192
+RECALL_DEHYDRATION_CACHE_SCHEMA = "ombre.recall-dehydration/v1"
+RECALL_REDACTION_CONTRACT = "redact_embedding_input/v1"
+RECALL_OUTPUT_CONTRACT = "normalized-summary/v1"
+RECALL_LEGACY_PROMPT_SHA256 = (
+    "4e55aaa28a183fe953a99f205873f05d484fc624d6c97609327aea5bd019b17a"
+)
 
 
 class SelfContainmentError(RuntimeError):
@@ -759,8 +767,17 @@ class Dehydrator:
         # --- SQLite 脱水缓存：content hash → summary ---
         db_path = os.path.join(config["buckets_dir"], "dehydration_cache.db")
         self.cache_db_path = db_path
+        self.recall_cache_dir_path = os.path.join(
+            config["buckets_dir"],
+            ".recall_cache",
+        )
+        self.recall_cache_db_path = os.path.join(
+            self.recall_cache_dir_path,
+            "recall_dehydration_cache.db",
+        )
         self._read_only_summary_cache: OrderedDict[str, str] = OrderedDict()
         self._init_cache_db()
+        self._init_recall_cache_db()
 
     def _init_cache_db(self):
         """Create dehydration cache table if not exists."""
@@ -789,6 +806,79 @@ class Dehydrator:
             """)
             conn.commit()
 
+    def _init_recall_cache_db(self) -> None:
+        """Initialize the disposable, recall-only derived-summary cache."""
+        try:
+            cache_dir = Path(self.recall_cache_dir_path)
+            if cache_dir.exists() or cache_dir.is_symlink():
+                info = os.lstat(cache_dir)
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or stat.S_ISLNK(info.st_mode)
+                    or info.st_mode & 0o077
+                ):
+                    raise OSError("unsafe recall cache directory")
+            else:
+                cache_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
+            os.chmod(cache_dir, 0o700)
+
+            cache_path = Path(self.recall_cache_db_path)
+            if not cache_path.exists() and not cache_path.is_symlink():
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                try:
+                    descriptor = os.open(cache_path, flags, 0o600)
+                except FileExistsError:
+                    pass
+                else:
+                    os.close(descriptor)
+            self._validate_recall_cache_path()
+            with closing(sqlite3.connect(self.recall_cache_db_path)) as conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS recall_dehydration_cache (
+                        cache_key TEXT PRIMARY KEY,
+                        content_hash TEXT NOT NULL,
+                        summary TEXT NOT NULL,
+                        model TEXT NOT NULL,
+                        cache_schema TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    )
+                """)
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "idx_recall_dehydration_content_hash "
+                    "ON recall_dehydration_cache (content_hash)"
+                )
+                conn.commit()
+            os.chmod(self.recall_cache_db_path, 0o600)
+        except (OSError, sqlite3.Error) as exc:
+            logger.warning(
+                "Unable to initialize recall dehydration cache; "
+                "recall will continue without persistence: %s",
+                exc,
+            )
+
+    def _validate_recall_cache_path(self) -> None:
+        """Refuse links or shared files before opening private recall data."""
+        cache_dir = Path(self.recall_cache_dir_path)
+        directory_info = os.lstat(cache_dir)
+        if (
+            not stat.S_ISDIR(directory_info.st_mode)
+            or stat.S_ISLNK(directory_info.st_mode)
+            or directory_info.st_mode & 0o077
+        ):
+            raise OSError("unsafe recall cache directory")
+        cache_path = Path(self.recall_cache_db_path)
+        info = os.lstat(cache_path)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_nlink != 1
+            or info.st_mode & 0o077
+        ):
+            raise OSError("unsafe recall cache database")
+
     def _get_cached_summary(
         self,
         content: str,
@@ -809,8 +899,9 @@ class Dehydrator:
             connection = sqlite3.connect(self.cache_db_path)
         with closing(connection) as conn:
             row = conn.execute(
-                "SELECT summary FROM dehydration_cache WHERE content_hash = ?",
-                (content_hash,)
+                "SELECT summary FROM dehydration_cache "
+                "WHERE content_hash = ? AND model = ?",
+                (content_hash, self.model),
             ).fetchone()
         if not row:
             return None
@@ -824,6 +915,14 @@ class Dehydrator:
             )
             return None
         return summary
+
+    @staticmethod
+    def _legacy_recall_cache_is_compatible() -> bool:
+        """Use legacy rows only while their unversioned prompt is unchanged."""
+        return (
+            hashlib.sha256(DEHYDRATE_PROMPT.encode()).hexdigest()
+            == RECALL_LEGACY_PROMPT_SHA256
+        )
 
     @staticmethod
     def _normalize_dehydration_summary(summary) -> str:
@@ -857,10 +956,114 @@ class Dehydrator:
         return True
 
     def _read_only_cache_key(self, content: str) -> str:
-        """Key the process-local recall cache by model and exact content."""
+        """Share the exact persistent recall-cache contract in memory."""
+        return self._recall_cache_key(content)
+
+    def _recall_cache_key(self, content: str) -> str:
+        """Bind a recall summary to the exact model, prompt, config and text."""
+        contract = {
+            "schema": RECALL_DEHYDRATION_CACHE_SCHEMA,
+            "redaction": RECALL_REDACTION_CONTRACT,
+            "output": RECALL_OUTPUT_CONTRACT,
+            "model": self.model,
+            "base_url": self.base_url,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "prompt": DEHYDRATE_PROMPT,
+        }
+        serialized = json.dumps(
+            contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         return hashlib.sha256(
-            f"{self.model}\x00{content}".encode()
+            f"{serialized}\x00{content}".encode()
         ).hexdigest()
+
+    def _get_recall_cached_summary(self, content: str) -> str | None:
+        """Read the disposable recall cache without mutating any database."""
+        cache_path = Path(self.recall_cache_db_path).absolute()
+        if not cache_path.is_file():
+            return None
+        try:
+            self._validate_recall_cache_path()
+            with closing(sqlite3.connect(
+                f"{cache_path.as_uri()}?mode=ro",
+                uri=True,
+                timeout=0.0,
+            )) as conn:
+                row = conn.execute(
+                    "SELECT summary FROM recall_dehydration_cache "
+                    "WHERE cache_key = ?",
+                    (self._recall_cache_key(content),),
+                ).fetchone()
+        except (OSError, sqlite3.Error) as exc:
+            logger.warning(
+                "Ignoring unreadable recall dehydration cache: %s",
+                exc,
+            )
+            return None
+        if not row:
+            return None
+        summary = self._normalize_dehydration_summary(row[0])
+        if not self._is_usable_dehydration_summary(summary):
+            logger.warning(
+                "Ignoring near-empty recall dehydration cache entry: "
+                "cache_key=%s length=%d",
+                self._recall_cache_key(content)[:12],
+                len(summary),
+            )
+            return None
+        return summary
+
+    def _set_recall_cached_summary(self, content: str, summary: str) -> bool:
+        """Persist a derived recall summary; cache failures never fail recall."""
+        summary = self._normalize_dehydration_summary(summary)
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        if not self._is_usable_dehydration_summary(summary):
+            return False
+        try:
+            cache_path = Path(self.recall_cache_db_path)
+            if not cache_path.exists() and not cache_path.is_symlink():
+                self._init_recall_cache_db()
+            self._validate_recall_cache_path()
+            with closing(sqlite3.connect(
+                self.recall_cache_db_path,
+                timeout=0.0,
+            )) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO recall_dehydration_cache "
+                    "(cache_key, content_hash, summary, model, cache_schema) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        self._recall_cache_key(content),
+                        content_hash,
+                        summary,
+                        self.model,
+                        RECALL_DEHYDRATION_CACHE_SCHEMA,
+                    ),
+                )
+                row_count = conn.execute(
+                    "SELECT count(*) FROM recall_dehydration_cache"
+                ).fetchone()[0]
+                overflow = row_count - RECALL_DEHYDRATION_CACHE_LIMIT
+                if overflow > 0:
+                    conn.execute(
+                        "DELETE FROM recall_dehydration_cache WHERE cache_key IN ("
+                        "SELECT cache_key FROM recall_dehydration_cache "
+                        "ORDER BY created_at, cache_key LIMIT ?)",
+                        (overflow,),
+                    )
+                conn.commit()
+        except (OSError, sqlite3.Error) as exc:
+            logger.warning(
+                "Unable to persist recall dehydration cache; "
+                "returning the generated summary: %s",
+                exc,
+            )
+            return False
+        return True
 
     def _get_read_only_memory_summary(self, content: str) -> str | None:
         """Read a recall-only summary without touching persistent storage."""
@@ -892,6 +1095,19 @@ class Dehydrator:
             self._read_only_cache_key(content),
             None,
         )
+        try:
+            self._validate_recall_cache_path()
+            with closing(sqlite3.connect(
+                self.recall_cache_db_path,
+                timeout=0.0,
+            )) as conn:
+                conn.execute(
+                    "DELETE FROM recall_dehydration_cache WHERE content_hash = ?",
+                    (content_hash,),
+                )
+                conn.commit()
+        except (OSError, sqlite3.Error):
+            pass
         with closing(sqlite3.connect(self.cache_db_path)) as conn:
             conn.execute("DELETE FROM dehydration_cache WHERE content_hash = ?", (content_hash,))
             conn.commit()
@@ -1276,14 +1492,23 @@ class Dehydrator:
 
         # --- Check cache first ---
         # --- 先查缓存 ---
-        cached = self._get_cached_summary(content, read_only=not write_cache)
-        if cached:
-            return self._format_output(cached, metadata)
         if not write_cache:
             cached = self._get_read_only_memory_summary(content)
             if cached:
                 return self._format_output(cached, metadata)
+            cached = self._get_recall_cached_summary(content)
+            if cached:
+                self._set_read_only_memory_summary(content, cached)
+                return self._format_output(cached, metadata)
 
+        cached = None
+        if write_cache or self._legacy_recall_cache_is_compatible():
+            cached = self._get_cached_summary(content, read_only=not write_cache)
+        if cached:
+            if not write_cache:
+                self._set_recall_cached_summary(content, cached)
+                self._set_read_only_memory_summary(content, cached)
+            return self._format_output(cached, metadata)
         # --- API dehydration (no local fallback) ---
         # --- API 脱水（无本地降级）---
         if not self.api_available:
@@ -1314,6 +1539,7 @@ class Dehydrator:
         if write_cache:
             self._set_cached_summary(content, result)
         else:
+            self._set_recall_cached_summary(content, result)
             self._set_read_only_memory_summary(content, result)
 
         return self._format_output(result, metadata)

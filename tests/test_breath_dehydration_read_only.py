@@ -1,4 +1,4 @@
-"""Guards for breath's persistent-cache read-only boundary."""
+"""Guards for breath's source-of-truth read-only boundary."""
 
 from __future__ import annotations
 
@@ -247,3 +247,35 @@ async def test_breath_y_walk_applies_z_gate_without_writing_dehydration_cache(
             "FROM dehydration_cache ORDER BY content_hash"
         ).fetchall()
     assert after_rows == before_rows
+    with sqlite3.connect(dehydrator.recall_cache_db_path) as conn:
+        derived_rows = conn.execute(
+            "SELECT content_hash, model FROM recall_dehydration_cache "
+            "ORDER BY content_hash"
+        ).fetchall()
+    assert len(derived_rows) == 2
+    assert {row[1] for row in derived_rows} == {dehydrator.model}
+
+    # A new process can render both the main result and the Y relation evidence
+    # from the isolated derived cache.  The previous in-memory LRU is not used.
+    restarted_completions = _Completions()
+    restarted = Dehydrator(test_config)
+    restarted.api_available = True
+    restarted.client = type(
+        "Client",
+        (),
+        {
+            "chat": type(
+                "Chat",
+                (),
+                {"completions": restarted_completions},
+            )()
+        },
+    )()
+    main_summary = await restarted.dehydrate(main["content"], write_cache=False)
+    current_summary = await restarted.dehydrate(
+        current["content"],
+        write_cache=False,
+    )
+    assert "只读召回摘要" in main_summary
+    assert "只读召回摘要" in current_summary
+    assert restarted_completions.requests == []
