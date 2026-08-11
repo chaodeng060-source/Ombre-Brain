@@ -895,12 +895,12 @@ async def test_inflight_success_clears_concurrent_error_streak(
     assert outcome.counts["proposer_circuit_breaker"] == 0
 
 
-@pytest.mark.parametrize("value", (1, 4, 8, 16))
+@pytest.mark.parametrize("value", (1, 4, 8))
 def test_proposer_policy_accepts_bounded_concurrency(value: int) -> None:
     assert NightRunPolicy(proposer_concurrency=value).proposer_concurrency == value
 
 
-@pytest.mark.parametrize("value", (0, 17, True, 1.0))
+@pytest.mark.parametrize("value", (0, 9, 16, True, 1.0))
 def test_proposer_policy_rejects_invalid_concurrency(value: object) -> None:
     with pytest.raises(ValueError):
         NightRunPolicy(proposer_concurrency=value)  # type: ignore[arg-type]

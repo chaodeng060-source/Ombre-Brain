@@ -158,7 +158,7 @@ def _proposer_concurrency(config: dict[str, Any]) -> int:
         "proposer_concurrency",
         DEFAULT_PROPOSER_CONCURRENCY,
     )
-    if type(value) is not int or not 1 <= value <= 16:
+    if type(value) is not int or not 1 <= value <= 8:
         raise NightRunRuntimeError("proposer.concurrency_invalid")
     return value
 

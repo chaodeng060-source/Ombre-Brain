@@ -109,8 +109,8 @@ class NightRunPolicy:
             raise ValueError("chunk_bytes exceeds the proposer input contract")
         if self.proposer_max_chunks_per_run > 256:
             raise ValueError("proposer run chunk cap cannot exceed 256")
-        if self.proposer_concurrency > 16:
-            raise ValueError("proposer concurrency cannot exceed 16")
+        if self.proposer_concurrency > 8:
+            raise ValueError("proposer concurrency cannot exceed 8")
         if self.proposer_wall_budget_seconds >= 3600:
             raise ValueError("proposer wall budget must be below 3600 seconds")
         timeout = self.barrier_timeout_seconds
