@@ -13,7 +13,7 @@ import pytest
 
 from curated_writer import CuratedWriteCoordinator, CuratedWriteResult
 from lmc5_ledger import LMC5Ledger
-from lmc5_proposer import StrictOmbreProposer
+from lmc5_proposer import ProposerBatch, StrictOmbreProposer
 from maintenance_barrier import MaintenanceBarrier
 from review_queue import ReviewQueue
 from night_run_coordinator import (
@@ -715,6 +715,74 @@ async def test_proposer_cap_defers_then_next_run_drains_without_repeats(
     assert second.counts["proposer_pending_before"] == 1
     assert second.counts["proposer_pending_after"] == 0
     assert len(harness.provider.prompts) == 3
+
+
+@pytest.mark.asyncio
+async def test_proposer_concurrency_parallelizes_independent_chunks(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(
+        tmp_path,
+        policy=NightRunPolicy(
+            proposer_max_chunks_per_run=4,
+            proposer_concurrency=4,
+        ),
+    )
+
+    class _ConcurrentEmptyProposer:
+        def __init__(self) -> None:
+            self.active = 0
+            self.peak = 0
+            self.release = asyncio.Event()
+
+        async def propose(self, *args: Any, **kwargs: Any) -> ProposerBatch:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            if self.peak == 4:
+                self.release.set()
+            try:
+                await asyncio.wait_for(self.release.wait(), timeout=1)
+                return ProposerBatch(
+                    schema_version=1,
+                    candidates=(),
+                    prompt_digest="a" * 64,
+                    output_digest="b" * 64,
+                    model="test-model",
+                    provider="test-provider",
+                )
+            finally:
+                self.active -= 1
+
+    proposer = _ConcurrentEmptyProposer()
+    harness.coordinator.proposer = proposer
+    for index in range(4):
+        harness.ledger.append_raw_event(
+            "room-main",
+            f"parallel-{index}",
+            json.dumps({"message": f"parallel-{index}"}),
+        )
+
+    outcome = await harness.coordinator.run(
+        run_id="night-parallel-proposer",
+        cutoff=datetime.now(timezone.utc),
+    )
+
+    assert outcome.run.stage == "complete"
+    assert outcome.counts["proposer_attempted"] == 4
+    assert outcome.counts["proposer_succeeded"] == 4
+    assert outcome.counts["proposer_pending_after"] == 0
+    assert proposer.peak == 4
+    with sqlite3.connect(harness.ledger.path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM chunk_proposer_outcomes "
+            "WHERE outcome = 'zero_candidates'"
+        ).fetchone() == (4,)
+
+
+@pytest.mark.parametrize("value", (0, 9, True, 1.0))
+def test_proposer_policy_rejects_invalid_concurrency(value: object) -> None:
+    with pytest.raises(ValueError):
+        NightRunPolicy(proposer_concurrency=value)  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio

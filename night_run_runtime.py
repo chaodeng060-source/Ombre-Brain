@@ -48,6 +48,7 @@ DEFAULT_PROPOSER_TEMPERATURE = 0.0
 DEFAULT_PROPOSER_DISABLE_THINKING = False
 DEFAULT_PROPOSER_JSON_OBJECT = False
 DEFAULT_PROPOSER_MAX_CHUNKS_PER_RUN = 16
+DEFAULT_PROPOSER_CONCURRENCY = 1
 DEFAULT_PROPOSER_WALL_BUDGET_SECONDS = 3000
 MIN_PROPOSER_MAX_TOKENS = 512
 MAX_PROPOSER_MAX_TOKENS = 8192
@@ -144,6 +145,21 @@ def _proposer_max_chunks_per_run(config: dict[str, Any]) -> int:
     )
     if type(value) is not int or not 1 <= value <= 256:
         raise NightRunRuntimeError("proposer.chunk_cap_invalid")
+    return value
+
+
+def _proposer_concurrency(config: dict[str, Any]) -> int:
+    section = config.get("lmc5_night", {})
+    if section is None:
+        section = {}
+    if type(section) is not dict:
+        raise NightRunRuntimeError("proposer.concurrency_invalid")
+    value = section.get(
+        "proposer_concurrency",
+        DEFAULT_PROPOSER_CONCURRENCY,
+    )
+    if type(value) is not int or not 1 <= value <= 8:
+        raise NightRunRuntimeError("proposer.concurrency_invalid")
     return value
 
 
@@ -443,6 +459,7 @@ def build_night_run_runtime(
     disable_thinking = _proposer_disable_thinking(config)
     json_object = _proposer_json_object(config)
     max_chunks_per_run = _proposer_max_chunks_per_run(config)
+    proposer_concurrency = _proposer_concurrency(config)
     wall_budget_seconds = _proposer_wall_budget_seconds(config)
     max_attempts = _night_max_attempts(config)
     provider_timeout = 75.0
@@ -516,6 +533,7 @@ def build_night_run_runtime(
         relation_target_provider=relation_targets,
         policy=NightRunPolicy(
             proposer_max_chunks_per_run=max_chunks_per_run,
+            proposer_concurrency=proposer_concurrency,
             proposer_wall_budget_seconds=wall_budget_seconds,
         ),
     )

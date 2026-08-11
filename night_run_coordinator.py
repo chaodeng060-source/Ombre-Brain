@@ -3,7 +3,7 @@
 The coordinator keeps every axis inside its production authority contract:
 
 * raw events are redacted and durably chunked before leaving local storage;
-* one chunk is proposed at a time and the candidate fan-out is transactional;
+* each provider call owns one chunk, with bounded independent concurrency;
 * normal X drafts may become recall-visible rows with immutable provenance;
 * safe Y edges write idempotently while dangerous edges enter named review;
 * Z only proposes registered fact pairs; approval is a separate transaction;
@@ -85,6 +85,7 @@ class NightRunPolicy:
     raw_page_size: int = 100
     pending_page_size: int = 100
     proposer_max_chunks_per_run: int = 16
+    proposer_concurrency: int = 1
     proposer_wall_budget_seconds: int = 3000
     chunk_bytes: int = 24 * 1024
     barrier_timeout_seconds: float = 60.0
@@ -95,6 +96,7 @@ class NightRunPolicy:
             "raw_page_size",
             "pending_page_size",
             "proposer_max_chunks_per_run",
+            "proposer_concurrency",
             "proposer_wall_budget_seconds",
             "chunk_bytes",
         ):
@@ -107,6 +109,8 @@ class NightRunPolicy:
             raise ValueError("chunk_bytes exceeds the proposer input contract")
         if self.proposer_max_chunks_per_run > 256:
             raise ValueError("proposer run chunk cap cannot exceed 256")
+        if self.proposer_concurrency > 8:
+            raise ValueError("proposer concurrency cannot exceed 8")
         if self.proposer_wall_budget_seconds >= 3600:
             raise ValueError("proposer wall budget must be below 3600 seconds")
         timeout = self.barrier_timeout_seconds
@@ -563,20 +567,13 @@ class NightRunCoordinator:
         )
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.policy.proposer_wall_budget_seconds
-        consecutive_errors = 0
-        for pending in pending_rows:
-            if len(pending.source_event_ids) != 1:
-                raise NightRunCoordinatorError("proposer.source_cardinality")
-            try:
-                text = pending.content.decode("utf-8", errors="strict")
-            except UnicodeError as exc:
-                raise NightRunCoordinatorError("proposer.chunk_utf8") from exc
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                counts["proposer_wall_budget_exhausted"] = 1
-                break
-            counts["proposer_attempted"] += 1
-            try:
+
+        async def propose_one(
+            pending: PendingProposerChunk,
+            text: str,
+            timeout: float,
+        ) -> ProposerBatch:
+            async def call() -> ProposerBatch:
                 relation_targets = frozenset()
                 if self.relation_target_provider is not None:
                     relation_targets = await self.relation_target_provider(text)
@@ -584,74 +581,119 @@ class NightRunCoordinator:
                         raise NightRunCoordinatorError(
                             "proposer.relation_targets_invalid"
                         )
-                batch = await asyncio.wait_for(
-                    self.proposer.propose(
-                        (ProposerChunk(id=pending.chunk_id, text=text),),
-                        relation_targets,
-                    ),
-                    timeout=remaining,
+                return await self.proposer.propose(
+                    (ProposerChunk(id=pending.chunk_id, text=text),),
+                    relation_targets,
                 )
-            except asyncio.TimeoutError:
-                self._record_proposer_error(
-                    run_id,
-                    pending,
-                    "provider.run_budget",
-                )
-                counts["proposer_retryable"] += 1
-                counts["proposer_errors"] = counts["proposer_retryable"]
-                consecutive_errors += 1
+
+            return await asyncio.wait_for(call(), timeout=timeout)
+
+        consecutive_errors = 0
+        for start in range(
+            0, len(pending_rows), self.policy.proposer_concurrency
+        ):
+            remaining = deadline - loop.time()
+            if remaining <= 0:
                 counts["proposer_wall_budget_exhausted"] = 1
-                if consecutive_errors >= 3:
-                    counts["proposer_circuit_breaker"] = 1
                 break
-            except ProposerContractError as exc:
-                self._record_proposer_error(run_id, pending, exc.code)
-                counts["proposer_retryable"] += 1
-                counts["proposer_errors"] = counts["proposer_retryable"]
-                consecutive_errors += 1
-                if consecutive_errors >= 3:
-                    counts["proposer_circuit_breaker"] = 1
-                    break
-                continue
-            consecutive_errors = 0
-            candidate_specs = self._candidate_specs(
-                run_id=run_id,
-                pending=pending,
-                batch=batch,
-            )
-            with self.ledger.transaction() as tx:
-                candidate_keys: list[str] = []
-                for key, axis, payload in candidate_specs:
-                    tx.record_candidate(
-                        key,
-                        axis,
-                        payload,
-                        (pending.chunk_id,),
+            wave = pending_rows[
+                start : start + self.policy.proposer_concurrency
+            ]
+            decoded: list[tuple[PendingProposerChunk, str]] = []
+            for pending in wave:
+                if len(pending.source_event_ids) != 1:
+                    raise NightRunCoordinatorError(
+                        "proposer.source_cardinality"
                     )
-                    candidate_keys.append(key)
-                outcome = (
-                    "candidates_persisted"
-                    if candidate_keys
-                    else "zero_candidates"
-                )
-                outcome_key = self._proposer_outcome_key(
+                try:
+                    text = pending.content.decode("utf-8", errors="strict")
+                except UnicodeError as exc:
+                    raise NightRunCoordinatorError(
+                        "proposer.chunk_utf8"
+                    ) from exc
+                decoded.append((pending, text))
+            counts["proposer_attempted"] += len(decoded)
+            results = await asyncio.gather(
+                *(
+                    propose_one(pending, text, remaining)
+                    for pending, text in decoded
+                ),
+                return_exceptions=True,
+            )
+            for (pending, _text), result in zip(decoded, results, strict=True):
+                if isinstance(result, asyncio.TimeoutError):
+                    self._record_proposer_error(
+                        run_id,
+                        pending,
+                        "provider.run_budget",
+                    )
+                    counts["proposer_retryable"] += 1
+                    counts["proposer_errors"] = counts[
+                        "proposer_retryable"
+                    ]
+                    counts["proposer_wall_budget_exhausted"] = 1
+                    consecutive_errors += 1
+                    if consecutive_errors >= 3:
+                        counts["proposer_circuit_breaker"] = 1
+                    continue
+                if isinstance(result, ProposerContractError):
+                    self._record_proposer_error(run_id, pending, result.code)
+                    counts["proposer_retryable"] += 1
+                    counts["proposer_errors"] = counts[
+                        "proposer_retryable"
+                    ]
+                    consecutive_errors += 1
+                    if consecutive_errors >= 3:
+                        counts["proposer_circuit_breaker"] = 1
+                    continue
+                if isinstance(result, BaseException):
+                    raise result
+                consecutive_errors = 0
+                candidate_specs = self._candidate_specs(
                     run_id=run_id,
                     pending=pending,
-                    batch=batch,
-                    candidate_keys=candidate_keys,
-                    outcome=outcome,
+                    batch=result,
                 )
-                tx.record_chunk_proposer_outcome(
-                    outcome_key,
-                    pending.chunk_id,
-                    outcome,
-                    candidate_keys=candidate_keys,
-                )
-            counts["proposer_succeeded"] += 1
-            counts["proposer_chunks"] = counts["proposer_succeeded"]
-            counts["candidates"] = counts.get("candidates", 0) + len(
-                candidate_specs
-            )
+                with self.ledger.transaction() as tx:
+                    candidate_keys: list[str] = []
+                    for key, axis, payload in candidate_specs:
+                        tx.record_candidate(
+                            key,
+                            axis,
+                            payload,
+                            (pending.chunk_id,),
+                        )
+                        candidate_keys.append(key)
+                    outcome = (
+                        "candidates_persisted"
+                        if candidate_keys
+                        else "zero_candidates"
+                    )
+                    outcome_key = self._proposer_outcome_key(
+                        run_id=run_id,
+                        pending=pending,
+                        batch=result,
+                        candidate_keys=candidate_keys,
+                        outcome=outcome,
+                    )
+                    tx.record_chunk_proposer_outcome(
+                        outcome_key,
+                        pending.chunk_id,
+                        outcome,
+                        candidate_keys=candidate_keys,
+                    )
+                counts["proposer_succeeded"] += 1
+                counts["proposer_chunks"] = counts[
+                    "proposer_succeeded"
+                ]
+                counts["candidates"] = counts.get(
+                    "candidates", 0
+                ) + len(candidate_specs)
+            if (
+                counts["proposer_circuit_breaker"]
+                or counts["proposer_wall_budget_exhausted"]
+            ):
+                break
 
         after = self.ledger.proposer_backlog_stats(through=watermark)
         counts["proposer_pending_after"] = after.pending

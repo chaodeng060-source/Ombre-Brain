@@ -23,6 +23,7 @@ from night_run_runtime import (
     OpenAIChatProvider,
     _night_max_attempts,
     _proposer_disable_thinking,
+    _proposer_concurrency,
     _proposer_json_object,
     _proposer_max_chunks_per_run,
     _proposer_max_tokens,
@@ -550,6 +551,7 @@ def test_proposer_budget_accepts_plain_integer_boundaries(value: int) -> None:
 def test_null_night_section_uses_safe_default() -> None:
     assert _proposer_max_tokens({"lmc5_night": None}) == 4096
     assert _proposer_max_chunks_per_run({"lmc5_night": None}) == 16
+    assert _proposer_concurrency({"lmc5_night": None}) == 1
     assert _proposer_wall_budget_seconds({"lmc5_night": None}) == 3000
     assert _night_max_attempts({"lmc5_night": None}) == 8
 
@@ -682,6 +684,24 @@ def test_proposer_chunk_cap_rejects_unsafe_config(value: object) -> None:
         )
 
 
+@pytest.mark.parametrize("value", (1, 4, 8))
+def test_proposer_concurrency_accepts_bounded_plain_integer(value: int) -> None:
+    assert _proposer_concurrency(
+        {"lmc5_night": {"proposer_concurrency": value}}
+    ) == value
+
+
+@pytest.mark.parametrize("value", (None, True, False, 0, -1, 9, 4.0, "4"))
+def test_proposer_concurrency_rejects_unsafe_config(value: object) -> None:
+    with pytest.raises(
+        NightRunRuntimeError,
+        match="^proposer\\.concurrency_invalid$",
+    ):
+        _proposer_concurrency(
+            {"lmc5_night": {"proposer_concurrency": value}}
+        )
+
+
 @pytest.mark.parametrize(
     "value",
     (None, True, False, 0, -1, 3600, 3000.0, "3000"),
@@ -721,11 +741,12 @@ def test_openai_provider_rejects_budget_outside_contract(value: object) -> None:
         "expected_disable_thinking",
         "expected_json_object",
         "expected_chunk_cap",
+        "expected_concurrency",
         "expected_wall_budget",
         "expected_max_attempts",
     ),
     (
-        (None, 4096, 0.0, False, False, 16, 3000, 8),
+        (None, 4096, 0.0, False, False, 16, 1, 3000, 8),
         (
             {
                 "proposer_max_tokens": 2048,
@@ -733,6 +754,7 @@ def test_openai_provider_rejects_budget_outside_contract(value: object) -> None:
                 "proposer_disable_thinking": True,
                 "proposer_json_object": True,
                 "proposer_max_chunks_per_run": 7,
+                "proposer_concurrency": 4,
                 "proposer_wall_budget_seconds": 900,
                 "max_attempts_per_logical_day": 32,
             },
@@ -741,6 +763,7 @@ def test_openai_provider_rejects_budget_outside_contract(value: object) -> None:
             True,
             True,
             7,
+            4,
             900,
             32,
         ),
@@ -755,6 +778,7 @@ def test_runtime_builder_wires_dedicated_proposer_controls(
     expected_disable_thinking: bool,
     expected_json_object: bool,
     expected_chunk_cap: int,
+    expected_concurrency: int,
     expected_wall_budget: int,
     expected_max_attempts: int,
 ) -> None:
@@ -829,6 +853,7 @@ def test_runtime_builder_wires_dedicated_proposer_controls(
     assert captured["disable_thinking"] is expected_disable_thinking
     assert captured["json_object"] is expected_json_object
     assert captured["policy"].proposer_max_chunks_per_run == expected_chunk_cap
+    assert captured["policy"].proposer_concurrency == expected_concurrency
     assert (
         captured["policy"].proposer_wall_budget_seconds
         == expected_wall_budget

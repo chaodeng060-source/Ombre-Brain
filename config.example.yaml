@@ -95,6 +95,8 @@ lmc5_night:
   # 冻结本轮 event_chunks 水位后，只处理一个有界切片；未清空时写入
   # truthful deferred，后续同日 -rN/次日夜班续跑，不伪装 complete。
   proposer_max_chunks_per_run: 128 # plain integer, 1..256; bounded catch-up slice
+  # 每次 provider 调用仍只处理一个 chunk；并发只放大独立调用，默认 1。
+  proposer_concurrency: 1          # plain integer, 1..8
   proposer_wall_budget_seconds: 3000 # plain integer, 1..3599
 
 # --- XYZME metabolism / M 轴代谢 ---
