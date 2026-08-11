@@ -348,6 +348,47 @@ async def test_event_run_completes_snapshot_chunk_x_and_report_only_m(
 
 
 @pytest.mark.asyncio
+async def test_report_only_receipt_flush_yields_during_large_backlog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _harness(tmp_path)
+    harness.ledger.append_raw_event(
+        "room-main",
+        "m-source",
+        '{"message":"report-only receipt source"}',
+    )
+    harness.ledger.record_event_chunk(
+        "m-chunk",
+        "report-only receipt source",
+        [("room-main", "m-source")],
+    )
+    for index in range(18):
+        harness.ledger.record_candidate(
+            f"m-candidate-{index}",
+            "M",
+            json.dumps({"index": index}),
+            ["m-chunk"],
+        )
+
+    original_sleep = asyncio.sleep
+    yields: list[float] = []
+
+    async def observed_sleep(delay: float) -> None:
+        yields.append(delay)
+        await original_sleep(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", observed_sleep)
+    counts: dict[str, int] = {}
+
+    await harness.coordinator._run_metabolism(counts)
+
+    assert counts["m_computed"] == 18
+    assert harness.ledger.list_candidates("pending") == ()
+    assert yields == [0]
+
+
+@pytest.mark.asyncio
 async def test_cutoff_is_exclusive_and_newer_event_remains_uncovered(
     tmp_path: Path,
 ) -> None:

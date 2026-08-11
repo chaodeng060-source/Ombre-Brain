@@ -78,6 +78,7 @@ _RETRYABLE_DISPATCH_CODES = frozenset(
         "z.source_write_retryable",
     }
 )
+_M_RECEIPT_YIELD_EVERY = 16
 
 
 class NightRunCoordinatorError(RuntimeError):
@@ -1316,6 +1317,7 @@ class NightRunCoordinator:
         report_hash = _canonical_digest(
             report, code="metabolism.report_invalid"
         )
+        receipts_since_yield = 0
         while True:
             pending_m = tuple(
                 row
@@ -1340,6 +1342,10 @@ class NightRunCoordinator:
                         expected_status="pending",
                     )
                 counts["m_computed"] = counts.get("m_computed", 0) + 1
+                receipts_since_yield += 1
+                if receipts_since_yield >= _M_RECEIPT_YIELD_EVERY:
+                    receipts_since_yield = 0
+                    await asyncio.sleep(0)
 
     @staticmethod
     def _validate_metabolism_result(
