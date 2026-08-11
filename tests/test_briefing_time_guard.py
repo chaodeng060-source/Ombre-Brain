@@ -76,11 +76,13 @@ async def test_briefing_retries_when_relative_time_survives(briefing_dehy):
 
 
 @pytest.mark.asyncio
-async def test_briefing_fails_closed_after_two_bad_outputs(briefing_dehy):
+async def test_briefing_mechanically_anchors_after_two_bad_outputs(briefing_dehy):
     _install_responses(briefing_dehy, "最近又疼了。", "刚刚又疼了。")
 
-    with pytest.raises(RuntimeError, match="相对时间词"):
-        await briefing_dehy._api_briefing("📅 发生于 2026-05-30", 300)
+    result = await briefing_dehy._api_briefing("📅 发生于 2026-05-30", 300)
+
+    assert result.endswith("稍早又疼了。")
+    assert _briefing_relative_time_violations(result) == []
 
 
 @pytest.mark.asyncio
