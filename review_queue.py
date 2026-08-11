@@ -473,7 +473,16 @@ class ReviewQueue:
                 ):
                     for field in ("source_name", "target_name"):
                         value = str(entry.get(field) or "").strip()
-                        if value and not str(existing.get(field) or "").strip():
+                        id_field = (
+                            "source_id" if field == "source_name" else "target_id"
+                        )
+                        identifier = str(existing.get(id_field) or "").strip()
+                        current = str(existing.get(field) or "").strip()
+                        if (
+                            value
+                            and value != identifier
+                            and (not current or current == identifier)
+                        ):
                             existing[field] = value[:160]
                             enriched = True
                 if enriched:

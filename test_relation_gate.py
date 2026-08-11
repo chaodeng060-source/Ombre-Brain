@@ -24,7 +24,7 @@ class _FakeBucketMgr:
     def __init__(self):
         self.added = []   # 实际写库的边
         self._buckets = {
-            "src": {"id": "src", "content": "源内容", "metadata": {"name": "源桶", "world": ""}},
+            "src": {"id": "src", "content": "源内容", "metadata": {"name": "src", "domain": ["源主题"], "world": ""}},
             "buk_kin": {"id": "buk_kin", "content": "同类桶", "metadata": {"name": "同类桶", "world": ""}},
             "buk_cause": {"id": "buk_cause", "content": "因果桶", "metadata": {"name": "因果桶", "world": ""}},
         }
@@ -85,7 +85,7 @@ def test_gate_on_applies_safe_and_queues_only_dangerous_edge():
     assert [e["rel_type"] for e in pend] == ["causes"]
     cause = pend[0]
     assert cause["source_id"] == "src" and cause["target_id"] == "buk_cause"
-    assert cause["source_name"] == "源桶"
+    assert cause["source_name"] == "源主题 · src"
     assert cause["target_name"] == "因果桶"
     assert sorted((e["type"], e["status"]) for e in proposals) == [
         ("causes", "pending_review"),

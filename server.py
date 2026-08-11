@@ -3302,13 +3302,29 @@ async def _auto_infer_edges(
     if not content or not content.strip():
         return []
 
+    def _relation_display_name(bucket: dict | None, bucket_id: str) -> str:
+        metadata = (
+            bucket.get("metadata", {})
+            if isinstance(bucket, dict)
+            else {}
+        )
+        raw_name = str(metadata.get("name") or "").strip()
+        if raw_name and raw_name != bucket_id:
+            return raw_name[:160]
+        domains = metadata.get("domain", [])
+        if isinstance(domains, str):
+            domains = [domains]
+        if isinstance(domains, list):
+            topic = next(
+                (str(value).strip() for value in domains if str(value).strip()),
+                "",
+            )
+            if topic:
+                return f"{topic} · {bucket_id}"[:160]
+        return bucket_id
+
     source_bucket = await bucket_mgr.get(source_id)
-    source_meta = (
-        source_bucket.get("metadata", {})
-        if isinstance(source_bucket, dict)
-        else {}
-    )
-    source_name = str(source_meta.get("name") or source_id)
+    source_name = _relation_display_name(source_bucket, source_id)
 
     # --- Gather candidates: vector neighbors + keyword search, dedup, exclude self ---
     candidate_ids: list[str] = []
@@ -3357,7 +3373,7 @@ async def _auto_infer_edges(
             summary = (b["content"] or "")[:200]
         candidates.append({
             "id": bid,
-            "name": b["metadata"].get("name", bid),
+            "name": _relation_display_name(b, bid),
             "summary": summary,
         })
 

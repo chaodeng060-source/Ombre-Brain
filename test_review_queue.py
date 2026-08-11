@@ -38,7 +38,9 @@ def test_enqueue_idempotent():
 
 def test_pending_relation_replay_only_enriches_missing_names():
     q = _q()
-    original = make_relation_entry("a", "b", "causes", "原备注")
+    original = make_relation_entry(
+        "a", "b", "causes", "原备注", source_name="a", target_name="b"
+    )
     assert q.enqueue(original) is True
 
     replay = make_relation_entry(
