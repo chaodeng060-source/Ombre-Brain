@@ -862,6 +862,8 @@ async def test_evidence_error_gets_one_full_batch_repair():
     assert "REPAIR ONE MODEL CONTRACT ERROR" not in prompts[0]
     assert "REPAIR ONE MODEL CONTRACT ERROR (provenance_evidence)" in prompts[1]
     assert "Regenerate the whole JSON object" in prompts[1]
+    assert "Return at most 4 high-signal candidates" in prompts[1]
+    assert "choose a short literal span" in prompts[1]
     assert batch.prompt_digest == hashlib.sha256(
         prompts[1].encode("utf-8")
     ).hexdigest()
@@ -886,6 +888,36 @@ async def test_evidence_repair_is_attempted_only_once():
 
 
 @pytest.mark.asyncio
+async def test_contract_repair_enforces_compact_candidate_bound():
+    prompts = []
+    responses = iter(
+        (
+            json.dumps(
+                _document(_candidate(evidence="模型改写的雨声证据"))
+            ),
+            json.dumps(
+                _document(
+                    *[
+                        _candidate(title=f"candidate-{index}")
+                        for index in range(5)
+                    ]
+                )
+            ),
+        )
+    )
+
+    async def provider(prompt):
+        prompts.append(prompt)
+        return {"choices": [{"message": {"content": next(responses)}}]}
+
+    with pytest.raises(ProposerContractError) as caught:
+        await StrictOmbreProposer(provider).propose(CHUNKS)
+
+    assert caught.value.code == "schema_root"
+    assert len(prompts) == 2
+
+
+@pytest.mark.asyncio
 async def test_schema_candidate_error_gets_one_full_batch_repair():
     prompts = []
     responses = iter(
@@ -906,6 +938,38 @@ async def test_schema_candidate_error_gets_one_full_batch_repair():
     assert batch.candidates[0].importance == 7
     assert len(prompts) == 2
     assert "schema_candidate" in prompts[1]
+    assert "include every candidate key exactly once" in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_relation_error_repair_prefers_empty_hints_to_invalid_relation():
+    prompts = []
+    responses = iter(
+        (
+            json.dumps(
+                _document(
+                    _candidate(
+                        relation_hints=[_relation(strength="0.8")]
+                    )
+                )
+            ),
+            json.dumps(_document(_candidate(relation_hints=[]))),
+        )
+    )
+
+    async def provider(prompt):
+        prompts.append(prompt)
+        return {"choices": [{"message": {"content": next(responses)}}]}
+
+    batch = await StrictOmbreProposer(provider).propose(
+        CHUNKS,
+        frozenset({"bucket-1"}),
+    )
+
+    assert batch.candidates[0].relation_hints == ()
+    assert len(prompts) == 2
+    assert "REPAIR ONE MODEL CONTRACT ERROR (schema_relation)" in prompts[1]
+    assert "otherwise use relation_hints:[]" in prompts[1]
 
 
 @pytest.mark.asyncio

@@ -82,6 +82,9 @@ _CONTRACT_REPAIR_INSTRUCTION = (
     "REPAIR ONE MODEL CONTRACT ERROR ({code}): Regenerate the whole JSON "
     "object; do not patch or discuss the prior output. Match every root, "
     "candidate, and relation key and value type in output_schema exactly. "
+    "Return at most "
+    f"{_COMPACT_RETRY_MAX_CANDIDATES} high-signal candidates and prefer fewer "
+    "fully valid candidates over repeating a large invalid batch. "
     "Copy every source_chunk_id verbatim from INPUT.chunks[].id and use only "
     "those ids. For every candidate, copy evidence verbatim as one exact "
     "contiguous substring from the text of one cited source_chunk_id, with "
@@ -89,6 +92,35 @@ _CONTRACT_REPAIR_INSTRUCTION = (
     "translate, normalize, splice, or invent evidence. All other schema and "
     "contract rules remain unchanged."
 )
+_CONTRACT_REPAIR_DETAILS = {
+    "provenance_evidence": (
+        "For this evidence repair, choose a short literal span that is visibly "
+        "present in one INPUT chunk. If a candidate has no exact literal "
+        "span, omit that candidate; candidates:[] is valid."
+    ),
+    "provenance_source": (
+        "For this source repair, cite only the exact id from INPUT.chunks[].id."
+    ),
+    "relation_target": (
+        "For this relation repair, emit a relation only when target_id is an "
+        "exact allowed_relation_target; otherwise use relation_hints:[] for "
+        "that candidate."
+    ),
+    "schema_relation": (
+        "For this relation repair, emit a relation only when all four relation "
+        "fields exactly match output_schema; otherwise use relation_hints:[] "
+        "for that candidate."
+    ),
+    "schema_candidate": (
+        "For this candidate repair, include every candidate key exactly once, "
+        "use an integer importance, risk normal or review, and arrays for "
+        "relation_hints and source_chunk_ids."
+    ),
+    "schema_root": (
+        "For this root repair, return exactly schema_version and candidates, "
+        "with schema_version as integer 1 and candidates as an array."
+    ),
+}
 _TYPE_AXES = {
     "event": frozenset({"X", "M"}),
     "fact": frozenset({"X", "Z", "M"}),
@@ -365,9 +397,11 @@ class StrictOmbreProposer:
                 max_candidates = _COMPACT_RETRY_MAX_CANDIDATES
             elif exc.code in _REPAIRABLE_MODEL_CODES:
                 effective_prompt = self._build_contract_repair_prompt(
-                    prompt, exc.code
+                    chunk_tuple,
+                    targets,
+                    exc.code,
                 )
-                max_candidates = _MAX_CANDIDATES
+                max_candidates = _COMPACT_RETRY_MAX_CANDIDATES
             else:
                 raise
             self._validate_prompt_size(effective_prompt)
@@ -603,10 +637,20 @@ class StrictOmbreProposer:
         )
         return f"{rules}\nINPUT={_canonical_json(payload)}"
 
-    @staticmethod
-    def _build_contract_repair_prompt(prompt: str, code: str) -> str:
+    def _build_contract_repair_prompt(
+        self,
+        chunks: tuple[ProposerChunk, ...],
+        targets: frozenset[str],
+        code: str,
+    ) -> str:
         instruction = _CONTRACT_REPAIR_INSTRUCTION.format(code=code)
-        return f"{instruction}\n{prompt}"
+        detail = _CONTRACT_REPAIR_DETAILS[code]
+        compact_prompt = self._build_prompt(
+            chunks,
+            targets,
+            max_candidates=_COMPACT_RETRY_MAX_CANDIDATES,
+        )
+        return f"{instruction} {detail}\n{compact_prompt}"
 
     def _build_incomplete_retry_prompt(
         self,
