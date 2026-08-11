@@ -9,6 +9,7 @@
 
 import asyncio
 import math
+import threading
 from datetime import datetime, timedelta
 
 from consolidation_engine import ConsolidationEngine
@@ -58,6 +59,18 @@ class FakeEmbedding:
 
         engine = EmbeddingEngine.__new__(EmbeddingEngine)
         return engine._max_stored_similarity(left, right)
+
+    def _prepare_embedding_record(self, value):
+        from embedding_engine import EmbeddingEngine
+
+        engine = EmbeddingEngine.__new__(EmbeddingEngine)
+        return engine._prepare_embedding_record(value)
+
+    @staticmethod
+    def _max_prepared_similarity(left, right):
+        from embedding_engine import EmbeddingEngine
+
+        return EmbeddingEngine._max_prepared_similarity(left, right)
 
 
 class FakeBucketMgr:
@@ -122,6 +135,37 @@ def test_find_duplicates_pairs_above_threshold():
     ids = {pairs[0]["a_id"], pairs[0]["b_id"]}
     assert ids == {"A", "B"}
     assert pairs[0]["similarity"] >= 0.99
+
+
+def test_find_duplicates_scores_off_event_loop():
+    buckets = [_bucket("A"), _bucket("B")]
+    vecs = {"A": [1.0, 0.0], "B": [1.0, 0.0]}
+    eng, _, _ = _engine(buckets, vecs)
+    release = threading.Event()
+    observed_release: list[bool] = []
+    original = eng._score_duplicate_pairs
+
+    def gated_score(candidates, embeddings, threshold):
+        observed_release.append(release.wait(timeout=0.2))
+        return original(candidates, embeddings, threshold)
+
+    eng._score_duplicate_pairs = gated_score
+
+    async def run() -> list[dict]:
+        async def release_from_loop() -> None:
+            await asyncio.sleep(0.01)
+            release.set()
+
+        result, _ = await asyncio.gather(
+            eng.find_duplicates(0.85),
+            release_from_loop(),
+        )
+        return result
+
+    pairs = asyncio.run(run())
+
+    assert observed_release == [True]
+    assert [{pair["a_id"], pair["b_id"]} for pair in pairs] == [{"A", "B"}]
 
 
 def test_find_duplicates_supports_single_and_multi_segment_vectors():

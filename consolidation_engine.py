@@ -136,18 +136,47 @@ class ConsolidationEngine:
             if emb is not None:
                 embs[b["id"]] = emb
 
+        pairs, pair_errors = await asyncio.to_thread(
+            self._score_duplicate_pairs,
+            candidates,
+            embs,
+            threshold,
+        )
+        self._read_errors.extend(pair_errors)
+        return pairs
+
+    def _score_duplicate_pairs(
+        self,
+        candidates: list[dict],
+        embs: dict[str, list],
+        threshold: float,
+    ) -> tuple[list[dict], list[str]]:
+        """Score one stable vector snapshot without blocking the event loop."""
+
         by_id = {b["id"]: b for b in candidates}
         ids = list(embs.keys())
-        pairs = []
+        prepared: dict[str, object] = {}
+        pairs: list[dict] = []
+        errors: list[str] = []
+
+        def prepared_record(bucket_id: str):
+            if bucket_id not in prepared:
+                prepared[bucket_id] = (
+                    self.embedding_engine._prepare_embedding_record(
+                        embs[bucket_id]
+                    )
+                )
+            return prepared[bucket_id]
+
         for i, a in enumerate(ids):
             for b in ids[i + 1:]:
                 try:
-                    sim = self.embedding_engine._max_stored_similarity(
-                        embs[a],
-                        embs[b],
+                    sim = self.embedding_engine._max_prepared_similarity(
+                        prepared_record(a),
+                        prepared_record(b),
                     )
                 except Exception as exc:
-                    self._read_errors.append(
+                    errors.append(
                         f"find_duplicates.cosine:{a}:{b}:{type(exc).__name__}"
                     )
                     continue
@@ -164,7 +193,7 @@ class ConsolidationEngine:
                         "similarity": round(sim, 4),
                     })
         pairs.sort(key=lambda p: p["similarity"], reverse=True)
-        return pairs[: self.max_report_pairs]
+        return pairs[: self.max_report_pairs], errors
 
     # ---------------------------------------------------------
     # find_stale — non-exempt, unresolved buckets idle > days.
