@@ -13,7 +13,11 @@ import pytest
 
 from curated_writer import CuratedWriteCoordinator, CuratedWriteResult
 from lmc5_ledger import LMC5Ledger
-from lmc5_proposer import ProposerBatch, StrictOmbreProposer
+from lmc5_proposer import (
+    ProposerBatch,
+    ProposerContractError,
+    StrictOmbreProposer,
+)
 from maintenance_barrier import MaintenanceBarrier
 from review_queue import ReviewQueue
 from night_run_coordinator import (
@@ -836,6 +840,59 @@ async def test_proposer_pool_refills_without_waiting_for_slow_tail(
     assert outcome.run.stage == "complete"
     assert outcome.counts["proposer_succeeded"] == 4
     assert proposer.calls == 4
+
+
+@pytest.mark.asyncio
+async def test_inflight_success_clears_concurrent_error_streak(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(
+        tmp_path,
+        policy=NightRunPolicy(
+            proposer_max_chunks_per_run=5,
+            proposer_concurrency=4,
+        ),
+    )
+
+    class _RecoveringProposer:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def propose(self, *args: Any, **kwargs: Any) -> ProposerBatch:
+            self.calls += 1
+            if self.calls <= 3:
+                raise ProposerContractError(
+                    "provider.no_choices",
+                    "test failure",
+                )
+            return ProposerBatch(
+                schema_version=1,
+                candidates=(),
+                prompt_digest="e" * 64,
+                output_digest="f" * 64,
+                model="test-model",
+                provider="test-provider",
+            )
+
+    proposer = _RecoveringProposer()
+    harness.coordinator.proposer = proposer
+    for index in range(5):
+        harness.ledger.append_raw_event(
+            "room-main",
+            f"recovery-{index}",
+            json.dumps({"message": f"recovery-{index}"}),
+        )
+
+    outcome = await harness.coordinator.run(
+        run_id="night-concurrent-recovery",
+        cutoff=datetime.now(timezone.utc),
+    )
+
+    assert outcome.run.stage == "deferred"
+    assert outcome.counts["proposer_attempted"] == 5
+    assert outcome.counts["proposer_retryable"] == 3
+    assert outcome.counts["proposer_succeeded"] == 2
+    assert outcome.counts["proposer_circuit_breaker"] == 0
 
 
 @pytest.mark.parametrize("value", (0, 9, True, 1.0))

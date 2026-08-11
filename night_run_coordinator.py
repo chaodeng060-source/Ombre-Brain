@@ -673,6 +673,7 @@ class NightRunCoordinator:
                     if isinstance(result, BaseException):
                         raise result
                     consecutive_errors = 0
+                    counts["proposer_circuit_breaker"] = 0
                     candidate_specs = self._candidate_specs(
                         run_id=run_id,
                         pending=pending,
