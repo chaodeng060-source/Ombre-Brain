@@ -24,6 +24,18 @@ _DEHYDRATION_OUTCOMES = frozenset({
     "passthrough",
     "persist_failed",
 })
+_RECALL_METRIC_MODES = {
+    "query_angle_count": "max",
+    "keyword_bucket_count": "max",
+    "vector_cache_hits": "sum",
+    "vector_cache_misses": "sum",
+    "vector_cache_rows_loaded": "sum",
+    "vector_entries_scanned": "sum",
+    "vector_stored_segments_scanned": "sum",
+    "vector_segment_comparisons": "sum",
+    "vector_invalid_rows": "sum",
+    "vector_dimension": "max",
+}
 
 
 def begin_recall_timing() -> contextvars.Token:
@@ -34,6 +46,7 @@ def begin_recall_timing() -> contextvars.Token:
         "stages": {},
         "active_stages": {},
         "dehydration": {},
+        "metrics": {},
     }
     return _recall_timing.set(state)
 
@@ -82,6 +95,24 @@ def record_recall_dehydration(outcome: str, count: int = 1) -> None:
     counters[outcome] = int(counters.get(outcome, 0)) + max(0, int(count))
 
 
+def record_recall_metric(name: str, value: int) -> None:
+    """Record one allowlisted, content-free diagnostic count."""
+    mode = _RECALL_METRIC_MODES.get(name)
+    if mode is None:
+        raise ValueError(f"unknown recall metric: {name}")
+    state = _recall_timing.get()
+    if not isinstance(state, dict):
+        return
+    metrics = state.get("metrics")
+    if not isinstance(metrics, dict):
+        return
+    number = max(0, int(value))
+    if mode == "max":
+        metrics[name] = max(int(metrics.get(name, 0)), number)
+    else:
+        metrics[name] = int(metrics.get(name, 0)) + number
+
+
 def start_recall_stage(name: str) -> None:
     state = _recall_timing.get()
     if not isinstance(state, dict):
@@ -124,6 +155,7 @@ def finish_recall_timing(*, status: str, partial: bool) -> dict:
             "unattributed_ms": 0.0,
             "stages": {},
             "dehydration": {},
+            "metrics": {},
         }
 
     total_ms = max(0.0, (time.perf_counter() - state["started_at"]) * 1000.0)
@@ -155,6 +187,11 @@ def finish_recall_timing(*, status: str, partial: bool) -> dict:
         "total_ms": round(total_ms, 3),
         "unattributed_ms": round(max(0.0, total_ms - attributed_ms), 3),
         "stages": stages,
+        "metrics": {
+            name: int(value)
+            for name, value in state.get("metrics", {}).items()
+            if name in _RECALL_METRIC_MODES and int(value) >= 0
+        },
         "dehydration": {
             name: int(count)
             for name, count in state.get("dehydration", {}).items()

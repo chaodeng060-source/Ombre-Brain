@@ -14,6 +14,7 @@ from recall_timing import (
     finish_recall_stage,
     record_recall_stage,
     record_recall_dehydration,
+    record_recall_metric,
     reset_recall_timing,
     set_recall_partial_result,
     start_recall_stage,
@@ -35,6 +36,10 @@ def test_timing_receipt_accumulates_calls_without_content():
         record_recall_stage("embedding", 0.003)
         record_recall_dehydration("frontmatter_hits", 2)
         record_recall_dehydration("computed")
+        record_recall_metric("vector_cache_hits", 1)
+        record_recall_metric("vector_cache_hits", 2)
+        record_recall_metric("vector_dimension", 3072)
+        record_recall_metric("vector_dimension", 768)
         receipt = finish_recall_timing(status="ok", partial=False)
     finally:
         reset_recall_timing(token)
@@ -49,6 +54,10 @@ def test_timing_receipt_accumulates_calls_without_content():
     assert receipt["dehydration"] == {
         "frontmatter_hits": 2,
         "computed": 1,
+    }
+    assert receipt["metrics"] == {
+        "vector_cache_hits": 3,
+        "vector_dimension": 3072,
     }
     assert "query" not in json.dumps(receipt)
 
@@ -86,7 +95,19 @@ async def test_embedding_engine_splits_remote_and_local_timing(tmp_path, monkeyp
     assert status == "ok"
     assert results == [("bucket-a", 1.0)]
     assert receipt["stages"]["embedding"]["calls"] == 1
-    assert receipt["stages"]["vector_retrieval"]["calls"] == 1
+    assert receipt["stages"]["vector_cache_load"]["calls"] == 1
+    assert receipt["stages"]["vector_query_prepare"]["calls"] == 1
+    assert receipt["stages"]["vector_scan"]["calls"] == 1
+    assert receipt["stages"]["vector_sort"]["calls"] == 1
+    assert receipt["metrics"] == {
+        "vector_cache_misses": 1,
+        "vector_cache_rows_loaded": 1,
+        "vector_entries_scanned": 1,
+        "vector_stored_segments_scanned": 1,
+        "vector_segment_comparisons": 1,
+        "vector_invalid_rows": 0,
+        "vector_dimension": 2,
+    }
     assert "secret query" not in json.dumps(receipt)
 
 

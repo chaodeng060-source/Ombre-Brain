@@ -23,7 +23,7 @@ import httpx
 from openai import AsyncOpenAI
 
 from maintenance_barrier import MaintenanceBarrier
-from recall_timing import recall_stage
+from recall_timing import recall_stage, record_recall_metric
 from redact import redact_embedding_input
 
 logger = logging.getLogger("ombre_brain.embedding")
@@ -287,28 +287,47 @@ class EmbeddingEngine:
             logger.warning(f"Query embedding failed: {e}")
             return [], "error"
 
-        with recall_stage("vector_retrieval"):
+        with recall_stage("vector_cache_load"):
             entries = await self._get_cached_vectors()
-            if not entries:
-                return [], "ok"
+        if not entries:
+            return [], "ok"
 
+        with recall_stage("vector_query_prepare"):
             try:
                 prepared_query = self._prepare_embedding_record(query_embedding)
             except Exception:
                 return [], "ok"
+        record_recall_metric("vector_dimension", len(prepared_query[0][0]))
 
-            results = []
-            for row_index, (bucket_id, stored) in enumerate(entries, start=1):
-                if row_index % 16 == 0:
-                    await asyncio.sleep(0)
-                try:
-                    sim = self._max_prepared_similarity(prepared_query, stored)
-                    results.append((bucket_id, sim))
-                except Exception:
-                    continue
-
+        results = []
+        entries_scanned = 0
+        stored_segments_scanned = 0
+        segment_comparisons = 0
+        invalid_rows = 0
+        try:
+            with recall_stage("vector_scan"):
+                for row_index, (bucket_id, stored) in enumerate(entries, start=1):
+                    if row_index % 16 == 0:
+                        await asyncio.sleep(0)
+                    entries_scanned += 1
+                    try:
+                        stored_segments_scanned += len(stored)
+                        segment_comparisons += len(prepared_query) * len(stored)
+                        sim = self._max_prepared_similarity(prepared_query, stored)
+                        results.append((bucket_id, sim))
+                    except Exception:
+                        invalid_rows += 1
+                        continue
+        finally:
+            record_recall_metric("vector_entries_scanned", entries_scanned)
+            record_recall_metric(
+                "vector_stored_segments_scanned", stored_segments_scanned
+            )
+            record_recall_metric("vector_segment_comparisons", segment_comparisons)
+            record_recall_metric("vector_invalid_rows", invalid_rows)
+        with recall_stage("vector_sort"):
             results.sort(key=lambda x: x[1], reverse=True)
-            return results[:top_k], "ok"
+        return results[:top_k], "ok"
 
     def _ensure_vector_cache_state(self) -> None:
         """Initialize cache fields for legacy tests that bypass __init__."""
@@ -397,6 +416,7 @@ class EmbeddingEngine:
             self._vector_cache_entries is not None
             and self._vector_cache_signature == signature
         ):
+            record_recall_metric("vector_cache_hits", 1)
             return self._vector_cache_entries
 
         async with self._vector_cache_lock:
@@ -405,13 +425,16 @@ class EmbeddingEngine:
                 self._vector_cache_entries is not None
                 and self._vector_cache_signature == signature
             ):
+                record_recall_metric("vector_cache_hits", 1)
                 return self._vector_cache_entries
 
+            record_recall_metric("vector_cache_misses", 1)
             generation = self._vector_cache_generation
             with closing(sqlite3.connect(self.db_path)) as conn:
                 rows = conn.execute(
                     "SELECT bucket_id, embedding FROM embeddings"
                 ).fetchall()
+            record_recall_metric("vector_cache_rows_loaded", len(rows))
 
             entries = []
             for row_index, (bucket_id, emb_json) in enumerate(rows, start=1):

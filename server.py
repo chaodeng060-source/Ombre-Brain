@@ -182,6 +182,7 @@ from recall_timing import (
     finish_recall_stage,
     recall_stage,
     record_recall_dehydration,
+    record_recall_metric,
     record_recall_stage,
     reset_recall_timing,
     set_recall_partial_result,
@@ -3699,12 +3700,15 @@ async def breath(
                 query_angles = [recall_query]
     if query_angles[0] != recall_query:
         query_angles = [recall_query] + [q for q in query_angles if q != recall_query]
+    record_recall_metric("query_angle_count", len(query_angles))
 
     # Keyword channel (already filtered by world/domain/threshold inside)
     keyword_by_id: dict[str, dict] = {}
     try:
-        with recall_stage("keyword_retrieval"):
+        with recall_stage("keyword_bucket_load"):
             keyword_candidates = await bucket_mgr.list_all(include_archive=False)
+        record_recall_metric("keyword_bucket_count", len(keyword_candidates))
+        with recall_stage("keyword_search"):
             for angle in query_angles:
                 for bucket in await bucket_mgr.search(
                     angle,
