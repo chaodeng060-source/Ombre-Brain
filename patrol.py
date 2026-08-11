@@ -51,6 +51,7 @@ STALE_DAYS = 90                 # 高重要度桶超此天数没激活 → 提�
 STALE_IMPORTANCE = 7            # 仅对 importance>=此值的桶报陈旧（重要的才值得提醒）
 AMNESIA_MONITOR_START_DATE = date(2026, 7, 30)
 AMNESIA_TIMEZONE = ZoneInfo("Asia/Shanghai")
+LIVE_BUCKET_ROOT_NAMES = ("permanent", "dynamic", "feel", "archive", "涩涩")
 
 
 def _load_patrol_config(path: str | os.PathLike) -> dict:
@@ -333,7 +334,19 @@ def _load_buckets(buckets_dir: Path) -> list[dict]:
     # 及世界线子目录下（对齐 bucket_manager.list_all 的 os.walk）。
     # 递归扫，把保护域被 resolve 的桶藏在子目录里也能巡到。
     out = []
-    for p in sorted(buckets_dir.rglob("*.md")):
+    if buckets_dir.name in LIVE_BUCKET_ROOT_NAMES:
+        live_roots = [buckets_dir]
+    else:
+        live_roots = [
+            buckets_dir / name
+            for name in LIVE_BUCKET_ROOT_NAMES
+            if (buckets_dir / name).is_dir()
+        ]
+    # A production vault also contains .lmc5 patrol reports, review ledgers and
+    # backup sidecars.  They are not buckets and must never affect M-axis health.
+    # When no live roots exist, keep accepting a standalone backup directory.
+    md_roots = live_roots or [buckets_dir]
+    for p in sorted(path for root in md_roots for path in root.rglob("*.md")):
         try:
             post = _safe_frontmatter(p)
             meta = dict(post.metadata)
@@ -348,7 +361,8 @@ def _load_buckets(buckets_dir: Path) -> list[dict]:
     # 本地/NAS 备份工具会把每个 Markdown 桶序列化成 <12hex>.json 快照。
     # patrol 同时读取这种只读备份格式；body_state.json 等运行时 sidecar
     # 没有 bucket schema，直接忽略，避免把它们误报成坏桶。
-    for p in sorted(buckets_dir.rglob("*.json")):
+    json_roots = live_roots or [buckets_dir]
+    for p in sorted(path for root in json_roots for path in root.rglob("*.json")):
         looks_like_snapshot = bool(re.fullmatch(r"[0-9a-fA-F]{12}", p.stem))
         try:
             data = json.loads(p.read_text(encoding="utf-8"))

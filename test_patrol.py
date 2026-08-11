@@ -113,6 +113,26 @@ def test_load_buckets_recursive_md():
     assert ids == {"a", "b"}
 
 
+def test_load_buckets_ignores_internal_reports_and_backups_in_live_vault():
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "dynamic/live.md", "---\nid: live\ntype: dynamic\n---\nreal bucket\n")
+        _write(d, ".lmc5/patrol/latest.md", "---\nid: patrol-report\n---\nreport\n")
+        _write(d, "backups/old.md", "---\nid: backup-copy\n---\nbackup\n")
+        Path(d, "backups", "abcdef123456.json").write_text(
+            json.dumps({
+                "id": "backup-snapshot",
+                "metadata": {"id": "backup-snapshot", "type": "dynamic"},
+                "content": "old copy",
+            }),
+            encoding="utf-8",
+        )
+
+        loaded = patrol._load_buckets(Path(d))
+
+    ids = {b.get("id") for b in loaded if not b.get("__broken__")}
+    assert ids == {"live"}
+
+
 # ---- 端到端：保护域 resolved + 陈旧重要 都命中，且不炸 ----
 def test_patrol_end_to_end_flags():
     with tempfile.TemporaryDirectory() as d:
