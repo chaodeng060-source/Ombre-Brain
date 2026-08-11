@@ -463,7 +463,28 @@ class ReviewQueue:
             raise ValueError("review_queue entry 缺 key")
         with advisory_file_lock(self.lock_path):
             rows = self._load_unlocked()
-            if key in self._keys(rows):
+            existing = next((row for row in rows if row.get("key") == key), None)
+            if existing is not None:
+                enriched = False
+                if (
+                    existing.get("status") == STATUS_PENDING
+                    and existing.get("kind") == KIND_RELATION
+                    and entry.get("kind") == KIND_RELATION
+                ):
+                    for field in ("source_name", "target_name"):
+                        value = str(entry.get(field) or "").strip()
+                        if value and not str(existing.get(field) or "").strip():
+                            existing[field] = value[:160]
+                            enriched = True
+                if enriched:
+                    atomic_write_text(
+                        self.path,
+                        "".join(
+                            json.dumps(row, ensure_ascii=False) + "\n"
+                            for row in rows
+                        ),
+                    )
+                    os.chmod(self.path, 0o600)
                 return False
             self.path.parent.mkdir(parents=True, exist_ok=True)
             payload = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")

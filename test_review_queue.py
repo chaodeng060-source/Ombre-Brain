@@ -36,6 +36,28 @@ def test_enqueue_idempotent():
     assert len(q.list_pending()) == 1
 
 
+def test_pending_relation_replay_only_enriches_missing_names():
+    q = _q()
+    original = make_relation_entry("a", "b", "causes", "原备注")
+    assert q.enqueue(original) is True
+
+    replay = make_relation_entry(
+        "a",
+        "b",
+        "causes",
+        "新备注不覆盖",
+        source_name="源桶",
+        target_name="目标桶",
+    )
+    assert q.enqueue(replay) is False
+
+    stored = q.get(original["key"])
+    assert stored["source_name"] == "源桶"
+    assert stored["target_name"] == "目标桶"
+    assert stored["note"] == "原备注"
+    assert len(q.all()) == 1
+
+
 def test_enqueue_is_idempotent_across_concurrent_writers():
     q = _q()
     entry = make_relation_entry("a", "b", "causes")
