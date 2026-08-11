@@ -8292,6 +8292,25 @@ if __name__ == "__main__":
         else:
             _app = mcp.sse_app()
 
+        # FastMCP(lifespan=_server_lifespan) does NOT run on this path:
+        # streamable_http_app()'s ASGI lifespan only manages the session
+        # manager, so the briefing prebuild worker never started (verified
+        # 2026-08-11: container log has "session manager started" but no
+        # "Briefing background pre-generation started"). Wrap the app's own
+        # lifespan so the worker starts under uvicorn too.
+        _transport_lifespan = _app.router.lifespan_context
+
+        @asynccontextmanager
+        async def _uvicorn_lifespan(app):
+            async with _transport_lifespan(app):
+                await _start_briefing_cache_refresh()
+                try:
+                    yield
+                finally:
+                    await _stop_briefing_cache_refresh()
+
+        _app.router.lifespan_context = _uvicorn_lifespan
+
         # --- Network authentication boundary ---
         # /api/* uses OMBRE_API_TOKEN; MCP transports use OMBRE_MCP_TOKEN.
         # Both are mandatory for network mode.  /health remains anonymous so
