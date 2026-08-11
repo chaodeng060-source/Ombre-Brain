@@ -46,6 +46,7 @@ import re
 import time
 import httpx
 import jieba
+from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 from uuid import uuid4
 from datetime import datetime, timedelta, timezone
@@ -1175,10 +1176,21 @@ def _recall_prefix(
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
 # stdio mode ignores host (no network)
+@asynccontextmanager
+async def _server_lifespan(_server):
+    """Own process-wide background tasks without delaying server readiness."""
+    await _start_briefing_cache_refresh()
+    try:
+        yield {}
+    finally:
+        await _stop_briefing_cache_refresh()
+
+
 mcp = FastMCP(
     "Ombre Brain",
     host="0.0.0.0",
     port=8000,
+    lifespan=_server_lifespan,
 )
 
 
@@ -4582,6 +4594,7 @@ async def hold(
                 except Exception as e:
                     logger.warning(f"Failed to mark source as digested / 标记已消化失败: {e}")
         await _synchronize_bucket_entities(bucket_id, content)
+        _mark_briefing_cache_dirty("hold_feel")
         return f"🫧feel→{bucket_id}"
 
     # --- Step 1: auto-tagging / 自动打标 ---
@@ -4629,6 +4642,7 @@ async def hold(
         await _synchronize_bucket_entities(
             bucket_id, content, analysis.get("entities", [])
         )
+        _mark_briefing_cache_dirty("hold_pinned")
         return f"📌钉选→{bucket_id} {','.join(domain)}"
 
     # --- Step 2: merge or create / 合并或新建 ---
@@ -4644,6 +4658,7 @@ async def hold(
         chord_tag=chord_tag,
         entities=analysis.get("entities", []),
     )
+    _mark_briefing_cache_dirty("hold_merge" if is_merged else "hold_create")
 
     # --- Step 3: machine relation proposals (new buckets only) ---
     # --- 机器只提关系候选；只有 agent 显式 add_relation 才写入关系图 ---
@@ -4731,6 +4746,9 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
             entities=analysis.get("entities", []),
         )
         _ela_m = time.perf_counter() - _t_m
+        _mark_briefing_cache_dirty(
+            "grow_fast_merge" if is_merged else "grow_fast_create"
+        )
         _ela_total = time.perf_counter() - _grow_t0
         logger.info(
             f"grow.timing path=fast chars={_content_len} "
@@ -4825,6 +4843,9 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
         f"items={len(items)} items_sum={_items_sum:.2f}s items_max={_items_max:.2f}s "
         f"created={created} merged={merged} total={_ela_total:.2f}s"
     )
+
+    if created or merged:
+        _mark_briefing_cache_dirty("grow_batch")
 
     return f"{len(items)}条|新{created}合{merged}\n" + "\n".join(results)
 
@@ -5206,6 +5227,9 @@ async def switch_world(world: str = "") -> str:
         bucket_mgr.invalidate_list_all_cache()
     except Exception:
         pass
+    _register_briefing_profile((1000, "", False, "", "text", target))
+    _register_briefing_profile((1500, "", False, "", "json", target))
+    _mark_briefing_cache_dirty("switch_world")
     label = target if target else "日常模式 (空)"
     logger.info(f"current_world switched → {label}")
     return f"已切换到 → {label}"
@@ -5777,6 +5801,268 @@ def _surface_feel_pool(all_buckets: list, seen_ids: set = None, cap: int = FEEL_
 
 
 # =============================================================
+# Briefing pre-generation cache
+# 简报后台预生成缓存
+# =============================================================
+def _briefing_env_seconds(name: str, default: float, minimum: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+BRIEFING_REFRESH_INTERVAL_SECONDS = _briefing_env_seconds(
+    "OMBRE_BRIEFING_REFRESH_INTERVAL_SECONDS",
+    600.0,
+    30.0,
+)
+BRIEFING_REFRESH_TIMEOUT_SECONDS = _briefing_env_seconds(
+    "OMBRE_BRIEFING_REFRESH_TIMEOUT_SECONDS",
+    120.0,
+    15.0,
+)
+
+# A profile is exactly the request shape that affects briefing material or
+# representation.  Body-state rendering remains request-time work and is not
+# cached; session_id stays in the key as required so sessions never share a
+# cache identity accidentally.
+_BriefingProfile = tuple[int, str, bool, str, str, str]
+_briefing_cache_lock = threading.Lock()
+_briefing_prebuilt_cache: dict[_BriefingProfile, dict] = {}
+_briefing_profiles: set[_BriefingProfile] = {
+    (1000, "", False, "", "text", ""),
+    (1500, "", False, "", "json", ""),
+}
+_briefing_refresh_event: asyncio.Event | None = None
+_briefing_refresh_task: asyncio.Task | None = None
+_briefing_refresh_loop: asyncio.AbstractEventLoop | None = None
+_briefing_background_refresh = contextvars.ContextVar(
+    "briefing_background_refresh",
+    default=False,
+)
+_briefing_timeout_override = contextvars.ContextVar(
+    "briefing_timeout_override",
+    default=None,
+)
+
+
+def _briefing_profile(
+    max_chars: int,
+    domain: str,
+    pinned_only: bool,
+    session_id: str,
+    format: str,
+) -> _BriefingProfile:
+    return (
+        max(300, min(int(max_chars), 4000)),
+        (domain or "").strip(),
+        bool(pinned_only),
+        (session_id or "").strip(),
+        "json" if format == "json" else "text",
+        (config.get("current_world", "") or "").strip(),
+    )
+
+
+def _register_briefing_profile(profile: _BriefingProfile) -> None:
+    with _briefing_cache_lock:
+        _briefing_profiles.add(profile)
+
+
+def _briefing_generation_shape(profile: _BriefingProfile) -> tuple:
+    """Fields that affect LLM material; session only affects request rendering."""
+    return (profile[0], profile[1], profile[2], profile[4], profile[5])
+
+
+def _get_briefing_cache_entry(profile: _BriefingProfile) -> dict | None:
+    with _briefing_cache_lock:
+        return _briefing_prebuilt_cache.get(profile)
+
+
+def _store_briefing_cache_entry(
+    profile: _BriefingProfile,
+    *,
+    text: str,
+    time_header: str,
+    buckets: list[dict],
+) -> None:
+    entry = {
+        "text": text,
+        "time_header": time_header,
+        "format": profile[4],
+        "buckets": list(buckets),
+        "generated_at": time.time(),
+    }
+    shape = _briefing_generation_shape(profile)
+    with _briefing_cache_lock:
+        for registered in _briefing_profiles:
+            if _briefing_generation_shape(registered) == shape:
+                _briefing_prebuilt_cache[registered] = dict(entry)
+        _briefing_prebuilt_cache[profile] = entry
+    logger.info(
+        "Briefing prebuilt cache refreshed max_chars=%d format=%s session=%s",
+        profile[0],
+        profile[4],
+        "set" if profile[3] else "empty",
+    )
+
+
+def _render_briefing_cache_entry(
+    entry: dict,
+    *,
+    session_id: str,
+    include_body_state: bool,
+    reset_body_state: bool,
+) -> str:
+    """Render a cached snapshot with a request-time clock and body state."""
+    fresh_header = _now_bj_header()
+    cached_text = str(entry.get("text") or "")
+    if entry.get("format") == "json":
+        payload = json.loads(cached_text)
+        payload["time_header"] = fresh_header
+        return json.dumps(payload, ensure_ascii=False)
+
+    old_header = str(entry.get("time_header") or "")
+    old_prefix = f"# {old_header}\n" if old_header else ""
+    if old_prefix and cached_text.startswith(old_prefix):
+        cached_text = f"# {fresh_header}\n" + cached_text[len(old_prefix):]
+    return _append_body_state_block(
+        cached_text,
+        list(entry.get("buckets") or []),
+        session_id,
+        include_body_state,
+        reset_body_state,
+    )
+
+
+def _mark_briefing_cache_dirty(reason: str) -> None:
+    """Wake the background loop after a durable hold/grow write."""
+    event = _briefing_refresh_event
+    loop = _briefing_refresh_loop
+    if event is None or loop is None or loop.is_closed():
+        return
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        event.set()
+    else:
+        loop.call_soon_threadsafe(event.set)
+    logger.debug("Briefing prebuilt cache marked dirty: %s", reason)
+
+
+async def _refresh_briefing_profile(profile: _BriefingProfile) -> None:
+    before = _get_briefing_cache_entry(profile)
+    background_token = _briefing_background_refresh.set(True)
+    timeout_token = _briefing_timeout_override.set(
+        BRIEFING_REFRESH_TIMEOUT_SECONDS
+    )
+    try:
+        await briefing(
+            max_chars=profile[0],
+            domain=profile[1],
+            pinned_only=profile[2],
+            session_id=profile[3],
+            include_body_state=False,
+            reset_body_state=False,
+            format=profile[4],
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "Briefing background refresh failed; preserving previous cache "
+            "max_chars=%d format=%s",
+            profile[0],
+            profile[4],
+        )
+    finally:
+        _briefing_timeout_override.reset(timeout_token)
+        _briefing_background_refresh.reset(background_token)
+    after = _get_briefing_cache_entry(profile)
+    if after is before:
+        logger.error(
+            "Briefing background refresh produced no usable summary; "
+            "preserving previous cache max_chars=%d format=%s",
+            profile[0],
+            profile[4],
+        )
+
+
+async def _briefing_cache_refresh_worker() -> None:
+    event = _briefing_refresh_event
+    if event is None:
+        return
+    logger.info(
+        "Briefing background pre-generation started interval=%.1fs timeout=%.1fs",
+        BRIEFING_REFRESH_INTERVAL_SECONDS,
+        BRIEFING_REFRESH_TIMEOUT_SECONDS,
+    )
+    while True:
+        event.clear()
+        with _briefing_cache_lock:
+            # session_id is a cache-key boundary, not an LLM-input boundary.
+            # Refresh one representative per material shape, then _store...
+            # fans the result out to every registered session key.
+            by_shape: dict[tuple, _BriefingProfile] = {}
+            current_world = (config.get("current_world", "") or "").strip()
+            for profile in sorted(
+                _briefing_profiles,
+                key=lambda item: (
+                    0
+                    if item[0] == 1500 and item[4] == "json" and not item[3]
+                    else 1,
+                    item,
+                ),
+            ):
+                if profile[5] != current_world:
+                    continue
+                by_shape.setdefault(_briefing_generation_shape(profile), profile)
+            profiles = list(by_shape.values())
+        for profile in profiles:
+            await _refresh_briefing_profile(profile)
+        try:
+            await asyncio.wait_for(
+                event.wait(),
+                timeout=BRIEFING_REFRESH_INTERVAL_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _start_briefing_cache_refresh() -> None:
+    global _briefing_refresh_event, _briefing_refresh_task, _briefing_refresh_loop
+    if _briefing_refresh_task is not None and not _briefing_refresh_task.done():
+        return
+    current_world = (config.get("current_world", "") or "").strip()
+    _register_briefing_profile((1000, "", False, "", "text", current_world))
+    _register_briefing_profile((1500, "", False, "", "json", current_world))
+    _briefing_refresh_loop = asyncio.get_running_loop()
+    _briefing_refresh_event = asyncio.Event()
+    _briefing_refresh_event.set()
+    _briefing_refresh_task = asyncio.create_task(
+        _briefing_cache_refresh_worker(),
+        name="briefing-prebuild",
+    )
+
+
+async def _stop_briefing_cache_refresh() -> None:
+    global _briefing_refresh_event, _briefing_refresh_task, _briefing_refresh_loop
+    task = _briefing_refresh_task
+    _briefing_refresh_task = None
+    _briefing_refresh_event = None
+    _briefing_refresh_loop = None
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+# =============================================================
 # Tool 7: briefing — Open-window handoff briefing
 # 工具 7：briefing — 开窗交接简报
 #
@@ -5800,6 +6086,31 @@ async def briefing(
     """开窗简报。聚合钉选+高权重未解决+最近活跃桶,LLM压缩为≤max_chars字简报,默认1000字。输出顺序:朝灯当前氛围/走向→最近因果链故事→活着的欠账→工程线→铁律。domain逗号分隔可过滤主题域。pinned_only=True只用钉选桶。session_id=同一会话内对感官刺激去重。include_body_state=False时只关闭外部身体状态块,不改变简报素材。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。format=text(默认)返回拼接好的简报字符串(向后兼容);format=json时把 tier==0 的桶单独剥出来作为 slots[] 返回原文、剩余桶继续走 LLM 压缩为 briefing 字段——治简报≠原文(#4 核心画像分离, 2026-05-30)。开窗调一次,省80%token。"""
     await _ensure_decay_background()
     max_chars = max(300, min(max_chars, 4000))
+    format = "json" if format == "json" else "text"
+    profile = _briefing_profile(
+        max_chars,
+        domain,
+        pinned_only,
+        session_id,
+        format,
+    )
+    _register_briefing_profile(profile)
+    is_background_refresh = _briefing_background_refresh.get()
+    if not is_background_refresh and not reset_body_state:
+        cached = _get_briefing_cache_entry(profile)
+        if cached is not None:
+            try:
+                return _render_briefing_cache_entry(
+                    cached,
+                    session_id=session_id,
+                    include_body_state=include_body_state,
+                    reset_body_state=False,
+                )
+            except Exception:
+                logger.exception(
+                    "Briefing prebuilt cache render failed; falling back to cold path"
+                )
+        _mark_briefing_cache_dirty("request_cache_miss")
 
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
@@ -5963,7 +6274,7 @@ async def briefing(
                     "label": "锚索引",
                     "text": anchor_index,
                 })
-            return _json.dumps(
+            output = _json.dumps(
                 {
                     "time_header": time_header,
                     "slots": slots,
@@ -5972,17 +6283,26 @@ async def briefing(
                 },
                 ensure_ascii=False,
             )
+            _store_briefing_cache_entry(
+                profile,
+                text=output,
+                time_header=time_header,
+                buckets=[],
+            )
+            return output
         _empty_body = (
             f"# {time_header}\n\n{protected_block}" if protected_block
             else f"# {time_header}\n\n记忆库当前空闲，没有可简报的素材。"
         )
         _empty_body = _append_anchor_index(_empty_body, anchor_index)
+        _store_briefing_cache_entry(
+            profile,
+            text=_empty_body,
+            time_header=time_header,
+            buckets=[],
+        )
         return _append_body_state_block(
-            _empty_body,
-            [],
-            session_id,
-            include_body_state,
-            reset_body_state,
+            _empty_body, [], session_id, include_body_state, reset_body_state
         )
 
     # --- Build raw material: name + meta + truncated content per bucket ---
@@ -6023,19 +6343,23 @@ async def briefing(
     raw_material = f"=== 当前时点 ===\n{time_header}\n\n" + "\n\n".join(sections)
 
     # --- Compress via LLM ---
-    # 2026-06-08 并入源码（原为 docker cp 热补丁、重建会丢）：briefing 的 LLM 压缩加
-    # 180s 内存缓存，按 sections 内容 + max_chars 为键。重复开窗 3.6s→0.19s（容器实测）。
-    # 缓存挂在已 import 的 dehydrator 模块对象上，只改这一处局部、不注入模块级变量。
+    # 冷启动缺缓存时仍走 Dehydrator 的 15s 总闸；后台预生成通过 context override
+    # 放宽到 120s。后台慢慢生成，读路径只消费完整成功产物。
     try:
-        import hashlib as _hl, time as _t
-        _bc = dehydrator.__dict__.setdefault('_briefing_llm_cache', {})
-        _ck = _hl.md5((chr(10).join(sections) + str(max_chars)).encode('utf-8')).hexdigest()
-        _ce = _bc.get(_ck)
-        if _ce and (_t.time() - _ce[1]) < 180:
-            result = _ce[0]
+        timeout_override = _briefing_timeout_override.get()
+        if timeout_override is None:
+            # Keep compatibility with local test doubles and the established
+            # request-time Dehydrator contract.
+            result = await dehydrator.briefing(
+                raw_material,
+                max_chars=max_chars,
+            )
         else:
-            result = await dehydrator.briefing(raw_material, max_chars=max_chars)
-            _bc[_ck] = (result, _t.time())
+            result = await dehydrator.briefing(
+                raw_material,
+                max_chars=max_chars,
+                total_timeout_seconds=timeout_override,
+            )
     except Exception as e:
         logger.error(f"Briefing compression failed: {e}")
         return f"# {time_header}\n\n简报生成失败：{e}"
@@ -6043,6 +6367,7 @@ async def briefing(
     if not result:
         return f"# {time_header}\n\n简报生成为空，请稍后重试。"
 
+    result_is_compressed = "简报压缩未完成" not in result
     result_with_anchor = _append_anchor_index(result, anchor_index)
 
     # --- Stats footer for visibility ---
@@ -6102,7 +6427,7 @@ async def briefing(
                 "label": "动态记忆简报",
                 "text": result_with_anchor,
             })
-        return _json.dumps(
+        output = _json.dumps(
             {
                 "time_header": time_header,
                 "slots": slots,
@@ -6112,13 +6437,24 @@ async def briefing(
             },
             ensure_ascii=False,
         )
+        if result_is_compressed:
+            _store_briefing_cache_entry(
+                profile,
+                text=output,
+                time_header=time_header,
+                buckets=briefing_buckets,
+            )
+        return output
 
+    if result_is_compressed:
+        _store_briefing_cache_entry(
+            profile,
+            text=text,
+            time_header=time_header,
+            buckets=briefing_buckets,
+        )
     return _append_body_state_block(
-        text,
-        briefing_buckets,
-        session_id,
-        include_body_state,
-        reset_body_state,
+        text, briefing_buckets, session_id, include_body_state, reset_body_state
     )
 
 

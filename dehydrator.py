@@ -2297,7 +2297,13 @@ class Dehydrator:
     # Aggregates raw bucket material into a compressed handoff note
     # 把原始桶素材压成一份紧凑交接简报
     # ---------------------------------------------------------
-    async def briefing(self, raw_material: str, max_chars: int = 1000) -> str:
+    async def briefing(
+        self,
+        raw_material: str,
+        max_chars: int = 1000,
+        *,
+        total_timeout_seconds: float | None = None,
+    ) -> str:
         """
         Compress aggregated bucket material into an open-window briefing.
         将聚合的桶素材压缩为开窗简报。
@@ -2311,7 +2317,11 @@ class Dehydrator:
             raise RuntimeError("脱水 API 不可用，请配置 OMBRE_API_KEY")
 
         try:
-            return await self._api_briefing(raw_material, max_chars)
+            return await self._api_briefing(
+                raw_material,
+                max_chars,
+                total_timeout_seconds=total_timeout_seconds,
+            )
         except RuntimeError:
             raise
         except Exception as e:
@@ -2321,7 +2331,13 @@ class Dehydrator:
     # API call: briefing
     # API 调用：开窗简报
     # ---------------------------------------------------------
-    async def _api_briefing(self, raw_material: str, max_chars: int) -> str:
+    async def _api_briefing(
+        self,
+        raw_material: str,
+        max_chars: int,
+        *,
+        total_timeout_seconds: float | None = None,
+    ) -> str:
         """
         Call LLM API to compress raw bucket material into a briefing.
         调用 LLM API 把原始桶素材压成简报。
@@ -2330,9 +2346,19 @@ class Dehydrator:
         prompt = BRIEFING_PROMPT.format(max_chars=max_chars)
         # Briefing token budget: ~1.5 chars/token for Chinese, +30% headroom
         # 简报 token 预算：中文约 1.5 字/token，留 30% 余量
-        briefing_max_tokens = int(max_chars / 1.5 * 1.3)
-        sent_material = raw_material[:20000]
+        _content_tokens = int(max_chars / 1.5 * 1.3)
+        # deepseek-v4-flash 的 reasoning_content 与正文共用预算。生产实测
+        # 1300 tokens 会在正文前撞 length，故保留已验证的推理余量与下限。
+        briefing_max_tokens = max(_content_tokens * 3, 4000)
+        # 生产现行止血值：更小素材让冷路径的 15s fallback 尽快放行；后台
+        # 预生成复用同一语义输入，只放宽总时长，不另造 prompt/素材路线。
+        sent_material = raw_material[:9000]
         fallback = _briefing_material_fallback(raw_material, max_chars)
+        timeout_seconds = (
+            BRIEFING_TOTAL_TIMEOUT_SECONDS
+            if total_timeout_seconds is None
+            else max(1.0, float(total_timeout_seconds))
+        )
 
         async def _generate() -> str | None:
             violations: list[str] = []
@@ -2353,7 +2379,7 @@ class Dehydrator:
                     len(sent_material),
                     max_chars,
                     briefing_max_tokens,
-                    BRIEFING_TOTAL_TIMEOUT_SECONDS,
+                    timeout_seconds,
                 )
                 response = await self.client.chat.completions.create(
                     model=self.model,
@@ -2395,13 +2421,13 @@ class Dehydrator:
         try:
             result = await asyncio.wait_for(
                 _generate(),
-                timeout=BRIEFING_TOTAL_TIMEOUT_SECONDS,
+                timeout=timeout_seconds,
             )
         except asyncio.TimeoutError:
             logger.error(
                 "Briefing exceeded total timeout %.1fs; returning source fallback "
                 "material_chars=%d sent_chars=%d max_tokens=%d",
-                BRIEFING_TOTAL_TIMEOUT_SECONDS,
+                timeout_seconds,
                 len(raw_material),
                 len(sent_material),
                 briefing_max_tokens,
