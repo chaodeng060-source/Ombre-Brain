@@ -588,112 +588,137 @@ class NightRunCoordinator:
 
             return await asyncio.wait_for(call(), timeout=timeout)
 
-        consecutive_errors = 0
-        for start in range(
-            0, len(pending_rows), self.policy.proposer_concurrency
-        ):
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                counts["proposer_wall_budget_exhausted"] = 1
-                break
-            wave = pending_rows[
-                start : start + self.policy.proposer_concurrency
-            ]
-            decoded: list[tuple[PendingProposerChunk, str]] = []
-            for pending in wave:
-                if len(pending.source_event_ids) != 1:
-                    raise NightRunCoordinatorError(
-                        "proposer.source_cardinality"
-                    )
-                try:
-                    text = pending.content.decode("utf-8", errors="strict")
-                except UnicodeError as exc:
-                    raise NightRunCoordinatorError(
-                        "proposer.chunk_utf8"
-                    ) from exc
-                decoded.append((pending, text))
-            counts["proposer_attempted"] += len(decoded)
-            results = await asyncio.gather(
-                *(
-                    propose_one(pending, text, remaining)
-                    for pending, text in decoded
-                ),
-                return_exceptions=True,
-            )
-            for (pending, _text), result in zip(decoded, results, strict=True):
-                if isinstance(result, asyncio.TimeoutError):
-                    self._record_proposer_error(
-                        run_id,
-                        pending,
-                        "provider.run_budget",
-                    )
-                    counts["proposer_retryable"] += 1
-                    counts["proposer_errors"] = counts[
-                        "proposer_retryable"
-                    ]
-                    counts["proposer_wall_budget_exhausted"] = 1
-                    consecutive_errors += 1
-                    if consecutive_errors >= 3:
-                        counts["proposer_circuit_breaker"] = 1
-                    continue
-                if isinstance(result, ProposerContractError):
-                    self._record_proposer_error(run_id, pending, result.code)
-                    counts["proposer_retryable"] += 1
-                    counts["proposer_errors"] = counts[
-                        "proposer_retryable"
-                    ]
-                    consecutive_errors += 1
-                    if consecutive_errors >= 3:
-                        counts["proposer_circuit_breaker"] = 1
-                    continue
-                if isinstance(result, BaseException):
-                    raise result
-                consecutive_errors = 0
-                candidate_specs = self._candidate_specs(
-                    run_id=run_id,
-                    pending=pending,
-                    batch=result,
+        decoded: list[tuple[PendingProposerChunk, str]] = []
+        for pending in pending_rows:
+            if len(pending.source_event_ids) != 1:
+                raise NightRunCoordinatorError(
+                    "proposer.source_cardinality"
                 )
-                with self.ledger.transaction() as tx:
-                    candidate_keys: list[str] = []
-                    for key, axis, payload in candidate_specs:
-                        tx.record_candidate(
-                            key,
-                            axis,
-                            payload,
-                            (pending.chunk_id,),
+            try:
+                text = pending.content.decode("utf-8", errors="strict")
+            except UnicodeError as exc:
+                raise NightRunCoordinatorError(
+                    "proposer.chunk_utf8"
+                ) from exc
+            decoded.append((pending, text))
+
+        consecutive_errors = 0
+        next_index = 0
+        active: dict[
+            asyncio.Task[ProposerBatch],
+            tuple[int, PendingProposerChunk],
+        ] = {}
+
+        def schedule_available() -> None:
+            nonlocal next_index
+            while (
+                next_index < len(decoded)
+                and len(active) < self.policy.proposer_concurrency
+                and not counts["proposer_circuit_breaker"]
+                and not counts["proposer_wall_budget_exhausted"]
+            ):
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    counts["proposer_wall_budget_exhausted"] = 1
+                    return
+                pending, text = decoded[next_index]
+                task = asyncio.create_task(
+                    propose_one(pending, text, remaining)
+                )
+                active[task] = (next_index, pending)
+                next_index += 1
+                counts["proposer_attempted"] += 1
+
+        schedule_available()
+        try:
+            while active:
+                done, _pending_tasks = await asyncio.wait(
+                    active,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                ordered = sorted(done, key=lambda task: active[task][0])
+                for task in ordered:
+                    _index, pending = active.pop(task)
+                    try:
+                        result: ProposerBatch | BaseException = task.result()
+                    except BaseException as exc:
+                        result = exc
+                    if isinstance(result, asyncio.TimeoutError):
+                        self._record_proposer_error(
+                            run_id,
+                            pending,
+                            "provider.run_budget",
                         )
-                        candidate_keys.append(key)
-                    outcome = (
-                        "candidates_persisted"
-                        if candidate_keys
-                        else "zero_candidates"
-                    )
-                    outcome_key = self._proposer_outcome_key(
+                        counts["proposer_retryable"] += 1
+                        counts["proposer_errors"] = counts[
+                            "proposer_retryable"
+                        ]
+                        counts["proposer_wall_budget_exhausted"] = 1
+                        consecutive_errors += 1
+                        if consecutive_errors >= 3:
+                            counts["proposer_circuit_breaker"] = 1
+                        continue
+                    if isinstance(result, ProposerContractError):
+                        self._record_proposer_error(
+                            run_id, pending, result.code
+                        )
+                        counts["proposer_retryable"] += 1
+                        counts["proposer_errors"] = counts[
+                            "proposer_retryable"
+                        ]
+                        consecutive_errors += 1
+                        if consecutive_errors >= 3:
+                            counts["proposer_circuit_breaker"] = 1
+                        continue
+                    if isinstance(result, BaseException):
+                        raise result
+                    consecutive_errors = 0
+                    candidate_specs = self._candidate_specs(
                         run_id=run_id,
                         pending=pending,
                         batch=result,
-                        candidate_keys=candidate_keys,
-                        outcome=outcome,
                     )
-                    tx.record_chunk_proposer_outcome(
-                        outcome_key,
-                        pending.chunk_id,
-                        outcome,
-                        candidate_keys=candidate_keys,
-                    )
-                counts["proposer_succeeded"] += 1
-                counts["proposer_chunks"] = counts[
-                    "proposer_succeeded"
-                ]
-                counts["candidates"] = counts.get(
-                    "candidates", 0
-                ) + len(candidate_specs)
-            if (
-                counts["proposer_circuit_breaker"]
-                or counts["proposer_wall_budget_exhausted"]
-            ):
-                break
+                    with self.ledger.transaction() as tx:
+                        candidate_keys: list[str] = []
+                        for key, axis, payload in candidate_specs:
+                            tx.record_candidate(
+                                key,
+                                axis,
+                                payload,
+                                (pending.chunk_id,),
+                            )
+                            candidate_keys.append(key)
+                        outcome = (
+                            "candidates_persisted"
+                            if candidate_keys
+                            else "zero_candidates"
+                        )
+                        outcome_key = self._proposer_outcome_key(
+                            run_id=run_id,
+                            pending=pending,
+                            batch=result,
+                            candidate_keys=candidate_keys,
+                            outcome=outcome,
+                        )
+                        tx.record_chunk_proposer_outcome(
+                            outcome_key,
+                            pending.chunk_id,
+                            outcome,
+                            candidate_keys=candidate_keys,
+                        )
+                    counts["proposer_succeeded"] += 1
+                    counts["proposer_chunks"] = counts[
+                        "proposer_succeeded"
+                    ]
+                    counts["candidates"] = counts.get(
+                        "candidates", 0
+                    ) + len(candidate_specs)
+                schedule_available()
+        finally:
+            if active:
+                for task in active:
+                    task.cancel()
+                await asyncio.gather(*active, return_exceptions=True)
 
         after = self.ledger.proposer_backlog_stats(through=watermark)
         counts["proposer_pending_after"] = after.pending

@@ -779,6 +779,65 @@ async def test_proposer_concurrency_parallelizes_independent_chunks(
         ).fetchone() == (4,)
 
 
+@pytest.mark.asyncio
+async def test_proposer_pool_refills_without_waiting_for_slow_tail(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(
+        tmp_path,
+        policy=NightRunPolicy(
+            proposer_max_chunks_per_run=4,
+            proposer_concurrency=2,
+        ),
+    )
+
+    class _TailAwareProposer:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.slow_release = asyncio.Event()
+            self.third_started = asyncio.Event()
+
+        async def propose(self, *args: Any, **kwargs: Any) -> ProposerBatch:
+            self.calls += 1
+            call_number = self.calls
+            if call_number == 1:
+                await self.slow_release.wait()
+            if call_number == 3:
+                self.third_started.set()
+            return ProposerBatch(
+                schema_version=1,
+                candidates=(),
+                prompt_digest="c" * 64,
+                output_digest="d" * 64,
+                model="test-model",
+                provider="test-provider",
+            )
+
+    proposer = _TailAwareProposer()
+    harness.coordinator.proposer = proposer
+    for index in range(4):
+        harness.ledger.append_raw_event(
+            "room-main",
+            f"refill-{index}",
+            json.dumps({"message": f"refill-{index}"}),
+        )
+
+    run = asyncio.create_task(
+        harness.coordinator.run(
+            run_id="night-refill-proposer",
+            cutoff=datetime.now(timezone.utc),
+        )
+    )
+    await asyncio.wait_for(proposer.third_started.wait(), timeout=1)
+    assert not run.done()
+    proposer.slow_release.set()
+    outcome = await run
+
+    assert outcome.run.stage == "complete"
+    assert outcome.counts["proposer_succeeded"] == 4
+    assert proposer.calls == 4
+
+
 @pytest.mark.parametrize("value", (0, 9, True, 1.0))
 def test_proposer_policy_rejects_invalid_concurrency(value: object) -> None:
     with pytest.raises(ValueError):
