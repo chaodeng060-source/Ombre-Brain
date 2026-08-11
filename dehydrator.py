@@ -850,6 +850,22 @@ class Dehydrator:
             )
         )
 
+        # Briefing hits the same failure: hidden reasoning ate the whole token
+        # budget (finish_reason="length", content empty) and the open-window
+        # briefing came back blank — 朝灯 2026-08-11 13:43 冷启动白等 70 秒那次。
+        # Same cure as the two paths above; config.yaml 里 8/10 就写了
+        # disable_thinking: true 但一直没人接线，这里按同款先例接上。
+        # 受控实测（同规模 9000 字素材+铁律 prompt）：17s 超时白纸 → 2.3s 出 315 字正文。
+        self.briefing_disable_thinking = (
+            dehy_cfg.get("disable_thinking") is True
+            or dehy_cfg.get("briefing_disable_thinking") is True
+            or (
+                "disable_thinking" not in dehy_cfg
+                and "briefing_disable_thinking" not in dehy_cfg
+                and str(self.base_url).lower().startswith("https://api.deepseek.com")
+            )
+        )
+
         # --- API availability / 是否有可用的 API ---
         self.api_available = bool(self.api_key)
 
@@ -2381,15 +2397,18 @@ class Dehydrator:
                     briefing_max_tokens,
                     timeout_seconds,
                 )
-                response = await self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
+                briefing_request: dict = {
+                    "model": self.model,
+                    "messages": [
                         {"role": "system", "content": prompt + retry_rule},
                         {"role": "user", "content": sent_material},
                     ],
-                    max_tokens=briefing_max_tokens,
-                    temperature=0,  # zero temp: deterministic, no creative fabrication
-                )
+                    "max_tokens": briefing_max_tokens,
+                    "temperature": 0,  # zero temp: deterministic, no creative fabrication
+                }
+                if self.briefing_disable_thinking:
+                    briefing_request["extra_body"] = {"thinking": {"type": "disabled"}}
+                response = await self.client.chat.completions.create(**briefing_request)
 
                 if not response.choices:
                     logger.error(
