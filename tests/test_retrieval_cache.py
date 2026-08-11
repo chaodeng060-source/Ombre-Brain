@@ -217,7 +217,7 @@ async def test_vector_cache_reuses_parse_and_refreshes_after_external_commit(
         "bucket-c",
         "bucket-b",
     ]
-    assert parsed == cold_parses + 3
+    assert parsed == cold_parses + 1
 
 
 @pytest.mark.asyncio
@@ -231,12 +231,26 @@ async def test_vector_store_and_delete_invalidate_warm_cache(tmp_path, monkeypat
         return [1.0, 0.0], "ok"
 
     monkeypatch.setattr(engine, "_generate_embedding_with_status", fake_embedding)
+    import embedding_engine as embedding_module
+
+    original_loads = embedding_module.json.loads
+    parsed = 0
+
+    def counting_loads(payload):
+        nonlocal parsed
+        parsed += 1
+        return original_loads(payload)
+
+    monkeypatch.setattr(embedding_module.json, "loads", counting_loads)
     await engine.search_similar_with_status("query", top_k=10)
+    cold_parses = parsed
 
     engine._store_embedding("bucket-b", [0.8, 0.2])
     stored, _status = await engine.search_similar_with_status("query", top_k=10)
     assert [bucket_id for bucket_id, _score in stored] == ["bucket-a", "bucket-b"]
+    assert parsed == cold_parses + 1
 
     engine.delete_embedding("bucket-a")
     remaining, _status = await engine.search_similar_with_status("query", top_k=10)
     assert [bucket_id for bucket_id, _score in remaining] == ["bucket-b"]
+    assert parsed == cold_parses + 1

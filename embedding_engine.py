@@ -75,6 +75,7 @@ class EmbeddingEngine:
         self._maintenance_barrier = MaintenanceBarrier(config["buckets_dir"])
         self._vector_cache_signature = None
         self._vector_cache_entries = None
+        self._vector_cache_records = None
         self._vector_cache_generation = 0
         self._vector_cache_lock = asyncio.Lock()
         self._vector_cache_observer = None
@@ -334,6 +335,7 @@ class EmbeddingEngine:
         if not hasattr(self, "_vector_cache_signature"):
             self._vector_cache_signature = None
             self._vector_cache_entries = None
+            self._vector_cache_records = None
             self._vector_cache_generation = 0
             self._vector_cache_lock = asyncio.Lock()
             self._vector_cache_observer = None
@@ -343,7 +345,8 @@ class EmbeddingEngine:
         self._ensure_vector_cache_state()
         self._vector_cache_generation += 1
         self._vector_cache_signature = None
-        self._vector_cache_entries = None
+        # Keep the parsed rows as the base for an incremental refresh.  The
+        # missing signature still prevents a stale fast-path hit.
 
     def _vector_store_signature(self):
         signature = []
@@ -409,7 +412,7 @@ class EmbeddingEngine:
             return None
 
     async def _get_cached_vectors(self):
-        """Return parsed vectors, reloading when the SQLite image changes."""
+        """Return parsed vectors, refreshing only changed SQLite rows."""
         self._ensure_vector_cache_state()
         signature = self._vector_store_signature()
         if (
@@ -426,35 +429,99 @@ class EmbeddingEngine:
                 and self._vector_cache_signature == signature
             ):
                 record_recall_metric("vector_cache_hits", 1)
+                record_recall_metric("vector_cache_coalesced_hits", 1)
                 return self._vector_cache_entries
 
-            record_recall_metric("vector_cache_misses", 1)
             generation = self._vector_cache_generation
+            cached_records = self._vector_cache_records
             with closing(sqlite3.connect(self.db_path)) as conn:
-                rows = conn.execute(
-                    "SELECT bucket_id, embedding FROM embeddings"
+                conn.execute("BEGIN")
+                columns = {
+                    str(row[1]) for row in conn.execute("PRAGMA table_info(embeddings)")
+                }
+                has_updated_at = "updated_at" in columns
+                updated_expr = "updated_at" if has_updated_at else "NULL"
+                manifest = conn.execute(
+                    f"SELECT rowid, bucket_id, {updated_expr} "
+                    "FROM embeddings ORDER BY rowid"
                 ).fetchall()
+                record_recall_metric("vector_cache_rows_examined", len(manifest))
+
+                can_refresh_incrementally = (
+                    cached_records is not None and has_updated_at
+                )
+                if can_refresh_incrementally:
+                    record_recall_metric("vector_cache_incremental_refreshes", 1)
+                    current_ids = {bucket_id for _rowid, bucket_id, _stamp in manifest}
+                    changed_ids = [
+                        bucket_id
+                        for rowid, bucket_id, stamp in manifest
+                        if bucket_id not in cached_records
+                        or cached_records[bucket_id][0] != rowid
+                        or cached_records[bucket_id][1] != stamp
+                    ]
+                    changed_set = set(changed_ids)
+                    next_records = {
+                        bucket_id: record
+                        for bucket_id, record in cached_records.items()
+                        if bucket_id in current_ids and bucket_id not in changed_set
+                    }
+                    record_recall_metric(
+                        "vector_cache_rows_reused", len(next_records)
+                    )
+                    record_recall_metric(
+                        "vector_cache_rows_removed",
+                        len(set(cached_records) - current_ids),
+                    )
+                else:
+                    record_recall_metric("vector_cache_misses", 1)
+                    record_recall_metric("vector_cache_cold_loads", 1)
+                    changed_ids = [
+                        bucket_id for _rowid, bucket_id, _stamp in manifest
+                    ]
+                    next_records = {}
+
+                rows = []
+                for offset in range(0, len(changed_ids), 400):
+                    batch = changed_ids[offset:offset + 400]
+                    placeholders = ",".join("?" for _item in batch)
+                    rows.extend(
+                        conn.execute(
+                            f"SELECT rowid, bucket_id, embedding, {updated_expr} "
+                            f"FROM embeddings WHERE bucket_id IN ({placeholders})",
+                            batch,
+                        ).fetchall()
+                    )
             record_recall_metric("vector_cache_rows_loaded", len(rows))
 
-            entries = []
-            for row_index, (bucket_id, emb_json) in enumerate(rows, start=1):
+            for row_index, (rowid, bucket_id, emb_json, stamp) in enumerate(
+                rows, start=1
+            ):
                 if row_index % 16 == 0:
                     await asyncio.sleep(0)
                 try:
-                    entries.append(
-                        (bucket_id, self._prepare_embedding_record(json.loads(emb_json)))
+                    next_records[bucket_id] = (
+                        rowid,
+                        stamp,
+                        self._prepare_embedding_record(json.loads(emb_json)),
                     )
                 except Exception:
+                    next_records.pop(bucket_id, None)
                     continue
 
             after_signature = self._vector_store_signature()
-            frozen_entries = tuple(entries)
+            frozen_entries = tuple(
+                (bucket_id, next_records[bucket_id][2])
+                for _rowid, bucket_id, _stamp in manifest
+                if bucket_id in next_records
+            )
             if (
                 generation == self._vector_cache_generation
                 and after_signature == signature
             ):
                 self._vector_cache_signature = signature
                 self._vector_cache_entries = frozen_entries
+                self._vector_cache_records = next_records
             return frozen_entries
 
     def _prepare_embedding_record(self, value):

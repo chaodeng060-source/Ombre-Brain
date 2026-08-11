@@ -8,6 +8,7 @@ import pytest
 
 import server
 from embedding_engine import EmbeddingEngine
+from maintenance_barrier import MaintenanceBarrier
 from recall_timing import (
     begin_recall_timing,
     finish_recall_timing,
@@ -63,6 +64,98 @@ def test_timing_receipt_accumulates_calls_without_content():
 
 
 @pytest.mark.asyncio
+async def test_incremental_vector_refresh_reports_reuse(tmp_path, monkeypatch):
+    engine = object.__new__(EmbeddingEngine)
+    engine.enabled = True
+    engine.db_path = str(tmp_path / "embeddings.db")
+    engine._maintenance_barrier = MaintenanceBarrier(str(tmp_path))
+
+    import sqlite3
+
+    with sqlite3.connect(engine.db_path) as conn:
+        conn.execute(
+            "CREATE TABLE embeddings ("
+            "bucket_id TEXT PRIMARY KEY, embedding TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO embeddings(bucket_id, embedding, updated_at) "
+            "VALUES (?, ?, 'first')",
+            ("bucket-a", "[1.0, 0.0]"),
+        )
+
+    async def fake_embedding(_query):
+        return [1.0, 0.0], "ok"
+
+    monkeypatch.setattr(engine, "_generate_embedding_with_status", fake_embedding)
+    await engine.search_similar_with_status("warm", top_k=10)
+    with sqlite3.connect(engine.db_path) as conn:
+        conn.execute(
+            "INSERT INTO embeddings(bucket_id, embedding, updated_at) "
+            "VALUES (?, ?, 'second')",
+            ("bucket-b", "[0.8, 0.2]"),
+        )
+
+    token = begin_recall_timing()
+    try:
+        results, status = await engine.search_similar_with_status("query", top_k=10)
+        receipt = finish_recall_timing(status="ok", partial=False)
+    finally:
+        reset_recall_timing(token)
+
+    assert status == "ok"
+    assert [bucket_id for bucket_id, _score in results] == ["bucket-a", "bucket-b"]
+    assert receipt["metrics"]["vector_cache_incremental_refreshes"] == 1
+    assert receipt["metrics"]["vector_cache_rows_examined"] == 2
+    assert receipt["metrics"]["vector_cache_rows_reused"] == 1
+    assert receipt["metrics"]["vector_cache_rows_loaded"] == 1
+    assert "vector_cache_misses" not in receipt["metrics"]
+
+
+@pytest.mark.asyncio
+async def test_vector_refresh_waiter_is_labeled_coalesced_hit(tmp_path):
+    engine = object.__new__(EmbeddingEngine)
+    engine.enabled = True
+    engine.db_path = str(tmp_path / "embeddings.db")
+    engine._maintenance_barrier = MaintenanceBarrier(str(tmp_path))
+
+    import sqlite3
+
+    with sqlite3.connect(engine.db_path) as conn:
+        conn.execute(
+            "CREATE TABLE embeddings ("
+            "bucket_id TEXT PRIMARY KEY, embedding TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO embeddings(bucket_id, embedding, updated_at) "
+            "VALUES (?, ?, 'first')",
+            ("bucket-a", "[1.0, 0.0]"),
+        )
+
+    await engine._get_cached_vectors()
+    current_signature = engine._vector_cache_signature
+    engine._vector_cache_signature = None
+    await engine._vector_cache_lock.acquire()
+
+    token = begin_recall_timing()
+    try:
+        waiter = asyncio.create_task(engine._get_cached_vectors())
+        await asyncio.sleep(0)
+        engine._vector_cache_signature = current_signature
+        engine._vector_cache_lock.release()
+        await waiter
+        receipt = finish_recall_timing(status="ok", partial=False)
+    finally:
+        if engine._vector_cache_lock.locked():
+            engine._vector_cache_lock.release()
+        reset_recall_timing(token)
+
+    assert receipt["metrics"] == {
+        "vector_cache_hits": 1,
+        "vector_cache_coalesced_hits": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_embedding_engine_splits_remote_and_local_timing(tmp_path, monkeypatch):
     engine = object.__new__(EmbeddingEngine)
     engine.enabled = True
@@ -101,6 +194,8 @@ async def test_embedding_engine_splits_remote_and_local_timing(tmp_path, monkeyp
     assert receipt["stages"]["vector_sort"]["calls"] == 1
     assert receipt["metrics"] == {
         "vector_cache_misses": 1,
+        "vector_cache_cold_loads": 1,
+        "vector_cache_rows_examined": 1,
         "vector_cache_rows_loaded": 1,
         "vector_entries_scanned": 1,
         "vector_stored_segments_scanned": 1,
