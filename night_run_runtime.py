@@ -482,32 +482,41 @@ def build_night_run_runtime(
     snapshots = SnapshotManager(config["buckets_dir"], snapshot_root)
     curated = CuratedWriteCoordinator(bucket_manager, embedding_engine)
 
+    relation_target_gate = asyncio.Semaphore(1)
+
     async def relation_targets(text: str) -> frozenset[str]:
-        target_ids: list[str] = []
-        seen: set[str] = set()
-        try:
-            for bucket_id, _score in await embedding_engine.search_similar(
-                text, top_k=12
-            ):
-                normalized = str(bucket_id or "").strip()
-                if normalized and normalized not in seen:
-                    seen.add(normalized)
-                    target_ids.append(normalized)
-        except Exception:
-            pass
-        try:
-            for bucket in await bucket_manager.search(text, limit=8):
-                normalized = str(bucket.get("id") or "").strip()
-                if normalized and normalized not in seen:
-                    seen.add(normalized)
-                    target_ids.append(normalized)
-        except Exception:
-            pass
-        verified: list[str] = []
-        for bucket_id in target_ids[:16]:
-            if await bucket_manager.get(bucket_id) is not None:
-                verified.append(bucket_id)
-        return frozenset(verified)
+        # The vector and lexical readers both scan the live bucket corpus.
+        # Keep those cooperative scans single-flight so proposer concurrency
+        # overlaps provider I/O without starving the online server event loop.
+        async with relation_target_gate:
+            target_ids: list[str] = []
+            seen: set[str] = set()
+            try:
+                for bucket_id, _score in await embedding_engine.search_similar(
+                    text,
+                    top_k=12,
+                    cooperative_yield_every=1,
+                ):
+                    normalized = str(bucket_id or "").strip()
+                    if normalized and normalized not in seen:
+                        seen.add(normalized)
+                        target_ids.append(normalized)
+            except Exception:
+                pass
+            if not target_ids:
+                try:
+                    for bucket in await bucket_manager.search(text, limit=8):
+                        normalized = str(bucket.get("id") or "").strip()
+                        if normalized and normalized not in seen:
+                            seen.add(normalized)
+                            target_ids.append(normalized)
+                except Exception:
+                    pass
+            verified: list[str] = []
+            for bucket_id in target_ids[:16]:
+                if await bucket_manager.get(bucket_id) is not None:
+                    verified.append(bucket_id)
+            return frozenset(verified)
 
     vault_root = Path(config["buckets_dir"])
     review_queue = ReviewQueue(

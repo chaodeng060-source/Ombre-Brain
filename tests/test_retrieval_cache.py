@@ -168,6 +168,41 @@ def test_prepared_similarity_preserves_python_cosine_result_exactly():
 
 
 @pytest.mark.asyncio
+async def test_vector_search_cooperative_yield_preserves_results(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _embedding_engine_with_rows(
+        tmp_path,
+        [
+            ("bucket-a", json.dumps([1.0, 0.0])),
+            ("bucket-b", json.dumps([0.0, 1.0])),
+        ],
+    )
+
+    async def fake_embedding(_query):
+        return [1.0, 0.0], "ok"
+
+    monkeypatch.setattr(engine, "_generate_embedding_with_status", fake_embedding)
+    expected = await engine.search_similar("query", top_k=10)
+    actual = await engine.search_similar(
+        "query",
+        top_k=10,
+        cooperative_yield_every=1,
+    )
+
+    assert actual == expected
+    with pytest.raises(
+        ValueError,
+        match="^cooperative_yield_every must be a positive integer$",
+    ):
+        await engine.search_similar(
+            "query",
+            cooperative_yield_every=0,
+        )
+
+
+@pytest.mark.asyncio
 async def test_vector_cache_reuses_parse_and_refreshes_after_external_commit(
     tmp_path,
     monkeypatch,

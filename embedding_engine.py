@@ -267,15 +267,32 @@ class EmbeddingEngine:
                 return None
         return None
 
-    async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
-        results, _status = await self.search_similar_with_status(query, top_k=top_k)
+    async def search_similar(
+        self,
+        query: str,
+        top_k: int = 10,
+        *,
+        cooperative_yield_every: int = 16,
+    ) -> list[tuple[str, float]]:
+        results, _status = await self.search_similar_with_status(
+            query,
+            top_k=top_k,
+            cooperative_yield_every=cooperative_yield_every,
+        )
         return results
 
     async def search_similar_with_status(
         self,
         query: str,
         top_k: int = 10,
+        *,
+        cooperative_yield_every: int = 16,
     ) -> tuple[list[tuple[str, float]], str]:
+        if (
+            type(cooperative_yield_every) is not int
+            or cooperative_yield_every < 1
+        ):
+            raise ValueError("cooperative_yield_every must be a positive integer")
         if not self.enabled:
             return [], "error"
 
@@ -308,7 +325,7 @@ class EmbeddingEngine:
         try:
             with recall_stage("vector_scan"):
                 for row_index, (bucket_id, stored) in enumerate(entries, start=1):
-                    if row_index % 16 == 0:
+                    if row_index % cooperative_yield_every == 0:
                         await asyncio.sleep(0)
                     entries_scanned += 1
                     try:

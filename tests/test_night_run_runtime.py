@@ -861,6 +861,123 @@ def test_runtime_builder_wires_dedicated_proposer_controls(
     assert runtime.max_attempts == expected_max_attempts
 
 
+@pytest.mark.asyncio
+async def test_runtime_serializes_live_relation_target_scans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class CoordinatorStub:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["relation_target_provider"] = kwargs[
+                "relation_target_provider"
+            ]
+            self.maintenance_barrier = object()
+            self.policy = SimpleNamespace(barrier_timeout_seconds=1.0)
+
+    class EmbeddingSpy:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.calls = 0
+            self.results: list[tuple[str, float]] = []
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def search_similar(
+            self,
+            _text: str,
+            *,
+            top_k: int,
+            cooperative_yield_every: int,
+        ) -> list[tuple[str, float]]:
+            assert top_k == 12
+            assert cooperative_yield_every == 1
+            self.calls += 1
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.entered.set()
+            await self.release.wait()
+            self.active -= 1
+            return list(self.results)
+
+    class BucketManagerStub:
+        def __init__(self) -> None:
+            self.search_calls = 0
+
+        async def search(self, _text: str, *, limit: int) -> list[dict]:
+            assert limit == 8
+            self.search_calls += 1
+            return []
+
+        async def get(self, bucket_id: str) -> dict:
+            return {"id": bucket_id}
+
+    monkeypatch.setenv(
+        "OMBRE_LMC5_SNAPSHOT_DIR",
+        str(tmp_path / "snapshots"),
+    )
+    monkeypatch.setattr(
+        night_runtime_module,
+        "OpenAIChatProvider",
+        lambda **_: object(),
+    )
+    monkeypatch.setattr(
+        night_runtime_module,
+        "StrictOmbreProposer",
+        lambda provider, **_: provider,
+    )
+    monkeypatch.setattr(
+        night_runtime_module,
+        "SnapshotManager",
+        lambda *_: object(),
+    )
+    monkeypatch.setattr(
+        night_runtime_module,
+        "CuratedWriteCoordinator",
+        lambda *_: object(),
+    )
+    monkeypatch.setattr(
+        night_runtime_module,
+        "NightRunCoordinator",
+        CoordinatorStub,
+    )
+    embedding = EmbeddingSpy()
+    bucket_manager = BucketManagerStub()
+    build_night_run_runtime(
+        config={
+            "buckets_dir": str(tmp_path / "vault"),
+            "dehydration": {"api_key": "test-key"},
+        },
+        ledger=_ledger(tmp_path),
+        bucket_manager=bucket_manager,
+        embedding_engine=embedding,
+        decay_engine=object(),
+        consolidation_engine=object(),
+    )
+    relation_targets = captured["relation_target_provider"]
+    tasks = [
+        asyncio.create_task(relation_targets(text))
+        for text in ("one", "two", "three")
+    ]
+    await embedding.entered.wait()
+    await asyncio.sleep(0)
+
+    assert embedding.calls == 1
+    assert embedding.max_active == 1
+
+    embedding.release.set()
+    assert await asyncio.gather(*tasks) == [frozenset()] * 3
+    assert embedding.calls == 3
+    assert embedding.max_active == 1
+    assert bucket_manager.search_calls == 3
+
+    embedding.results = [("bucket-1", 0.9)]
+    assert await relation_targets("four") == frozenset({"bucket-1"})
+    assert bucket_manager.search_calls == 3
+
+
 def test_trigger_summary_strips_snapshot_and_internal_fields() -> None:
     summary = _safe_summary(
         {
