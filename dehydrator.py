@@ -671,6 +671,40 @@ _BRIEFING_QUOTED_SPAN_RE = re.compile(
 )
 
 
+def _anchor_relative_time_terms(text: str, now_bj) -> str:
+    """Deterministically rewrite weak relative-time words to date-anchored forms.
+
+    机械救回：LLM 两次都写出裸相对时间词时，用确定性替换补上日期锚，
+    而不是整轮作废保旧缓存（后台预生成曾因此连续空转，2026-08-11 账）。
+    引号内的原话先摘出占位、替换完放回——原话必须保真。
+    """
+    from datetime import timedelta as _td
+    today = now_bj.strftime("%Y-%m-%d")
+    yesterday = (now_bj - _td(days=1)).strftime("%Y-%m-%d")
+    day_before = (now_bj - _td(days=2)).strftime("%Y-%m-%d")
+    mapping = [
+        ("前两天", f"{day_before}前后"),
+        ("前几天", f"{day_before}前后"),
+        ("昨晚", f"{yesterday}晚"),
+        ("昨天", yesterday),
+        ("今早", f"{today}早上"),
+        ("刚刚", f"{today}稍早"),
+        ("刚才", f"{today}稍早"),
+        ("近期", "这段时间"),
+        ("最近", "这段时间"),
+    ]
+    spans: list[str] = []
+
+    def _stash(m):
+        spans.append(m.group(0))
+        return f"\x00{len(spans) - 1}\x00"
+
+    tmp = _BRIEFING_QUOTED_SPAN_RE.sub(_stash, text or "")
+    for src, dst in mapping:
+        tmp = tmp.replace(src, dst)
+    return re.sub(r"\x00(\d+)\x00", lambda m: spans[int(m.group(1))], tmp)
+
+
 def _safe_chat_completion_diagnostics(response) -> str:
     """Serialize response metadata without logging generated/private text."""
     try:
@@ -2359,7 +2393,20 @@ class Dehydrator:
         调用 LLM API 把原始桶素材压成简报。
         """
         raw_material = redact_embedding_input(raw_material)
-        prompt = BRIEFING_PROMPT.format(max_chars=max_chars)
+        # 相对时间词校验此前是概率闸：prompt 里没有禁词表、也没告诉 LLM 今天
+        # 几号，第一次生成全凭运气，重试才收到告诫（还是没日期）。素材里全是
+        # "今早修了 X"时后台刷新连败（2026-08-11 07:18 实证）。attempt=1 就把
+        # 日期和替代写法给全。
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        _now_bj = _dt.now(_tz(_td(hours=8)))
+        _weekday_cn = "一二三四五六日"[_now_bj.weekday()]
+        _time_rule = (
+            f"\n\n【时间铁律】今天是 {_now_bj.strftime('%Y-%m-%d')}（周{_weekday_cn}）。"
+            "叙述中禁止使用裸相对时间词：近期/前两天/前几天/刚刚/刚才/最近/昨天/昨晚/今早——"
+            f"一律写成带日期的形式，如「{_now_bj.strftime('%Y-%m-%d')} 早上」。"
+            "引号内的原话保持原样，不改写。"
+        )
+        prompt = BRIEFING_PROMPT.format(max_chars=max_chars) + _time_rule
         # Briefing token budget: ~1.5 chars/token for Chinese, +30% headroom
         # 简报 token 预算：中文约 1.5 字/token，留 30% 余量
         _content_tokens = int(max_chars / 1.5 * 1.3)
@@ -2432,6 +2479,14 @@ class Dehydrator:
                     ",".join(violations),
                 )
 
+            anchored = _anchor_relative_time_terms(result, _now_bj)
+            if not _briefing_relative_time_violations(anchored):
+                logger.warning(
+                    "Briefing relative-time terms mechanically anchored after "
+                    "2 rejected attempts: %s",
+                    ",".join(violations),
+                )
+                return anchored
             raise RuntimeError(
                 "简报连续两次包含无日期锚的相对时间词: "
                 + ",".join(violations)
