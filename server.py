@@ -134,7 +134,7 @@ from e_axis_recall import (
     apply_resonance_tie_break,
     derive_response_posture,
     format_response_posture,
-    group_candidate_rows,
+    group_primary_authored_buckets,
     infer_query_emotion,
     load_e_axis_recall_config,
     rank_annotation_bucket_ids,
@@ -161,7 +161,7 @@ from mcp_auth import (
 from review_queue import (
     ReviewQueue, make_relation_entry, make_z_pair_entry,
     render_md as _render_review_md,
-    KIND_RELATION, KIND_Z_CONFLICT, KIND_METABOLISM,
+    KIND_RELATION, KIND_Z_CONFLICT, KIND_METABOLISM, KIND_E_PROPOSAL,
     query_requests_history,
     rest_resolve_status_allowed,
 )
@@ -3289,15 +3289,16 @@ def _maybe_start_backfill() -> None:
 # Helper: auto-edge inference for newly created bucket
 # 工具：新桶自动建边
 # Wraps embedding-similar + keyword-search candidate gathering, LLM relation
-# inference via dehydrator, then queue proposals for explicit agent review.
+# inference via dehydrator, then write safe edges or queue dangerous proposals.
 # All failures are swallowed so this never blocks hold.
-# 包装 embedding 邻居 + 关键词搜索拿候选，dehydrator LLM 判边，只挂待审提议。
-# 所有失败吞掉——绝不阻塞 hold 主流程，也绝不由自动任务直接写边。
+# 包装 embedding 邻居 + 关键词搜索拿候选，dehydrator LLM 判边：
+# kin/explains 经审计幂等写入；因果/取代类只挂具名待审。
+# 所有失败吞掉——绝不阻塞 hold 主流程。
 # =============================================================
 async def _auto_infer_edges(
     source_id: str, content: str, world: str = ""
 ) -> list[dict]:
-    """Queue machine-inferred edge proposals; never commit them to the graph."""
+    """Commit safe inferred edges and queue dangerous ones for named review."""
     if not content or not content.strip():
         return []
 
@@ -3362,12 +3363,43 @@ async def _auto_infer_edges(
     cand_name_by_id = {c["id"]: c["name"] for c in candidates}
     proposed: list[dict] = []
     queued = 0
+    applied = 0
     for edge in edges:
         etype = str(edge.get("type") or "").strip()
         target = str(edge.get("target") or "").strip()
         if etype not in RELATION_TYPES or target not in cand_name_by_id:
             continue
         try:
+            outcome = {
+                "type": etype,
+                "target": target,
+                "target_name": cand_name_by_id.get(target, target),
+                "note": edge.get("note", ""),
+            }
+            if etype in SAFE_RELATION_TYPES:
+                if not await bucket_mgr.add_relation(
+                    source_id,
+                    target,
+                    etype,
+                    edge.get("note", ""),
+                    actor="lmc5-safe-relation",
+                ):
+                    continue
+                applied += 1
+                outcome["status"] = "applied"
+                proposed.append(outcome)
+                continue
+            if etype not in REVIEW_RELATION_TYPES:
+                continue
+            if not _review_gate("relation_review"):
+                logger.info(
+                    "Dangerous relation proposal skipped: review gate disabled "
+                    "source=%s target=%s type=%s",
+                    source_id,
+                    target,
+                    etype,
+                )
+                continue
             entry = make_relation_entry(
                 source_id,
                 target,
@@ -3377,12 +3409,8 @@ async def _auto_infer_edges(
             )
             if _get_review_queue().enqueue(entry):
                 queued += 1
-            proposed.append({
-                "type": etype,
-                "target": target,
-                "target_name": cand_name_by_id.get(target, target),
-                "note": edge.get("note", ""),
-            })
+            outcome["status"] = "pending_review"
+            proposed.append(outcome)
         except Exception as e:
             logger.warning(
                 "关系提议入队失败（不阻塞）/ relation proposal enqueue failed: %s",
@@ -3392,6 +3420,11 @@ async def _auto_infer_edges(
         logger.info(
             "Machine relation inference queued %d proposal(s); graph unchanged",
             queued,
+        )
+    if applied:
+        logger.info(
+            "Machine relation inference applied %d safe audited edge(s)",
+            applied,
         )
     return proposed
 
@@ -3673,10 +3706,11 @@ async def breath(
                 valence_01=q_valence,
                 arousal=q_arousal,
             )
-            e_rows = await _await_daemon_thread(
-                _get_e_axis_shadow_store().load
+            e_buckets = await bucket_mgr.list_all(include_archive=False)
+            e_rows_by_bucket = group_primary_authored_buckets(
+                e_buckets,
+                e_recall_cfg,
             )
-            e_rows_by_bucket = group_candidate_rows(e_rows, e_recall_cfg)
     except Exception as exc:
         # E is an optional behavioural projection.  A corrupt ledger or bad
         # live config fails closed to the relevance-first legacy path instead
@@ -4660,8 +4694,7 @@ async def hold(
     )
     _mark_briefing_cache_dirty("hold_merge" if is_merged else "hold_create")
 
-    # --- Step 3: machine relation proposals (new buckets only) ---
-    # --- 机器只提关系候选；只有 agent 显式 add_relation 才写入关系图 ---
+    # --- Step 3: safe relations write directly; dangerous ones stay pending ---
     relation_proposals: list[dict] = []
     if not is_merged:
         try:
@@ -4675,15 +4708,146 @@ async def hold(
     base = f"{action}{result_name} {','.join(domain)}"
     if not relation_proposals:
         return base
-    # 提议不等于图事实：明确标待审，避免调用方误以为已经落边。
+    applied = sum(e.get("status") == "applied" for e in relation_proposals)
+    pending = sum(e.get("status") == "pending_review" for e in relation_proposals)
     related_lines = [
-        f"  • [{e['type']}] {e['target_name']} ({e['target']})"
+        f"  • [{'已落图' if e.get('status') == 'applied' else '待审'}] "
+        f"[{e['type']}] {e['target_name']} ({e['target']})"
         + (f" — {e['note']}" if e.get("note") else "")
         for e in relation_proposals
     ]
     return (
-        f"{base} +{len(relation_proposals)}条关系提议（待审，未落图）\n"
+        f"{base} +{applied}条安全关系已落图，+{pending}条危险关系待审\n"
         "候选关联：\n" + "\n".join(related_lines)
+    )
+
+
+# =============================================================
+# Tool: experience — primary-agent-authored E record
+# =============================================================
+@mcp.tool()
+async def experience(
+    content: str,
+    e_authored_by: str,
+    e_initial_priority: int,
+    e_valence: float,
+    e_arousal: float,
+    e_tension: float,
+    e_response_tendency: str,
+    e_growth_delta: str,
+    e_confidence: float = 1.0,
+    source_bucket_id: str = "",
+    proposal_key: str = "",
+    name: str = "",
+    domain: str = "关系",
+    world: str = "",
+) -> str:
+    """主对话 AI 亲自写 E 轴体验并选择 1..100 初始优先级。
+
+    内容原样落桶，不经过 scorer/digest 改写。模型夜跑只能产生 e_proposal；
+    传 proposal_key 可在写成权威 E 后把对应提案标为 reviewed。
+    """
+    if not content or not content.strip():
+        return "E 内容为空，未写入。"
+    author = str(e_authored_by or "").strip()
+    source_id = str(source_bucket_id or "").strip()
+    proposal_id = str(proposal_key or "").strip()
+    if not author:
+        return "e_authored_by 必填；E 必须由主对话 AI 具名书写。"
+    if proposal_id:
+        proposal = _get_review_queue().get(proposal_id)
+        if proposal is None or proposal.get("kind") != KIND_E_PROPOSAL:
+            return "未找到对应的 E proposal。"
+        for bucket in await bucket_mgr.list_all(include_archive=True):
+            metadata = bucket.get("metadata") or {}
+            if metadata.get("e_proposal_key") == proposal_id:
+                return (
+                    f"E→{bucket['id']} [author:{metadata.get('e_authored_by')}] "
+                    f"[initial_priority:{metadata.get('e_initial_priority')}] "
+                    "[idempotent:existing]"
+                )
+        if proposal.get("status") != "pending":
+            return "对应的 E proposal 已裁决，未重复写入。"
+        proposed_source = str(proposal.get("source_bucket_id") or "")
+        if source_id and source_id != proposed_source:
+            return "source_bucket_id 与 E proposal 不一致。"
+        source_id = proposed_source
+    if source_id and await bucket_mgr.get(source_id) is None:
+        return f"E 来源桶不存在: {source_id}"
+    effective_world = (world or "").strip() or (
+        config.get("current_world", "") or ""
+    ).strip()
+    domains = [
+        part.strip()
+        for part in str(domain or "").split(",")
+        if part.strip()
+    ]
+    try:
+        bucket_id = await bucket_mgr.create(
+            content=content,
+            tags=["lmc5", "experience", "relationship_moment"],
+            importance=max(
+                1,
+                min(10, (int(e_initial_priority) + 9) // 10),
+            ),
+            domain=domains or ["关系"],
+            valence=max(
+                0.0,
+                min(1.0, (float(e_valence) + 1.0) / 2.0),
+            ),
+            arousal=float(e_arousal),
+            name=name or "主AI体验",
+            bucket_type="dynamic",
+            world=effective_world,
+            actor=f"e-axis:{author}",
+            e_authored_by=author,
+            e_initial_priority=e_initial_priority,
+            e_valence=e_valence,
+            e_arousal=e_arousal,
+            e_tension=e_tension,
+            e_confidence=e_confidence,
+            e_response_tendency=e_response_tendency,
+            e_growth_delta=e_growth_delta,
+            e_source_bucket_id=source_id,
+            e_proposal_key=proposal_id,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Primary-authored E write rejected: %s",
+            type(exc).__name__,
+        )
+        return f"E 写入失败: {exc}"
+    try:
+        vector_ready = await embedding_engine.generate_and_store(
+            bucket_id,
+            content,
+        )
+    except Exception as exc:
+        vector_ready = False
+        logger.warning(
+            "Primary-authored E vector unavailable for %s: %s",
+            bucket_id,
+            type(exc).__name__,
+        )
+    if proposal_id:
+        try:
+            _get_review_queue().resolve(
+                proposal_id,
+                "reviewed",
+                reviewer=author,
+                verdict_note=f"primary-authored E bucket {bucket_id}",
+            )
+        except Exception as exc:
+            logger.warning(
+                "E proposal remained pending after authored write %s: %s",
+                bucket_id,
+                type(exc).__name__,
+            )
+    _mark_briefing_cache_dirty("experience_create")
+    return (
+        f"E→{bucket_id} [author:{author}] "
+        f"[initial_priority:{e_initial_priority}] "
+        f"[vector:{'ready' if vector_ready else 'missing'}]"
     )
 
 
@@ -5132,7 +5296,7 @@ async def backfill_relations(
     limit: int = 5,
     offset: int = 0,
 ) -> str:
-    """对已有桶批量生成待审关系提议，不直接写入关系图。
+    """对已有桶推断关系：安全边审计落图，危险边具名待审。
     bucket_id=指定单桶处理（最快验证用）。
     bucket_id 为空时按 limit/offset 批量遍历 dynamic 桶（跳过 pinned/permanent/feel/resolved），每次最多 10 个，多次调用滚动跑完。
     返回每桶生成了几条提议和下一批 offset。"""
@@ -5146,8 +5310,9 @@ async def backfill_relations(
                 content=bucket["content"],
                 world=bucket["metadata"].get("world", ""),
             )
-            n = len(edges)
-            return f"{bucket['id']}: +{n}条提议（未落图）"
+            applied = sum(e.get("status") == "applied" for e in edges)
+            pending = sum(e.get("status") == "pending_review" for e in edges)
+            return f"{bucket['id']}: +{applied}安全边已落图，+{pending}危险边待审"
         except Exception as e:
             logger.warning(f"backfill single failed {bucket_id}: {e}")
             return f"{bucket_id}: 失败 {e}"
@@ -5175,7 +5340,8 @@ async def backfill_relations(
         return f"无桶可处理 (eligible={len(eligible)}, offset={offset})"
 
     results = []
-    total = 0
+    total_applied = 0
+    total_pending = 0
     for b in batch:
         try:
             edges = await _auto_infer_edges(
@@ -5183,9 +5349,11 @@ async def backfill_relations(
                 content=b["content"],
                 world=b["metadata"].get("world", ""),
             )
-            n = len(edges)
-            results.append(f"{b['id'][:6]}+{n}")
-            total += n
+            applied = sum(e.get("status") == "applied" for e in edges)
+            pending = sum(e.get("status") == "pending_review" for e in edges)
+            results.append(f"{b['id'][:6]}+{applied}a/{pending}r")
+            total_applied += applied
+            total_pending += pending
         except Exception as e:
             logger.warning(f"backfill bucket {b['id']} failed: {e}")
             results.append(f"{b['id'][:6]}!err")
@@ -5194,7 +5362,7 @@ async def backfill_relations(
     remaining = len(eligible) - next_offset
     return (
         f"批 {offset}-{next_offset - 1}/{len(eligible)} | "
-        f"+{total}条提议（未落图） | {' '.join(results)} | "
+        f"+{total_applied}安全边已落图/+{total_pending}危险边待审 | {' '.join(results)} | "
         f"剩 {remaining}, next offset={next_offset}"
     )
 
@@ -5245,15 +5413,20 @@ async def review_pending(kind: str = "") -> str:
     关系边（#3 关系闸）和事实演化冲突（#2 Z轴），都先挂这等人显式裁决。
 
     永不改库：本工具只把清单念出来，建边/supersede/resolve 都需人另外显式操作。
-    kind 可选过滤：'metabolism' / 'relation' / 'z_conflict' / 留空看全部。
+    kind 可选过滤：'metabolism' / 'relation' / 'z_conflict' / 'e_proposal' / 留空看全部。
     """
     k = (kind or "").strip().lower()
-    allowed_kinds = (KIND_METABOLISM, KIND_RELATION, KIND_Z_CONFLICT)
+    allowed_kinds = (
+        KIND_METABOLISM,
+        KIND_RELATION,
+        KIND_Z_CONFLICT,
+        KIND_E_PROPOSAL,
+    )
     if k and k not in allowed_kinds:
         return (
             "kind 只能是 "
             f"'{KIND_METABOLISM}' / '{KIND_RELATION}' / "
-            f"'{KIND_Z_CONFLICT}' 或留空。"
+            f"'{KIND_Z_CONFLICT}' / '{KIND_E_PROPOSAL}' 或留空。"
         )
     try:
         # The queue is a small local JSONL ledger.  Reading it inline avoids
@@ -7044,7 +7217,12 @@ async def api_review_queue(request):
     """Return the real pending review queue; never substitute demo rows."""
     from starlette.responses import JSONResponse
     kind = (request.query_params.get("kind") or "").strip().lower()
-    if kind and kind not in (KIND_RELATION, KIND_Z_CONFLICT, KIND_METABOLISM):
+    if kind and kind not in (
+        KIND_RELATION,
+        KIND_Z_CONFLICT,
+        KIND_METABOLISM,
+        KIND_E_PROPOSAL,
+    ):
         return JSONResponse({"error": "invalid kind"}, status_code=400)
     try:
         items = await asyncio.to_thread(_get_review_queue().list_pending, kind or None)

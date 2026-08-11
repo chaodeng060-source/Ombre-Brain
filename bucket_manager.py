@@ -76,6 +76,21 @@ RECALL_DERIVED_METADATA_FIELDS = frozenset({
     "dehydrated_summary",
     "dehydrated_content_hash",
 })
+E_RESPONSE_TENDENCIES = frozenset({"comfort", "engage", "withdraw", "alert"})
+E_GROWTH_DELTAS = frozenset({"growth", "stable", "setback"})
+E_IMMUTABLE_FIELDS = frozenset({
+    "e_authored_by",
+    "e_initial_priority",
+    "e_valence",
+    "e_arousal",
+    "e_tension",
+    "e_confidence",
+    "e_response_tendency",
+    "e_growth_delta",
+    "e_authored_at",
+    "e_source_bucket_id",
+    "e_proposal_key",
+})
 
 
 def bucket_revision_hash(content: str, metadata: dict) -> str:
@@ -284,6 +299,16 @@ class BucketManager:
         curated_payload_sha256: str = None,
         vector_policy: str = None,
         lmc5_recall_state: str = None,
+        e_authored_by: str = "",
+        e_initial_priority: int | None = None,
+        e_valence: float | None = None,
+        e_arousal: float | None = None,
+        e_tension: float | None = None,
+        e_confidence: float | None = None,
+        e_response_tendency: str = "",
+        e_growth_delta: str = "",
+        e_source_bucket_id: str = "",
+        e_proposal_key: str = "",
     ) -> str:
         bucket_id = generate_bucket_id()
         domain = domain or ["未分类"]
@@ -340,6 +365,60 @@ class BucketManager:
             "last_active": recorded_at,
             "activation_count": 1,
         }
+        e_fields = (
+            e_authored_by,
+            e_initial_priority,
+            e_valence,
+            e_arousal,
+            e_tension,
+            e_confidence,
+            e_response_tendency,
+            e_growth_delta,
+            e_source_bucket_id,
+            e_proposal_key,
+        )
+        if any(value not in (None, "") for value in e_fields):
+            author = str(e_authored_by or "").strip()
+            if not author or len(author) > 120 or "\n" in author:
+                raise ValueError("E-axis content requires a bounded e_authored_by")
+            if type(e_initial_priority) is not int or not 1 <= e_initial_priority <= 100:
+                raise ValueError("e_initial_priority must be a plain integer in 1..100")
+
+            def e_number(value, name: str, low: float, high: float) -> float:
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError(f"{name} must be in [{low}, {high}]")
+                number = float(value)
+                if not math.isfinite(number) or not low <= number <= high:
+                    raise ValueError(f"{name} must be in [{low}, {high}]")
+                return number
+
+            tendency = str(e_response_tendency or "").strip()
+            growth = str(e_growth_delta or "").strip()
+            if tendency not in E_RESPONSE_TENDENCIES:
+                raise ValueError("invalid e_response_tendency")
+            if growth not in E_GROWTH_DELTAS:
+                raise ValueError("invalid e_growth_delta")
+            source_bucket_id = str(e_source_bucket_id or "").strip()
+            if len(source_bucket_id) > 128 or "\n" in source_bucket_id:
+                raise ValueError("invalid e_source_bucket_id")
+            proposal_key = str(e_proposal_key or "").strip()
+            if len(proposal_key) > 160 or "\n" in proposal_key:
+                raise ValueError("invalid e_proposal_key")
+            metadata.update({
+                "e_authored_by": author,
+                "e_initial_priority": e_initial_priority,
+                "e_valence": e_number(e_valence, "e_valence", -1.0, 1.0),
+                "e_arousal": e_number(e_arousal, "e_arousal", 0.0, 1.0),
+                "e_tension": e_number(e_tension, "e_tension", 0.0, 1.0),
+                "e_confidence": e_number(e_confidence, "e_confidence", 0.0, 1.0),
+                "e_response_tendency": tendency,
+                "e_growth_delta": growth,
+                "e_authored_at": recorded_at,
+            })
+            if source_bucket_id:
+                metadata["e_source_bucket_id"] = source_bucket_id
+            if proposal_key:
+                metadata["e_proposal_key"] = proposal_key
         if x_provenance is not None:
             # X provenance is part of the bucket's first durable write.  It
             # must never be patched in after create, because a failed second
@@ -571,6 +650,16 @@ class BucketManager:
             event_id = None
             try:
                 post = self._safe_load_post(file_path)
+                if post.get("e_authored_by"):
+                    for field in E_IMMUTABLE_FIELDS:
+                        if field in kwargs and kwargs[field] != post.get(field):
+                            raise ValueError(
+                                f"{field} is immutable; write a successor E record"
+                            )
+                    if "content" in kwargs and kwargs["content"] != post.content:
+                        raise ValueError(
+                            "primary-authored E content is immutable; write a successor"
+                        )
                 if expected_revision_hash:
                     actual_revision_hash = bucket_revision_hash(
                         post.content,
@@ -736,12 +825,20 @@ class BucketManager:
     async def add_relation(
         self, source_id: str, target_id: str, rel_type: str, note: str = "",
         actor: str = "system",
+        *,
+        strength: float | None = None,
     ) -> bool:
         if rel_type not in RELATION_TYPES:
             logger.warning(f"Unknown relation type / 未知关系类型: {rel_type}")
             return False
         if source_id == target_id:
             return False
+        if strength is not None:
+            if isinstance(strength, bool) or not isinstance(strength, (int, float)):
+                return False
+            strength = float(strength)
+            if not 0.0 <= strength <= 1.0:
+                return False
         if not await self.get(target_id):
             logger.warning(f"Relation target not found / 关系目标桶不存在: {target_id}")
             return False
@@ -760,6 +857,8 @@ class BucketManager:
                 edge = {"type": rel_type, "target": target_id}
                 if note and note.strip():
                     edge["note"] = note.strip()
+                if strength is not None:
+                    edge["strength"] = strength
                 relations.append(edge)
                 post["relations"] = relations
                 post["last_active"] = now_iso()

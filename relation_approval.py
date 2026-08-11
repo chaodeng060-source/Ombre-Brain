@@ -608,7 +608,7 @@ class RelationApprovalTransaction:
         self._write_manifest(transaction_fd, manifest)
 
     @staticmethod
-    def _validate_entry(entry: dict) -> tuple[str, str, str, str]:
+    def _validate_entry(entry: dict) -> tuple[str, str, str, str, float | None]:
         if entry.get("kind") != KIND_RELATION:
             raise RelationApprovalStateError(
                 "review item is not a relation candidate"
@@ -617,6 +617,13 @@ class RelationApprovalTransaction:
         target_id = str(entry.get("target_id") or "").strip()
         rel_type = str(entry.get("rel_type") or "").strip()
         note = str(entry.get("note") or "").strip()[:500]
+        strength = entry.get("strength")
+        if strength is not None:
+            if isinstance(strength, bool) or not isinstance(strength, (int, float)):
+                raise RelationApprovalStateError("relation strength is invalid")
+            strength = float(strength)
+            if not 0.0 <= strength <= 1.0:
+                raise RelationApprovalStateError("relation strength is invalid")
         if not source_id or not target_id or source_id == target_id:
             raise RelationApprovalStateError("relation endpoints are invalid")
         if rel_type not in REVIEW_RELATION_TYPES:
@@ -628,11 +635,11 @@ class RelationApprovalTransaction:
             raise RelationApprovalStateError(
                 "relation candidate key is inconsistent"
             )
-        return source_id, target_id, rel_type, note
+        return source_id, target_id, rel_type, note, strength
 
     @classmethod
     def _validate_manifest_entry(cls, manifest: dict, entry: dict) -> None:
-        source_id, target_id, rel_type, _ = cls._validate_entry(entry)
+        source_id, target_id, rel_type, _, strength = cls._validate_entry(entry)
         if any(
             str(manifest.get(field) or "") != expected
             for field, expected in (
@@ -641,7 +648,7 @@ class RelationApprovalTransaction:
                 ("target_id", target_id),
                 ("rel_type", rel_type),
             )
-        ):
+        ) or manifest.get("strength") != strength:
             raise RelationApprovalStateError(
                 "relation journal does not match the queue row"
             )
@@ -744,7 +751,7 @@ class RelationApprovalTransaction:
             entry = self._entry(self.review_queue.all(), key)
             if entry is None:
                 raise RelationApprovalNotFound("pending review item not found")
-            source_id, target_id, rel_type, note = self._validate_entry(entry)
+            source_id, target_id, rel_type, note, strength = self._validate_entry(entry)
 
             root_fd = self._open_root()
             journal_fd = -1
@@ -819,6 +826,8 @@ class RelationApprovalTransaction:
                     edge = {"type": rel_type, "target": target_id}
                     if note:
                         edge["note"] = note
+                    if strength is not None:
+                        edge["strength"] = strength
                     relations.append(edge)
                     target_post["relations"] = relations
                     target_post["last_active"] = now_iso()
@@ -848,6 +857,7 @@ class RelationApprovalTransaction:
                     "source_id": source_id,
                     "target_id": target_id,
                     "rel_type": rel_type,
+                    "strength": strength,
                     "source_path": source_relative,
                     "original_sha256": _sha256_bytes(original_bytes),
                     "target_sha256": _sha256_bytes(target_bytes),

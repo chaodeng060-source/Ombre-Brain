@@ -86,13 +86,15 @@ dehydration:
 # 下次必须用新 run_id 重试，绝不把 partial JSON 当成空候选。
 lmc5_night:
   proposer_max_tokens: 4096       # plain integer, 512..8192
+  # 同一自然夜的有界重试槽；常态默认 8，积压追平可显式提至 32。
+  max_attempts_per_logical_day: 8 # plain integer, 1..32
   # DeepSeek V4 defaults to thinking mode; only enable these for providers that
   # explicitly support the matching OpenAI-compatible request extensions.
   proposer_disable_thinking: false # strict boolean; sends thinking.type=disabled
   proposer_json_object: false      # strict boolean; requests JSON object output
   # 冻结本轮 event_chunks 水位后，只处理一个有界切片；未清空时写入
   # truthful deferred，后续同日 -rN/次日夜班续跑，不伪装 complete。
-  proposer_max_chunks_per_run: 16 # plain integer, 1..16
+  proposer_max_chunks_per_run: 128 # plain integer, 1..256; bounded catch-up slice
   proposer_wall_budget_seconds: 3000 # plain integer, 1..3599
 
 # --- XYZME metabolism / M 轴代谢 ---
@@ -104,9 +106,9 @@ metabolism:
 # --- XYZME experience axis / E 轴体验信号 ---
 # E0 同时只读扫描 LMC-5 已脱敏 candidate 和五个固定 curated Markdown 根：
 # permanent / dynamic / archive / feel / 涩涩。只写 <buckets_dir>/.axis/ 私有 sidecar；
-# E0 原始行永久不覆盖记忆，也不自行参与 decay/RRF/relation。只有下方具名 E1
-# live projection 可在逐桶重验 source_digest 后消费 curated_memory 行。manual API
-# 标记为 source_kind=manual_bucket，完全排除于正式 cohort、自然日、分布和 E1。
+# E0 原始行永久不覆盖记忆，也不参与 decay/RRF/relation/E1。自然日成熟度只描述
+# 这份 proposal 样本的观测跨度，不授予召回权威。manual API 标记为
+# source_kind=manual_bucket，完全排除于正式 cohort、自然日和分布。
 # enabled 只是运行配置，不代表生产已部署；镜像与独立 cron 仍必须通过部署闸。
 e_axis_shadow:
   enabled: true                        # absent/false fails closed
@@ -121,9 +123,10 @@ e_axis_shadow:
   temperature: 0.0
 
 # --- LMC-5 E1 live projection / E 轴正式召回投影 ---
-# 可逆消费 E0 的不可变评分：只在既有相关性窄带内细排；显式情绪查询最多补 1 条
-# supporting experience；并注入回应姿态。它永远不能覆盖事实、跨过 Z 轴或把
-# manual/candidate 行升级成权威。关闭 enabled 即恢复旧召回，不改任何账本/桶。
+# 只消费主对话 AI 亲自写入桶内的 E 元数据与不可变初始优先级。DeepSeek 等模型
+# 的 E0/shadow 行永远只是 proposal，不参与正式召回。投影只在既有相关性窄带内
+# 细排；显式情绪查询最多补 1 条 supporting experience，并注入回应姿态。
+# 它不能覆盖事实或跨过 Z 轴；关闭 enabled 即恢复旧召回，不改账本/桶。
 e_axis_recall:
   enabled: true
   mode: active
@@ -277,14 +280,14 @@ intent_recall:
       temporal_recent_days: 14
 
 # --- Review gates / 待审闸（对位 lmc-5 的 Z 轴事实演化 + Y 轴关系安全）---
-# 机器只提候选、不直接改写真相：所有自动推断关系边和合并时检出的事实冲突，
-# 都先挂进 <buckets_dir>/review_queue.jsonl。危险关系候选只有经过
+# 机器推断出的 kin/explains 安全关系经审计幂等写入；危险关系和事实冲突
+# 挂进 <buckets_dir>/review_queue.jsonl。危险关系候选只有经过
 # /api/review_queue/apply-relation 的具名人工审批事务才落图。
 # 只读查看：python review_queue.py --path <buckets_dir>/review_queue.jsonl
 # 红线：保护域感情桶（恋爱/纪念日/约定/家庭/自省/feel）在合并层已被排除，
 #       绝不会被自动 supersede。
 review_gate:
-  relation_review: true           # compatibility flag; auto relations are always proposals
+  relation_review: true           # dangerous relations queue for named review; safe relations write directly
   fact_evolution_audit: true      # compatibility flag; conflicts stay as separate buckets until explicit Z apply
 
 # --- Stage-0 query expansion / 查询扩展 ---

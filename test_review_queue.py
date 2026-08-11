@@ -8,10 +8,10 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 from review_queue import (
-    ReviewQueue, lifecycle_updates, make_metabolism_entry, make_relation_entry,
+    ReviewQueue, lifecycle_updates, make_e_proposal_entry, make_metabolism_entry, make_relation_entry,
     make_z_conflict_entry,
     make_z_pair_entry, render_md,
-    KIND_METABOLISM, KIND_RELATION, KIND_Z_CONFLICT,
+    KIND_E_PROPOSAL, KIND_METABOLISM, KIND_RELATION, KIND_Z_CONFLICT,
     STATUS_PENDING, STATUS_APPLIED, STATUS_REJECTED,
     ReviewQueueCorruptError,
 )
@@ -66,10 +66,18 @@ def test_list_pending_by_kind():
         "高重要度桶长期未激活，只建议复核。",
         bucket_ids=["old"],
     ))
-    assert len(q.list_pending()) == 3
+    q.enqueue(make_e_proposal_entry(
+        "source",
+        "relationship_moment",
+        "值得主 AI 复看",
+        "这只是机器证据摘要，不是体验正文。",
+        suggested_priority=70,
+    ))
+    assert len(q.list_pending()) == 4
     assert len(q.list_pending(KIND_RELATION)) == 1
     assert len(q.list_pending(KIND_Z_CONFLICT)) == 1
     assert len(q.list_pending(KIND_METABOLISM)) == 1
+    assert len(q.list_pending(KIND_E_PROPOSAL)) == 1
 
 
 def test_resolve_removes_from_pending():
@@ -172,6 +180,15 @@ def test_entry_shapes():
     assert m["kind"] == KIND_METABOLISM
     assert m["bucket_ids"] == ["a", "b"]
     assert m["reason"] and m["status"] == STATUS_PENDING
+    e = make_e_proposal_entry(
+        "source",
+        "relationship_moment",
+        "主 AI 待写",
+        "模型只提供证据。",
+        suggested_priority=77,
+    )
+    assert e["kind"] == KIND_E_PROPOSAL
+    assert e["authority"] == "proposal_only"
 
 
 def test_metabolism_entry_requires_reason_and_known_action():
@@ -206,10 +223,18 @@ def test_render_md_smoke():
         "正文超过阈值，仅建议人工拆分。",
         bucket_ids=["long"],
     ))
+    q.enqueue(make_e_proposal_entry(
+        "source",
+        "relationship_moment",
+        "主 AI 待写",
+        "模型只提供证据。",
+        suggested_priority=77,
+    ))
     md = render_md(q.list_pending())
-    assert "关系闸" in md and "Z轴" in md and "M轴" in md
+    assert "关系闸" in md and "Z轴" in md and "M轴" in md and "E轴" in md
     assert "桶A" in md and "数量桶" in md
     assert "正文超过阈值" in md
+    assert "模型只提供证据" in md
     # 空清单也不炸
     assert "✅ 无" in render_md([])
 

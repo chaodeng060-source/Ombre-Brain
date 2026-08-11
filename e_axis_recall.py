@@ -1,9 +1,10 @@
 """Audited E-axis live projection for recall and response posture.
 
-E0 rows stay immutable and permanently declare ``shadow_only=true`` and
-``affects_ranking=false``.  This module does not rewrite that history.  It
-builds a bounded, reversible E1 *projection* at read time after proving that an
-annotation still matches the current curated Markdown source.
+Model-produced E0 rows stay immutable proposals and permanently declare
+``shadow_only=true`` and ``affects_ranking=false``.  They never feed the live
+projection.  Live E rows come only from immutable bucket metadata written by a
+named primary user-facing agent with its own initial priority.  This module
+then proves that the row still binds to the current curated Markdown source.
 
 The projection has three deliberately narrow effects:
 
@@ -13,7 +14,7 @@ The projection has three deliberately narrow effects:
 * recalled experience may produce a compact response-posture instruction.
 
 Turning ``e_axis_recall.enabled`` off restores the legacy recall path without
-changing buckets, E0 rows, relation edges, or fact lifecycle state.
+changing buckets, proposals, relation edges, or fact lifecycle state.
 """
 
 from __future__ import annotations
@@ -232,6 +233,8 @@ class ActiveEAnnotation:
     growth_delta: str
     rubric_version: str
     scored_at: str
+    authored_by: str = ""
+    initial_priority: int = 0
 
 
 def _row_timestamp(row: Mapping[str, object]) -> float:
@@ -291,6 +294,76 @@ def group_candidate_rows(
     }
 
 
+def group_primary_authored_buckets(
+    buckets: Iterable[object],
+    config: EAxisRecallConfig,
+) -> dict[str, tuple[dict, ...]]:
+    """Build live E rows only from immutable primary-authored bucket metadata."""
+
+    if not config.enabled:
+        return {}
+    grouped: dict[str, list[dict]] = {}
+    for bucket in buckets:
+        if not isinstance(bucket, Mapping):
+            continue
+        metadata = bucket.get("metadata")
+        content = bucket.get("content")
+        if not isinstance(metadata, Mapping) or type(content) is not str:
+            continue
+        author = metadata.get("e_authored_by")
+        priority = metadata.get("e_initial_priority")
+        if (
+            type(author) is not str
+            or not author.strip()
+            or author != author.strip()
+            or type(priority) is not int
+            or isinstance(priority, bool)
+            or not 1 <= priority <= 100
+        ):
+            continue
+        binding = bind_loaded_curated_source(metadata, content)
+        if binding is None or binding.bucket_id != str(bucket.get("id") or ""):
+            continue
+        score = {
+            "valence": metadata.get("e_valence"),
+            "arousal": metadata.get("e_arousal"),
+            "tension": metadata.get("e_tension"),
+            "confidence": metadata.get("e_confidence"),
+            "response_tendency": metadata.get("e_response_tendency"),
+            "growth_delta": metadata.get("e_growth_delta"),
+        }
+        normalized_score, error = validate_shadow_score(
+            score,
+            min_confidence=config.min_confidence,
+        )
+        if error or normalized_score is None:
+            continue
+        row = {
+            "status": "success",
+            "authority": "primary_agent",
+            "source_kind": "primary_authored",
+            "bucket_id": "bucket:" + binding.bucket_id,
+            "source_digest": binding.source_digest,
+            "score": normalized_score,
+            "rubric_version": "primary-authored/v1",
+            "scored_at": str(metadata.get("e_authored_at") or ""),
+            "e_authored_by": author,
+            "e_initial_priority": priority,
+        }
+        grouped.setdefault(binding.bucket_id, []).append(row)
+    return {
+        bucket_id: tuple(sorted(
+            rows,
+            key=lambda row: (
+                int(row["e_initial_priority"]),
+                _row_timestamp(row),
+            ),
+            reverse=True,
+        ))
+        for bucket_id, rows in grouped.items()
+    }
+
+
 def select_current_annotation(
     rows: Sequence[Mapping[str, object]],
     bucket: Mapping[str, object],
@@ -329,6 +402,8 @@ def select_current_annotation(
             growth_delta=score["growth_delta"],
             rubric_version=str(row.get("rubric_version") or ""),
             scored_at=str(row.get("scored_at") or ""),
+            authored_by=str(row.get("e_authored_by") or ""),
+            initial_priority=int(row.get("e_initial_priority") or 0),
         )
     return None
 
@@ -485,14 +560,21 @@ def rank_annotation_bucket_ids(
 ) -> list[str]:
     """Cheap pre-rank before current-source hydration and digest validation."""
 
-    scored: list[tuple[str, float, float]] = []
+    scored: list[tuple[str, float, int, float]] = []
     for bucket_id, rows in grouped.items():
         if not rows:
             continue
         row = rows[0]
-        scored.append((bucket_id, resonance_score(query, row), _row_timestamp(row)))
-    scored.sort(key=lambda item: (-item[1], -item[2], item[0]))
-    return [bucket_id for bucket_id, _, _ in scored[:max(0, limit)]]
+        priority = row.get("e_initial_priority")
+        safe_priority = priority if type(priority) is int else 0
+        scored.append((
+            bucket_id,
+            resonance_score(query, row),
+            safe_priority,
+            _row_timestamp(row),
+        ))
+    scored.sort(key=lambda item: (-item[1], -item[2], -item[3], item[0]))
+    return [bucket_id for bucket_id, _, _, _ in scored[:max(0, limit)]]
 
 
 __all__ = [
@@ -504,6 +586,7 @@ __all__ = [
     "derive_response_posture",
     "format_response_posture",
     "group_candidate_rows",
+    "group_primary_authored_buckets",
     "infer_query_emotion",
     "load_e_axis_recall_config",
     "rank_annotation_bucket_ids",

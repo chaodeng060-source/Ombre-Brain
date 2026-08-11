@@ -38,6 +38,7 @@ from storage_safety import advisory_file_lock, atomic_write_text
 KIND_RELATION = "relation"    # #3：机器自动推断的「危险」关系边（因果/取代类）
 KIND_Z_CONFLICT = "z_conflict"  # #2：合并时检出的事实冲突（数字/日期/否定翻转）
 KIND_METABOLISM = "metabolism"  # M：只读巡检建议，永不自动执行
+KIND_E_PROPOSAL = "e_proposal"  # E：模型只提建议，主 AI 亲自写权威体验
 
 METABOLISM_ACTIONS = frozenset({
     "promote",
@@ -216,10 +217,17 @@ def make_relation_entry(
     *,
     source_name: str = "",
     target_name: str = "",
+    strength: float | None = None,
     now: Optional[datetime] = None,
 ) -> dict:
     """#3：一条等待人审的机器自动推断关系边。"""
-    return {
+    if strength is not None:
+        if isinstance(strength, bool) or not isinstance(strength, (int, float)):
+            raise ValueError("relation strength must be a number in 0..1")
+        strength = float(strength)
+        if not 0.0 <= strength <= 1.0:
+            raise ValueError("relation strength must be a number in 0..1")
+    entry = {
         "key": "rel|" + _short_hash(source_id, rel_type, target_id),
         "kind": KIND_RELATION,
         "status": STATUS_PENDING,
@@ -231,6 +239,9 @@ def make_relation_entry(
         "note": note or "",
         "created": _now_iso(now),
     }
+    if strength is not None:
+        entry["strength"] = strength
+    return entry
 
 
 def make_metabolism_entry(
@@ -272,6 +283,38 @@ def make_metabolism_entry(
         "bucket_ids": normalized_ids,
         "details": dict(details or {}),
         "source": "patrol_read_only",
+        "created": _now_iso(now),
+    }
+
+
+def make_e_proposal_entry(
+    source_bucket_id: str,
+    candidate_type: str,
+    title: str,
+    evidence: str,
+    *,
+    suggested_priority: int,
+    now: Optional[datetime] = None,
+) -> dict:
+    """Create a non-authoritative E proposal for the primary agent."""
+    source_bucket_id = str(source_bucket_id or "").strip()
+    candidate_type = str(candidate_type or "").strip()
+    title = str(title or "").strip()
+    evidence = str(evidence or "").strip()
+    if not source_bucket_id or not candidate_type or not title or not evidence:
+        raise ValueError("E proposal requires source, type, title and evidence")
+    if type(suggested_priority) is not int or not 1 <= suggested_priority <= 100:
+        raise ValueError("suggested_priority must be a plain integer in 1..100")
+    return {
+        "key": "e|" + _short_hash(source_bucket_id, candidate_type, evidence),
+        "kind": KIND_E_PROPOSAL,
+        "status": STATUS_PENDING,
+        "source_bucket_id": source_bucket_id,
+        "candidate_type": candidate_type,
+        "title": title[:240],
+        "evidence": evidence[:500],
+        "suggested_priority": suggested_priority,
+        "authority": "proposal_only",
         "created": _now_iso(now),
     }
 
@@ -534,6 +577,7 @@ def render_md(items: list[dict], now: Optional[datetime] = None) -> str:
     rels = [e for e in items if e.get("kind") == KIND_RELATION]
     zs = [e for e in items if e.get("kind") == KIND_Z_CONFLICT]
     metabolism = [e for e in items if e.get("kind") == KIND_METABOLISM]
+    e_proposals = [e for e in items if e.get("kind") == KIND_E_PROPOSAL]
 
     L.append(f"## 🩺 M轴 · 待审代谢建议（{len(metabolism)}）")
     L.append("> 巡检只提出建议，不改桶；晋升、降级、拆分或归档均需人显式执行。")
@@ -545,6 +589,19 @@ def render_md(items: list[dict], now: Optional[datetime] = None) -> str:
             L.append(
                 f"- `{entry['key']}` [{entry['severity']}] "
                 f"`{entry['action']}` · {bucket_ids} —— {entry['reason']}"
+            )
+    L.append("")
+
+    L.append(f"## 🫧 E轴 · 主 AI 待写体验提案（{len(e_proposals)}）")
+    L.append("> 模型输出没有 E 权威；主 AI 需自己措辞并选择初始优先级。")
+    if not e_proposals:
+        L.append("- ✅ 无")
+    else:
+        for entry in e_proposals:
+            L.append(
+                f"- `{entry['key']}` {entry['title']} · "
+                f"source={entry['source_bucket_id']} · "
+                f"建议优先级 {entry['suggested_priority']} —— {entry['evidence']}"
             )
     L.append("")
 

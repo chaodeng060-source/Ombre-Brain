@@ -15,6 +15,7 @@ from e_axis_recall import (
     derive_response_posture,
     format_response_posture,
     group_candidate_rows,
+    group_primary_authored_buckets,
     infer_query_emotion,
     load_e_axis_recall_config,
     resonance_score,
@@ -188,6 +189,35 @@ def test_manual_candidate_and_old_rubric_never_promote():
     assert grouped["memory-a"] == (curated,)
 
 
+def test_primary_authored_bucket_is_live_without_shadow_authority():
+    bucket = _bucket("primary", "朝灯难过时，先安静接住她。")
+    bucket["metadata"].update({
+        "created": "2026-08-11T10:00:00+00:00",
+        "e_authored_by": "claude",
+        "e_initial_priority": 91,
+        "e_valence": -0.7,
+        "e_arousal": 0.35,
+        "e_tension": 0.55,
+        "e_confidence": 1.0,
+        "e_response_tendency": "comfort",
+        "e_growth_delta": "stable",
+        "e_authored_at": "2026-08-11T10:00:00+00:00",
+    })
+    cfg = _live_config()
+
+    grouped = group_primary_authored_buckets([bucket], cfg)
+    annotation = select_current_annotation(grouped["primary"], bucket, cfg)
+
+    assert annotation is not None
+    assert annotation.authored_by == "claude"
+    assert annotation.initial_priority == 91
+    assert annotation.response_tendency == "comfort"
+
+    missing_author = {**bucket, "metadata": dict(bucket["metadata"])}
+    missing_author["metadata"].pop("e_authored_by")
+    assert group_primary_authored_buckets([missing_author], cfg) == {}
+
+
 def test_e_reranks_only_inside_existing_relevance_band():
     query = infer_query_emotion("我真的很难过")
     comforting = _bucket("comforting", "难过时先抱住朝灯。")
@@ -275,6 +305,8 @@ def test_posture_is_explicitly_non_factual():
 def test_breath_wires_live_e_after_authority_filters():
     breath = _function_source(ROOT / "server.py", "breath")
     assert "load_e_axis_recall_config" in breath
+    assert "group_primary_authored_buckets" in breath
+    assert "_get_e_axis_shadow_store" not in breath
     assert "select_current_annotation" in breath
     assert "apply_resonance_tie_break" in breath
     assert breath.index("_filter_z_fact_candidates") < breath.index(
@@ -338,7 +370,24 @@ async def test_real_breath_changes_close_order_and_injects_posture(
             "created": "2026-08-04T00:00:00+00:00",
             "valence": 0.5,
             "arousal": 0.3,
+            "e_authored_by": "claude",
+            "e_initial_priority": 80,
+            "e_confidence": 1.0,
+            "e_growth_delta": "stable",
+            "e_authored_at": "2026-08-11T10:00:00+00:00",
         })
+    cheerful["metadata"].update({
+        "e_valence": 0.9,
+        "e_arousal": 0.9,
+        "e_tension": 0.1,
+        "e_response_tendency": "engage",
+    })
+    comforting["metadata"].update({
+        "e_valence": -0.7,
+        "e_arousal": 0.35,
+        "e_tension": 0.55,
+        "e_response_tendency": "comfort",
+    })
     vault = tmp_path / "vault"
     vault.mkdir()
     cfg = {
@@ -352,7 +401,6 @@ async def test_real_breath_changes_close_order_and_injects_posture(
             "literal_candidate_floor": 0.0,
             "fused_relevance_tie_band": 0.35,
         },
-        "e_axis_shadow": {"rubric_version": RUBRIC},
         "e_axis_recall": {
             "enabled": True,
             "mode": "active",
@@ -375,7 +423,6 @@ async def test_real_breath_changes_close_order_and_injects_posture(
     monkeypatch.setattr(server, "episode_engine", _NoopLoop())
     monkeypatch.setattr(server, "_backfill_started", True)
     monkeypatch.setattr(server, "_entity_store", None)
-    monkeypatch.setattr(server, "_e_axis_shadow_store", None)
 
     async def passthrough(
         _query,
@@ -388,23 +435,6 @@ async def test_real_breath_changes_close_order_and_injects_posture(
         return values[:max_results]
 
     monkeypatch.setattr(server, "_ds_filter_candidates", passthrough)
-    store = server._get_e_axis_shadow_store()
-    assert store.append(_row(
-        cheerful,
-        valence=0.9,
-        arousal=0.9,
-        tension=0.1,
-        tendency="engage",
-    ))
-    assert store.append(_row(
-        comforting,
-        valence=-0.7,
-        arousal=0.35,
-        tension=0.55,
-        tendency="comfort",
-    ))
-    assert len(store.load()) == 2
-
     task = asyncio.create_task(server.breath(
         query="我现在真的很难过",
         max_results=2,

@@ -15,6 +15,7 @@ from curated_writer import CuratedWriteCoordinator, CuratedWriteResult
 from lmc5_ledger import LMC5Ledger
 from lmc5_proposer import StrictOmbreProposer
 from maintenance_barrier import MaintenanceBarrier
+from review_queue import ReviewQueue
 from night_run_coordinator import (
     NightRunCoordinator,
     NightRunCoordinatorError,
@@ -80,16 +81,54 @@ class _FakeCurated:
     def __init__(self, barrier: MaintenanceBarrier) -> None:
         self._maintenance_barrier = barrier
         self.calls: list[dict[str, Any]] = []
+        self.results: dict[str, CuratedWriteResult] = {}
 
     async def write(self, **kwargs: Any) -> CuratedWriteResult:
         self.calls.append(kwargs)
-        return CuratedWriteResult(
+        key = kwargs["idempotency_key"]
+        if key in self.results:
+            return self.results[key]
+        result = CuratedWriteResult(
             success=True,
             status="completed",
-            bucket_id=f"bucket-{len(self.calls)}",
+            bucket_id=f"bucket-{len(self.results) + 1}",
             vector_policy="required",
             recall_state="ready_vector",
         )
+        self.results[key] = result
+        return result
+
+
+class _AxisBucketManager:
+    def __init__(self, barrier: MaintenanceBarrier, buckets: dict[str, dict]) -> None:
+        self._maintenance_barrier = barrier
+        self.buckets = buckets
+        self.relations: list[dict[str, Any]] = []
+
+    async def get(self, bucket_id: str):
+        return self.buckets.get(bucket_id)
+
+    async def list_all(self, include_archive: bool = False):
+        return list(self.buckets.values())
+
+    async def add_relation(
+        self,
+        source_id: str,
+        target_id: str,
+        rel_type: str,
+        note: str = "",
+        strength: float | None = None,
+        actor: str = "system",
+    ) -> bool:
+        self.relations.append({
+            "source": source_id,
+            "target": target_id,
+            "type": rel_type,
+            "note": note,
+            "strength": strength,
+            "actor": actor,
+        })
+        return True
 
 
 class _RetryEmbedding:
@@ -331,7 +370,7 @@ async def test_cutoff_is_exclusive_and_newer_event_remains_uncovered(
 
 
 @pytest.mark.asyncio
-async def test_preference_axes_are_explicitly_deferred_without_x_write(
+async def test_preference_writes_x_but_defers_unwired_z_and_e(
     tmp_path: Path,
 ) -> None:
     harness = _harness(tmp_path, candidate_type="preference")
@@ -345,15 +384,195 @@ async def test_preference_axes_are_explicitly_deferred_without_x_write(
     )
 
     assert outcome.run.stage == "complete"
-    assert harness.curated.calls == []
+    assert len(harness.curated.calls) == 1
+    assert harness.curated.calls[0]["bucket_options"]["tags"] == [
+        "lmc5", "night", "preference"
+    ]
     deferred = harness.ledger.list_candidates("deferred")
     assert {(row.axis, row.error_code) for row in deferred} == {
-        ("X", "x.type_requires_axis_decision"),
-        ("Z", "z.fact_pair_unavailable"),
-        ("E", "e.scorer_unavailable"),
+        ("Z", "z.storage_unavailable"),
+        ("E", "e.proposal_storage_unavailable"),
     }
     ready = harness.ledger.list_candidates("ready")
-    assert [(row.axis, row.error_code) for row in ready] == [("M", None)]
+    assert {(row.axis, row.error_code) for row in ready} == {
+        ("M", None),
+        ("X", None),
+    }
+
+
+@pytest.mark.asyncio
+async def test_night_y_writes_safe_relation_and_queues_dangerous_with_strength(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    barrier = harness.coordinator.maintenance_barrier
+    buckets = {
+        "bucket-1": {
+            "id": "bucket-1",
+            "content": "朝灯今晚想看星星",
+            "metadata": {"id": "bucket-1", "name": "夜间候选", "type": "dynamic"},
+        },
+        "safe-target": {
+            "id": "safe-target",
+            "content": "一起看过月亮",
+            "metadata": {"id": "safe-target", "name": "月亮", "type": "dynamic"},
+        },
+        "danger-target": {
+            "id": "danger-target",
+            "content": "后来睡得很晚",
+            "metadata": {"id": "danger-target", "name": "晚睡", "type": "dynamic"},
+        },
+    }
+    manager = _AxisBucketManager(barrier, buckets)
+    queue = ReviewQueue(
+        harness.source / "review_queue.jsonl",
+        maintenance_root=harness.source,
+    )
+    harness.coordinator.bucket_manager = manager
+    harness.coordinator.review_queue = queue
+
+    async def targets(_text: str) -> frozenset[str]:
+        return frozenset({"safe-target", "danger-target"})
+
+    def provider(prompt: str) -> dict[str, Any]:
+        proposer_input = json.loads(prompt.split("INPUT=", 1)[1])
+        chunk = proposer_input["chunks"][0]
+        content = json.dumps({
+            "schema_version": 1,
+            "candidates": [{
+                "type": "event",
+                "title": "夜间候选",
+                "content": "朝灯今晚想看星星",
+                "importance": 7,
+                "thread_hint": "night",
+                "relation_hints": [
+                    {
+                        "relation_type": "kin",
+                        "target_id": "safe-target",
+                        "strength": 0.8,
+                        "reason": "同类夜空记忆",
+                    },
+                    {
+                        "relation_type": "causes",
+                        "target_id": "danger-target",
+                        "strength": 0.6,
+                        "reason": "可能导致晚睡",
+                    },
+                ],
+                "source_chunk_ids": [chunk["id"]],
+                "evidence": "看星星",
+                "risk": "normal",
+            }],
+        }, ensure_ascii=False)
+        return {"choices": [{"finish_reason": "stop", "message": {"content": content}}]}
+
+    harness.coordinator.proposer = StrictOmbreProposer(provider)
+    harness.coordinator.relation_target_provider = targets
+    harness.ledger.append_raw_event(
+        "room-main", "relation-1", '{"message":"朝灯今晚想看星星"}'
+    )
+
+    outcome = await harness.coordinator.run(
+        run_id="night-y-ready",
+        cutoff=datetime.now(timezone.utc),
+    )
+
+    assert outcome.counts["y_safe_ready"] == 1
+    assert outcome.counts["y_review_ready"] == 1
+    assert manager.relations == [{
+        "source": "bucket-1",
+        "target": "safe-target",
+        "type": "kin",
+        "note": "同类夜空记忆",
+        "strength": 0.8,
+        "actor": "lmc5:night:y-safe",
+    }]
+    pending = queue.list_pending("relation")
+    assert [(row["rel_type"], row["strength"]) for row in pending] == [
+        ("causes", 0.6)
+    ]
+    assert {row.axis for row in harness.ledger.list_candidates("ready")} == {
+        "M", "X", "Y"
+    }
+
+
+@pytest.mark.asyncio
+async def test_night_z_queues_registered_fact_pair_without_applying_lifecycle(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path, candidate_type="preference")
+    barrier = harness.coordinator.maintenance_barrier
+    buckets = {
+        "bucket-1": {
+            "id": "bucket-1",
+            "content": "主色: 墨绿",
+            "metadata": {
+                "id": "bucket-1",
+                "name": "新主色",
+                "type": "dynamic",
+                "recorded_at": "2026-08-11T17:00:00+08:00",
+            },
+        },
+        "old-color": {
+            "id": "old-color",
+            "content": "主色: 浅绿",
+            "metadata": {
+                "id": "old-color",
+                "name": "旧主色",
+                "type": "dynamic",
+                "recorded_at": "2026-08-01T12:00:00+08:00",
+            },
+        },
+    }
+    manager = _AxisBucketManager(barrier, buckets)
+    queue = ReviewQueue(
+        harness.source / "review_queue.jsonl",
+        maintenance_root=harness.source,
+    )
+    harness.coordinator.bucket_manager = manager
+    harness.coordinator.review_queue = queue
+    harness.coordinator.fact_slot_registry = {"preference.ui.primary_color": frozenset({"主色"})}
+    harness.coordinator._fact_slot_config = {
+        "preference.ui.primary_color": {"aliases": ["主色"]}
+    }
+
+    def provider(prompt: str) -> dict[str, Any]:
+        proposer_input = json.loads(prompt.split("INPUT=", 1)[1])
+        chunk = proposer_input["chunks"][0]
+        content = json.dumps({
+            "schema_version": 1,
+            "candidates": [{
+                "type": "preference",
+                "title": "新主色",
+                "content": "主色: 墨绿",
+                "importance": 8,
+                "thread_hint": "ui",
+                "relation_hints": [],
+                "source_chunk_ids": [chunk["id"]],
+                "evidence": "墨绿",
+                "risk": "normal",
+            }],
+        }, ensure_ascii=False)
+        return {"choices": [{"finish_reason": "stop", "message": {"content": content}}]}
+
+    harness.coordinator.proposer = StrictOmbreProposer(provider)
+    harness.ledger.append_raw_event(
+        "room-main", "fact-1", '{"message":"主色改成墨绿"}'
+    )
+
+    outcome = await harness.coordinator.run(
+        run_id="night-z-ready",
+        cutoff=datetime.now(timezone.utc),
+    )
+
+    assert outcome.counts["z_review_ready"] == 1
+    pending = queue.list_pending("z_conflict")
+    assert len(pending) == 1
+    assert pending[0]["fact_key"] == "preference.ui.primary_color"
+    assert pending[0]["current_bucket_id"] == "bucket-1"
+    assert pending[0]["historical_bucket_id"] == "old-color"
+    assert "fact_status" not in buckets["bucket-1"]["metadata"]
+    assert "fact_status" not in buckets["old-color"]["metadata"]
 
 
 @pytest.mark.asyncio

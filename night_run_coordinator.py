@@ -1,11 +1,13 @@
-"""Fail-closed coordinator for one conservative LMC-5 night run.
+"""Fail-closed coordinator for one bounded LMC-5 night run.
 
-The coordinator deliberately does less than the eventual LMC-5 design:
+The coordinator keeps every axis inside its production authority contract:
 
 * raw events are redacted and durably chunked before leaving local storage;
 * one chunk is proposed at a time and the candidate fan-out is transactional;
-* only normal, relation-free ``event`` drafts may become recall-visible X rows;
-* Y/Z/E stay deferred until their stronger storage contracts are available;
+* normal X drafts may become recall-visible rows with immutable provenance;
+* safe Y edges write idempotently while dangerous edges enter named review;
+* Z only proposes registered fact pairs; approval is a separate transaction;
+* E only proposes source material; a primary agent must author the E record;
 * M is a verified ``report_only`` computation and never mutates memory.
 
 An interrupted run is evidence, not a resume token.  A caller must retry with
@@ -23,7 +25,7 @@ import re
 import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from curated_writer import CuratedWriteCoordinator, CuratedWriteResult
 from lmc5_ledger import (
@@ -37,6 +39,7 @@ from lmc5_ledger import (
     TERMINAL_NIGHT_STAGES,
 )
 from lmc5_proposer import (
+    CANDIDATE_TYPES,
     CandidateDraft,
     ProposerBatch,
     ProposerChunk,
@@ -44,6 +47,17 @@ from lmc5_proposer import (
     RelationHint,
     StrictOmbreProposer,
     route_candidate_axes,
+)
+from fact_slots import (
+    FACT_STATUS_HISTORICAL,
+    extract_registered_facts,
+    is_fact_slot_exempt,
+    normalize_fact_slot_registry,
+)
+from review_queue import (
+    make_e_proposal_entry,
+    make_relation_entry,
+    make_z_pair_entry,
 )
 from redact import redact_obj
 from snapshot_manager import SnapshotManager, SnapshotResult
@@ -91,8 +105,8 @@ class NightRunPolicy:
             raise ValueError("ledger page sizes cannot exceed 1000")
         if self.chunk_bytes > 256 * 1024:
             raise ValueError("chunk_bytes exceeds the proposer input contract")
-        if self.proposer_max_chunks_per_run > 16:
-            raise ValueError("proposer run chunk cap cannot exceed 16")
+        if self.proposer_max_chunks_per_run > 256:
+            raise ValueError("proposer run chunk cap cannot exceed 256")
         if self.proposer_wall_budget_seconds >= 3600:
             raise ValueError("proposer wall budget must be below 3600 seconds")
         timeout = self.barrier_timeout_seconds
@@ -285,6 +299,12 @@ class NightRunCoordinator:
         curated: CuratedWriteCoordinator,
         decay_engine: Any,
         consolidation_engine: Any,
+        bucket_manager: Any | None = None,
+        review_queue: Any | None = None,
+        fact_slot_registry: Mapping[str, Any] | None = None,
+        relation_target_provider: (
+            Callable[[str], Awaitable[frozenset[str]]] | None
+        ) = None,
         policy: NightRunPolicy | None = None,
     ) -> None:
         self.ledger = ledger
@@ -293,6 +313,13 @@ class NightRunCoordinator:
         self.curated = curated
         self.decay_engine = decay_engine
         self.consolidation_engine = consolidation_engine
+        self.bucket_manager = bucket_manager
+        self.review_queue = review_queue
+        self.fact_slot_registry = normalize_fact_slot_registry(
+            fact_slot_registry
+        )
+        self._fact_slot_config = dict(fact_slot_registry or {})
+        self.relation_target_provider = relation_target_provider
         self.policy = policy or NightRunPolicy()
         self._barrier = snapshots.maintenance_barrier
         self._assert_contract()
@@ -317,6 +344,9 @@ class NightRunCoordinator:
                 None,
             ),
         ]
+        for component in (self.bucket_manager, self.review_queue):
+            if component is not None:
+                barriers.append(getattr(component, "_maintenance_barrier", None))
         if any(barrier is None for barrier in barriers):
             raise ValueError("all night components need one maintenance barrier")
         lock_paths = {str(barrier.lock_path) for barrier in barriers}
@@ -547,10 +577,17 @@ class NightRunCoordinator:
                 break
             counts["proposer_attempted"] += 1
             try:
+                relation_targets = frozenset()
+                if self.relation_target_provider is not None:
+                    relation_targets = await self.relation_target_provider(text)
+                    if not isinstance(relation_targets, frozenset):
+                        raise NightRunCoordinatorError(
+                            "proposer.relation_targets_invalid"
+                        )
                 batch = await asyncio.wait_for(
                     self.proposer.propose(
                         (ProposerChunk(id=pending.chunk_id, text=text),),
-                        frozenset(),
+                        relation_targets,
                     ),
                     timeout=remaining,
                 )
@@ -770,13 +807,13 @@ class NightRunCoordinator:
             await self._dispatch_x(record, payload, counts)
             return
         if axis == "Y":
-            self._defer(record, "y.strength_storage_unavailable", counts)
+            await self._dispatch_y(record, payload, counts)
             return
         if axis == "Z":
-            self._defer(record, "z.fact_pair_unavailable", counts)
+            await self._dispatch_z(record, payload, counts)
             return
         if axis == "E":
-            self._defer(record, "e.scorer_unavailable", counts)
+            await self._dispatch_e(record, payload, counts)
             return
         if axis == "M":
             return
@@ -795,13 +832,12 @@ class NightRunCoordinator:
         if draft.get("risk") != "normal":
             self._defer(record, "x.human_review_required", counts)
             return
-        if draft.get("type") != "event":
+        if draft.get("type") not in CANDIDATE_TYPES:
             self._defer(record, "x.type_requires_axis_decision", counts)
             return
         relation_hints = draft.get("relation_hints")
-        if type(relation_hints) is not list or relation_hints:
-            self._defer(record, "x.relation_review_required", counts)
-            return
+        if type(relation_hints) is not list:
+            raise NightRunCoordinatorError("candidate.persisted_invalid")
         content = draft.get("content")
         title = draft.get("title")
         importance = draft.get("importance")
@@ -830,24 +866,7 @@ class NightRunCoordinator:
         ):
             raise NightRunCoordinatorError("candidate.persisted_invalid")
 
-        result = await self.curated.write(
-            idempotency_key=write_key,
-            content=content,
-            vector_policy=self.policy.vector_policy,
-            bucket_options={
-                "bucket_type": "dynamic",
-                "importance": importance,
-                "name": title,
-                "tags": ["lmc5", "night", "event"],
-                "x_provenance": {
-                    "source_kind": "conversation",
-                    "source_session": session_id,
-                    "source_event_ids": event_ids,
-                    "source_digest": source_digest,
-                },
-            },
-            actor="lmc5:night",
-        )
+        result = await self._write_x_payload(payload)
         if not self._x_result_is_complete(result):
             raise NightRunCoordinatorError("x.write_retryable")
         result_value = asdict(result)
@@ -867,6 +886,274 @@ class NightRunCoordinator:
                 expected_status="pending",
             )
         counts["x_ready"] = counts.get("x_ready", 0) + 1
+
+    async def _write_x_payload(
+        self,
+        payload: dict[str, Any],
+    ) -> CuratedWriteResult:
+        draft = payload.get("draft")
+        source = payload.get("source")
+        if type(draft) is not dict or type(source) is not dict:
+            raise NightRunCoordinatorError("candidate.persisted_invalid")
+        content = draft.get("content")
+        title = draft.get("title")
+        importance = draft.get("importance")
+        candidate_type = draft.get("type")
+        session_id = source.get("session_id")
+        event_ids = source.get("source_event_ids")
+        source_digest = source.get("source_digest")
+        write_key = payload.get("x_write_key")
+        if (
+            type(content) is not str
+            or not content.strip()
+            or type(title) is not str
+            or not title.strip()
+            or type(importance) is not int
+            or isinstance(importance, bool)
+            or not 1 <= importance <= 10
+            or candidate_type not in CANDIDATE_TYPES
+            or type(session_id) is not str
+            or type(event_ids) is not list
+            or not event_ids
+            or any(type(item) is not str or not item for item in event_ids)
+            or type(source_digest) is not str
+            or not _SHA256_RE.fullmatch(source_digest)
+            or type(write_key) is not str
+        ):
+            raise NightRunCoordinatorError("candidate.persisted_invalid")
+        return await self.curated.write(
+            idempotency_key=write_key,
+            content=content,
+            vector_policy=self.policy.vector_policy,
+            bucket_options={
+                "bucket_type": "dynamic",
+                "importance": importance,
+                "name": title,
+                "tags": ["lmc5", "night", candidate_type],
+                "x_provenance": {
+                    "source_kind": "conversation",
+                    "source_session": session_id,
+                    "source_event_ids": event_ids,
+                    "source_digest": source_digest,
+                },
+            },
+            actor="lmc5:night",
+        )
+
+    async def _dispatch_y(
+        self,
+        record: CandidateRecord,
+        payload: dict[str, Any],
+        counts: dict[str, int],
+    ) -> None:
+        if self.bucket_manager is None or self.review_queue is None:
+            self._defer(record, "y.storage_unavailable", counts)
+            return
+        draft = payload.get("draft")
+        if type(draft) is not dict or draft.get("risk") != "normal":
+            self._defer(record, "y.human_review_required", counts)
+            return
+        relations = draft.get("relation_hints")
+        if type(relations) is not list or not relations:
+            self._defer(record, "y.relation_pair_unavailable", counts)
+            return
+        result = await self._write_x_payload(payload)
+        if not self._x_result_is_complete(result):
+            raise NightRunCoordinatorError("y.source_write_retryable")
+        source_id = str(result.bucket_id)
+        safe_count = 0
+        review_count = 0
+        outcomes: list[dict[str, Any]] = []
+        for relation in relations:
+            if type(relation) is not dict:
+                raise NightRunCoordinatorError("candidate.persisted_invalid")
+            rel_type = str(relation.get("relation_type") or "")
+            target_id = str(relation.get("target_id") or "")
+            reason = str(relation.get("reason") or "")
+            strength = relation.get("strength")
+            target = await self.bucket_manager.get(target_id)
+            if target is None:
+                raise NightRunCoordinatorError("y.target_unavailable")
+            if rel_type in {"kin", "explains"}:
+                ok = await self.bucket_manager.add_relation(
+                    source_id,
+                    target_id,
+                    rel_type,
+                    reason,
+                    strength=strength,
+                    actor="lmc5:night:y-safe",
+                )
+                if not ok:
+                    raise NightRunCoordinatorError("y.safe_write_retryable")
+                safe_count += 1
+                outcomes.append({"status": "applied", **relation})
+                continue
+            entry = make_relation_entry(
+                source_id,
+                target_id,
+                rel_type,
+                reason,
+                source_name=str(draft.get("title") or source_id),
+                target_name=str((target.get("metadata") or {}).get("name") or target_id),
+                strength=strength,
+            )
+            self.review_queue.enqueue(entry)
+            review_count += 1
+            outcomes.append({"status": "pending_review", **relation})
+        result_hash = _canonical_digest(outcomes, code="y.result_invalid")
+        with self.ledger.transaction() as tx:
+            tx.record_write_receipt(
+                f"y-receipt:v1:{record.payload_digest}",
+                record.payload_digest,
+                f"relations:{source_id}",
+                result_hash=result_hash,
+            )
+            tx.transition_candidate(
+                record.idempotency_key,
+                "ready",
+                expected_status="pending",
+            )
+        counts["y_safe_ready"] = counts.get("y_safe_ready", 0) + safe_count
+        counts["y_review_ready"] = counts.get("y_review_ready", 0) + review_count
+
+    async def _dispatch_z(
+        self,
+        record: CandidateRecord,
+        payload: dict[str, Any],
+        counts: dict[str, int],
+    ) -> None:
+        if (
+            self.bucket_manager is None
+            or self.review_queue is None
+            or not self.fact_slot_registry
+        ):
+            self._defer(record, "z.storage_unavailable", counts)
+            return
+        draft = payload.get("draft")
+        if type(draft) is not dict or draft.get("risk") != "normal":
+            self._defer(record, "z.human_review_required", counts)
+            return
+        result = await self._write_x_payload(payload)
+        if not self._x_result_is_complete(result):
+            raise NightRunCoordinatorError("z.source_write_retryable")
+        new_bucket = await self.bucket_manager.get(str(result.bucket_id))
+        if new_bucket is None or is_fact_slot_exempt(new_bucket):
+            self._defer(record, "z.fact_pair_unavailable", counts)
+            return
+        facts = extract_registered_facts(
+            str(new_bucket.get("content") or ""),
+            self._fact_slot_config,
+            bucket=new_bucket,
+        )
+        if len(facts) != 1:
+            self._defer(record, "z.fact_pair_unavailable", counts)
+            return
+        fact_key = next(iter(facts))
+        candidates: list[dict[str, Any]] = []
+        for bucket in await self.bucket_manager.list_all(include_archive=True):
+            if bucket.get("id") == new_bucket.get("id") or is_fact_slot_exempt(bucket):
+                continue
+            metadata = bucket.get("metadata") or {}
+            existing_key = str(metadata.get("fact_key") or "").strip().lower()
+            status = str(metadata.get("fact_status") or "current").strip().lower()
+            if existing_key == fact_key and status != FACT_STATUS_HISTORICAL:
+                candidates.append(bucket)
+                continue
+            extracted = extract_registered_facts(
+                str(bucket.get("content") or ""),
+                self._fact_slot_config,
+                bucket=bucket,
+            )
+            if fact_key in extracted:
+                candidates.append(bucket)
+        if not candidates:
+            self._defer(record, "z.fact_pair_unavailable", counts)
+            return
+
+        def order_key(bucket: dict[str, Any]) -> tuple[str, str]:
+            metadata = bucket.get("metadata") or {}
+            timestamp = str(
+                metadata.get("event_at")
+                or metadata.get("recorded_at")
+                or metadata.get("created")
+                or ""
+            )
+            return timestamp, str(bucket.get("id") or "")
+
+        prior = max(candidates, key=order_key)
+        new_key = order_key(new_bucket)
+        prior_key = order_key(prior)
+        current, historical = (
+            (new_bucket, prior) if new_key >= prior_key else (prior, new_bucket)
+        )
+        entry = make_z_pair_entry(
+            str(current["id"]),
+            str(historical["id"]),
+            fact_key=fact_key,
+            current_name=str((current.get("metadata") or {}).get("name") or current["id"]),
+            historical_name=str((historical.get("metadata") or {}).get("name") or historical["id"]),
+            reason="lmc5_night_registered_fact_transition",
+            source="lmc5_night",
+        )
+        self.review_queue.enqueue(entry)
+        result_hash = _canonical_digest(entry, code="z.result_invalid")
+        with self.ledger.transaction() as tx:
+            tx.record_write_receipt(
+                f"z-receipt:v1:{record.payload_digest}",
+                record.payload_digest,
+                f"review:{entry['key']}",
+                result_hash=result_hash,
+            )
+            tx.transition_candidate(
+                record.idempotency_key,
+                "ready",
+                expected_status="pending",
+            )
+        counts["z_review_ready"] = counts.get("z_review_ready", 0) + 1
+
+    async def _dispatch_e(
+        self,
+        record: CandidateRecord,
+        payload: dict[str, Any],
+        counts: dict[str, int],
+    ) -> None:
+        if self.review_queue is None:
+            self._defer(record, "e.proposal_storage_unavailable", counts)
+            return
+        draft = payload.get("draft")
+        if type(draft) is not dict:
+            raise NightRunCoordinatorError("candidate.persisted_invalid")
+        if draft.get("risk") != "normal":
+            self._defer(record, "e.human_review_required", counts)
+            return
+        result = await self._write_x_payload(payload)
+        if not self._x_result_is_complete(result):
+            raise NightRunCoordinatorError("e.source_write_retryable")
+        importance = draft.get("importance")
+        if type(importance) is not int or isinstance(importance, bool):
+            raise NightRunCoordinatorError("candidate.persisted_invalid")
+        entry = make_e_proposal_entry(
+            str(result.bucket_id),
+            str(draft.get("type") or ""),
+            str(draft.get("title") or ""),
+            str(draft.get("evidence") or ""),
+            suggested_priority=max(1, min(100, importance * 10)),
+        )
+        self.review_queue.enqueue(entry)
+        result_hash = _canonical_digest(entry, code="e.result_invalid")
+        with self.ledger.transaction() as tx:
+            tx.record_write_receipt(
+                f"e-receipt:v1:{record.payload_digest}",
+                record.payload_digest,
+                f"proposal:{entry['key']}",
+                result_hash=result_hash,
+            )
+            tx.transition_candidate(
+                record.idempotency_key,
+                "ready",
+                expected_status="pending",
+            )
+        counts["e_proposal_ready"] = counts.get("e_proposal_ready", 0) + 1
 
     @staticmethod
     def _x_result_is_complete(result: CuratedWriteResult) -> bool:

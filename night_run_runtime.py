@@ -1,14 +1,14 @@
-"""Production runtime boundary for the conservative LMC-5 night job.
+"""Production runtime boundary for the bounded LMC-5 night job.
 
-This module deliberately exposes only the Stage-1 contract:
+The runtime exposes the production five-axis contract:
 
 * snapshot the live vault;
-* consolidate exact raw events and apply safe X writes;
+* consolidate exact raw events and apply provenance-bound X writes;
+* write safe Y edges and queue dangerous Y edges for named review;
+* queue registered Z current/history pairs for explicit approval;
+* queue non-authoritative E proposals for primary-agent authorship;
 * compute M in ``report_only`` mode;
-* leave Y/Z/E explicitly deferred;
 * fence one logical run per Asia/Shanghai calendar date.
-
-It is not the full five-axis dream pipeline and must not be presented as one.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from typing import Any, Callable
@@ -29,6 +30,7 @@ from lmc5_ledger import (
 )
 from lmc5_proposer import StrictOmbreProposer
 from maintenance_barrier import MaintenanceBarrierTimeout
+from review_queue import ReviewQueue
 from night_run_coordinator import (
     NightRunCoordinator,
     NightRunCoordinatorError,
@@ -49,6 +51,7 @@ DEFAULT_PROPOSER_MAX_CHUNKS_PER_RUN = 16
 DEFAULT_PROPOSER_WALL_BUDGET_SECONDS = 3000
 MIN_PROPOSER_MAX_TOKENS = 512
 MAX_PROPOSER_MAX_TOKENS = 8192
+MAX_NIGHT_ATTEMPTS = 32
 
 
 class NightRunRuntimeError(RuntimeError):
@@ -139,7 +142,7 @@ def _proposer_max_chunks_per_run(config: dict[str, Any]) -> int:
         "proposer_max_chunks_per_run",
         DEFAULT_PROPOSER_MAX_CHUNKS_PER_RUN,
     )
-    if type(value) is not int or not 1 <= value <= 16:
+    if type(value) is not int or not 1 <= value <= 256:
         raise NightRunRuntimeError("proposer.chunk_cap_invalid")
     return value
 
@@ -156,6 +159,18 @@ def _proposer_wall_budget_seconds(config: dict[str, Any]) -> int:
     )
     if type(value) is not int or not 1 <= value < 3600:
         raise NightRunRuntimeError("proposer.wall_budget_invalid")
+    return value
+
+
+def _night_max_attempts(config: dict[str, Any]) -> int:
+    section = config.get("lmc5_night", {})
+    if section is None:
+        section = {}
+    if type(section) is not dict:
+        raise NightRunRuntimeError("run.max_attempts_invalid")
+    value = section.get("max_attempts_per_logical_day", DEFAULT_MAX_ATTEMPTS)
+    if type(value) is not int or not 1 <= value <= MAX_NIGHT_ATTEMPTS:
+        raise NightRunRuntimeError("run.max_attempts_invalid")
     return value
 
 
@@ -429,6 +444,7 @@ def build_night_run_runtime(
     json_object = _proposer_json_object(config)
     max_chunks_per_run = _proposer_max_chunks_per_run(config)
     wall_budget_seconds = _proposer_wall_budget_seconds(config)
+    max_attempts = _night_max_attempts(config)
     provider_timeout = 75.0
     provider = OpenAIChatProvider(
         api_key=api_key,
@@ -448,6 +464,45 @@ def build_night_run_runtime(
     )
     snapshots = SnapshotManager(config["buckets_dir"], snapshot_root)
     curated = CuratedWriteCoordinator(bucket_manager, embedding_engine)
+
+    async def relation_targets(text: str) -> frozenset[str]:
+        target_ids: list[str] = []
+        seen: set[str] = set()
+        try:
+            for bucket_id, _score in await embedding_engine.search_similar(
+                text, top_k=12
+            ):
+                normalized = str(bucket_id or "").strip()
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    target_ids.append(normalized)
+        except Exception:
+            pass
+        try:
+            for bucket in await bucket_manager.search(text, limit=8):
+                normalized = str(bucket.get("id") or "").strip()
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    target_ids.append(normalized)
+        except Exception:
+            pass
+        verified: list[str] = []
+        for bucket_id in target_ids[:16]:
+            if await bucket_manager.get(bucket_id) is not None:
+                verified.append(bucket_id)
+        return frozenset(verified)
+
+    vault_root = Path(config["buckets_dir"])
+    review_queue = ReviewQueue(
+        vault_root / "review_queue.jsonl",
+        maintenance_root=vault_root,
+    )
+    fact_slot_section = config.get("fact_slots", {}) or {}
+    fact_slot_registry = (
+        fact_slot_section.get("registry", {})
+        if isinstance(fact_slot_section, dict)
+        else {}
+    )
     coordinator = NightRunCoordinator(
         ledger=ledger,
         snapshots=snapshots,
@@ -455,12 +510,20 @@ def build_night_run_runtime(
         curated=curated,
         decay_engine=decay_engine,
         consolidation_engine=consolidation_engine,
+        bucket_manager=bucket_manager,
+        review_queue=review_queue,
+        fact_slot_registry=fact_slot_registry,
+        relation_target_provider=relation_targets,
         policy=NightRunPolicy(
             proposer_max_chunks_per_run=max_chunks_per_run,
             proposer_wall_budget_seconds=wall_budget_seconds,
         ),
     )
-    return NightRunRuntime(coordinator=coordinator, ledger=ledger)
+    return NightRunRuntime(
+        coordinator=coordinator,
+        ledger=ledger,
+        max_attempts=max_attempts,
+    )
 
 
 __all__ = [
