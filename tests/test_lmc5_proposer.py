@@ -10,6 +10,7 @@ import pytest
 
 from lmc5_proposer import (
     CANDIDATE_TYPES,
+    _PROVIDER_POLL_INTERVAL_SECONDS,
     CandidateDraft,
     ProposerChunk,
     ProposerContractError,
@@ -101,6 +102,10 @@ async def test_provider_timeout_is_hard_bounded():
 
     proposer = StrictOmbreProposer(slow, timeout_seconds=0.01)
     assert await _error_code(proposer) == "provider.timeout"
+
+
+def test_provider_poll_interval_avoids_busy_loop_without_blunting_deadline():
+    assert 0.01 <= _PROVIDER_POLL_INTERVAL_SECONDS <= 0.05
 
 
 @pytest.mark.asyncio

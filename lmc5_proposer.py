@@ -59,6 +59,7 @@ _MAX_EVIDENCE_BYTES = 4 * 1024
 _MAX_RELATION_REASON_BYTES = 2 * 1024
 _MAX_CANDIDATES = 8
 _COMPACT_RETRY_MAX_CANDIDATES = 4
+_PROVIDER_POLL_INTERVAL_SECONDS = 0.02
 _REPAIRABLE_MODEL_CODES = frozenset(
     {
         "provenance_evidence",
@@ -487,7 +488,9 @@ class StrictOmbreProposer:
                             "provider.timeout",
                             "provider exceeded hard deadline",
                         )
-                    await asyncio.sleep(min(0.002, remaining))
+                    await asyncio.sleep(
+                        min(_PROVIDER_POLL_INTERVAL_SECONDS, remaining)
+                    )
         except asyncio.CancelledError:
             abandoned.set()
             raise
