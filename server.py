@@ -73,7 +73,11 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 
 from bucket_manager import BucketManager, bucket_revision_hash
-from dehydrator import Dehydrator, SelfContainmentError
+from dehydrator import (
+    Dehydrator,
+    SelfContainmentError,
+    _safe_chat_completion_diagnostics,
+)
 from decay_engine import DecayEngine
 from consolidation_engine import ConsolidationEngine
 from episode_engine import EpisodeEngine
@@ -1621,6 +1625,13 @@ async def _ds_semantic_select(
     raw = resp.choices[0].message.content if resp.choices else ""
     idxs = _parse_ds_keep_indices(raw, len(buckets))
     if idxs is None:
+        logger.error(
+            "DS filter received invalid DeepSeek response raw_chars=%d "
+            "raw_sha256=%s response=%s",
+            len(raw),
+            hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            _safe_chat_completion_diagnostics(resp),
+        )
         raise ValueError("invalid DeepSeek recall selection payload")
     keep_idx = set(idxs)
     selected = [

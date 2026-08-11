@@ -41,6 +41,7 @@ from redact import redact_embedding_input  # 出本地去外部 LLM 前脱敏
 logger = logging.getLogger("ombre_brain.dehydrator")
 
 MIN_DEHYDRATION_SUMMARY_CHARS = 10
+BRIEFING_TOTAL_TIMEOUT_SECONDS = 15.0
 READ_ONLY_DEHYDRATION_CACHE_LIMIT = 256
 RECALL_DEHYDRATION_CACHE_LIMIT = 8192
 RECALL_DEHYDRATION_CACHE_SCHEMA_V1 = "ombre.recall-dehydration/v1"
@@ -668,6 +669,94 @@ _BRIEFING_WEAK_RELATIVE_TIME_RE = re.compile(
 _BRIEFING_QUOTED_SPAN_RE = re.compile(
     r"“[^”]*”|「[^」]*」|『[^』]*』|\"[^\"]*\"|'[^']*'"
 )
+
+
+def _safe_chat_completion_diagnostics(response) -> str:
+    """Serialize response metadata without logging generated/private text."""
+    try:
+        if hasattr(response, "model_dump"):
+            payload = response.model_dump(mode="json")
+        else:
+            payload = {
+                key: getattr(response, key, None)
+                for key in (
+                    "id", "object", "created", "model", "service_tier",
+                    "system_fingerprint", "usage", "choices",
+                )
+            }
+    except Exception as exc:
+        return json.dumps(
+            {
+                "response_type": type(response).__name__,
+                "diagnostic_error": type(exc).__name__,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    if not isinstance(payload, dict):
+        payload = {"response_type": type(response).__name__}
+
+    safe = {
+        key: payload.get(key)
+        for key in (
+            "id", "object", "created", "model", "service_tier",
+            "system_fingerprint", "usage",
+        )
+        if payload.get(key) is not None
+    }
+    safe["request_id"] = getattr(response, "_request_id", None)
+
+    source_choices = payload.get("choices")
+    if not isinstance(source_choices, list):
+        source_choices = list(getattr(response, "choices", None) or [])
+    safe_choices = []
+    for position, choice in enumerate(source_choices):
+        if isinstance(choice, dict):
+            message = choice.get("message") or {}
+            finish_reason = choice.get("finish_reason")
+            index = choice.get("index", position)
+        else:
+            message = getattr(choice, "message", None)
+            finish_reason = getattr(choice, "finish_reason", None)
+            index = getattr(choice, "index", position)
+
+        def _message_value(name):
+            if isinstance(message, dict):
+                return message.get(name)
+            return getattr(message, name, None) if message is not None else None
+
+        content = _message_value("content")
+        reasoning = _message_value("reasoning_content")
+        refusal = _message_value("refusal")
+        tool_calls = _message_value("tool_calls")
+        safe_choices.append({
+            "index": index,
+            "finish_reason": finish_reason,
+            "content_chars": len(content) if isinstance(content, str) else 0,
+            "reasoning_content_chars": (
+                len(reasoning) if isinstance(reasoning, str) else 0
+            ),
+            "refusal_chars": len(refusal) if isinstance(refusal, str) else 0,
+            "tool_call_count": len(tool_calls) if isinstance(tool_calls, list) else 0,
+        })
+    safe["choices"] = safe_choices
+    return json.dumps(safe, ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _briefing_material_fallback(raw_material: str, max_chars: int) -> str:
+    """Return a bounded, already-redacted source excerpt when compression fails."""
+    material = (raw_material or "").strip()
+    if material.startswith("=== 当前时点 ==="):
+        _, separator, remainder = material.partition("\n\n")
+        if separator and remainder.strip():
+            material = remainder.strip()
+    prefix = "【简报压缩未完成，以下为已脱敏素材摘录】\n"
+    limit = max(1, int(max_chars or 1))
+    if not material:
+        return prefix[:limit].strip()
+    room = max(0, limit - len(prefix))
+    return (prefix + material[:room]).strip()[:limit]
 
 
 def _briefing_relative_time_violations(text: str) -> list[str]:
@@ -2242,41 +2331,88 @@ class Dehydrator:
         # Briefing token budget: ~1.5 chars/token for Chinese, +30% headroom
         # 简报 token 预算：中文约 1.5 字/token，留 30% 余量
         briefing_max_tokens = int(max_chars / 1.5 * 1.3)
-        violations: list[str] = []
-        for attempt in range(2):
-            retry_rule = ""
-            if attempt:
-                retry_rule = (
-                    "\n\n【上次输出因含弱相对时间词被程序拒绝。必须重写："
-                    "只用 YYYY-MM-DD 或『上一窗』，不得出现"
-                    + "/".join(violations)
-                    + "。】"
+        sent_material = raw_material[:20000]
+        fallback = _briefing_material_fallback(raw_material, max_chars)
+
+        async def _generate() -> str | None:
+            violations: list[str] = []
+            for attempt in range(2):
+                retry_rule = ""
+                if attempt:
+                    retry_rule = (
+                        "\n\n【上次输出因含弱相对时间词被程序拒绝。必须重写："
+                        "只用 YYYY-MM-DD 或『上一窗』，不得出现"
+                        + "/".join(violations)
+                        + "。】"
+                    )
+                logger.info(
+                    "Briefing LLM attempt=%d material_chars=%d sent_chars=%d "
+                    "max_chars=%d max_tokens=%d total_timeout_seconds=%.1f",
+                    attempt + 1,
+                    len(raw_material),
+                    len(sent_material),
+                    max_chars,
+                    briefing_max_tokens,
+                    BRIEFING_TOTAL_TIMEOUT_SECONDS,
                 )
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": prompt + retry_rule},
-                    {"role": "user", "content": raw_material[:20000]},
-                ],
-                max_tokens=briefing_max_tokens,
-                temperature=0,  # zero temp: deterministic, no creative fabrication
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": prompt + retry_rule},
+                        {"role": "user", "content": sent_material},
+                    ],
+                    max_tokens=briefing_max_tokens,
+                    temperature=0,  # zero temp: deterministic, no creative fabrication
+                )
+
+                if not response.choices:
+                    logger.error(
+                        "Briefing DeepSeek response had no choices: %s",
+                        _safe_chat_completion_diagnostics(response),
+                    )
+                    return None
+                result = (response.choices[0].message.content or "").strip()
+                if not result:
+                    logger.error(
+                        "Briefing DeepSeek response had empty content: %s",
+                        _safe_chat_completion_diagnostics(response),
+                    )
+                    return None
+                violations = _briefing_relative_time_violations(result)
+                if not violations:
+                    return result
+                logger.warning(
+                    "Briefing rejected weak relative time terms (attempt %d): %s",
+                    attempt + 1,
+                    ",".join(violations),
+                )
+
+            raise RuntimeError(
+                "简报连续两次包含无日期锚的相对时间词: "
+                + ",".join(violations)
             )
 
-            if not response.choices:
-                return ""
-            result = (response.choices[0].message.content or "").strip()
-            violations = _briefing_relative_time_violations(result)
-            if not violations:
-                return result
-            logger.warning(
-                "Briefing rejected weak relative time terms (attempt %d): %s",
-                attempt + 1,
-                ",".join(violations),
+        try:
+            result = await asyncio.wait_for(
+                _generate(),
+                timeout=BRIEFING_TOTAL_TIMEOUT_SECONDS,
             )
-
-        raise RuntimeError(
-            "简报连续两次包含无日期锚的相对时间词: " + ",".join(violations)
-        )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Briefing exceeded total timeout %.1fs; returning source fallback "
+                "material_chars=%d sent_chars=%d max_tokens=%d",
+                BRIEFING_TOTAL_TIMEOUT_SECONDS,
+                len(raw_material),
+                len(sent_material),
+                briefing_max_tokens,
+            )
+            return fallback
+        if not result:
+            logger.error(
+                "Briefing compression returned no usable text; returning source fallback"
+            )
+            return fallback
+        return result
 
     # ---------------------------------------------------------
     # Recall-before-write arbitration

@@ -1,4 +1,5 @@
 import json
+import logging
 import types
 
 import pytest
@@ -562,6 +563,40 @@ async def test_ds_gate_falls_back_to_capped_on_error(monkeypatch):
         "工程", buckets, mode="search", max_results=2
     )
     assert [b["id"] for b in selected] == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_ds_gate_logs_sanitized_response_metadata_on_invalid_payload(
+    monkeypatch, caplog,
+):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+
+    async def _create(**_kw):
+        msg = types.SimpleNamespace(content="not-json")
+        choice = types.SimpleNamespace(
+            index=0,
+            message=msg,
+            finish_reason="length",
+        )
+        return types.SimpleNamespace(
+            id="ds-response-id",
+            model="deepseek-v4-flash",
+            choices=[choice],
+        )
+
+    monkeypatch.setattr(server, "dehydrator", _fake_dehydrator_with_response(_create))
+    buckets = [_bucket("a", "A"), _bucket("b", "B")]
+    with caplog.at_level(logging.ERROR, logger="ombre_brain"):
+        selected = await server._ds_filter_candidates(
+            "工程", buckets, mode="search", max_results=2
+        )
+
+    assert [b["id"] for b in selected] == ["a", "b"]
+    assert "DS filter received invalid DeepSeek response" in caplog.text
+    assert '"finish_reason": "length"' in caplog.text
+    assert "ds-response-id" in caplog.text
+    assert "not-json" not in caplog.text
 
 
 @pytest.mark.asyncio
