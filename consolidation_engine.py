@@ -36,6 +36,8 @@ logger = logging.getLogger("ombre_brain.consolidation")
 # leave them alone (they legitimately summarize many buckets, not duplicates).
 # episode/saga 是内核 3 的派生叙事层，整理引擎不碰（它们本就是多桶摘要、非重复）。
 _EXEMPT_TYPES = ("permanent", "feel", "archived", "episode", "saga")
+_PAIRWISE_YIELD_EVERY = 64
+_VECTOR_LOAD_YIELD_EVERY = 16
 
 
 class ConsolidationEngine:
@@ -125,7 +127,7 @@ class ConsolidationEngine:
 
         # Load embeddings once.
         embs: dict[str, list] = {}
-        for b in candidates:
+        for index, b in enumerate(candidates, start=1):
             try:
                 emb = await self.embedding_engine.get_embedding(b["id"])
             except Exception as exc:
@@ -135,9 +137,10 @@ class ConsolidationEngine:
                 emb = None
             if emb is not None:
                 embs[b["id"]] = emb
+            if index % _VECTOR_LOAD_YIELD_EVERY == 0:
+                await asyncio.sleep(0)
 
-        pairs, pair_errors = await asyncio.to_thread(
-            self._score_duplicate_pairs,
+        pairs, pair_errors = await self._score_duplicate_pairs(
             candidates,
             embs,
             threshold,
@@ -145,7 +148,7 @@ class ConsolidationEngine:
         self._read_errors.extend(pair_errors)
         return pairs
 
-    def _score_duplicate_pairs(
+    async def _score_duplicate_pairs(
         self,
         candidates: list[dict],
         embs: dict[str, list],
@@ -158,6 +161,7 @@ class ConsolidationEngine:
         prepared: dict[str, object] = {}
         pairs: list[dict] = []
         errors: list[str] = []
+        scored = 0
 
         def prepared_record(bucket_id: str):
             if bucket_id not in prepared:
@@ -170,6 +174,8 @@ class ConsolidationEngine:
 
         for i, a in enumerate(ids):
             for b in ids[i + 1:]:
+                scored += 1
+                sim = None
                 try:
                     sim = self.embedding_engine._max_prepared_similarity(
                         prepared_record(a),
@@ -179,8 +185,10 @@ class ConsolidationEngine:
                     errors.append(
                         f"find_duplicates.cosine:{a}:{b}:{type(exc).__name__}"
                     )
-                    continue
-                if sim >= threshold:
+                else:
+                    if sim < threshold:
+                        sim = None
+                if sim is not None:
                     ma = by_id[a]["metadata"]
                     mb = by_id[b]["metadata"]
                     pairs.append({
@@ -192,6 +200,8 @@ class ConsolidationEngine:
                         "b_len": len(by_id[b].get("content", "") or ""),
                         "similarity": round(sim, 4),
                     })
+                if scored % _PAIRWISE_YIELD_EVERY == 0:
+                    await asyncio.sleep(0)
         pairs.sort(key=lambda p: p["similarity"], reverse=True)
         return pairs[: self.max_report_pairs], errors
 

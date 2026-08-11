@@ -9,7 +9,6 @@
 
 import asyncio
 import math
-import threading
 from datetime import datetime, timedelta
 
 from consolidation_engine import ConsolidationEngine
@@ -137,35 +136,25 @@ def test_find_duplicates_pairs_above_threshold():
     assert pairs[0]["similarity"] >= 0.99
 
 
-def test_find_duplicates_scores_off_event_loop():
-    buckets = [_bucket("A"), _bucket("B")]
-    vecs = {"A": [1.0, 0.0], "B": [1.0, 0.0]}
+def test_find_duplicates_yields_during_vector_load_and_pair_scoring(monkeypatch):
+    buckets = [_bucket(f"B{index}") for index in range(18)]
+    vecs = {
+        bucket["id"]: [1.0, float(index)]
+        for index, bucket in enumerate(buckets)
+    }
     eng, _, _ = _engine(buckets, vecs)
-    release = threading.Event()
-    observed_release: list[bool] = []
-    original = eng._score_duplicate_pairs
+    original_sleep = asyncio.sleep
+    yields: list[float] = []
 
-    def gated_score(candidates, embeddings, threshold):
-        observed_release.append(release.wait(timeout=0.2))
-        return original(candidates, embeddings, threshold)
+    async def observed_sleep(delay: float) -> None:
+        yields.append(delay)
+        await original_sleep(delay)
 
-    eng._score_duplicate_pairs = gated_score
+    monkeypatch.setattr(asyncio, "sleep", observed_sleep)
 
-    async def run() -> list[dict]:
-        async def release_from_loop() -> None:
-            await asyncio.sleep(0.01)
-            release.set()
+    asyncio.run(eng.find_duplicates(0.85))
 
-        result, _ = await asyncio.gather(
-            eng.find_duplicates(0.85),
-            release_from_loop(),
-        )
-        return result
-
-    pairs = asyncio.run(run())
-
-    assert observed_release == [True]
-    assert [{pair["a_id"], pair["b_id"]} for pair in pairs] == [{"A", "B"}]
+    assert yields == [0, 0, 0]
 
 
 def test_find_duplicates_supports_single_and_multi_segment_vectors():
