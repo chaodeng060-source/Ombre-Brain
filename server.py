@@ -3302,6 +3302,14 @@ async def _auto_infer_edges(
     if not content or not content.strip():
         return []
 
+    source_bucket = await bucket_mgr.get(source_id)
+    source_meta = (
+        source_bucket.get("metadata", {})
+        if isinstance(source_bucket, dict)
+        else {}
+    )
+    source_name = str(source_meta.get("name") or source_id)
+
     # --- Gather candidates: vector neighbors + keyword search, dedup, exclude self ---
     candidate_ids: list[str] = []
     seen = {source_id}
@@ -3405,6 +3413,7 @@ async def _auto_infer_edges(
                 target,
                 etype,
                 edge.get("note", ""),
+                source_name=source_name,
                 target_name=cand_name_by_id.get(target, target),
             )
             if _get_review_queue().enqueue(entry):
