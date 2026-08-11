@@ -684,14 +684,14 @@ def test_proposer_chunk_cap_rejects_unsafe_config(value: object) -> None:
         )
 
 
-@pytest.mark.parametrize("value", (1, 4, 8))
+@pytest.mark.parametrize("value", (1, 4, 8, 16))
 def test_proposer_concurrency_accepts_bounded_plain_integer(value: int) -> None:
     assert _proposer_concurrency(
         {"lmc5_night": {"proposer_concurrency": value}}
     ) == value
 
 
-@pytest.mark.parametrize("value", (None, True, False, 0, -1, 9, 4.0, "4"))
+@pytest.mark.parametrize("value", (None, True, False, 0, -1, 17, 4.0, "4"))
 def test_proposer_concurrency_rejects_unsafe_config(value: object) -> None:
     with pytest.raises(
         NightRunRuntimeError,
