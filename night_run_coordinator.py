@@ -70,6 +70,14 @@ _SNAPSHOT_RECEIPT_SCHEMA = "ombre.lmc5-snapshot-receipt/v1"
 _METABOLISM_RECEIPT_SCHEMA = "ombre.lmc5-metabolism-receipt/v1"
 _CHUNK_SCHEMA = "ombre.lmc5-redacted-event/v1"
 _REDACTION_VERSION = "redact_obj/v1"
+_RETRYABLE_DISPATCH_CODES = frozenset(
+    {
+        "e.source_write_retryable",
+        "x.write_retryable",
+        "y.source_write_retryable",
+        "z.source_write_retryable",
+    }
+)
 
 
 class NightRunCoordinatorError(RuntimeError):
@@ -422,7 +430,10 @@ class NightRunCoordinator:
                 )
                 terminal_stage = (
                     "deferred"
-                    if counts["proposer_pending_after"] > 0
+                    if (
+                        counts["proposer_pending_after"] > 0
+                        or counts["dispatch_pending_after"] > 0
+                    )
                     else "complete"
                 )
                 completed = self._advance(
@@ -842,6 +853,10 @@ class NightRunCoordinator:
         )
 
     async def _dispatch_pending(self, counts: dict[str, int]) -> None:
+        counts["dispatch_attempted"] = 0
+        counts["dispatch_retryable"] = 0
+        counts["dispatch_circuit_breaker"] = 0
+        consecutive_errors = 0
         after: int | None = None
         while True:
             rows = self.ledger.list_candidates(
@@ -850,13 +865,49 @@ class NightRunCoordinator:
                 after=after,
             )
             if not rows:
+                counts["dispatch_pending_after"] = (
+                    self._pending_candidate_counts()[0]
+                )
                 return
             for record in rows:
                 # M remains pending until both report-only engines have
                 # completed.  Leaving it here must not make this page spin.
                 if record.axis == "M":
                     continue
-                await self._dispatch_candidate(record, counts)
+                counts["dispatch_attempted"] += 1
+                try:
+                    await self._dispatch_candidate(record, counts)
+                except NightRunCoordinatorError as exc:
+                    if exc.code not in _RETRYABLE_DISPATCH_CODES:
+                        raise
+                    counts["dispatch_retryable"] += 1
+                    error_key = f"dispatch_retryable_{exc.code.replace('.', '_')}"
+                    counts[error_key] = counts.get(error_key, 0) + 1
+                    consecutive_errors += 1
+                    if consecutive_errors >= 3:
+                        counts["dispatch_circuit_breaker"] = 1
+                        counts["dispatch_pending_after"] = (
+                            self._pending_candidate_counts()[0]
+                        )
+                        return
+                    continue
+                consecutive_errors = 0
+            after = rows[-1].candidate_id
+
+    def _pending_candidate_counts(self) -> tuple[int, int]:
+        dispatch_count = 0
+        metabolism_count = 0
+        after: int | None = None
+        while True:
+            rows = self.ledger.list_candidates(
+                "pending",
+                limit=self.policy.pending_page_size,
+                after=after,
+            )
+            if not rows:
+                return dispatch_count, metabolism_count
+            dispatch_count += sum(record.axis != "M" for record in rows)
+            metabolism_count += sum(record.axis == "M" for record in rows)
             after = rows[-1].candidate_id
 
     async def _dispatch_candidate(
@@ -1351,6 +1402,10 @@ class NightRunCoordinator:
             "proposer_quarantined",
             "proposer_circuit_breaker",
             "proposer_wall_budget_exhausted",
+            "dispatch_attempted",
+            "dispatch_retryable",
+            "dispatch_pending_after",
+            "dispatch_circuit_breaker",
         )
         if any(key not in counts for key in required_counts):
             raise NightRunCoordinatorError("validation.proposer_counts")
@@ -1373,7 +1428,25 @@ class NightRunCoordinator:
             or backlog.quarantined != counts["proposer_quarantined"]
         ):
             raise NightRunCoordinatorError("validation.proposer_counts")
-        if self.ledger.list_candidates("pending", limit=1):
+        dispatch_attempted = counts["dispatch_attempted"]
+        dispatch_retryable = counts["dispatch_retryable"]
+        dispatch_pending = counts["dispatch_pending_after"]
+        dispatch_breaker = counts["dispatch_circuit_breaker"]
+        if (
+            dispatch_retryable > dispatch_attempted
+            or dispatch_breaker not in {0, 1}
+            or (dispatch_breaker and dispatch_retryable < 3)
+            or (not dispatch_breaker and dispatch_pending != dispatch_retryable)
+            or (dispatch_breaker and dispatch_pending < dispatch_retryable)
+        ):
+            raise NightRunCoordinatorError("validation.dispatch_counts")
+        live_dispatch_pending, live_metabolism_pending = (
+            self._pending_candidate_counts()
+        )
+        if (
+            live_dispatch_pending != dispatch_pending
+            or live_metabolism_pending != 0
+        ):
             raise NightRunCoordinatorError("validation.candidate_pending")
         if self.ledger.list_candidates("error", limit=1):
             raise NightRunCoordinatorError("validation.candidate_error")

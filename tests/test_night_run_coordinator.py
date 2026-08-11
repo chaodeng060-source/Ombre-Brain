@@ -1145,15 +1145,18 @@ async def test_real_x_write_retries_without_duplicate_bucket(
         '{"message":"朝灯今晚想看星星"}',
     )
 
-    with pytest.raises(NightRunCoordinatorError) as raised:
-        await coordinator.run(
-            run_id="night-real-write-r1",
-            cutoff=datetime.now(timezone.utc),
-        )
+    first = await coordinator.run(
+        run_id="night-real-write-r1",
+        cutoff=datetime.now(timezone.utc),
+    )
 
-    assert raised.value.code == "x.write_retryable"
-    assert ledger.get_night_run("night-real-write-r1").stage == "error"
-    assert len(ledger.list_candidates("pending")) == 2
+    assert first.run.stage == "deferred"
+    assert first.counts["dispatch_attempted"] == 1
+    assert first.counts["dispatch_retryable"] == 1
+    assert first.counts["dispatch_pending_after"] == 1
+    assert first.counts["dispatch_circuit_breaker"] == 0
+    assert first.counts["m_computed"] == 1
+    assert len(ledger.list_candidates("pending")) == 1
 
     second = await coordinator.run(
         run_id="night-real-write-r2",
@@ -1187,3 +1190,91 @@ async def test_real_x_write_retries_without_duplicate_bucket(
     assert seed_after is not None
     assert seed_after["content"] == seed_before["content"]
     assert seed_after["metadata"] == seed_before["metadata"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_retryable_candidate_does_not_block_later_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _harness(tmp_path)
+    records = (
+        SimpleNamespace(candidate_id=1, axis="X"),
+        SimpleNamespace(candidate_id=2, axis="E"),
+    )
+    statuses = {1: "pending", 2: "pending"}
+    seen: list[int] = []
+
+    def list_candidates(
+        status: str,
+        *,
+        limit: int,
+        after: int | None = None,
+    ):
+        return tuple(
+            record
+            for record in records
+            if statuses[record.candidate_id] == status
+            and (after is None or record.candidate_id > after)
+        )[:limit]
+
+    async def dispatch(record, _counts) -> None:
+        seen.append(record.candidate_id)
+        if record.candidate_id == 1:
+            raise NightRunCoordinatorError("x.write_retryable")
+        statuses[record.candidate_id] = "ready"
+
+    monkeypatch.setattr(harness.ledger, "list_candidates", list_candidates)
+    monkeypatch.setattr(harness.coordinator, "_dispatch_candidate", dispatch)
+    counts: dict[str, int] = {}
+
+    await harness.coordinator._dispatch_pending(counts)
+
+    assert seen == [1, 2]
+    assert counts["dispatch_attempted"] == 2
+    assert counts["dispatch_retryable"] == 1
+    assert counts["dispatch_pending_after"] == 1
+    assert counts["dispatch_circuit_breaker"] == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_three_consecutive_retryables_open_circuit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _harness(tmp_path)
+    records = tuple(
+        SimpleNamespace(candidate_id=index, axis="X")
+        for index in range(1, 5)
+    )
+    seen: list[int] = []
+
+    def list_candidates(
+        status: str,
+        *,
+        limit: int,
+        after: int | None = None,
+    ):
+        if status != "pending":
+            return ()
+        return tuple(
+            record
+            for record in records
+            if after is None or record.candidate_id > after
+        )[:limit]
+
+    async def dispatch(record, _counts) -> None:
+        seen.append(record.candidate_id)
+        raise NightRunCoordinatorError("x.write_retryable")
+
+    monkeypatch.setattr(harness.ledger, "list_candidates", list_candidates)
+    monkeypatch.setattr(harness.coordinator, "_dispatch_candidate", dispatch)
+    counts: dict[str, int] = {}
+
+    await harness.coordinator._dispatch_pending(counts)
+
+    assert seen == [1, 2, 3]
+    assert counts["dispatch_attempted"] == 3
+    assert counts["dispatch_retryable"] == 3
+    assert counts["dispatch_pending_after"] == 4
+    assert counts["dispatch_circuit_breaker"] == 1
