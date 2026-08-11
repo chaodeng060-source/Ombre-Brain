@@ -1059,13 +1059,27 @@ class LMC5Ledger:
             return
         for suffix in ("", "-wal", "-shm"):
             candidate = Path(f"{self.path}{suffix}")
+            descriptor = None
             try:
-                if candidate.exists():
-                    file_stat = candidate.lstat()
-                    if stat.S_ISREG(file_stat.st_mode):
-                        os.chmod(candidate, 0o600)
+                descriptor = os.open(
+                    candidate,
+                    os.O_RDONLY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
+                file_stat = os.fstat(descriptor)
+                if stat.S_ISREG(file_stat.st_mode):
+                    os.fchmod(descriptor, 0o600)
+            except FileNotFoundError:
+                # SQLite may remove WAL/SHM between concurrent transactions.
+                # A vanished optional sidecar is already secure; it is not a
+                # failure of the durable main ledger.
+                continue
             except OSError as exc:
                 raise LedgerSecurityError("unable to secure ledger files") from exc
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
 
     @staticmethod
     def _quick_check(connection: sqlite3.Connection, *, deep: bool = False) -> None:
