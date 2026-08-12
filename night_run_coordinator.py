@@ -596,6 +596,7 @@ class NightRunCoordinator:
                 return await self.proposer.propose(
                     (ProposerChunk(id=pending.chunk_id, text=text),),
                     relation_targets,
+                    retry_error_code=pending.latest_error_code,
                 )
 
             return await asyncio.wait_for(call(), timeout=timeout)

@@ -888,6 +888,80 @@ async def test_evidence_repair_is_attempted_only_once():
 
 
 @pytest.mark.asyncio
+async def test_historical_retry_starts_with_latest_targeted_repair():
+    prompts = []
+
+    async def provider(prompt):
+        prompts.append(prompt)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            _document(_candidate(relation_hints=[]))
+                        )
+                    }
+                }
+            ]
+        }
+
+    batch = await StrictOmbreProposer(provider).propose(
+        CHUNKS,
+        retry_error_code="schema_relation",
+    )
+
+    assert len(batch.candidates) == 1
+    assert len(prompts) == 1
+    assert "REPAIR ONE MODEL CONTRACT ERROR (schema_relation)" in prompts[0]
+    assert "Return at most 4 high-signal candidates" in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_historical_retry_does_not_repeat_same_deterministic_repair():
+    prompts = []
+    invalid = json.dumps(
+        _document(_candidate(relation_hints=[_relation(strength="0.8")]))
+    )
+
+    async def provider(prompt):
+        prompts.append(prompt)
+        return {"choices": [{"message": {"content": invalid}}]}
+
+    with pytest.raises(ProposerContractError) as caught:
+        await StrictOmbreProposer(provider).propose(
+            CHUNKS,
+            frozenset({"bucket-1"}),
+            retry_error_code="schema_relation",
+        )
+
+    assert caught.value.code == "schema_relation"
+    assert len(prompts) == 1
+    assert "REPAIR ONE MODEL CONTRACT ERROR (schema_relation)" in prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_nonrepairable_historical_error_keeps_normal_first_prompt():
+    prompts = []
+
+    async def provider(prompt):
+        prompts.append(prompt)
+        return {
+            "choices": [
+                {"message": {"content": json.dumps(_document(_candidate()))}}
+            ]
+        }
+
+    await StrictOmbreProposer(provider).propose(
+        CHUNKS,
+        retry_error_code="provider.timeout",
+    )
+
+    assert len(prompts) == 1
+    assert "REPAIR ONE MODEL CONTRACT ERROR" not in prompts[0]
+    assert "Return at most 8 high-signal candidates" in prompts[0]
+
+
+@pytest.mark.asyncio
 async def test_contract_repair_enforces_compact_candidate_bound():
     prompts = []
     responses = iter(

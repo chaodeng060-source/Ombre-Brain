@@ -335,6 +335,7 @@ class PendingProposerChunk:
     source_event_ids: tuple[EventIdentity, ...]
     created_at: str
     retry_count: int
+    latest_error_code: str | None
 
 
 @dataclass(frozen=True)
@@ -1667,7 +1668,15 @@ class LMC5Ledger:
                            FROM chunk_proposer_outcomes retry
                            WHERE retry.chunk_id = ec.chunk_id
                              AND retry.outcome = 'retryable_error'
-                       ) AS retry_count
+                       ) AS retry_count,
+                       (
+                           SELECT retry.error_code
+                           FROM chunk_proposer_outcomes retry
+                           WHERE retry.chunk_id = ec.chunk_id
+                             AND retry.outcome = 'retryable_error'
+                           ORDER BY retry.id DESC
+                           LIMIT 1
+                       ) AS latest_error_code
                 FROM event_chunks ec
                 WHERE ec.rowid > ?
                   AND (? IS NULL OR ec.rowid <= ?)
@@ -1726,6 +1735,7 @@ class LMC5Ledger:
                         source_event_ids=sources,
                         created_at=row["created_at"],
                         retry_count=int(row["retry_count"]),
+                        latest_error_code=row["latest_error_code"],
                     )
                 )
             connection.commit()
