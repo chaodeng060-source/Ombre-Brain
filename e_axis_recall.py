@@ -297,10 +297,20 @@ def group_candidate_rows(
 def group_primary_authored_buckets(
     buckets: Iterable[object],
     config: EAxisRecallConfig,
+    *,
+    authored_by: str = "claude",
 ) -> dict[str, tuple[dict, ...]]:
-    """Build live E rows only from immutable primary-authored bucket metadata."""
+    """Build live E rows for exactly one named primary agent.
+
+    E records are first-person experience.  Mixing authors would let one
+    agent's feelings steer another agent's response posture, so a missing
+    author scope fails closed instead of widening to every authored bucket.
+    """
 
     if not config.enabled:
+        return {}
+    expected_author = str(authored_by or "").strip()
+    if not expected_author:
         return {}
     grouped: dict[str, list[dict]] = {}
     for bucket in buckets:
@@ -316,6 +326,7 @@ def group_primary_authored_buckets(
             type(author) is not str
             or not author.strip()
             or author != author.strip()
+            or author != expected_author
             or type(priority) is not int
             or isinstance(priority, bool)
             or not 1 <= priority <= 100

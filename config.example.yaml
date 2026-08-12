@@ -128,6 +128,8 @@ e_axis_shadow:
 # 只消费主对话 AI 亲自写入桶内的 E 元数据与不可变初始优先级。DeepSeek 等模型
 # 的 E0/shadow 行永远只是 proposal，不参与正式召回。投影只在既有相关性窄带内
 # 细排；显式情绪查询最多补 1 条 supporting experience，并注入回应姿态。
+# breath 默认只使用 e_authored_by=claude；共享服务上的其他 AI 必须显式传
+# 自己的 author id，绝不把一个 AI 的第一人称体验投影给另一个 AI。
 # 它不能覆盖事实或跨过 Z 轴；关闭 enabled 即恢复旧召回，不改账本/桶。
 e_axis_recall:
   enabled: true

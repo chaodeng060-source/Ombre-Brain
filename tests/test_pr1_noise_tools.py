@@ -384,7 +384,42 @@ async def test_api_breath_forwards_anchor_policy(monkeypatch):
 
     payload = json.loads(response.body)
     assert observed["policy"] == "conversation"
+    assert observed["e_authored_by"] == "claude"
     assert payload["policy"] == "conversation"
+
+
+@pytest.mark.asyncio
+async def test_api_breath_forwards_explicit_e_author(monkeypatch):
+    observed = {}
+
+    async def fake_breath(**kwargs):
+        observed.update(kwargs)
+        return "未找到相关记忆。"
+
+    monkeypatch.setattr(server, "breath", fake_breath)
+    response = await server.api_breath(
+        _JsonRequest({"query": "难过时怎么办", "e_authored_by": "xiaojuan"})
+    )
+
+    assert response.status_code == 200
+    assert observed["e_authored_by"] == "xiaojuan"
+
+
+@pytest.mark.asyncio
+async def test_api_breath_explicit_blank_disables_e_projection(monkeypatch):
+    observed = {}
+
+    async def fake_breath(**kwargs):
+        observed.update(kwargs)
+        return "未找到相关记忆。"
+
+    monkeypatch.setattr(server, "breath", fake_breath)
+    response = await server.api_breath(
+        _JsonRequest({"query": "难过时怎么办", "e_authored_by": ""})
+    )
+
+    assert response.status_code == 200
+    assert observed["e_authored_by"] == ""
 
 
 @pytest.mark.asyncio

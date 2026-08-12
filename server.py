@@ -3476,12 +3476,13 @@ async def breath(
     since: str = "",
     until: str = "",
     session_id: str = "",
+    e_authored_by: str = "claude",
     policy: str = "search",
     include_images: bool = True,
     include_body_state: bool = True,
     reset_body_state: bool = False,
 ) -> str | list[TextContent | ImageContent]:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认6000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制注入数量上限(默认8,最大50; 内部仍先召回20条给过滤器)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿安全关系边双向召回邻居的跳数(默认1,0=关闭,最大2)，关联证据单独列出且不改变主排序。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。session_id=同一会话内对已浮现动态桶去重。include_images=True时,白名单图桶会随文本返回 MCP image content。include_body_state=False时只关闭外部身体状态块,不改变记忆检索。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认6000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制注入数量上限(默认8,最大50; 内部仍先召回20条给过滤器)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿安全关系边双向召回邻居的跳数(默认1,0=关闭,最大2)，关联证据单独列出且不改变主排序。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。session_id=同一会话内对已浮现动态桶去重。e_authored_by=只允许该具名AI自己的E轴体验参与细排/旁证，空值关闭E投影。include_images=True时,白名单图桶会随文本返回 MCP image content。include_body_state=False时只关闭外部身体状态块,不改变记忆检索。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。"""
     with recall_stage("setup"):
         await _ensure_decay_background()
         await _ensure_consolidation_background()
@@ -3735,6 +3736,7 @@ async def breath(
             e_rows_by_bucket = group_primary_authored_buckets(
                 e_buckets,
                 e_recall_cfg,
+                authored_by=e_authored_by,
             )
     except Exception as exc:
         # E is an optional behavioural projection.  A corrupt ledger or bad
@@ -8022,6 +8024,11 @@ async def api_breath(request):
 
     requested_policy = str(body.get("policy") or "search").strip().lower()
     recall_policy = _normalize_anchor_recall_policy(requested_policy)
+    e_author_value = (
+        body["e_authored_by"]
+        if "e_authored_by" in body
+        else "claude"
+    )
     timing_token = begin_recall_timing()
     breath_task = None
     partial = False
@@ -8039,6 +8046,7 @@ async def api_breath(request):
                 since=str(body.get("since") or ""),
                 until=str(body.get("until") or ""),
                 session_id=str(body.get("session_id") or ""),
+                e_authored_by=str(e_author_value or ""),
                 policy=recall_policy,
                 include_images=False,
                 include_body_state=False,

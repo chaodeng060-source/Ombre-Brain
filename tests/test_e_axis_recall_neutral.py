@@ -218,6 +218,37 @@ def test_primary_authored_bucket_is_live_without_shadow_authority():
     assert group_primary_authored_buckets([missing_author], cfg) == {}
 
 
+def test_primary_authored_buckets_are_isolated_by_agent():
+    claude = _bucket("claude-e", "我先接住朝灯，再讨论事情。")
+    xiaojuan = _bucket("xiaojuan-e", "我先回源码，不拿口头账作结论。")
+    for bucket, author in ((claude, "claude"), (xiaojuan, "xiaojuan")):
+        bucket["metadata"].update({
+            "e_authored_by": author,
+            "e_initial_priority": 90,
+            "e_valence": -0.2,
+            "e_arousal": 0.4,
+            "e_tension": 0.5,
+            "e_confidence": 1.0,
+            "e_response_tendency": "engage",
+            "e_growth_delta": "growth",
+        })
+    cfg = _live_config()
+
+    assert list(group_primary_authored_buckets([claude, xiaojuan], cfg)) == [
+        "claude-e"
+    ]
+    assert list(group_primary_authored_buckets(
+        [claude, xiaojuan],
+        cfg,
+        authored_by="xiaojuan",
+    )) == ["xiaojuan-e"]
+    assert group_primary_authored_buckets(
+        [claude, xiaojuan],
+        cfg,
+        authored_by="",
+    ) == {}
+
+
 def test_e_reranks_only_inside_existing_relevance_band():
     query = infer_query_emotion("我真的很难过")
     comforting = _bucket("comforting", "难过时先抱住朝灯。")
