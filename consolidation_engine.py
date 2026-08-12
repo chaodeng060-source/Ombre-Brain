@@ -23,6 +23,8 @@
 # ============================================================
 
 import asyncio
+import hashlib
+import json
 import logging
 from datetime import datetime
 
@@ -76,6 +78,13 @@ class ConsolidationEngine:
         self._task: asyncio.Task | None = None
         self._running = False
         self._read_errors: list[str] = []
+        self._duplicate_cache_vector_digests: dict[str, str] | None = None
+        self._duplicate_cache_vector_order: tuple[str, ...] | None = None
+        self._duplicate_cache_fingerprints: dict[str, str] | None = None
+        self._duplicate_cache_pairs: list[dict] | None = None
+        self._duplicate_cache_threshold: float | None = None
+        self._last_duplicate_scan_mode = "full"
+        self._last_duplicate_pairs_scored = 0
 
     @property
     def is_running(self) -> bool:
@@ -140,13 +149,126 @@ class ConsolidationEngine:
             if index % _VECTOR_LOAD_YIELD_EVERY == 0:
                 await asyncio.sleep(0)
 
-        pairs, pair_errors = await self._score_duplicate_pairs(
-            candidates,
-            embs,
-            threshold,
+        cacheable = True
+        vector_digests: dict[str, str] = {}
+        fingerprints: dict[str, str] = {}
+        try:
+            vector_digests = {
+                bucket_id: self._stable_digest(value)
+                for bucket_id, value in embs.items()
+            }
+            fingerprints = {
+                bucket["id"]: self._candidate_fingerprint(bucket)
+                for bucket in candidates
+            }
+        except (TypeError, ValueError, OverflowError):
+            # Cache eligibility must never turn malformed source data into a
+            # green report. The normal scorer below remains authoritative.
+            cacheable = False
+
+        can_increment = bool(
+            cacheable
+            and self._duplicate_cache_vector_digests is not None
+            and self._duplicate_cache_vector_order is not None
+            and self._duplicate_cache_fingerprints is not None
+            and self._duplicate_cache_pairs is not None
+            and self._duplicate_cache_threshold == float(threshold)
+            and self._duplicate_cache_vector_digests.items()
+            <= vector_digests.items()
+            and self._duplicate_cache_fingerprints.items()
+            <= fingerprints.items()
+            and tuple(
+                bucket_id
+                for bucket_id in embs
+                if bucket_id in self._duplicate_cache_vector_digests
+            )
+            == self._duplicate_cache_vector_order
         )
+        if can_increment:
+            old_ids = set(self._duplicate_cache_vector_digests or {})
+            current_ids = list(embs)
+            new_ids = [bucket_id for bucket_id in current_ids if bucket_id not in old_ids]
+            new_set = set(new_ids)
+            new_positions = [
+                index
+                for index, bucket_id in enumerate(current_ids)
+                if bucket_id in new_set
+            ]
+            pair_ids = []
+            for index, left in enumerate(current_ids):
+                if left in new_set:
+                    pair_ids.extend(
+                        (left, right) for right in current_ids[index + 1:]
+                    )
+                    continue
+                pair_ids.extend(
+                    (left, current_ids[position])
+                    for position in new_positions
+                    if position > index
+                )
+            added_pairs, pair_errors = await self._score_pair_ids(
+                candidates,
+                embs,
+                pair_ids,
+                threshold,
+            )
+            pairs = self._top_pairs(
+                [*(self._duplicate_cache_pairs or []), *added_pairs],
+                current_ids,
+            )
+            self._last_duplicate_scan_mode = "incremental_append"
+            self._last_duplicate_pairs_scored = len(pair_ids)
+        else:
+            pairs, pair_errors = await self._score_duplicate_pairs(
+                candidates,
+                embs,
+                threshold,
+            )
+            self._last_duplicate_scan_mode = "full"
+            self._last_duplicate_pairs_scored = len(embs) * (len(embs) - 1) // 2
         self._read_errors.extend(pair_errors)
+        if not self._read_errors and cacheable:
+            self._duplicate_cache_vector_digests = dict(vector_digests)
+            self._duplicate_cache_vector_order = tuple(embs)
+            self._duplicate_cache_fingerprints = dict(fingerprints)
+            self._duplicate_cache_pairs = [dict(pair) for pair in pairs]
+            self._duplicate_cache_threshold = float(threshold)
+        else:
+            self._clear_duplicate_cache()
         return pairs
+
+    @staticmethod
+    def _stable_digest(value) -> str:
+        payload = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    @classmethod
+    def _candidate_fingerprint(cls, bucket: dict) -> str:
+        meta = bucket.get("metadata", {})
+        domain = meta.get("domain", [])
+        if isinstance(domain, str):
+            domain = [domain]
+        return cls._stable_digest({
+            "content_length": len(bucket.get("content", "") or ""),
+            "domain": domain or [],
+            "name": meta.get("name", bucket.get("id")),
+            "pinned": bool(meta.get("pinned")),
+            "protected": bool(meta.get("protected")),
+            "type": meta.get("type"),
+        })
+
+    def _clear_duplicate_cache(self) -> None:
+        self._duplicate_cache_vector_digests = None
+        self._duplicate_cache_vector_order = None
+        self._duplicate_cache_fingerprints = None
+        self._duplicate_cache_pairs = None
+        self._duplicate_cache_threshold = None
 
     async def _score_duplicate_pairs(
         self,
@@ -156,8 +278,27 @@ class ConsolidationEngine:
     ) -> tuple[list[dict], list[str]]:
         """Score one stable vector snapshot without blocking the event loop."""
 
+        ids = list(embs)
+        pair_ids = (
+            (left, right)
+            for index, left in enumerate(ids)
+            for right in ids[index + 1:]
+        )
+        return await self._score_pair_ids(
+            candidates,
+            embs,
+            pair_ids,
+            threshold,
+        )
+
+    async def _score_pair_ids(
+        self,
+        candidates: list[dict],
+        embs: dict[str, list],
+        pair_ids,
+        threshold: float,
+    ) -> tuple[list[dict], list[str]]:
         by_id = {b["id"]: b for b in candidates}
-        ids = list(embs.keys())
         prepared: dict[str, object] = {}
         pairs: list[dict] = []
         errors: list[str] = []
@@ -172,38 +313,54 @@ class ConsolidationEngine:
                 )
             return prepared[bucket_id]
 
-        for i, a in enumerate(ids):
-            for b in ids[i + 1:]:
-                scored += 1
-                sim = None
-                try:
-                    sim = self.embedding_engine._max_prepared_similarity(
-                        prepared_record(a),
-                        prepared_record(b),
-                    )
-                except Exception as exc:
-                    errors.append(
-                        f"find_duplicates.cosine:{a}:{b}:{type(exc).__name__}"
-                    )
-                else:
-                    if sim < threshold:
-                        sim = None
-                if sim is not None:
-                    ma = by_id[a]["metadata"]
-                    mb = by_id[b]["metadata"]
-                    pairs.append({
-                        "a_id": a,
-                        "a_name": ma.get("name", a),
-                        "a_len": len(by_id[a].get("content", "") or ""),
-                        "b_id": b,
-                        "b_name": mb.get("name", b),
-                        "b_len": len(by_id[b].get("content", "") or ""),
-                        "similarity": round(sim, 4),
-                    })
-                if scored % _PAIRWISE_YIELD_EVERY == 0:
-                    await asyncio.sleep(0)
-        pairs.sort(key=lambda p: p["similarity"], reverse=True)
-        return pairs[: self.max_report_pairs], errors
+        for a, b in pair_ids:
+            scored += 1
+            sim = None
+            try:
+                sim = self.embedding_engine._max_prepared_similarity(
+                    prepared_record(a),
+                    prepared_record(b),
+                )
+            except Exception as exc:
+                errors.append(
+                    f"find_duplicates.cosine:{a}:{b}:{type(exc).__name__}"
+                )
+            else:
+                if sim < threshold:
+                    sim = None
+            if sim is not None:
+                ma = by_id[a]["metadata"]
+                mb = by_id[b]["metadata"]
+                pairs.append({
+                    "a_id": a,
+                    "a_name": ma.get("name", a),
+                    "a_len": len(by_id[a].get("content", "") or ""),
+                    "b_id": b,
+                    "b_name": mb.get("name", b),
+                    "b_len": len(by_id[b].get("content", "") or ""),
+                    "similarity": round(sim, 4),
+                })
+            if scored % _PAIRWISE_YIELD_EVERY == 0:
+                await asyncio.sleep(0)
+        return self._top_pairs(pairs, list(embs)), errors
+
+    def _top_pairs(
+        self,
+        pairs: list[dict],
+        vector_order: list[str],
+    ) -> list[dict]:
+        order = {
+            bucket_id: index
+            for index, bucket_id in enumerate(vector_order)
+        }
+        pairs.sort(
+            key=lambda pair: (
+                -float(pair["similarity"]),
+                order[str(pair["a_id"])],
+                order[str(pair["b_id"])],
+            )
+        )
+        return pairs[: self.max_report_pairs]
 
     # ---------------------------------------------------------
     # find_stale — non-exempt, unresolved buckets idle > days.
@@ -314,17 +471,21 @@ class ConsolidationEngine:
             "stale_candidates": stale,
             "report_bucket_id": report_id,
             "errors": operation_errors,
+            "duplicate_scan_mode": self._last_duplicate_scan_mode,
+            "duplicate_pairs_scored": self._last_duplicate_pairs_scored,
         }
         logger.info(
             "Consolidation cycle complete / 整理周期完成: "
             "ok=%s mode=%s dup_pairs=%d stale_count=%d "
-            "would_digest=%d errors=%d",
+            "would_digest=%d errors=%d scan=%s scored=%d",
             result["ok"],
             result["mode"],
             result["dup_pairs"],
             result["stale_count"],
             len(result["would_digest"]),
             len(result["errors"]),
+            result["duplicate_scan_mode"],
+            result["duplicate_pairs_scored"],
         )
         return result
 

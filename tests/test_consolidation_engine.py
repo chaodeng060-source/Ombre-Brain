@@ -157,6 +157,91 @@ def test_find_duplicates_yields_during_vector_load_and_pair_scoring(monkeypatch)
     assert yields == [0, 0, 0]
 
 
+def test_find_duplicates_append_cache_is_exact_and_scores_only_new_pairs():
+    buckets = [_bucket("A"), _bucket("B"), _bucket("C")]
+    vecs = {
+        "A": [1.0, 0.0],
+        "B": [1.0, 0.0],
+        "C": [1.0, 0.0],
+    }
+    eng, bm, emb = _engine(
+        buckets,
+        vecs,
+        cfg={"max_report_pairs": 2},
+    )
+
+    asyncio.run(eng.find_duplicates(0.85))
+    assert eng._last_duplicate_scan_mode == "full"
+    assert eng._last_duplicate_pairs_scored == 3
+
+    new_bucket = _bucket("D")
+    bm._buckets = {"D": new_bucket, **bm._buckets}
+    emb._vecs["D"] = [1.0, 0.0]
+    incremental = asyncio.run(eng.find_duplicates(0.85))
+
+    fresh, _, _ = _engine(
+        [new_bucket, *buckets],
+        {**vecs, "D": [1.0, 0.0]},
+        cfg={"max_report_pairs": 2},
+    )
+    full = asyncio.run(fresh.find_duplicates(0.85))
+
+    assert incremental == full
+    assert eng._last_duplicate_scan_mode == "incremental_append"
+    assert eng._last_duplicate_pairs_scored == 3
+
+
+def test_find_duplicates_unchanged_cache_reuses_exact_top_pairs():
+    buckets = [_bucket("A"), _bucket("B"), _bucket("C")]
+    vecs = {
+        "A": [1.0, 0.0],
+        "B": [1.0, 0.0],
+        "C": [0.0, 1.0],
+    }
+    eng, _, _ = _engine(buckets, vecs)
+
+    first = asyncio.run(eng.find_duplicates(0.85))
+    second = asyncio.run(eng.find_duplicates(0.85))
+
+    assert second == first
+    assert eng._last_duplicate_scan_mode == "incremental_append"
+    assert eng._last_duplicate_pairs_scored == 0
+
+
+def test_find_duplicates_changed_existing_vector_falls_back_to_full_scan():
+    buckets = [_bucket("A"), _bucket("B"), _bucket("C")]
+    vecs = {
+        "A": [1.0, 0.0],
+        "B": [1.0, 0.0],
+        "C": [0.0, 1.0],
+    }
+    eng, _, emb = _engine(buckets, vecs)
+    asyncio.run(eng.find_duplicates(0.85))
+
+    emb._vecs["B"] = [0.0, 1.0]
+    changed = asyncio.run(eng.find_duplicates(0.85))
+
+    fresh, _, _ = _engine(buckets, dict(emb._vecs))
+    expected = asyncio.run(fresh.find_duplicates(0.85))
+    assert changed == expected
+    assert eng._last_duplicate_scan_mode == "full"
+    assert eng._last_duplicate_pairs_scored == 3
+
+
+def test_find_duplicates_changed_existing_metadata_falls_back_to_full_scan():
+    buckets = [_bucket("A"), _bucket("B")]
+    vecs = {"A": [1.0, 0.0], "B": [1.0, 0.0]}
+    eng, bm, _ = _engine(buckets, vecs)
+    asyncio.run(eng.find_duplicates(0.85))
+
+    bm._buckets["B"]["metadata"]["pinned"] = True
+    pairs = asyncio.run(eng.find_duplicates(0.85))
+
+    assert pairs == []
+    assert eng._last_duplicate_scan_mode == "full"
+    assert eng._last_duplicate_pairs_scored == 0
+
+
 def test_find_duplicates_supports_single_and_multi_segment_vectors():
     buckets = [_bucket("SINGLE"), _bucket("MULTI"), _bucket("OTHER")]
     vecs = {
