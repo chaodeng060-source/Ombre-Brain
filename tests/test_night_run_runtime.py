@@ -1070,7 +1070,7 @@ def test_trigger_ignores_proxy_environment_and_uses_origin_form(
     result = night_run_trigger.trigger()
 
     assert result["ok"] is True
-    assert observed["connect"] == ("127.0.0.1", 8000, 3600)
+    assert observed["connect"] == ("127.0.0.1", 8000, 7200)
     method, path, body, headers = observed["request"]
     assert method == "POST"
     assert path == "/api/maintenance/lmc5-night"

@@ -18,6 +18,7 @@ HOST = "127.0.0.1"
 PORT = 8000
 PATH = "/api/maintenance/lmc5-night"
 MAX_RESPONSE_BYTES = 64 * 1024
+RESPONSE_TIMEOUT_SECONDS = 2 * 60 * 60
 
 
 class NightTriggerHTTPError(RuntimeError):
@@ -49,7 +50,12 @@ def trigger() -> dict[str, object]:
     token = os.environ.get("OMBRE_API_TOKEN", "")
     if not token:
         raise RuntimeError("api token is unavailable")
-    connection = HTTPConnection(HOST, PORT, timeout=3600)
+    # A full conservative run can legitimately take more than one hour while
+    # draining a historical proposer backlog.  Keep the authenticated local
+    # request alive long enough to receive its terminal ledger receipt; an
+    # early client timeout does not cancel the server-side run and makes the
+    # catch-up wrapper mistake healthy work for a failed round.
+    connection = HTTPConnection(HOST, PORT, timeout=RESPONSE_TIMEOUT_SECONDS)
     try:
         connection.request(
             "POST",
