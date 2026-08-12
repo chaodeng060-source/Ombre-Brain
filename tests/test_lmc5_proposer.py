@@ -95,6 +95,61 @@ async def test_exact_valid_empty_is_the_only_empty_success():
     assert len(batch.prompt_digest) == len(batch.output_digest) == 64
 
 
+def test_prompt_schema_types_match_the_strict_validator_contract():
+    proposer = _proposer(json.dumps(_document()))
+    prompt = proposer._build_prompt(
+        CHUNKS,
+        frozenset({"bucket-1"}),
+        max_candidates=4,
+    )
+    rules, raw_payload = prompt.split("\nINPUT=", 1)
+    payload = json.loads(raw_payload)
+    schema = payload["output_schema"]
+    candidate = schema["properties"]["candidates"]["items"]
+    fields = candidate["properties"]
+    relation = fields["relation_hints"]["items"]["properties"]
+
+    assert "JSON Schema description, not a response template" in rules
+    assert schema["properties"]["schema_version"] == {"const": 1}
+    assert schema["properties"]["candidates"]["maxItems"] == 4
+    assert fields["type"] == {
+        "type": "string",
+        "enum": sorted(CANDIDATE_TYPES),
+    }
+    assert fields["importance"]["type"] == "integer"
+    assert fields["risk"]["type"] == "string"
+    assert relation["relation_type"] == {
+        "type": "string",
+        "enum": sorted(RELATION_TYPES),
+    }
+    assert relation["target_id"] == {
+        "type": "string",
+        "enum": ["bucket-1"],
+    }
+    assert relation["strength"]["type"] == "number"
+    assert fields["source_chunk_ids"]["items"]["enum"] == [
+        "chunk-1",
+        "chunk-2",
+    ]
+    assert fields["evidence"]["type"] == "string"
+
+
+def test_prompt_schema_makes_relations_impossible_without_allowed_targets():
+    proposer = _proposer(json.dumps(_document()))
+    prompt = proposer._build_prompt(
+        CHUNKS,
+        frozenset(),
+        max_candidates=4,
+    )
+    payload = json.loads(prompt.split("\nINPUT=", 1)[1])
+    relation_hints = payload["output_schema"]["properties"]["candidates"][
+        "items"
+    ]["properties"]["relation_hints"]
+
+    assert relation_hints["maxItems"] == 0
+    assert relation_hints["items"]["properties"]["target_id"]["enum"] == []
+
+
 @pytest.mark.asyncio
 async def test_provider_timeout_is_hard_bounded():
     async def slow(_prompt):

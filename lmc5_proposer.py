@@ -80,8 +80,9 @@ _INCOMPLETE_RETRY_INSTRUCTION = (
 )
 _CONTRACT_REPAIR_INSTRUCTION = (
     "REPAIR ONE MODEL CONTRACT ERROR ({code}): Regenerate the whole JSON "
-    "object; do not patch or discuss the prior output. Match every root, "
-    "candidate, and relation key and value type in output_schema exactly. "
+    "object; do not patch or discuss the prior output. Return a JSON instance "
+    "that satisfies every required key, type, enum, and bound in "
+    "output_schema. "
     "Return at most "
     f"{_COMPACT_RETRY_MAX_CANDIDATES} high-signal candidates and prefer fewer "
     "fully valid candidates over repeating a large invalid batch. "
@@ -108,7 +109,7 @@ _CONTRACT_REPAIR_DETAILS = {
     ),
     "schema_relation": (
         "For this relation repair, emit a relation only when all four relation "
-        "fields exactly match output_schema; otherwise use relation_hints:[] "
+        "fields satisfy output_schema; otherwise use relation_hints:[] "
         "for that candidate."
     ),
     "schema_candidate": (
@@ -588,28 +589,82 @@ class StrictOmbreProposer:
         *,
         max_candidates: int,
     ) -> str:
+        relation_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": sorted(_RELATION_FIELDS),
+            "properties": {
+                "relation_type": {
+                    "type": "string",
+                    "enum": sorted(RELATION_TYPES),
+                },
+                "target_id": {
+                    "type": "string",
+                    "enum": sorted(targets),
+                },
+                "strength": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                },
+                "reason": {"type": "string", "minLength": 1},
+            },
+        }
+        candidate_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": sorted(_CANDIDATE_FIELDS),
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": sorted(CANDIDATE_TYPES),
+                },
+                "title": {"type": "string", "minLength": 1},
+                "content": {"type": "string", "minLength": 1},
+                "importance": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                },
+                "thread_hint": {"type": "string"},
+                "relation_hints": {
+                    "type": "array",
+                    "maxItems": 0 if not targets else max_candidates,
+                    "items": relation_schema,
+                },
+                "source_chunk_ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "uniqueItems": True,
+                    "items": {
+                        "type": "string",
+                        "enum": [chunk.id for chunk in chunks],
+                    },
+                },
+                "evidence": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": (
+                        "One exact contiguous substring copied verbatim from "
+                        "the text of a cited source_chunk_id"
+                    ),
+                },
+                "risk": {"type": "string", "enum": sorted(_RISKS)},
+            },
+        }
         schema = {
-            "schema_version": 1,
-            "candidates": [
-                {
-                    "type": sorted(CANDIDATE_TYPES),
-                    "title": "string",
-                    "content": "string",
-                    "importance": "integer 1..10",
-                    "thread_hint": "string",
-                    "relation_hints": [
-                        {
-                            "relation_type": sorted(RELATION_TYPES),
-                            "target_id": "one allowed_relation_target",
-                            "strength": "finite number 0..1",
-                            "reason": "string",
-                        }
-                    ],
-                    "source_chunk_ids": ["unique cited chunk ids"],
-                    "evidence": "non-empty literal substring of a cited chunk",
-                    "risk": sorted(_RISKS),
-                }
-            ],
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": False,
+            "required": sorted(_ROOT_FIELDS),
+            "properties": {
+                "schema_version": {"const": SCHEMA_VERSION},
+                "candidates": {
+                    "type": "array",
+                    "maxItems": max_candidates,
+                    "items": candidate_schema,
+                },
+            },
         }
         payload = {
             "allowed_relation_targets": sorted(targets),
@@ -619,7 +674,9 @@ class StrictOmbreProposer:
             "output_schema": schema,
         }
         rules = (
-            "Return exactly one JSON object and no markdown. Root keys must be "
+            "output_schema is a JSON Schema description, not a response "
+            "template. Return exactly one JSON instance and no markdown. "
+            "Root keys must be "
             "exactly schema_version,candidates. Candidate and relation keys "
             f"must exactly match output_schema. Return at most {max_candidates} "
             "high-signal candidates and prefer fewer concise candidates over "
