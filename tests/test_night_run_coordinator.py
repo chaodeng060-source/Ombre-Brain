@@ -647,29 +647,6 @@ async def test_provider_failure_is_retryable_and_run_is_deferred(
             "SELECT outcome, error_code FROM chunk_proposer_outcomes"
         ).fetchall() == [("retryable_error", "provider.no_choices")]
 
-    retry_codes = []
-
-    class _RetryAwareProposer:
-        async def propose(self, *args: Any, **kwargs: Any) -> ProposerBatch:
-            retry_codes.append(kwargs.get("retry_error_code"))
-            return ProposerBatch(
-                schema_version=1,
-                candidates=(),
-                prompt_digest="a" * 64,
-                output_digest="b" * 64,
-                model="test-model",
-                provider="test-provider",
-            )
-
-    harness.coordinator.proposer = _RetryAwareProposer()
-    retry_outcome = await harness.coordinator.run(
-        run_id="night-provider-error-retry",
-        cutoff=datetime.now(timezone.utc),
-    )
-
-    assert retry_outcome.counts["proposer_succeeded"] == 1
-    assert retry_codes == ["provider.no_choices"]
-
 
 @pytest.mark.asyncio
 async def test_retryable_head_chunk_does_not_block_later_proposals(

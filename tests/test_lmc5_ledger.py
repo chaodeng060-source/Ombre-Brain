@@ -184,18 +184,6 @@ def test_pending_proposer_chunks_require_a_successful_terminal_outcome(tmp_path)
     assert [
         chunk.chunk_id for chunk in ledger.list_pending_proposer_chunks()
     ] == ["chunk-1"]
-    pending = ledger.list_pending_proposer_chunks()[0]
-    assert pending.retry_count == 1
-    assert pending.latest_error_code == "model.timeout"
-    ledger.record_chunk_proposer_outcome(
-        "attempt-error-newer",
-        "chunk-1",
-        "retryable_error",
-        error_code="schema_relation",
-    )
-    pending = ledger.list_pending_proposer_chunks()[0]
-    assert pending.retry_count == 2
-    assert pending.latest_error_code == "schema_relation"
     ledger.record_chunk_proposer_outcome(
         "attempt-retry-success",
         "chunk-1",

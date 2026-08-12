@@ -61,9 +61,6 @@ I/O 密集任务争抢同一数据目录：
 - 单块 provider/合同错误只记录为 `retryable_error`；连续三块错误会熔断本轮。
   重试三次以上的块计入 `proposer_quarantined` 以便审计，但仍保持 pending，
   不伪造成功终态，也不永久丢弃。
-- 历史重试会读取该块最近一次机器错误码；若它属于既有的合同修复集合，
-  第一次请求就使用对应的严格 repair prompt。温度为零时，同一个 repair prompt
-  不会在一轮内原样重发；只有错误类型变化时才使用剩余的一次有界修复机会。
 - 失败或被中断的 run 永久保留为证据；重试使用有界的新 run ID，
   且所有 `-rN` 使用完全相同的固定 cutoff。
 - X 正文先进入冷仓，required 向量成功后才提升；相同 idempotency key

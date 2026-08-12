@@ -369,8 +369,6 @@ class StrictOmbreProposer:
         self,
         chunks: Sequence[ProposerChunk],
         allowed_relation_targets: frozenset[str] = frozenset(),
-        *,
-        retry_error_code: str | None = None,
     ) -> ProposerBatch:
         chunk_tuple, targets = self._validate_input(
             chunks, allowed_relation_targets
@@ -382,39 +380,15 @@ class StrictOmbreProposer:
         )
         self._validate_prompt_size(prompt)
 
-        if retry_error_code is not None and not _is_bounded_text(
-            retry_error_code, 128
-        ):
-            raise ProposerContractError(
-                "input_invalid", "retry error code is not a bounded identifier"
-            )
-
         effective_prompt = prompt
-        max_candidates = _MAX_CANDIDATES
-        if retry_error_code == "provider.incomplete":
-            effective_prompt = self._build_incomplete_retry_prompt(
-                chunk_tuple,
-                targets,
-            )
-            max_candidates = _COMPACT_RETRY_MAX_CANDIDATES
-        elif retry_error_code in _REPAIRABLE_MODEL_CODES:
-            effective_prompt = self._build_contract_repair_prompt(
-                chunk_tuple,
-                targets,
-                retry_error_code,
-            )
-            max_candidates = _COMPACT_RETRY_MAX_CANDIDATES
-        self._validate_prompt_size(effective_prompt)
         try:
             candidates = await self._call_and_validate(
-                effective_prompt,
+                prompt,
                 chunk_tuple,
                 targets,
-                max_candidates=max_candidates,
+                max_candidates=_MAX_CANDIDATES,
             )
         except ProposerContractError as exc:
-            if retry_error_code == exc.code and effective_prompt != prompt:
-                raise
             if exc.code == "provider.incomplete":
                 effective_prompt = self._build_incomplete_retry_prompt(
                     chunk_tuple,
