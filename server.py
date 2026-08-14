@@ -80,6 +80,7 @@ from dehydrator import (
     _safe_chat_completion_diagnostics,
     anchor_memory_relative_time_terms,
     recall_frontmatter_time_contract,
+    sanitize_dehydration_sample_voice,
 )
 from decay_engine import DecayEngine
 from consolidation_engine import ConsolidationEngine
@@ -1878,10 +1879,32 @@ async def _dehydrate_for_recall(
         )
     ):
         record_recall_dehydration("frontmatter_hits")
+        stored_summary = stored_summary.strip()
+        sanitized_summary = sanitize_dehydration_sample_voice(
+            stored_summary,
+            raw_body or content,
+            bucket_metadata,
+        )
+        if sanitized_summary != stored_summary and bucket:
+            writer = getattr(bucket_mgr, "cache_recall_dehydration", None)
+            if callable(writer):
+                try:
+                    await writer(
+                        str(bucket.get("id") or ""),
+                        expected_content_hash=body_hash,
+                        summary=sanitized_summary,
+                        contract=time_contract,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Recall sample_voice cleanup failed for %s: %s",
+                        bucket.get("id"),
+                        type(exc).__name__,
+                    )
         formatter = getattr(dehydrator, "format_dehydration_summary", None)
         if callable(formatter):
-            return formatter(stored_summary.strip(), metadata)
-        return stored_summary.strip()
+            return formatter(sanitized_summary, metadata)
+        return sanitized_summary
 
     with_source = getattr(dehydrator, "dehydrate_with_source", None)
     dehydration_input = anchor_memory_relative_time_terms(content, bucket_metadata)
@@ -1907,6 +1930,19 @@ async def _dehydrate_for_recall(
         )
         raw_summary = rendered
         source = "computed"
+
+    raw_summary = sanitize_dehydration_sample_voice(
+        raw_summary,
+        raw_body or content,
+        bucket_metadata,
+    )
+    if callable(with_source):
+        formatter = getattr(dehydrator, "format_dehydration_summary", None)
+        rendered = (
+            formatter(raw_summary, metadata)
+            if callable(formatter)
+            else raw_summary
+        )
 
     if source == "cached":
         record_recall_dehydration("backfilled")

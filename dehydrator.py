@@ -786,6 +786,71 @@ def anchor_memory_relative_time_terms(
     return f"【记忆发生日：{today}】\n{anchored}"
 
 
+_CHAODENG_QUOTE_ATTRIBUTION_RE = re.compile(
+    r"(?:(?<!跟)(?<!对)(?<!向)朝灯|她)"
+    r"[^。！？\n「」“”]{0,24}"
+    r"(?:说(?:了|过)?|问(?:了)?|一句|原话|回应|表示|告诉|写(?:道)?)"
+    r"[^。！？\n「」“”]{0,4}$"
+)
+
+
+def _explicitly_attributed_to_chaodeng(content: str, quote: str) -> bool:
+    source = str(content or "")
+    needle = str(quote or "").strip()
+    if not needle:
+        return False
+    offset = 0
+    while True:
+        index = source.find(needle, offset)
+        if index < 0:
+            return False
+        sentence_start = max(
+            source.rfind(mark, 0, index)
+            for mark in "。！？\n"
+        ) + 1
+        prefix = source[sentence_start:index].rstrip(" 　：:「『“\"")
+        if _CHAODENG_QUOTE_ATTRIBUTION_RE.search(prefix):
+            return True
+        offset = index + len(needle)
+
+
+def sanitize_dehydration_sample_voice(
+    summary: str,
+    content: str,
+    metadata: dict | None,
+) -> str:
+    """Fail closed on model-attributed ``sample_voice`` for authored E memory.
+
+    ``sample_voice`` is optional and reserved for explicit Chaodeng quotes.  An
+    E memory authored by Claude commonly contains both speakers, so ambiguous
+    or self-authored quotes are removed locally before recall persistence.
+    """
+    author = str((metadata or {}).get("e_authored_by") or "").strip().lower()
+    if not author or author in {"chaodeng", "朝灯"}:
+        return str(summary or "")
+    try:
+        payload = json.loads(str(summary or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return str(summary or "")
+    if not isinstance(payload, dict) or not isinstance(payload.get("sample_voice"), list):
+        return str(summary or "")
+
+    original = payload["sample_voice"]
+    filtered = [
+        voice
+        for voice in original
+        if isinstance(voice, str)
+        and _explicitly_attributed_to_chaodeng(content, voice)
+    ]
+    if filtered == original:
+        return str(summary or "")
+    if filtered:
+        payload["sample_voice"] = filtered
+    else:
+        payload.pop("sample_voice", None)
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def _anchor_relative_time_terms(text: str, now_bj) -> str:
     """Deterministically rewrite weak relative-time words to date-anchored forms.
 

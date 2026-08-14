@@ -7,6 +7,7 @@ from bucket_manager import BucketManager, bucket_revision_hash
 from dehydrator import (
     anchor_memory_relative_time_terms,
     recall_frontmatter_time_contract,
+    sanitize_dehydration_sample_voice,
 )
 from recall_timing import (
     begin_recall_timing,
@@ -227,3 +228,25 @@ async def test_relative_time_frontmatter_requires_dated_contract(monkeypatch):
     assert "新算出的原始摘要" in result
     assert source.calls == 1
     assert manager.writes[0][1]["contract"].endswith(":2026-08-14")
+
+
+def test_e_authored_sample_voice_keeps_only_explicit_chaodeng_quotes():
+    content = (
+        '朝灯问「没推到GitHub吗居然」，'
+        '我又反手说「GitHub 上没有副本」。'
+        '她今天没骂我，只说了「居然」。'
+    )
+    summary = (
+        '{"summary":"归属验证",'
+        '"sample_voice":["没推到GitHub吗居然","GitHub 上没有副本","居然"]}'
+    )
+
+    cleaned = sanitize_dehydration_sample_voice(
+        summary,
+        content,
+        {"e_authored_by": "claude"},
+    )
+
+    assert '"没推到GitHub吗居然"' in cleaned
+    assert '"居然"' in cleaned
+    assert '"GitHub 上没有副本"' not in cleaned
