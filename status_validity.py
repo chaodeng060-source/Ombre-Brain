@@ -33,16 +33,18 @@ _PROTECTED_DOMAINS = frozenset({"恋爱", "纪念日", "约定", "家庭", "自�
 _NARRATIVE_TYPES = frozenset({"feel", "episode", "saga", "permanent"})
 _ENGINEERING_DOMAIN_HINTS = (
     "工程", "编程", "技术", "开发", "运维", "工作进展", "里程碑",
+    "记忆恢复", "记忆库", "备份", "nas",
     "software", "engineering", "programming", "devops",
 )
 _TECHNICAL_CONTENT_HINTS = (
     "任务", "验收", "测试", "代码", "提交", "commit", "push", "分支",
     "branch", "部署", "上线", "发布", "容器", "container", "服务", "server",
     "缓存", "cache", "assembly", "filter", "bug", "接口", "api", "mcp",
+    "nas", "vps", "rsync", "manifest", "cron",
 )
 _STATUS_RE = re.compile(
-    r"(?:已|未|没|尚未)?(?:上线|部署|发布|落地|合入|完成|做完|跑完|收口|通过)"
-    r"|(?:进行中|进度|跑了|回滚|撤回|结案|暂停|停滞|失败|全绿|验收)",
+    r"(?:已|未|没|尚未)?(?:上线|部署|发布|落地|合入|完成|做完|跑完|收口|通过|同步|恢复|修复|重启|备份)"
+    r"|(?:进行中|进度|跑了|回滚|撤回|结案|暂停|停滞|失败|全绿|验收|挂起|待办|计划)",
     re.IGNORECASE,
 )
 _PROGRESS_SNAPSHOT_RE = re.compile(

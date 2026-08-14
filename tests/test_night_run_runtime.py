@@ -1080,6 +1080,46 @@ def test_trigger_ignores_proxy_environment_and_uses_origin_form(
     assert observed["closed"] is True
 
 
+def test_trigger_accepts_explicit_loopback_disaster_runtime_port(
+    monkeypatch,
+) -> None:
+    observed: dict[str, Any] = {}
+
+    class Response:
+        status = 200
+
+        @staticmethod
+        def getheader(_name: str, _default: str = "") -> str:
+            return "application/json"
+
+        @staticmethod
+        def read(_limit: int) -> bytes:
+            return b'{"ok":true,"run_id":"night-vps"}'
+
+    class Connection:
+        def __init__(self, host: str, port: int, *, timeout: int) -> None:
+            observed["connect"] = (host, port, timeout)
+
+        @staticmethod
+        def request(*_args, **_kwargs) -> None:
+            return None
+
+        @staticmethod
+        def getresponse() -> Response:
+            return Response()
+
+        @staticmethod
+        def close() -> None:
+            return None
+
+    monkeypatch.setenv("OMBRE_API_TOKEN", "night-secret-token")
+    monkeypatch.setenv("OMBRE_NIGHT_TRIGGER_PORT", "18080")
+    monkeypatch.setattr(night_run_trigger, "HTTPConnection", Connection)
+
+    assert night_run_trigger.trigger()["run_id"] == "night-vps"
+    assert observed["connect"] == ("127.0.0.1", 18080, 7200)
+
+
 def test_trigger_rejects_redirect_without_following_it(monkeypatch) -> None:
     calls = 0
 

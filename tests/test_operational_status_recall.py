@@ -47,6 +47,35 @@ def test_current_status_query_filters_historical_but_keeps_unknown(monkeypatch):
     assert [bucket["id"] for bucket in kept] == ["current", "unknown"]
 
 
+def test_disaster_policy_drops_unknown_status_but_keeps_non_status(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_get_operational_status_validity_store",
+        lambda: _AttachedStore(),
+    )
+    monkeypatch.setitem(
+        server.config,
+        "status_validity",
+        {"enabled": True, "current_unknown_policy": "drop"},
+    )
+    current = _bucket("current", "NAS 工程已同步", "current")
+    unknown = _bucket("unknown", "NAS 工程尚未同步")
+    recovery_plan = _bucket(
+        "recovery-plan",
+        "记忆正在恢复，NAS 计划周末修复",
+    )
+    recovery_plan["metadata"]["domain"] = ["记忆恢复"]
+    unrelated = _bucket("unrelated", "NAS 放在客厅靠近路由器")
+
+    kept = server._filter_z_fact_candidates(
+        [current, unknown, recovery_plan, unrelated],
+        query="NAS 工程是否同步",
+        intent="fact",
+    )
+
+    assert [bucket["id"] for bucket in kept] == ["current", "unrelated"]
+
+
 def test_status_prefix_never_presents_unmarked_snapshot_as_current():
     profile = server._state_recall_profile("Ombre 缓存上线了吗")
     current = _bucket("current", "Ombre 缓存已上线", "current")

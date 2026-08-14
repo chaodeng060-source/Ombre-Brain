@@ -323,6 +323,9 @@ recall_evidence_roles:
 # <buckets_dir>/.validity/operational_status.sqlite3。关闭后读写链均回到旧行为。
 status_validity:
   enabled: true
+  # keep preserves the normal fail-open behavior. Disaster recovery may set
+  # drop so unverified operational snapshots cannot masquerade as current.
+  current_unknown_policy: keep     # exact enum: keep | drop
 
 # --- State-aware fact recall / 状态感知事实召回 ---
 # 只读取 Z 轴人工批准后写下的 current/historical 双向链；不建新向量库、不调用模型，

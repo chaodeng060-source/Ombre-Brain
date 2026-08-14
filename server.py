@@ -710,6 +710,12 @@ def _operational_status_validity_enabled() -> bool:
     return cfg.get("enabled", True) is True
 
 
+def _drop_unknown_current_status() -> bool:
+    """Fail closed on unverified status snapshots when explicitly configured."""
+    cfg = config.get("status_validity", {}) or {}
+    return cfg.get("current_unknown_policy", "keep") == "drop"
+
+
 def _get_operational_status_validity_store() -> OperationalStatusValidityStore:
     """Bind the additive validity sidecar to the active test/prod vault."""
     global _operational_status_validity_store
@@ -761,14 +767,18 @@ def _filter_z_fact_candidates(buckets, *, query: str, intent: str):
                 type(exc).__name__,
             )
         if profile["operational_view"] == OPERATIONAL_VIEW_CURRENT:
-            candidates = [
-                bucket
-                for bucket in candidates
-                if operational_validity_label(
+            kept = []
+            for bucket in candidates:
+                state = operational_validity_label(
                     bucket,
                     view=profile["operational_view"],
-                ).get("state") != OPERATIONAL_STATE_HISTORICAL
-            ]
+                ).get("state")
+                if state == OPERATIONAL_STATE_HISTORICAL:
+                    continue
+                if state == "unknown" and _drop_unknown_current_status():
+                    continue
+                kept.append(bucket)
+            candidates = kept
     if not profile["enabled"]:
         if query_requests_history(query):
             return candidates
@@ -3750,7 +3760,10 @@ async def breath(
         e_query_emotion = None
         e_rows_by_bucket = {}
     recall_query, raw_entity_ranked = _resolve_entity_recall(query)
-    state_profile = _state_recall_profile(recall_query)
+    # Entity canonicalization may deliberately shorten the retrieval query.
+    # Current/history intent belongs to the user's full question and must not
+    # disappear when an entity alias is resolved.
+    state_profile = _state_recall_profile(query)
     state_seed_by_id: dict[str, dict] = {}
     intent_policy = _resolve_recall_policy(
         recall_query,
@@ -3824,7 +3837,7 @@ async def breath(
                 for bucket in keyword_by_id.values()
                 if _is_main_recall_bucket(bucket)
             ),
-            query=recall_query,
+            query=query,
             intent=intent_policy["intent"],
         )
     except Exception as e:
@@ -3885,7 +3898,7 @@ async def breath(
             state_seed_by_id[str(bid)] = bucket
             if not _filter_z_fact_candidates(
                 [bucket],
-                query=recall_query,
+                query=query,
                 intent=intent_policy["intent"],
             ):
                 continue
@@ -3954,7 +3967,7 @@ async def breath(
         state_seed_by_id[str(bid)] = b
         if not _filter_z_fact_candidates(
             [b],
-            query=recall_query,
+            query=query,
             intent=intent_policy["intent"],
         ):
             continue
@@ -4294,7 +4307,7 @@ async def breath(
             relation_neighbors = _relation_recall_neighbors(
                 graph_buckets,
                 result_ids,
-                query=recall_query,
+                query=query,
                 intent=intent_policy["intent"],
                 world_filter=world_filter,
                 domain_filter=domain_filter,
@@ -4406,7 +4419,7 @@ async def breath(
                     continue
                 if not _filter_z_fact_candidates(
                     [e_bucket],
-                    query=recall_query,
+                    query=query,
                     intent=intent_policy["intent"],
                 ):
                     continue
@@ -4501,7 +4514,7 @@ async def breath(
             ]
             low_weight = _filter_z_fact_candidates(
                 low_weight,
-                query=recall_query,
+                query=query,
                 intent=intent_policy["intent"],
             )
             if low_weight:
