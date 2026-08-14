@@ -78,6 +78,8 @@ from dehydrator import (
     Dehydrator,
     SelfContainmentError,
     _safe_chat_completion_diagnostics,
+    anchor_memory_relative_time_terms,
+    recall_frontmatter_time_contract,
 )
 from decay_engine import DecayEngine
 from consolidation_engine import ConsolidationEngine
@@ -1863,12 +1865,17 @@ async def _dehydrate_for_recall(
     )
     raw_body = str(bucket.get("content") or "") if isinstance(bucket, dict) else ""
     body_hash = hashlib.sha256(raw_body.encode("utf-8")).hexdigest() if bucket else ""
+    time_contract = recall_frontmatter_time_contract(content, bucket_metadata)
     stored_summary = bucket_metadata.get("dehydrated_summary")
     if (
         cache_enabled
         and isinstance(stored_summary, str)
         and len(stored_summary.strip()) >= 10
         and bucket_metadata.get("dehydrated_content_hash") == body_hash
+        and (
+            not time_contract
+            or bucket_metadata.get("dehydrated_summary_contract") == time_contract
+        )
     ):
         record_recall_dehydration("frontmatter_hits")
         formatter = getattr(dehydrator, "format_dehydration_summary", None)
@@ -1877,9 +1884,10 @@ async def _dehydrate_for_recall(
         return stored_summary.strip()
 
     with_source = getattr(dehydrator, "dehydrate_with_source", None)
+    dehydration_input = anchor_memory_relative_time_terms(content, bucket_metadata)
     if callable(with_source):
         raw_summary, source = await with_source(
-            content,
+            dehydration_input,
             None,
             write_cache=False,
         )
@@ -1893,7 +1901,7 @@ async def _dehydrate_for_recall(
         # Test doubles and older rollback implementations keep the original
         # dehydrate signature.  Production always uses the source-aware path.
         rendered = await dehydrator.dehydrate(
-            content,
+            dehydration_input,
             metadata,
             write_cache=False,
         )
@@ -1916,6 +1924,7 @@ async def _dehydrate_for_recall(
                     str(bucket.get("id") or ""),
                     expected_content_hash=body_hash,
                     summary=raw_summary,
+                    contract=time_contract,
                 )
             except Exception as exc:
                 logger.warning(

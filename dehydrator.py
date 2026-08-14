@@ -32,7 +32,9 @@ import asyncio
 import stat
 from collections import OrderedDict
 from contextlib import closing
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from openai import AsyncOpenAI
 from e_axis_shadow import strict_json_loads
 from utils import count_tokens_approx
@@ -48,6 +50,7 @@ RECALL_DEHYDRATION_CACHE_SCHEMA_V1 = "ombre.recall-dehydration/v1"
 RECALL_DEHYDRATION_CACHE_SCHEMA = "ombre.recall-dehydration/v2"
 RECALL_REDACTION_CONTRACT = "redact_embedding_input/v1"
 RECALL_OUTPUT_CONTRACT = "normalized-summary/v1"
+RECALL_FRONTMATTER_TIME_CONTRACT = "ombre.recall-frontmatter/event-time/v1"
 RECALL_LEGACY_PROMPT_SHA256 = (
     "4e55aaa28a183fe953a99f205873f05d484fc624d6c97609327aea5bd019b17a"
 )
@@ -669,6 +672,118 @@ _BRIEFING_WEAK_RELATIVE_TIME_RE = re.compile(
 _BRIEFING_QUOTED_SPAN_RE = re.compile(
     r"“[^”]*”|「[^」]*」|『[^』]*』|\"[^\"]*\"|'[^']*'"
 )
+
+_MEMORY_RELATIVE_TIME_TERMS = (
+    "今天上午",
+    "今天下午",
+    "今天晚上",
+    "今天早上",
+    "今天中午",
+    "昨天上午",
+    "昨天下午",
+    "昨天晚上",
+    "昨天早上",
+    "昨天中午",
+    "前两天",
+    "前几天",
+    "昨晚",
+    "昨天",
+    "今早",
+    "今晚",
+    "今天",
+    "刚刚",
+    "刚才",
+)
+_MEMORY_RELATIVE_TIME_RE = re.compile(
+    "|".join(re.escape(term) for term in _MEMORY_RELATIVE_TIME_TERMS)
+)
+
+
+def _memory_reference_date(metadata: dict | None) -> datetime | None:
+    """Resolve a memory's own event day in the production Beijing timezone."""
+    if not isinstance(metadata, dict):
+        return None
+    beijing = ZoneInfo("Asia/Shanghai")
+    for field in ("event_at", "recorded_at", "created"):
+        raw = str(metadata.get(field) or "").strip()
+        if not raw:
+            continue
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            continue
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=beijing)
+        return parsed.astimezone(beijing)
+    return None
+
+
+def recall_frontmatter_time_contract(
+    content: str,
+    metadata: dict | None,
+) -> str:
+    """Return a dated contract only when relative memory time needs anchoring."""
+    if not _MEMORY_RELATIVE_TIME_RE.search(str(content or "")):
+        return ""
+    reference = _memory_reference_date(metadata)
+    if reference is None:
+        return ""
+    return f"{RECALL_FRONTMATTER_TIME_CONTRACT}:{reference:%Y-%m-%d}"
+
+
+def anchor_memory_relative_time_terms(
+    content: str,
+    metadata: dict | None,
+) -> str:
+    """Anchor recall input to the memory event day, never the recall day.
+
+    Quoted speech remains byte-for-byte intact.  The explicit date header still
+    tells the dehydration model how to interpret relative words inside quotes.
+    """
+    text = str(content or "")
+    reference = _memory_reference_date(metadata)
+    if reference is None or not _MEMORY_RELATIVE_TIME_RE.search(text):
+        return text
+
+    today = reference.strftime("%Y-%m-%d")
+    yesterday = (reference - timedelta(days=1)).strftime("%Y-%m-%d")
+    day_before = (reference - timedelta(days=2)).strftime("%Y-%m-%d")
+    mapping = (
+        ("今天上午", f"{today} 上午"),
+        ("今天下午", f"{today} 下午"),
+        ("今天晚上", f"{today} 晚上"),
+        ("今天早上", f"{today} 早上"),
+        ("今天中午", f"{today} 中午"),
+        ("昨天上午", f"{yesterday} 上午"),
+        ("昨天下午", f"{yesterday} 下午"),
+        ("昨天晚上", f"{yesterday} 晚上"),
+        ("昨天早上", f"{yesterday} 早上"),
+        ("昨天中午", f"{yesterday} 中午"),
+        ("前两天", f"{day_before}前后"),
+        ("前几天", f"{day_before}前后"),
+        ("昨晚", f"{yesterday} 晚上"),
+        ("昨天", yesterday),
+        ("今早", f"{today} 早上"),
+        ("今晚", f"{today} 晚上"),
+        ("今天", today),
+        ("刚刚", f"{today} 稍早"),
+        ("刚才", f"{today} 稍早"),
+    )
+    quoted: list[str] = []
+
+    def _stash(match):
+        quoted.append(match.group(0))
+        return f"\x00{len(quoted) - 1}\x00"
+
+    anchored = _BRIEFING_QUOTED_SPAN_RE.sub(_stash, text)
+    for source, target in mapping:
+        anchored = anchored.replace(source, target)
+    anchored = re.sub(
+        r"\x00(\d+)\x00",
+        lambda match: quoted[int(match.group(1))],
+        anchored,
+    )
+    return f"【记忆发生日：{today}】\n{anchored}"
 
 
 def _anchor_relative_time_terms(text: str, now_bj) -> str:

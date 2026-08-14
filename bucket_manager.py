@@ -75,6 +75,7 @@ _BucketTreeSnapshot = tuple[_BucketFileRevision, ...]
 RECALL_DERIVED_METADATA_FIELDS = frozenset({
     "dehydrated_summary",
     "dehydrated_content_hash",
+    "dehydrated_summary_contract",
 })
 E_RESPONSE_TENDENCIES = frozenset({"comfort", "engage", "withdraw", "alert"})
 E_GROWTH_DELTAS = frozenset({"growth", "stable", "setback"})
@@ -554,6 +555,7 @@ class BucketManager:
         *,
         expected_content_hash: str,
         summary: str,
+        contract: str = "",
         actor: str = "system:recall-dehydration-cache",
     ) -> bool:
         """Persist a derived recall summary without changing memory activity.
@@ -564,10 +566,13 @@ class BucketManager:
         """
         expected_content_hash = str(expected_content_hash or "").strip().lower()
         summary = str(summary or "").strip()
+        contract = str(contract or "").strip()
         if not re.fullmatch(r"[0-9a-f]{64}", expected_content_hash):
             raise ValueError("expected_content_hash must be sha256 hex")
         if len(summary) < 10:
             raise ValueError("dehydrated summary is empty or too short")
+        if len(contract) > 160 or "\n" in contract or "\r" in contract:
+            raise ValueError("dehydrated summary contract is invalid")
 
         async with self._write_guard(bucket_id):
             file_path = self._find_bucket_file(bucket_id)
@@ -589,12 +594,23 @@ class BucketManager:
                 if (
                     post.get("dehydrated_content_hash") == expected_content_hash
                     and post.get("dehydrated_summary") == summary
+                    and (
+                        not contract
+                        or post.get("dehydrated_summary_contract") == contract
+                    )
                 ):
                     return True
 
                 before = self._post_snapshot(post, file_path)
                 post["dehydrated_summary"] = summary
                 post["dehydrated_content_hash"] = expected_content_hash
+                changed_fields = [
+                    "dehydrated_content_hash",
+                    "dehydrated_summary",
+                ]
+                if contract:
+                    post["dehydrated_summary_contract"] = contract
+                    changed_fields.append("dehydrated_summary_contract")
                 event_id = self.audit_log.begin(
                     actor=actor,
                     action="cache_recall_dehydration",
@@ -602,10 +618,7 @@ class BucketManager:
                     before=before,
                     after=self._post_snapshot(post, file_path),
                     details={
-                        "changed_fields": [
-                            "dehydrated_content_hash",
-                            "dehydrated_summary",
-                        ],
+                        "changed_fields": changed_fields,
                     },
                 )
                 self._atomic_write_post(file_path, post)

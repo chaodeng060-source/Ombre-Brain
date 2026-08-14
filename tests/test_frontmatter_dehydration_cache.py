@@ -4,6 +4,10 @@ import pytest
 
 import server
 from bucket_manager import BucketManager, bucket_revision_hash
+from dehydrator import (
+    anchor_memory_relative_time_terms,
+    recall_frontmatter_time_contract,
+)
 from recall_timing import (
     begin_recall_timing,
     finish_recall_timing,
@@ -32,6 +36,7 @@ async def test_derived_summary_write_preserves_body_activity_and_semantic_revisi
         bucket_id,
         expected_content_hash=body_hash,
         summary='{"summary":"桶内持久化摘要"}',
+        contract="ombre.recall-frontmatter/event-time/v1:2026-08-14",
     )
 
     after = await manager.get(bucket_id)
@@ -39,6 +44,7 @@ async def test_derived_summary_write_preserves_body_activity_and_semantic_revisi
     assert after["metadata"]["last_active"] == before["metadata"]["last_active"]
     assert after["metadata"]["dehydrated_content_hash"] == body_hash
     assert after["metadata"]["dehydrated_summary"] == '{"summary":"桶内持久化摘要"}'
+    assert after["metadata"]["dehydrated_summary_contract"].endswith(":2026-08-14")
     assert bucket_revision_hash(after["content"], after["metadata"]) == before_revision
 
 
@@ -169,3 +175,55 @@ async def test_content_change_invalidates_frontmatter_summary(monkeypatch):
     assert manager.writes[0][1]["expected_content_hash"] == hashlib.sha256(
         new_body.encode("utf-8")
     ).hexdigest()
+
+
+def test_memory_relative_time_uses_event_day_and_preserves_quotes():
+    content = '今天上午完成了核验，朝灯说「今天下午再看」，昨晚先做了备份。'
+    metadata = {
+        "event_at": "2026-08-14T23:30:00+08:00",
+        "recorded_at": "2026-09-01T09:00:00+08:00",
+    }
+
+    anchored = anchor_memory_relative_time_terms(content, metadata)
+
+    assert anchored.startswith("【记忆发生日：2026-08-14】")
+    assert "2026-08-14 上午完成了核验" in anchored
+    assert "2026-08-13 晚上先做了备份" in anchored
+    assert "「今天下午再看」" in anchored
+    assert recall_frontmatter_time_contract(content, metadata).endswith(":2026-08-14")
+
+
+@pytest.mark.asyncio
+async def test_relative_time_frontmatter_requires_dated_contract(monkeypatch):
+    manager = _RecordingManager()
+    source = _SourceAwareDehydrator()
+    monkeypatch.setattr(server, "bucket_mgr", manager)
+    monkeypatch.setattr(server, "dehydrator", source)
+    monkeypatch.setattr(
+        server,
+        "config",
+        {"dehydration": {"recall_frontmatter_cache_enabled": True}},
+    )
+    body = "今天上午我核对了部署证据。" * 60
+    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    bucket = {
+        "id": "bucket-relative",
+        "content": body,
+        "metadata": {
+            "id": "bucket-relative",
+            "name": "相对时间",
+            "event_at": "2026-08-14T11:04:27",
+            "dehydrated_summary": '{"summary":"5.21上午的错误摘要"}',
+            "dehydrated_content_hash": body_hash,
+        },
+    }
+
+    result = await server._dehydrate_for_recall(
+        body,
+        {"name": "相对时间"},
+        bucket=bucket,
+    )
+
+    assert "新算出的原始摘要" in result
+    assert source.calls == 1
+    assert manager.writes[0][1]["contract"].endswith(":2026-08-14")
