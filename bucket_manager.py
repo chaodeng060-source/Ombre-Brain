@@ -53,6 +53,7 @@ from mutation_audit import MutationAuditLog
 from maintenance_barrier import MaintenanceBarrier
 from storage_safety import advisory_file_lock, atomic_write_post
 from x_provenance import normalize_x_provenance, validate_x_provenance_update
+from review_queue import ReviewQueue, make_clothing_entry
 
 logger = logging.getLogger("ombre_brain.bucket")
 
@@ -91,6 +92,51 @@ E_IMMUTABLE_FIELDS = frozenset({
     "e_source_bucket_id",
     "e_proposal_key",
 })
+
+_RETRIEVAL_KEY_LINE_RE = re.compile(r"\[检索钥匙:\s*([^\]\n]+)\]")
+_GENERIC_RETRIEVAL_KEYS = frozenset({
+    "今天", "昨天", "明天", "事情", "内容", "消息", "问题", "感觉", "聊天",
+    "朝灯", "哥哥", "小卷", "哈基米", "记忆", "记忆库", "海马体", "账本",
+    "真账", "亲亲", "截图", "心跳", "发情", "复制粘贴", "小红书",
+    "today", "yesterday", "tomorrow", "memory", "message", "chat",
+})
+
+
+def literal_retrieval_keys(content: str, candidates) -> list[str]:
+    """Keep bounded, distinctive candidates that occur verbatim in content."""
+    source = str(content or "")
+    values: list[str] = []
+    existing = _RETRIEVAL_KEY_LINE_RE.search(source)
+    if existing:
+        values.extend(existing.group(1).split("/"))
+    if isinstance(candidates, str):
+        values.append(candidates)
+    elif candidates:
+        values.extend(str(value) for value in candidates)
+
+    accepted: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        candidate = (
+            str(value or "").strip().removeprefix("[[").removesuffix("]]").strip()
+        )
+        folded = candidate.casefold()
+        if (
+            not candidate
+            or len(candidate) < 2
+            or len(candidate) > 48
+            or candidate not in source
+            or folded in _GENERIC_RETRIEVAL_KEYS
+            or re.fullmatch(r"[\W_\d]+", candidate, flags=re.UNICODE)
+            or any(ord(char) < 32 for char in candidate)
+            or folded in seen
+        ):
+            continue
+        seen.add(folded)
+        accepted.append(candidate)
+        if len(accepted) >= 4:
+            break
+    return accepted
 
 
 def bucket_revision_hash(content: str, metadata: dict) -> str:
@@ -226,6 +272,10 @@ class BucketManager:
         self.content_weight = scoring.get("content_weight", 3.0)
         self._locks_dir = os.path.join(self.base_dir, ".locks")
         self._maintenance_barrier = MaintenanceBarrier(self.base_dir)
+        self._clothing_review_queue = ReviewQueue(
+            os.path.join(self.base_dir, "review_queue.jsonl"),
+            maintenance_root=self.base_dir,
+        )
         with self._maintenance_barrier.shared():
             self.audit_log = MutationAuditLog(
                 self.base_dir,
@@ -283,6 +333,7 @@ class BucketManager:
         arousal: float = 0.3,
         bucket_type: str = "dynamic",
         name: str = None,
+        retrieval_keys: list[str] = None,
         pinned: bool = False,
         protected: bool = False,
         world: str = "",
@@ -313,6 +364,15 @@ class BucketManager:
         bucket_id = generate_bucket_id()
         domain = domain or ["未分类"]
         tags = list(tags) if tags else []
+        original_content = str(content or "")
+        retrieval_candidates = list(retrieval_keys or []) + [name or ""] + tags
+        selected_retrieval_keys = literal_retrieval_keys(
+            original_content,
+            retrieval_candidates,
+        )
+        needs_clothing = not selected_retrieval_keys
+        if not str(name or "").strip():
+            name = selected_retrieval_keys[0] if selected_retrieval_keys else "待补衣"
         recorded_at = now_iso()
         if event_at is None:
             normalized_event_at = recorded_at
@@ -341,7 +401,20 @@ class BucketManager:
                 tags.append(today)
 
         bucket_name = sanitize_name(name) if name else bucket_id
-        linked_content = content
+        linked_content = original_content
+        if selected_retrieval_keys and not _RETRIEVAL_KEY_LINE_RE.search(linked_content):
+            if linked_content.endswith("\n\n"):
+                separator = ""
+            elif linked_content.endswith("\n"):
+                separator = "\n"
+            else:
+                separator = "\n\n"
+            linked_content += (
+                separator
+                + "[检索钥匙: "
+                + " / ".join(selected_retrieval_keys)
+                + "]\n"
+            )
 
         if pinned or protected:
             importance = 10
@@ -365,6 +438,11 @@ class BucketManager:
             "last_active": recorded_at,
             "activation_count": 1,
         }
+        if selected_retrieval_keys:
+            metadata["retrieval_keys"] = selected_retrieval_keys
+        else:
+            metadata["needs_clothing"] = True
+            metadata["clothing_reason"] = "no_literal_retrieval_key"
         e_fields = (
             e_authored_by,
             e_initial_priority,
@@ -535,6 +613,26 @@ class BucketManager:
             f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
             + (" [PINNED]" if pinned else "") + (" [PROTECTED]" if protected else "")
         )
+        if needs_clothing:
+            try:
+                self._clothing_review_queue.enqueue(
+                    make_clothing_entry(
+                        bucket_id,
+                        bucket_name,
+                        content_sha256=hashlib.sha256(
+                            original_content.encode("utf-8")
+                        ).hexdigest(),
+                        source=actor,
+                    )
+                )
+            except Exception as exc:
+                # The durable memory is authoritative and must survive a
+                # sidecar outage.  Frontmatter still makes the gap observable.
+                logger.warning(
+                    "Bucket clothing queue unavailable for %s: %s",
+                    bucket_id,
+                    type(exc).__name__,
+                )
         return bucket_id
 
     # ---------------------------------------------------------

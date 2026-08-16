@@ -161,7 +161,7 @@ from mcp_auth import (
 from review_queue import (
     ReviewQueue, make_relation_entry, make_z_pair_entry,
     render_md as _render_review_md,
-    KIND_RELATION, KIND_Z_CONFLICT, KIND_METABOLISM, KIND_E_PROPOSAL,
+    KIND_CLOTHING, KIND_RELATION, KIND_Z_CONFLICT, KIND_METABOLISM, KIND_E_PROPOSAL,
     query_requests_history,
     rest_resolve_status_allowed,
 )
@@ -2502,6 +2502,15 @@ def _metadata_list(value) -> list:
     return [str(value)]
 
 
+def _entity_retrieval_keys(entities: list[dict] | None) -> list[str]:
+    """Extract exact, already-validated entity mentions for bucket clothing."""
+    return [
+        str(entity.get("mention") or "").strip()
+        for entity in (entities or [])
+        if isinstance(entity, dict) and str(entity.get("mention") or "").strip()
+    ]
+
+
 def _bucket_primary_domain_matches(meta: dict, domain: list) -> bool:
     if not domain:
         return True
@@ -2847,6 +2856,7 @@ async def _create_operational_status_successor(
             valence=valence,
             arousal=arousal,
             name=name or None,
+            retrieval_keys=_entity_retrieval_keys(entities),
             world=world,
             chord_tag=chord_tag,
             sense=detected_senses or None,
@@ -2861,6 +2871,7 @@ async def _create_operational_status_successor(
                 type(exc).__name__,
             )
 
+    new_meta: dict = {}
     try:
         new_bucket = await bucket_mgr.get(new_bucket_id)
         if not new_bucket:
@@ -2896,7 +2907,8 @@ async def _create_operational_status_successor(
             type(exc).__name__,
         )
     await _synchronize_bucket_entities(new_bucket_id, content, entities)
-    return new_bucket_id, (name or new_bucket_id), False
+    created_name = str((new_meta or {}).get("name") or "").strip()
+    return new_bucket_id, (created_name or name or new_bucket_id), False
 
 
 # =============================================================
@@ -3163,6 +3175,7 @@ async def _merge_or_create(
             valence=valence,
             arousal=arousal,
             name=name or None,
+            retrieval_keys=_entity_retrieval_keys(entities),
             world=world,
             chord_tag=chord_tag,
             sense=detected_senses or None,
@@ -3174,7 +3187,14 @@ async def _merge_or_create(
         except Exception as e:
             logger.warning(f"Embedding for new bucket failed / 新桶向量生成失败: {bucket_id}: {e}")
     await _synchronize_bucket_entities(bucket_id, content, entities)
-    display = name if name else bucket_id
+    get_created_bucket = getattr(bucket_mgr, "get", None)
+    created_bucket = (
+        await get_created_bucket(bucket_id)
+        if callable(get_created_bucket)
+        else None
+    )
+    created_metadata = (created_bucket or {}).get("metadata", {}) or {}
+    display = str(created_metadata.get("name") or name or bucket_id)
     return bucket_id, display, False
 
 
@@ -4689,6 +4709,9 @@ async def hold(
                 valence=valence,
                 arousal=arousal,
                 name=suggested_name or None,
+                retrieval_keys=_entity_retrieval_keys(
+                    analysis.get("entities", [])
+                ),
                 bucket_type="permanent",
                 pinned=True,
                 world=effective_world,
@@ -5013,7 +5036,7 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
                 results.append(f"📎{result_name}")
                 merged += 1
             else:
-                results.append(f"📝{item.get('name', result_name)}")
+                results.append(f"📝{item.get('name') or result_name}")
                 created += 1
         except Exception as e:
             logger.warning(
@@ -7243,6 +7266,7 @@ async def api_review_queue(request):
     from starlette.responses import JSONResponse
     kind = (request.query_params.get("kind") or "").strip().lower()
     if kind and kind not in (
+        KIND_CLOTHING,
         KIND_RELATION,
         KIND_Z_CONFLICT,
         KIND_METABOLISM,

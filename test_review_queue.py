@@ -8,10 +8,10 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 from review_queue import (
-    ReviewQueue, lifecycle_updates, make_e_proposal_entry, make_metabolism_entry, make_relation_entry,
+    ReviewQueue, lifecycle_updates, make_clothing_entry, make_e_proposal_entry, make_metabolism_entry, make_relation_entry,
     make_z_conflict_entry,
     make_z_pair_entry, render_md,
-    KIND_E_PROPOSAL, KIND_METABOLISM, KIND_RELATION, KIND_Z_CONFLICT,
+    KIND_CLOTHING, KIND_E_PROPOSAL, KIND_METABOLISM, KIND_RELATION, KIND_Z_CONFLICT,
     STATUS_PENDING, STATUS_APPLIED, STATUS_REJECTED,
     ReviewQueueCorruptError,
 )
@@ -97,11 +97,34 @@ def test_list_pending_by_kind():
         "这只是机器证据摘要，不是体验正文。",
         suggested_priority=70,
     ))
-    assert len(q.list_pending()) == 4
+    q.enqueue(make_clothing_entry(
+        "bare-bucket",
+        "待补衣_2026-08-16",
+        content_sha256="a" * 64,
+        source="grow",
+    ))
+    assert len(q.list_pending()) == 5
     assert len(q.list_pending(KIND_RELATION)) == 1
     assert len(q.list_pending(KIND_Z_CONFLICT)) == 1
     assert len(q.list_pending(KIND_METABOLISM)) == 1
     assert len(q.list_pending(KIND_E_PROPOSAL)) == 1
+    assert len(q.list_pending(KIND_CLOTHING)) == 1
+
+
+def test_clothing_entry_is_content_free_and_rendered():
+    q = _q()
+    entry = make_clothing_entry(
+        "bare-bucket",
+        "待补衣_2026-08-16",
+        content_sha256="b" * 64,
+        source="hold",
+    )
+    assert q.enqueue(entry) is True
+    assert entry["kind"] == KIND_CLOTHING
+    assert "content" not in entry
+    rendered = render_md(q.list_pending())
+    assert "待补衣" in rendered
+    assert "bare-bucket" in rendered
 
 
 def test_resolve_removes_from_pending():
