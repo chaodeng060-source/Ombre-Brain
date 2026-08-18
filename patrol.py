@@ -1028,6 +1028,9 @@ def main():
                     help="可选 config.yaml，用于读取 fact_slots.registry")
     ap.add_argument("--review-queue", default=None,
                     help="可选待审队列路径；只入 pending 建议，不修改任何桶")
+    ap.add_argument("--enqueue-z", action="store_true",
+                    help="连同 Z 轴同槽新旧候选一起入待审队列（默认只报告不入队："
+                         "2026-08-18 真库 dry-run 三轮候选抽样误报率过高，先人看报告再决定）")
     ap.add_argument("--apply", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
@@ -1081,7 +1084,8 @@ def main():
     if args.review_queue:
         queue = ReviewQueue(args.review_queue)
         queued = enqueue_metabolism_suggestions(report, queue)
-        queued_z = enqueue_z_pair_candidates(report, queue)
+        if args.enqueue_z:
+            queued_z = enqueue_z_pair_candidates(report, queue)
 
     if args.out:
         outp = Path(args.out)

@@ -15,10 +15,11 @@ whose contents actually conflict.
 """
 from __future__ import annotations
 
+import re
 from datetime import date, datetime
 from typing import Iterable, Mapping
 
-from fact_conflicts import detect_fact_conflicts, is_z_scan_candidate
+from fact_conflicts import detect_fact_conflicts, is_z_scan_candidate, strip_wikilinks_local
 from fact_slots import (
     FACT_STATUS_CONTESTED,
     FACT_STATUS_HISTORICAL,
@@ -32,7 +33,53 @@ from fact_slots import (
 REASON_SLOT_NEWER_SUPERSEDES = "same_fact_slot_newer_supersedes"
 MATCH_STRUCTURED = "structured"   # content had a registered `label: value` line
 MATCH_METADATA = "metadata"       # bucket metadata.fact_key is a registered slot
+MATCH_VALUE = "value"             # registry `value_patterns` extracted a slot value from content
 MATCH_CONTEXT = "context"         # only registry context (domains/types/tags/name) matched
+
+# Production reality (2026-08-18, 11726 buckets): almost no bucket carries a
+# structured `label: value` line, so context-only membership pairs the newest
+# bucket whose *name* mentions "IP" with 125 unrelated buckets.  A pair is
+# therefore only proposed when BOTH sides carry an extracted slot value and the
+# values differ; context-only members stay in the pool for statistics only.
+_VALUE_PATTERN_CACHE: dict[str, list[re.Pattern]] = {}
+
+
+def _value_patterns(spec) -> list[re.Pattern]:
+    if not isinstance(spec, Mapping):
+        return []
+    raw = spec.get("value_patterns") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    patterns: list[re.Pattern] = []
+    for item in raw:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        cached = _VALUE_PATTERN_CACHE.get(text)
+        if cached is None:
+            try:
+                cached = [re.compile(text, re.IGNORECASE)]
+            except re.error:
+                cached = []
+            _VALUE_PATTERN_CACHE[text] = cached
+        patterns.extend(cached)
+    return patterns
+
+
+def _normalise_value(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())[:240]
+
+
+def extract_slot_values(content: str, spec) -> list[str]:
+    """Deterministic value extraction from content via registry `value_patterns`."""
+    values: list[str] = []
+    text = strip_wikilinks_local(content or "")
+    for pattern in _value_patterns(spec):
+        for match in pattern.finditer(text):
+            value = _normalise_value(match.group(1) if match.groups() else match.group(0))
+            if value and value not in values:
+                values.append(value)
+    return values
 
 
 def _meta(bucket: dict) -> dict:
@@ -97,11 +144,30 @@ def slot_memberships(bucket: dict, registry: Mapping | None) -> dict[str, dict]:
     if meta_key and meta_key not in out and fact_slot_applies_to_bucket(meta_key, bucket, registry):
         value = _meta(bucket).get("fact_value")
         out[meta_key] = {"match": MATCH_METADATA, "values": [str(value)[:240]] if value else []}
+    content = bucket.get("content", "") or ""
     for key in slots:
-        if key in out:
-            continue
         spec = registry.get(key, {}) if isinstance(registry, Mapping) else {}
-        if _spec_has_context(spec) and fact_slot_applies_to_bucket(key, bucket, registry):
+        if key in out:
+            # structured / metadata member without a value: try the value extractor too
+            if not out[key]["values"]:
+                out[key]["values"] = extract_slot_values(content, spec)
+            continue
+        if not (_spec_has_context(spec) and fact_slot_applies_to_bucket(key, bucket, registry)):
+            continue
+        values = extract_slot_values(content, spec)
+        # A value buried deep in a long bucket is usually a passing mention, not the
+        # bucket's fact.  Count it only when the bucket *leads* with it: name or the
+        # first `value_head_chars` characters (default 200; registry may override).
+        head_chars = spec.get("value_head_chars", 200) if isinstance(spec, Mapping) else 200
+        try:
+            head_chars = max(0, int(head_chars))
+        except (TypeError, ValueError):
+            head_chars = 200
+        head = (_name(bucket) + "\n" + strip_wikilinks_local(content)[:head_chars]).lower()
+        leading = [v for v in values if v in head]
+        if leading:
+            out[key] = {"match": MATCH_VALUE, "values": leading + [v for v in values if v not in leading]}
+        else:
             out[key] = {"match": MATCH_CONTEXT, "values": []}
     return out
 
@@ -126,7 +192,7 @@ def propose_z_pair_candidates(
     registry: Mapping | None,
     *,
     limit: int = 200,
-    allow_context_only: bool = True,
+    allow_context_only: bool = False,
 ) -> dict:
     """Group buckets by registered slot; propose newer→older pairs that conflict.
 
@@ -138,12 +204,18 @@ def propose_z_pair_candidates(
     (fact_key / current_bucket_id / historical_bucket_id / names) plus the
     evidence (created timestamps, matched values, conflicting fields).
     Nothing is written anywhere.
+
+    ``allow_context_only=False`` (default since the 2026-08-18 production
+    dry-run) means a pair needs an extracted slot value on BOTH sides and the
+    values must differ.  Context-only members are counted in stats but never
+    paired: on the real library they produced 200 candidates of which the
+    sampled ones were unrelated buckets whose names merely contained "IP".
     """
     groups: dict[str, list[tuple[dict, dict]]] = {}
     stats = {
         "buckets_seen": 0,
         "buckets_in_slots": 0,
-        "memberships_by_match": {MATCH_STRUCTURED: 0, MATCH_METADATA: 0, MATCH_CONTEXT: 0},
+        "memberships_by_match": {MATCH_STRUCTURED: 0, MATCH_METADATA: 0, MATCH_VALUE: 0, MATCH_CONTEXT: 0},
         "slots_with_members": 0,
         "slots_with_pairs": 0,
         "pairs_compared": 0,
@@ -152,6 +224,7 @@ def propose_z_pair_candidates(
         "skipped_historical_current": 0,
         "skipped_contested": 0,
         "skipped_no_conflict": 0,
+        "skipped_no_values": 0,
         "skipped_same_values": 0,
         "candidates": 0,
         "hit_limit": False,
@@ -159,13 +232,14 @@ def propose_z_pair_candidates(
     for bucket in buckets:
         stats["buckets_seen"] += 1
         memberships = slot_memberships(bucket, registry)
+        for info in memberships.values():
+            stats["memberships_by_match"][info["match"]] += 1
         if not allow_context_only:
-            memberships = {k: v for k, v in memberships.items() if v["match"] != MATCH_CONTEXT}
+            memberships = {k: v for k, v in memberships.items() if v.get("values")}
         if not memberships:
             continue
         stats["buckets_in_slots"] += 1
         for key, info in memberships.items():
-            stats["memberships_by_match"][info["match"]] += 1
             groups.setdefault(key, []).append((bucket, info))
 
     candidates: list[dict] = []
@@ -209,7 +283,15 @@ def propose_z_pair_candidates(
                     continue
                 newer_values = newer_info.get("values") or []
                 older_values = older_info.get("values") or []
-                if newer_values and older_values and set(newer_values) == set(older_values):
+                if not allow_context_only and not (newer_values and older_values):
+                    stats["skipped_no_values"] += 1
+                    continue
+                if newer_values and older_values and (
+                    set(newer_values) == set(older_values)
+                    # primary value = first value found in content; buckets that lead with the
+                    # same value restate the same fact (side values like a router IP don't count)
+                    or newer_values[0] == older_values[0]
+                ):
                     stats["skipped_same_values"] += 1
                     continue
                 conflicts = detect_fact_conflicts(older.get("content", ""), newer.get("content", ""))

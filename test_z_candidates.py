@@ -2,6 +2,7 @@ from datetime import datetime
 
 from z_candidates import (
     MATCH_CONTEXT,
+    MATCH_VALUE,
     MATCH_METADATA,
     MATCH_STRUCTURED,
     REASON_SLOT_NEWER_SUPERSEDES,
@@ -112,16 +113,40 @@ def test_only_newest_non_retired_bucket_acts_as_current_and_limit_is_honoured():
     assert limited["stats"]["hit_limit"] is True
 
 
-def test_context_only_matches_need_a_real_content_conflict():
-    # both buckets only match by name/domain context; contents do not conflict → no candidate
+def test_context_only_members_are_counted_but_never_paired():
+    # both buckets only match by name/domain context and carry no slot value → never a pair
+    # (2026-08-18 production dry-run: context-only pairing produced 200 unrelated candidates)
     a = _bucket("k1", "记忆库杂谈", "今天聊了聊记忆库设计。", created="2026-07-01T10:00:00+08:00")
     b = _bucket("k2", "记忆库杂谈2", "又聊了聊记忆库设计。", created="2026-08-01T10:00:00+08:00")
     report = propose_z_pair_candidates([a, b], REGISTRY)
     assert report["candidates"] == []
-    assert report["stats"]["skipped_no_conflict"] == 1
-    # allow_context_only=False drops context matches entirely
-    strict = propose_z_pair_candidates([a, b], REGISTRY, allow_context_only=False)
-    assert strict["stats"]["buckets_in_slots"] == 0
+    assert report["stats"]["memberships_by_match"][MATCH_CONTEXT] == 2
+    assert report["stats"]["buckets_in_slots"] == 0
+    # legacy permissive mode still needs a real content conflict
+    loose = propose_z_pair_candidates([a, b], REGISTRY, allow_context_only=True)
+    assert loose["candidates"] == []
+    assert loose["stats"]["skipped_no_conflict"] == 1
+
+
+def test_value_patterns_extract_values_and_overlapping_values_do_not_pair():
+    reg = {
+        "infra.zhaodeng_windows.ip": {
+            "aliases": ["ip"],
+            "types": ["dynamic"],
+            "name_contains": ["IP", "电脑"],
+            "value_patterns": [r"\b(?:10|172|192)\.(?:\d{1,3})\.(?:\d{1,3})\.(?:\d{1,3})\b"],
+        }
+    }
+    old = _bucket("ip1", "朝灯电脑网络", "她电脑在 192.168.1.10，路由器 192.168.1.1。", created="2026-07-01T10:00:00+08:00")
+    new = _bucket("ip2", "朝灯电脑真实 IP", "实测朝灯 Windows 真实 IP 是 192.168.1.52。", created="2026-08-10T10:00:00+08:00")
+    same = _bucket("ip3", "电脑 IP 复述", "还是 192.168.1.52 没变，路由 192.168.1.1。", created="2026-08-12T10:00:00+08:00")
+    m_old = slot_memberships(old, reg)["infra.zhaodeng_windows.ip"]
+    assert m_old["match"] == MATCH_VALUE and m_old["values"] == ["192.168.1.10", "192.168.1.1"]
+    report = propose_z_pair_candidates([old, new, same], reg)
+    pairs = [(c["current_bucket_id"], c["historical_bucket_id"]) for c in report["candidates"]]
+    # newest is ip3; ip3 vs ip2 share 192.168.1.52 → not a supersession; ip3 vs ip1 → differ → pair
+    assert pairs == [("ip3", "ip1")]
+    assert report["stats"]["skipped_same_values"] == 1
 
 
 def test_created_parsing_accepts_datetime_and_missing_created_is_skipped():

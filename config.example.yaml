@@ -370,15 +370,18 @@ fact_slots:
     infra.memory_store.location:
       aliases: [记忆库位置, 记忆库, 海马体位置, 记忆存放]
       types: [dynamic]
-      name_contains: [记忆库, 记忆搬, 海马体, memory.zhaodeng, NAS, 远程记忆]
+      name_contains: [记忆库, 记忆搬, 记忆迁, 海马体, 记忆存放]
+      value_patterns: ['memory\.zhaodeng\.xyz', '\bNAS\b', '本地记忆库', '远程记忆库', '记忆库(?:搬|迁)?到(?:了)?\s*([^\s，。,]{2,24})']
     infra.zhaodeng_windows.ip:
       aliases: [真实ip, ip, windows ip, 电脑ip]
       types: [dynamic]
-      name_contains: [IP, Windows, 朝灯电脑, 朝灯的电脑]
+      name_contains: [IP, 内网地址, 朝灯电脑, 朝灯的电脑]
+      value_patterns: ['\b(?:10|172|192)\.(?:\d{1,3})\.(?:\d{1,3})\.(?:\d{1,3})\b']
     infra.local_llm.model_name:
       aliases: [本地模型, 模型名, model, 本地模型名]
       types: [dynamic]
-      name_contains: [本地模型, qwen, ollama, 模型名, GLM]
+      name_contains: [本地模型, 模型名, 模型选型, 换模型, 本地 LLM]
+      value_patterns: ['\b(qwen[0-9][a-z0-9._:-]*)', '\b(glm-?[a-z0-9._-]+)', '\b(deepseek-[a-z0-9._-]+)', '\b(llama[0-9][a-z0-9._:-]*)', '\b(gemma[0-9]?[a-z0-9._:-]*)']
 
 # --- World axis / 世界轴 ---
 # 用来隔离不同剧情世界的记忆。日常聊天的桶 world 留空（不属于任何世界）；
