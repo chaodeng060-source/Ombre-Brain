@@ -1054,7 +1054,7 @@ def _relation_recall_neighbors(
     })
 
     relation_cfg = config.get("relation_recall", {}) or {}
-    raw_propagation_only = relation_cfg.get("propagation_only", False)
+    raw_propagation_only = relation_cfg.get("propagation_only", True)
     if isinstance(raw_propagation_only, str):
         propagation_only = raw_propagation_only.strip().lower() in {
             "1", "true", "yes", "on",

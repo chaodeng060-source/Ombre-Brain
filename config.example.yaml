@@ -333,12 +333,12 @@ state_aware_recall:
   state_link_limit: 2             # 每次最多补几条已验证的状态链证据（硬上限 3）
 
 # --- Typed relation recall / 类型化关系召回 ---
-# propagation_only=false 是上线前的精确旧行为/紧急回滚；打开后仅
-# causes/contributes/improves/explains 可传播，kin/updates 只记录关系。
+# propagation_only=false 仅用于紧急回滚到旧行为；默认只允许 explains
+# 传播。kin/updates 只记录关系，causes/contributes/improves 留待 review。
 relation_recall:
-  propagation_only: false
+  propagation_only: true
   allowed_types: [kin, explains]  # rollback/legacy mode only
-  propagation_types: [causes, contributes, improves, explains]
+  propagation_types: [explains]
   hop1_min_strength: 0.4
   hop2_min_strength: 0.7
 

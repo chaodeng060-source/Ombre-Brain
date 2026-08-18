@@ -51,7 +51,15 @@ def _configure(
     )
 
 
-def _neighbors(buckets, *, query="我们之间的关系", intent="relation", excluded=()):
+def _neighbors(
+    buckets,
+    *,
+    query="我们之间的关系",
+    intent="relation",
+    excluded=(),
+    max_depth=2,
+    max_results=8,
+):
     return server._relation_recall_neighbors(
         buckets,
         ["a"],
@@ -61,18 +69,25 @@ def _neighbors(buckets, *, query="我们之间的关系", intent="relation", exc
         domain_filter=None,
         created_after=None,
         created_before=None,
-        max_depth=2,
-        max_results=8,
+        max_depth=max_depth,
+        max_results=max_results,
         excluded_ids=excluded,
     )
 
 
 def test_y_axis_walks_propagation_edges_bidirectionally_and_two_hops(monkeypatch):
-    _configure(monkeypatch, ["kin", "explains", "causes"])
+    _configure(
+        monkeypatch,
+        ["kin", "explains", "causes", "contributes", "improves", "updates"],
+    )
     buckets = [
         _bucket("a", relations=[
             {"type": "kin", "target": "semantic-only", "strength": 0.9},
-            {"type": "causes", "target": "b", "strength": 1.0},
+            {"type": "explains", "target": "b", "strength": 1.0},
+            {"type": "causes", "target": "review-causes", "strength": 1.0},
+            {"type": "contributes", "target": "review-contributes", "strength": 1.0},
+            {"type": "improves", "target": "review-improves", "strength": 1.0},
+            {"type": "updates", "target": "storage-update", "strength": 1.0},
         ]),
         _bucket("b", relations=[
             {"type": "explains", "target": "c", "strength": 0.8},
@@ -80,8 +95,12 @@ def test_y_axis_walks_propagation_edges_bidirectionally_and_two_hops(monkeypatch
         _bucket("c"),
         _bucket("semantic-only"),
         _bucket("incoming", relations=[
-            {"type": "causes", "target": "a", "strength": 0.7},
+            {"type": "explains", "target": "a", "strength": 0.7},
         ]),
+        _bucket("review-causes"),
+        _bucket("review-contributes"),
+        _bucket("review-improves"),
+        _bucket("storage-update"),
         _bucket("other-world", world="role", relations=[
             {"type": "explains", "target": "a", "strength": 1.0},
         ]),
@@ -139,15 +158,28 @@ def test_y_axis_honors_session_dedup_and_scalar_config(monkeypatch):
     assert [item.bucket_id for item in found] == ["fresh"]
 
 
-def test_semantic_edges_never_expand_even_when_configured(monkeypatch):
-    _configure(monkeypatch, ["kin", "updates"])
+def test_storage_only_review_and_unknown_edges_never_expand_even_when_configured(
+    monkeypatch,
+):
+    _configure(
+        monkeypatch,
+        ["kin", "updates", "causes", "contributes", "improves", "future_type"],
+    )
     buckets = [
         _bucket("a", relations=[
             {"type": "kin", "target": "same-topic", "strength": 1.0},
             {"type": "updates", "target": "old-state", "strength": 1.0},
+            {"type": "causes", "target": "cause", "strength": 1.0},
+            {"type": "contributes", "target": "support", "strength": 1.0},
+            {"type": "improves", "target": "improvement", "strength": 1.0},
+            {"type": "future_type", "target": "unknown", "strength": 1.0},
         ]),
         _bucket("same-topic"),
         _bucket("old-state"),
+        _bucket("cause"),
+        _bucket("support"),
+        _bucket("improvement"),
+        _bucket("unknown"),
     ]
 
     assert _neighbors(buckets) == []
@@ -188,9 +220,101 @@ def test_switch_on_ignores_stale_legacy_allowed_types(monkeypatch):
         _bucket("a", relations=[
             {"type": "kin", "target": "same-topic", "strength": 1.0},
             {"type": "causes", "target": "hard-edge", "strength": 1.0},
+            {"type": "explains", "target": "explanation", "strength": 1.0},
         ]),
         _bucket("same-topic"),
         _bucket("hard-edge"),
+        _bucket("explanation"),
     ]
 
-    assert [item.bucket_id for item in _neighbors(buckets)] == ["hard-edge"]
+    assert [item.bucket_id for item in _neighbors(buckets)] == ["explanation"]
+
+
+def test_missing_switch_defaults_to_propagation_policy(monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            **server.config,
+            "relation_recall": {
+                "allowed_types": ["kin", "explains"],
+                "propagation_types": [
+                    "kin",
+                    "explains",
+                    "causes",
+                    "contributes",
+                    "improves",
+                    "updates",
+                ],
+                "hop1_min_strength": 0.4,
+                "hop2_min_strength": 0.7,
+            },
+        },
+    )
+    buckets = [
+        _bucket("a", relations=[
+            {"type": "kin", "target": "same-topic", "strength": 1.0},
+            {"type": "explains", "target": "explanation", "strength": 1.0},
+            {"type": "causes", "target": "hard-edge", "strength": 1.0},
+        ]),
+        _bucket("same-topic"),
+        _bucket("explanation"),
+        _bucket("hard-edge"),
+    ]
+
+    assert [item.bucket_id for item in _neighbors(buckets)] == ["explanation"]
+
+
+def test_switch_true_false_true_is_exact_and_reversible(monkeypatch):
+    buckets = [
+        _bucket("a", relations=[
+            {"type": "kin", "target": "same-topic", "strength": 1.0},
+            {"type": "explains", "target": "explanation", "strength": 1.0},
+            {"type": "causes", "target": "hard-edge", "strength": 1.0},
+        ]),
+        _bucket("same-topic"),
+        _bucket("explanation"),
+        _bucket("hard-edge"),
+    ]
+
+    _configure(
+        monkeypatch,
+        ["kin", "explains", "causes"],
+        propagation_only=True,
+    )
+    assert [item.bucket_id for item in _neighbors(buckets)] == ["explanation"]
+
+    _configure(
+        monkeypatch,
+        ["kin", "explains", "causes"],
+        propagation_only=False,
+        allowed_types=["kin", "explains", "causes"],
+    )
+    assert {item.bucket_id for item in _neighbors(buckets)} == {
+        "same-topic",
+        "explanation",
+    }
+
+    _configure(
+        monkeypatch,
+        ["kin", "explains", "causes"],
+        propagation_only=True,
+    )
+    assert [item.bucket_id for item in _neighbors(buckets)] == ["explanation"]
+
+
+def test_relation_depth_zero_and_max_results_remain_bounded(monkeypatch):
+    _configure(monkeypatch, ["explains"])
+    buckets = [
+        _bucket("a", relations=[
+            {"type": "explains", "target": "b", "strength": 1.0},
+            {"type": "explains", "target": "c", "strength": 0.9},
+            {"type": "explains", "target": "d", "strength": 0.8},
+        ]),
+        _bucket("b"),
+        _bucket("c"),
+        _bucket("d"),
+    ]
+
+    assert _neighbors(buckets, max_depth=0) == []
+    assert len(_neighbors(buckets, max_results=2)) == 2

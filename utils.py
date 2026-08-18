@@ -73,21 +73,29 @@ REVIEW_RELATION_TYPES = frozenset({
 assert SAFE_RELATION_TYPES | REVIEW_RELATION_TYPES == RELATION_TYPES
 assert not (SAFE_RELATION_TYPES & REVIEW_RELATION_TYPES)
 
-# Recall propagation is independent from write-risk classification.  Hard
-# causal/explanatory edges may carry context into recall; topic/update edges
-# remain graph facts but must not drag a neighboring bucket into the result.
+# Recall propagation is independent from write-risk classification.  Existing
+# relation records remain authoritative storage; this partition only decides
+# whether an already-stored edge may pull a neighboring bucket into recall.
 PROPAGATION_RELATION_TYPES = frozenset({
-    "causes",
-    "contributes",
-    "improves",
     "explains",
 })
-SEMANTIC_RELATION_TYPES = frozenset({
+STORAGE_ONLY_RELATION_TYPES = frozenset({
     "updates",
     "kin",
 })
-assert PROPAGATION_RELATION_TYPES | SEMANTIC_RELATION_TYPES == RELATION_TYPES
-assert not (PROPAGATION_RELATION_TYPES & SEMANTIC_RELATION_TYPES)
+RECALL_REVIEW_RELATION_TYPES = frozenset({
+    "causes",
+    "contributes",
+    "improves",
+})
+assert (
+    PROPAGATION_RELATION_TYPES
+    | STORAGE_ONLY_RELATION_TYPES
+    | RECALL_REVIEW_RELATION_TYPES
+) == RELATION_TYPES
+assert not (PROPAGATION_RELATION_TYPES & STORAGE_ONLY_RELATION_TYPES)
+assert not (PROPAGATION_RELATION_TYPES & RECALL_REVIEW_RELATION_TYPES)
+assert not (STORAGE_ONLY_RELATION_TYPES & RECALL_REVIEW_RELATION_TYPES)
 
 
 def default_graph_relation_allowed(value) -> bool:
@@ -222,7 +230,7 @@ def load_config(config_path: str = None) -> dict:
             # False is the exact pre-classification behavior and therefore the
             # emergency rollback.  When enabled, propagation_types replaces
             # the legacy allowed_types list for graph expansion.
-            "propagation_only": False,
+            "propagation_only": True,
             "allowed_types": sorted(SAFE_RELATION_TYPES),
             "propagation_types": sorted(PROPAGATION_RELATION_TYPES),
             "hop1_min_strength": 0.4,
