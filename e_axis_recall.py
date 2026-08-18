@@ -47,6 +47,52 @@ _POSITIVE_LOW = (
     "安心", "放心", "平静", "舒服", "温柔", "幸福", "放松", "踏实",
     "calm", "relaxed", "safe", "content",
 )
+# 2026-08-18：小卷审出「我还是不放心」被子串命中「放心」判成 positive_low（本地扩词
+# 697bc45 引入；上游默认表里没有「放心」，同句上游返回 None）。E 是感受轴不是正负面
+# 分类器，但入口把情绪认反，整条 E 轴就朝错方向排序。修法不是删词，是命中前看否定：
+# 线索前 ≤3 个字符（英文 ≤8）里有否定词就不算这次命中；被否定的正向词按低唤起负向
+# 记（不放心/不安心=担忧），被否定的负向词（不生气/没难过）不硬翻成正向，落回中性先验。
+_NEGATION_CUES_ZH = ("不太", "不怎么", "不算", "不是", "没有", "没", "不", "别", "未", "非", "无", "哪里", "才不")
+# 否定词和线索之间可以隔程度词：「不是很放心」「不太安心」「没那么开心」
+_DEGREE_ZH = ("很", "太", "够", "那么", "这么", "特别", "十分", "挺", "真的", "有点", "有些", "再")
+_NEGATION_WORDS_EN = frozenset({"not", "no", "never", "hardly", "barely", "without", "nothing", "neither", "nor"})
+_NEG_WINDOW_ZH = 6
+_EN_MAX_GAP_WORDS = 2  # never felt safe / not really happy
+
+
+def _cue_negated(text: str, start: int, cue: str) -> bool:
+    """线索 ``cue`` 在 ``text[start:]`` 处命中时，紧邻前文是否把它否定掉。
+    只看同一分句（标点截断），否定词和线索之间最多隔程度词/两个英文词。"""
+    if cue.isascii():
+        before = re.split(r"[,.;:!?，。；：！？…]", text[max(0, start - 40):start])[-1]
+        words = re.findall(r"[a-z']+", before)
+        for i in range(len(words) - 1, -1, -1):
+            word = words[i]
+            if word in _NEGATION_WORDS_EN or word.endswith("n't"):
+                return len(words) - 1 - i <= _EN_MAX_GAP_WORDS
+        return False
+    before = re.split(r"[,.;:!?，。；：！？…、]", text[max(0, start - _NEG_WINDOW_ZH):start])[-1]
+    stripped = before
+    for _ in range(2):
+        for deg in _DEGREE_ZH:
+            if stripped.endswith(deg):
+                stripped = stripped[: -len(deg)]
+                break
+    return any(stripped.endswith(neg) for neg in _NEGATION_CUES_ZH)
+
+
+def _cue_hits(text: str, cues: tuple[str, ...]) -> tuple[bool, bool]:
+    """返回 (有未被否定的命中, 有被否定的命中)。"""
+    plain = negated = False
+    for cue in cues:
+        start = text.find(cue)
+        while start != -1:
+            if _cue_negated(text, start, cue):
+                negated = True
+            else:
+                plain = True
+            start = text.find(cue, start + 1)
+    return plain, negated
 
 
 def _plain_finite(value: object) -> float | None:
@@ -187,14 +233,21 @@ def infer_query_emotion(
     """
 
     text = str(query or "").lower()
-    if any(cue in text for cue in _NEGATIVE_HIGH):
+    neg_high, _ = _cue_hits(text, _NEGATIVE_HIGH)
+    neg_low, _ = _cue_hits(text, _NEGATIVE_LOW)
+    pos_high, pos_high_negated = _cue_hits(text, _POSITIVE_HIGH)
+    pos_low, pos_low_negated = _cue_hits(text, _POSITIVE_LOW)
+    if neg_high:
         guessed = (-0.85, 0.85, 0.8, True, "lexicon.negative_high")
-    elif any(cue in text for cue in _NEGATIVE_LOW):
+    elif neg_low:
         guessed = (-0.7, 0.35, 0.55, True, "lexicon.negative_low")
-    elif any(cue in text for cue in _POSITIVE_HIGH):
+    elif pos_high:
         guessed = (0.8, 0.8, 0.2, True, "lexicon.positive_high")
-    elif any(cue in text for cue in _POSITIVE_LOW):
+    elif pos_low:
         guessed = (0.65, 0.3, 0.1, True, "lexicon.positive_low")
+    elif pos_high_negated or pos_low_negated:
+        # 「不放心」「不安心」「不爱你」：正向词被否定 = 低唤起的负向，不是正向。
+        guessed = (-0.55, 0.35, 0.5, True, "lexicon.negated_positive")
     else:
         guessed = (0.0, 0.35, 0.2, False, "neutral_prior")
 

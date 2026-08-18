@@ -459,3 +459,32 @@ async def test_real_breath_changes_close_order_and_injects_posture(
     assert "E轴回应姿态" in result
     assert "tendency:comfort" in result
     assert "不可改写事实" in result
+
+
+def test_negated_cues_do_not_flip_polarity():
+    """2026-08-18 小卷审出：「我还是不放心」被子串命中「放心」判成 positive_low。
+    否定词紧邻在前的线索不算命中；被否定的正向词按低唤起负向记；被否定的负向词落回中性。"""
+    worried = infer_query_emotion("我还是不放心")
+    assert worried.valence < 0 and worried.source == "lexicon.negated_positive"
+    assert infer_query_emotion("我很放心").source == "lexicon.positive_low"
+    assert infer_query_emotion("不太安心").source == "lexicon.negated_positive"
+    assert infer_query_emotion("你是不是不爱你老婆了").valence < 0
+    # 「不开心」本来就在负向表里，行为不变
+    assert infer_query_emotion("今天不开心").source == "lexicon.negative_low"
+    # 被否定的负向词不硬翻成正向：中性先验、不解锁情绪侧通道
+    calm = infer_query_emotion("我没生气")
+    assert calm.source == "neutral_prior" and calm.explicit is False
+    assert infer_query_emotion("不难过啦").source == "neutral_prior"
+    # 英文
+    assert infer_query_emotion("i'm not happy about this").source == "lexicon.negated_positive"
+    assert infer_query_emotion("i'm happy").source == "lexicon.positive_high"
+    assert infer_query_emotion("never felt safe here").valence < 0
+    # 否定词不紧邻不算否定：「不管怎样我都放心」→ 「都放心」前是「都」
+    assert infer_query_emotion("不管怎样我都放心").source == "lexicon.positive_low"
+    # 否定词和线索之间隔程度词 / 隔一个动词
+    assert infer_query_emotion("我不是很放心").source == "lexicon.negated_positive"
+    assert infer_query_emotion("没那么开心").source == "lexicon.negated_positive"
+    assert infer_query_emotion("i don't feel safe").source == "lexicon.negated_positive"
+    # 标点截断：前一分句的否定不跨过来
+    assert infer_query_emotion("not bad, i'm happy").source == "lexicon.positive_high"
+    assert infer_query_emotion("不用担心，我很放心").source == "lexicon.positive_low"
