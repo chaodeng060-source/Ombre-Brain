@@ -38,7 +38,9 @@ from fact_conflicts import scan_cross_bucket_z_conflicts
 from review_queue import (
     ReviewQueue,
     make_metabolism_entry,
+    make_z_pair_entry,
 )
+from z_candidates import propose_z_pair_candidates
 from utils import RELATION_TYPES
 
 # 与 utils.PROTECTED_RESOLVE_DOMAINS 保持一致（resolve=遗忘的禁区）。
@@ -289,6 +291,41 @@ def enqueue_metabolism_suggestions(report: dict, queue: ReviewQueue) -> int:
     """Append new pending M suggestions; bucket contents remain untouched."""
     added = 0
     for entry in report.get("suggestions", []):
+        if queue.enqueue(entry):
+            added += 1
+    return added
+
+
+Z_PAIR_QUEUE_SOURCE = "patrol_z_scan"
+
+
+def z_pair_entries(report: dict) -> list[dict]:
+    """Turn patrol Z candidates into review-queue z_conflict entries (pure)."""
+    entries: list[dict] = []
+    for cand in report.get("z_pair_candidates", []):
+        try:
+            entries.append(make_z_pair_entry(
+                cand["current_bucket_id"],
+                cand["historical_bucket_id"],
+                fact_key=cand["fact_key"],
+                current_name=cand.get("current_name", ""),
+                historical_name=cand.get("historical_name", ""),
+                reason=str(cand.get("reason") or "same_fact_slot_newer_supersedes"),
+                source=Z_PAIR_QUEUE_SOURCE,
+            ))
+        except (KeyError, ValueError):
+            continue
+    return entries
+
+
+def enqueue_z_pair_candidates(report: dict, queue: ReviewQueue) -> int:
+    """Append new pending Z pair candidates; enqueue is idempotent, buckets untouched.
+
+    fact_status only changes when a human approves the pending entry later
+    (review_queue lifecycle_updates); patrol never writes it.
+    """
+    added = 0
+    for entry in z_pair_entries(report):
         if queue.enqueue(entry):
             added += 1
     return added
@@ -750,6 +787,9 @@ def patrol(
     duplicates = {n: ids_ for n, ids_ in name_index.items() if len(ids_) > 1}
     fact_report = audit_fact_slots(buckets, fact_slot_registry or {})
     z_conflicts = scan_cross_bucket_z_conflicts(buckets)
+    # Z 轴同槽新旧候选：只按已注册 fact slot 分组、按 created 新→旧配对、内容真冲突才出；
+    # 这里只生成候选，入队由 enqueue_z_pair_candidates 负责，改 fact_status 只有人审批准后。
+    z_pair_report = propose_z_pair_candidates(buckets, fact_slot_registry or {})
     for source_id, target_id, rel_type in sorted(typed_edges):
         if rel_type == "kin" and (target_id, source_id, rel_type) in typed_edges and source_id < target_id:
             reciprocal_kin.append({"from": source_id, "target": target_id, "type": rel_type})
@@ -770,6 +810,8 @@ def patrol(
         "duplicates": duplicates,
         **fact_report,
         "z_conflicts": z_conflicts,
+        "z_pair_candidates": z_pair_report["candidates"],
+        "z_pair_stats": z_pair_report["stats"],
         "protected_resolved": protected_resolved,
         "stale_important": sorted(stale_important, key=lambda x: -x["days"])[:20],
         "curated_without_vector": curated_without_vector,
@@ -872,6 +914,39 @@ def render_md(report: dict, buckets_dir: Path, now: datetime) -> str:
     section("⚠️ Z轴跨桶事实冲突候选（只报告，不入队、不改库）", report.get("z_conflicts", []),
             fmt_z_conflict,
             empty="未发现同名/同域跨桶事实冲突候选")
+
+    def fmt_z_pair(item):
+        conflicts = ", ".join(
+            f"{c['field']}: {c['old']} → {c['new']}"
+            for c in item.get("conflicts", [])
+        ) or "槽值不同"
+        return (
+            f"`{item['fact_key']}` 新 `{item['current_bucket_id']}` {item['current_name']}"
+            f"（{item['current_created'][:10]}，{item['current_match']}） ← 旧 "
+            f"`{item['historical_bucket_id']}` {item['historical_name']}"
+            f"（{item['historical_created'][:10]}，{item['historical_match']}） —— {conflicts}"
+        )
+
+    z_stats = report.get("z_pair_stats", {}) or {}
+    section("🧭 Z轴同槽新旧候选（入待审队列，人批准前不改 fact_status）",
+            report.get("z_pair_candidates", []),
+            fmt_z_pair,
+            empty="没有已注册事实槽内的新旧冲突候选")
+    if z_stats:
+        L.append(
+            f"- 统计：桶入槽 {z_stats.get('buckets_in_slots', 0)}"
+            f"（结构化 {z_stats.get('memberships_by_match', {}).get('structured', 0)}"
+            f" / metadata {z_stats.get('memberships_by_match', {}).get('metadata', 0)}"
+            f" / 上下文 {z_stats.get('memberships_by_match', {}).get('context', 0)}）"
+            f" · 有成员的槽 {z_stats.get('slots_with_members', 0)}"
+            f" · 比对 {z_stats.get('pairs_compared', 0)} 对"
+            f" · 无 created 跳过 {z_stats.get('skipped_no_created', 0)}"
+            f" · 已关联跳过 {z_stats.get('skipped_already_linked', 0)}"
+            f" · 无冲突跳过 {z_stats.get('skipped_no_conflict', 0)}"
+            f" · 候选 {z_stats.get('candidates', 0)}"
+            f"{'（触顶截断）' if z_stats.get('hit_limit') else ''}"
+        )
+        L.append("")
     zero_deposition = report.get("zero_deposition", {})
     L.append("## 🚨 连续零沉淀监控（对照真实对话活跃）")
     status = zero_deposition.get("status", "not_configured")
@@ -1002,11 +1077,11 @@ def main():
     )
     md = render_md(report, buckets_dir, now)
     queued = 0
+    queued_z = 0
     if args.review_queue:
-        queued = enqueue_metabolism_suggestions(
-            report,
-            ReviewQueue(args.review_queue),
-        )
+        queue = ReviewQueue(args.review_queue)
+        queued = enqueue_metabolism_suggestions(report, queue)
+        queued_z = enqueue_z_pair_candidates(report, queue)
 
     if args.out:
         outp = Path(args.out)
@@ -1016,7 +1091,7 @@ def main():
     else:
         print(md)
     if args.review_queue:
-        print(f"待审建议新增 {queued} 条；记忆桶未改。")
+        print(f"待审建议新增 {queued} 条；Z 轴新旧候选新增 {queued_z} 条；记忆桶未改。")
 
 
 if __name__ == "__main__":

@@ -362,6 +362,23 @@ fact_slots:
       types: [dynamic]
       tags_any: [UI偏好, 朝灯UI偏好, UI设计, 前端调色]
       name_contains: [UI, 前端, 调色]
+    # --- 2026-08-18 Z 轴闭环新增的基础设施事实槽（task_wr_976a40a17657_02）---
+    # 这三类事实会随时间翻篇（记忆库搬家 / 电脑换 IP / 换本地模型），旧桶不标 historical
+    # 召回就会把旧值当真。约束先只用 types + name_contains，domains 等生产诊断数字校准后再收紧。
+    # 候选来源：patrol → z_candidates.propose_z_pair_candidates → review_queue（只入队），
+    # fact_status 只有人批准 apply-lifecycle 后才写。
+    infra.memory_store.location:
+      aliases: [记忆库位置, 记忆库, 海马体位置, 记忆存放]
+      types: [dynamic]
+      name_contains: [记忆库, 记忆搬, 海马体, memory.zhaodeng, NAS, 远程记忆]
+    infra.zhaodeng_windows.ip:
+      aliases: [真实ip, ip, windows ip, 电脑ip]
+      types: [dynamic]
+      name_contains: [IP, Windows, 朝灯电脑, 朝灯的电脑]
+    infra.local_llm.model_name:
+      aliases: [本地模型, 模型名, model, 本地模型名]
+      types: [dynamic]
+      name_contains: [本地模型, qwen, ollama, 模型名, GLM]
 
 # --- World axis / 世界轴 ---
 # 用来隔离不同剧情世界的记忆。日常聊天的桶 world 留空（不属于任何世界）；

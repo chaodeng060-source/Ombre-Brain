@@ -81,6 +81,8 @@ def run_nightly_patrol(
             maintenance_root=buckets_dir,
         )
         queued = patrol_module.enqueue_metabolism_suggestions(report, queue)
+        # Z 轴：同槽新旧候选只入待审队列；fact_status 只有人批准后才会变
+        queued_z = patrol_module.enqueue_z_pair_candidates(report, queue)
         report_path = runs_dir / f"{run_id}.md"
         atomic_write_text(report_path, rendered + "\n")
         atomic_write_text(state_root / "latest.md", rendered + "\n")
@@ -91,6 +93,8 @@ def run_nightly_patrol(
             "bucket_count": int(report.get("total", 0)),
             "suggestion_count": len(report.get("suggestions", [])),
             "queued_count": queued,
+            "z_candidate_count": len(report.get("z_pair_candidates", [])),
+            "z_queued_count": queued_z,
         })
         _write_status(state_root, status)
         return status
