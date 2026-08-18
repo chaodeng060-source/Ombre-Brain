@@ -430,6 +430,7 @@ async def test_real_breath_changes_close_order_and_injects_posture(
         *,
         mode,
         max_results,
+        force_keep_ids=None,
         allow_empty=False,
     ):
         return values[:max_results]

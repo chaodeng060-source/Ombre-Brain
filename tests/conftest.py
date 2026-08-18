@@ -19,6 +19,23 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
+@pytest.fixture(autouse=True)
+def isolate_briefing_prebuilt_cache():
+    """Keep server-level briefing material from leaking between test cases."""
+
+    def _clear() -> None:
+        server_module = sys.modules.get("server")
+        cache = getattr(server_module, "_briefing_prebuilt_cache", None)
+        lock = getattr(server_module, "_briefing_cache_lock", None)
+        if cache is not None and lock is not None:
+            with lock:
+                cache.clear()
+
+    _clear()
+    yield
+    _clear()
+
+
 @pytest.fixture
 def test_config(tmp_path):
     """Minimal config pointing to a temp directory."""

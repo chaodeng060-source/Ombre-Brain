@@ -113,6 +113,34 @@ async def test_second_request_reads_prebuilt_cache_and_refreshes_time_header(
 
 
 @pytest.mark.asyncio
+async def test_new_session_reuses_same_generation_shape_without_model_call(
+    monkeypatch,
+):
+    manager = _FakeMgr()
+    dehydrator = _GoodDehydrator()
+    monkeypatch.setattr(server, "bucket_mgr", manager)
+    monkeypatch.setattr(server, "dehydrator", dehydrator)
+
+    first = await server.briefing(
+        max_chars=1500,
+        format="json",
+        session_id="session-a",
+        include_body_state=False,
+    )
+    manager.fail = True
+    second = await server.briefing(
+        max_chars=1500,
+        format="json",
+        session_id="session-b",
+        include_body_state=False,
+    )
+
+    assert json.loads(first)["briefing"] == json.loads(second)["briefing"]
+    assert manager.calls == 1
+    assert len(dehydrator.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_background_fallback_keeps_previous_good_cache(monkeypatch):
     manager = _FakeMgr()
     dehydrator = _FallbackDehydrator()
@@ -170,6 +198,27 @@ def test_background_store_fans_out_without_merging_session_keys():
     assert server._briefing_prebuilt_cache[first] is not server._briefing_prebuilt_cache[second]
 
 
+def test_new_profile_only_reuses_identical_generation_shape():
+    source = server._briefing_profile(1500, "daily", False, "session-a", "json")
+    same_shape = server._briefing_profile(1500, "daily", False, "session-b", "json")
+    different_size = server._briefing_profile(1000, "daily", False, "session-b", "json")
+    different_format = server._briefing_profile(1500, "daily", False, "session-b", "text")
+
+    server._store_briefing_cache_entry(
+        source,
+        text=json.dumps({"time_header": "old", "briefing": "GOOD"}),
+        time_header="old",
+        buckets=[],
+    )
+    server._register_briefing_profile(same_shape)
+    server._register_briefing_profile(different_size)
+    server._register_briefing_profile(different_format)
+
+    assert server._get_briefing_cache_entry(same_shape) is not None
+    assert server._get_briefing_cache_entry(different_size) is None
+    assert server._get_briefing_cache_entry(different_format) is None
+
+
 @pytest.mark.asyncio
 async def test_dirty_write_wakes_background_refresh(monkeypatch):
     event = server.asyncio.Event()
@@ -201,3 +250,70 @@ async def test_startup_schedules_immediate_background_generation(monkeypatch):
         assert not server._briefing_refresh_task.done()
     finally:
         await server._stop_briefing_cache_refresh()
+
+
+@pytest.mark.asyncio
+async def test_clean_worker_does_not_refresh_again_while_idle(monkeypatch):
+    profile = server._briefing_profile(1500, "", False, "", "json")
+    event = server.asyncio.Event()
+    event.set()
+    first_refresh = server.asyncio.Event()
+    seen = []
+
+    async def _record_refresh(current):
+        seen.append(current)
+        first_refresh.set()
+
+    monkeypatch.setattr(server, "_briefing_refresh_event", event)
+    monkeypatch.setattr(server, "_briefing_profiles", {profile})
+    monkeypatch.setattr(server, "_refresh_briefing_profile", _record_refresh)
+    monkeypatch.setattr(server, "BRIEFING_REFRESH_INTERVAL_SECONDS", 0.03)
+
+    task = server.asyncio.create_task(server._briefing_cache_refresh_worker())
+    try:
+        await server.asyncio.wait_for(first_refresh.wait(), timeout=1)
+        await server.asyncio.sleep(0.08)
+        assert seen == [profile]
+    finally:
+        task.cancel()
+        with pytest.raises(server.asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.asyncio
+async def test_dirty_marks_coalesce_into_one_rate_limited_refresh(monkeypatch):
+    profile = server._briefing_profile(1500, "", False, "", "json")
+    event = server.asyncio.Event()
+    event.set()
+    first_refresh = server.asyncio.Event()
+    second_refresh = server.asyncio.Event()
+    seen = []
+
+    async def _record_refresh(current):
+        seen.append((current, server.asyncio.get_running_loop().time()))
+        if len(seen) == 1:
+            first_refresh.set()
+        elif len(seen) == 2:
+            second_refresh.set()
+
+    monkeypatch.setattr(server, "_briefing_refresh_event", event)
+    monkeypatch.setattr(server, "_briefing_profiles", {profile})
+    monkeypatch.setattr(server, "_refresh_briefing_profile", _record_refresh)
+    monkeypatch.setattr(server, "BRIEFING_REFRESH_INTERVAL_SECONDS", 0.05)
+
+    task = server.asyncio.create_task(server._briefing_cache_refresh_worker())
+    try:
+        await server.asyncio.wait_for(first_refresh.wait(), timeout=1)
+        event.set()
+        await server.asyncio.sleep(0.01)
+        event.set()
+        event.set()
+        await server.asyncio.wait_for(second_refresh.wait(), timeout=1)
+        await server.asyncio.sleep(0.08)
+
+        assert len(seen) == 2
+        assert seen[1][1] - seen[0][1] >= 0.04
+    finally:
+        task.cancel()
+        with pytest.raises(server.asyncio.CancelledError):
+            await task

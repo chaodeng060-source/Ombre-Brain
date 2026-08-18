@@ -27,6 +27,18 @@ class NightTriggerHTTPError(RuntimeError):
         super().__init__(f"night trigger returned HTTP {status}")
 
 
+def _connection_target() -> tuple[str, int]:
+    host = os.environ.get("OMBRE_NIGHT_TRIGGER_HOST", HOST).strip()
+    raw_port = os.environ.get(
+        "OMBRE_NIGHT_TRIGGER_PORT",
+        os.environ.get("OMBRE_HOST_PORT", str(PORT)),
+    )
+    port = int(raw_port)
+    if host != "127.0.0.1" or not 1 <= port <= 65535:
+        raise ValueError("night trigger target is invalid")
+    return host, port
+
+
 def _safe_summary(payload: object) -> dict[str, object]:
     if type(payload) is not dict:
         raise ValueError("night response is not an object")
@@ -55,7 +67,8 @@ def trigger() -> dict[str, object]:
     # request alive long enough to receive its terminal ledger receipt; an
     # early client timeout does not cancel the server-side run and makes the
     # catch-up wrapper mistake healthy work for a failed round.
-    connection = HTTPConnection(HOST, PORT, timeout=RESPONSE_TIMEOUT_SECONDS)
+    host, port = _connection_target()
+    connection = HTTPConnection(host, port, timeout=RESPONSE_TIMEOUT_SECONDS)
     try:
         connection.request(
             "POST",

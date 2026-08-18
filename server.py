@@ -73,7 +73,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 
-from bucket_manager import BucketManager, bucket_revision_hash
+from bucket_manager import BucketManager, bucket_revision_hash, literal_retrieval_keys
 from dehydrator import (
     Dehydrator,
     SelfContainmentError,
@@ -161,7 +161,7 @@ from mcp_auth import (
 from review_queue import (
     ReviewQueue, make_relation_entry, make_z_pair_entry,
     render_md as _render_review_md,
-    KIND_RELATION, KIND_Z_CONFLICT, KIND_METABOLISM, KIND_E_PROPOSAL,
+    KIND_CLOTHING, KIND_RELATION, KIND_Z_CONFLICT, KIND_METABOLISM, KIND_E_PROPOSAL,
     query_requests_history,
     rest_resolve_status_allowed,
 )
@@ -1603,6 +1603,54 @@ def _parse_ds_keep_indices(raw: str, n: int) -> list[int] | None:
     return out
 
 
+def _exact_retrieval_key_ids(query: str, buckets: list[dict]) -> set[str]:
+    """Return buckets whose curated retrieval key occurs verbatim in query."""
+    query_text = str(query or "").casefold()
+    if not query_text:
+        return set()
+
+    matched: set[str] = set()
+    for bucket in buckets:
+        metadata = bucket.get("metadata", {}) or {}
+        candidates = metadata.get("retrieval_keys", [])
+        if isinstance(candidates, str):
+            candidates = [candidates]
+        elif not isinstance(candidates, (list, tuple, set)):
+            candidates = []
+        keys = literal_retrieval_keys(
+            str(bucket.get("content") or ""),
+            candidates,
+        )
+        if not any(str(key).casefold() in query_text for key in keys):
+            continue
+        bucket_id = str(bucket.get("id") or "").strip()
+        if bucket_id:
+            matched.add(bucket_id)
+    return matched
+
+
+def _cap_candidates_preserving_forced(
+    candidates: list[dict],
+    force_keep_ids: set[str],
+    max_results: int,
+) -> list[dict]:
+    """Keep forced rows in order while making them consume the normal cap."""
+    if max_results <= 0:
+        return []
+    forced_count = sum(
+        1 for bucket in candidates if bucket.get("id") in force_keep_ids
+    )
+    ordinary_budget = max(0, max_results - forced_count)
+    selected: list[dict] = []
+    for bucket in candidates:
+        if bucket.get("id") in force_keep_ids:
+            selected.append(bucket)
+        elif ordinary_budget > 0:
+            selected.append(bucket)
+            ordinary_budget -= 1
+    return selected
+
+
 async def _ds_semantic_select(
     query: str,
     buckets: list[dict],
@@ -1650,7 +1698,7 @@ async def _ds_semantic_select(
         b for i, b in enumerate(buckets)
         if i in keep_idx or b.get("id") in keep
     ]
-    return selected[:max_results]
+    return _cap_candidates_preserving_forced(selected, keep, max_results)
 
 
 async def _ds_filter_candidates(
@@ -1674,11 +1722,7 @@ async def _ds_filter_candidates(
     if max_results <= 0:
         return []
     keep = force_keep_ids or set()
-    capped: list[dict] = []
-    for b in candidates:
-        is_forced = b.get("id") in keep
-        if len(capped) < max_results or is_forced:
-            capped.append(b)
+    capped = _cap_candidates_preserving_forced(candidates, keep, max_results)
 
     if not _ds_gate_enabled(mode) or not query or not capped:
         logger.debug(
@@ -1686,6 +1730,22 @@ async def _ds_filter_candidates(
             mode,
             query[:80] if query else "",
             len(candidates),
+            len(capped),
+        )
+        return capped
+
+    # The gate is subtractive only.  With one non-empty result required, a
+    # singleton can never change: keeping it returns ``capped`` and rejecting
+    # it also falls back to ``capped`` below.  Likewise, forced candidates can
+    # never be removed.  Avoid paying for a model decision whose result is
+    # already determined locally.
+    if (len(capped) == 1 and not allow_empty) or all(
+        bucket.get("id") in keep for bucket in capped
+    ):
+        logger.debug(
+            "DS filter deterministic no-op mode=%s query=%r capped=%d",
+            mode,
+            query[:80],
             len(capped),
         )
         return capped
@@ -2502,6 +2562,15 @@ def _metadata_list(value) -> list:
     return [str(value)]
 
 
+def _entity_retrieval_keys(entities: list[dict] | None) -> list[str]:
+    """Extract exact, already-validated entity mentions for bucket clothing."""
+    return [
+        str(entity.get("mention") or "").strip()
+        for entity in (entities or [])
+        if isinstance(entity, dict) and str(entity.get("mention") or "").strip()
+    ]
+
+
 def _bucket_primary_domain_matches(meta: dict, domain: list) -> bool:
     if not domain:
         return True
@@ -2847,6 +2916,7 @@ async def _create_operational_status_successor(
             valence=valence,
             arousal=arousal,
             name=name or None,
+            retrieval_keys=_entity_retrieval_keys(entities),
             world=world,
             chord_tag=chord_tag,
             sense=detected_senses or None,
@@ -2861,6 +2931,7 @@ async def _create_operational_status_successor(
                 type(exc).__name__,
             )
 
+    new_meta: dict = {}
     try:
         new_bucket = await bucket_mgr.get(new_bucket_id)
         if not new_bucket:
@@ -2896,7 +2967,8 @@ async def _create_operational_status_successor(
             type(exc).__name__,
         )
     await _synchronize_bucket_entities(new_bucket_id, content, entities)
-    return new_bucket_id, (name or new_bucket_id), False
+    created_name = str((new_meta or {}).get("name") or "").strip()
+    return new_bucket_id, (created_name or name or new_bucket_id), False
 
 
 # =============================================================
@@ -3163,6 +3235,7 @@ async def _merge_or_create(
             valence=valence,
             arousal=arousal,
             name=name or None,
+            retrieval_keys=_entity_retrieval_keys(entities),
             world=world,
             chord_tag=chord_tag,
             sense=detected_senses or None,
@@ -3174,7 +3247,14 @@ async def _merge_or_create(
         except Exception as e:
             logger.warning(f"Embedding for new bucket failed / 新桶向量生成失败: {bucket_id}: {e}")
     await _synchronize_bucket_entities(bucket_id, content, entities)
-    display = name if name else bucket_id
+    get_created_bucket = getattr(bucket_mgr, "get", None)
+    created_bucket = (
+        await get_created_bucket(bucket_id)
+        if callable(get_created_bucket)
+        else None
+    )
+    created_metadata = (created_bucket or {}).get("metadata", {}) or {}
+    display = str(created_metadata.get("name") or name or bucket_id)
     return bucket_id, display, False
 
 
@@ -3578,6 +3658,7 @@ async def breath(
             scored,
             mode="surfacing",
             max_results=max_results,
+            force_keep_ids=_exact_retrieval_key_ids("", scored),
         )
 
         if scored:
@@ -4121,6 +4202,7 @@ async def breath(
             matches,
             mode="search",
             max_results=max(0, max_results - len(state_link_candidates)),
+            force_keep_ids=_exact_retrieval_key_ids(recall_query, matches),
             allow_empty=allow_empty_recall,
         )
     with recall_stage("assembly"):
@@ -4689,6 +4771,9 @@ async def hold(
                 valence=valence,
                 arousal=arousal,
                 name=suggested_name or None,
+                retrieval_keys=_entity_retrieval_keys(
+                    analysis.get("entities", [])
+                ),
                 bucket_type="permanent",
                 pinned=True,
                 world=effective_world,
@@ -5013,7 +5098,7 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
                 results.append(f"📎{result_name}")
                 merged += 1
             else:
-                results.append(f"📝{item.get('name', result_name)}")
+                results.append(f"📝{item.get('name') or result_name}")
                 created += 1
         except Exception as e:
             logger.warning(
@@ -6012,7 +6097,7 @@ def _briefing_env_seconds(name: str, default: float, minimum: float) -> float:
 
 BRIEFING_REFRESH_INTERVAL_SECONDS = _briefing_env_seconds(
     "OMBRE_BRIEFING_REFRESH_INTERVAL_SECONDS",
-    600.0,
+    3600.0,
     30.0,
 )
 BRIEFING_REFRESH_TIMEOUT_SECONDS = _briefing_env_seconds(
@@ -6023,8 +6108,9 @@ BRIEFING_REFRESH_TIMEOUT_SECONDS = _briefing_env_seconds(
 
 # A profile is exactly the request shape that affects briefing material or
 # representation.  Body-state rendering remains request-time work and is not
-# cached; session_id stays in the key as required so sessions never share a
-# cache identity accidentally.
+# cached; session_id stays in the key so request-time state remains isolated,
+# while profiles with the same LLM generation shape may reuse immutable
+# briefing material instead of regenerating it for every new window.
 _BriefingProfile = tuple[int, str, bool, str, str, str]
 _briefing_cache_lock = threading.Lock()
 _briefing_prebuilt_cache: dict[_BriefingProfile, dict] = {}
@@ -6062,14 +6148,27 @@ def _briefing_profile(
     )
 
 
-def _register_briefing_profile(profile: _BriefingProfile) -> None:
-    with _briefing_cache_lock:
-        _briefing_profiles.add(profile)
-
-
 def _briefing_generation_shape(profile: _BriefingProfile) -> tuple:
     """Fields that affect LLM material; session only affects request rendering."""
     return (profile[0], profile[1], profile[2], profile[4], profile[5])
+
+
+def _register_briefing_profile(profile: _BriefingProfile) -> None:
+    shape = _briefing_generation_shape(profile)
+    with _briefing_cache_lock:
+        _briefing_profiles.add(profile)
+        if profile in _briefing_prebuilt_cache:
+            return
+        shared_entry = next(
+            (
+                entry
+                for cached_profile, entry in _briefing_prebuilt_cache.items()
+                if _briefing_generation_shape(cached_profile) == shape
+            ),
+            None,
+        )
+        if shared_entry is not None:
+            _briefing_prebuilt_cache[profile] = dict(shared_entry)
 
 
 def _get_briefing_cache_entry(profile: _BriefingProfile) -> dict | None:
@@ -6192,13 +6291,34 @@ async def _briefing_cache_refresh_worker() -> None:
     event = _briefing_refresh_event
     if event is None:
         return
+    loop = asyncio.get_running_loop()
+    last_refresh_completed_at: float | None = None
     logger.info(
-        "Briefing background pre-generation started interval=%.1fs timeout=%.1fs",
+        "Briefing background pre-generation started minimum_gap=%.1fs timeout=%.1fs",
         BRIEFING_REFRESH_INTERVAL_SECONDS,
         BRIEFING_REFRESH_TIMEOUT_SECONDS,
     )
     while True:
+        # Refresh only when startup or a durable write marks the cache dirty.
+        # The old timeout loop regenerated every known profile while idle and
+        # could immediately run again when writes arrived during a refresh.
+        # A minimum gap keeps those writes coalesced into one bounded batch.
+        await event.wait()
         event.clear()
+        if last_refresh_completed_at is not None:
+            remaining = BRIEFING_REFRESH_INTERVAL_SECONDS - (
+                loop.time() - last_refresh_completed_at
+            )
+            if remaining > 0:
+                logger.info(
+                    "Briefing background refresh coalescing dirty writes for %.1fs",
+                    remaining,
+                )
+                await asyncio.sleep(remaining)
+                # Every dirty mark received during the gap belongs to this
+                # refresh batch.  Marks raised while refreshing remain set and
+                # schedule one later batch instead of being lost.
+                event.clear()
         with _briefing_cache_lock:
             # session_id is a cache-key boundary, not an LLM-input boundary.
             # Refresh one representative per material shape, then _store...
@@ -6220,13 +6340,7 @@ async def _briefing_cache_refresh_worker() -> None:
             profiles = list(by_shape.values())
         for profile in profiles:
             await _refresh_briefing_profile(profile)
-        try:
-            await asyncio.wait_for(
-                event.wait(),
-                timeout=BRIEFING_REFRESH_INTERVAL_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            pass
+        last_refresh_completed_at = loop.time()
 
 
 async def _start_briefing_cache_refresh() -> None:
@@ -7191,7 +7305,11 @@ async def _probe_anchor_status(query: str) -> dict:
             bucket["score"] = round(fused_score * 1000, 2)
             matches.append(bucket)
         matches = await _ds_filter_candidates(
-            recall_query, matches, mode="search", max_results=2
+            recall_query,
+            matches,
+            mode="search",
+            max_results=2,
+            force_keep_ids=_exact_retrieval_key_ids(recall_query, matches),
         )
 
     has_evidence = bool(matches) if vector_status == "ok" and not keyword_error else False
@@ -7243,6 +7361,7 @@ async def api_review_queue(request):
     from starlette.responses import JSONResponse
     kind = (request.query_params.get("kind") or "").strip().lower()
     if kind and kind not in (
+        KIND_CLOTHING,
         KIND_RELATION,
         KIND_Z_CONFLICT,
         KIND_METABOLISM,
@@ -8470,12 +8589,27 @@ if __name__ == "__main__":
 
         # --- Application-level keepalive: ping /health every 60s ---
         # --- 应用层保活：每 60 秒 ping 一次 /health，防止 Cloudflare Tunnel 空闲断连 ---
+        bind_host = os.environ.get("OMBRE_BIND_ADDRESS", "127.0.0.1").strip()
+        if bind_host not in {"127.0.0.1", "::1", "localhost"}:
+            raise RuntimeError(
+                "VPS disaster-recovery runtime only permits a loopback bind"
+            )
+        try:
+            host_port = int(os.environ.get("OMBRE_HOST_PORT", "18080"))
+        except ValueError as exc:
+            raise RuntimeError("OMBRE_HOST_PORT must be an integer") from exc
+        if not 1 <= host_port <= 65535:
+            raise RuntimeError("OMBRE_HOST_PORT is outside the valid range")
+
         async def _keepalive_loop():
             await asyncio.sleep(10)  # Wait for server to fully start
             async with httpx.AsyncClient() as client:
                 while True:
                     try:
-                        await client.get("http://localhost:8000/health", timeout=5)
+                        await client.get(
+                            f"http://{bind_host}:{host_port}/health",
+                            timeout=5,
+                        )
                         logger.debug("Keepalive ping OK / 保活 ping 成功")
                     except Exception as e:
                         logger.warning(f"Keepalive ping failed / 保活 ping 失败: {e}")
@@ -8539,6 +8673,6 @@ if __name__ == "__main__":
         logger.info(
             "CORS + /api + MCP Bearer 鉴权已启用 / network auth middleware enabled"
         )
-        uvicorn.run(_app, host="0.0.0.0", port=8000)
+        uvicorn.run(_app, host=bind_host, port=host_port)
     else:
         mcp.run(transport=transport)

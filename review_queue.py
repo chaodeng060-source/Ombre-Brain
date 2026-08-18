@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -39,6 +40,7 @@ KIND_RELATION = "relation"    # #3：机器自动推断的「危险」关系边�
 KIND_Z_CONFLICT = "z_conflict"  # #2：合并时检出的事实冲突（数字/日期/否定翻转）
 KIND_METABOLISM = "metabolism"  # M：只读巡检建议，永不自动执行
 KIND_E_PROPOSAL = "e_proposal"  # E：模型只提建议，主 AI 亲自写权威体验
+KIND_CLOTHING = "clothing"  # 裸桶补衣：正文已保留，等待补检索身份
 
 METABOLISM_ACTIONS = frozenset({
     "promote",
@@ -242,6 +244,38 @@ def make_relation_entry(
     if strength is not None:
         entry["strength"] = strength
     return entry
+
+
+def make_clothing_entry(
+    bucket_id: str,
+    bucket_name: str,
+    *,
+    content_sha256: str,
+    source: str = "bucket-create",
+    reason: str = "no_literal_retrieval_key",
+    now: Optional[datetime] = None,
+) -> dict:
+    """Create one content-free, idempotent bucket-clothing review row."""
+    bucket_id = str(bucket_id or "").strip()
+    bucket_name = str(bucket_name or "").strip()
+    content_sha256 = str(content_sha256 or "").strip().lower()
+    source = str(source or "bucket-create").strip()
+    reason = str(reason or "no_literal_retrieval_key").strip()
+    if not bucket_id or not bucket_name:
+        raise ValueError("clothing entry requires bucket id and name")
+    if not re.fullmatch(r"[0-9a-f]{64}", content_sha256):
+        raise ValueError("clothing entry requires a sha256 content hash")
+    return {
+        "key": "clothing|" + bucket_id,
+        "kind": KIND_CLOTHING,
+        "status": STATUS_PENDING,
+        "bucket_id": bucket_id,
+        "bucket_name": bucket_name[:160],
+        "content_sha256": content_sha256,
+        "reason": reason[:160],
+        "source": source[:120],
+        "created": _now_iso(now),
+    }
 
 
 def make_metabolism_entry(
@@ -608,6 +642,19 @@ def render_md(items: list[dict], now: Optional[datetime] = None) -> str:
     zs = [e for e in items if e.get("kind") == KIND_Z_CONFLICT]
     metabolism = [e for e in items if e.get("kind") == KIND_METABOLISM]
     e_proposals = [e for e in items if e.get("kind") == KIND_E_PROPOSAL]
+    clothing = [e for e in items if e.get("kind") == KIND_CLOTHING]
+
+    L.append(f"## 👕 裸桶补衣 · 待补检索身份（{len(clothing)}）")
+    L.append("> 正文已经完整落库；这里只列 bucket id、名称和内容哈希，不复制正文。")
+    if not clothing:
+        L.append("- ✅ 无")
+    else:
+        for entry in clothing:
+            L.append(
+                f"- `{entry['key']}` {entry['bucket_name']} "
+                f"(`{entry['bucket_id']}`) —— {entry['reason']} · {entry['source']}"
+            )
+    L.append("")
 
     L.append(f"## 🩺 M轴 · 待审代谢建议（{len(metabolism)}）")
     L.append("> 巡检只提出建议，不改桶；晋升、降级、拆分或归档均需人显式执行。")
@@ -668,10 +715,22 @@ def main():
     ap.add_argument("--path", default=os.path.join(default_dir, "review_queue.jsonl"),
                     help="队列文件（默认 <OMBRE_BUCKETS_DIR>/review_queue.jsonl）")
     ap.add_argument("--out", default=None, help="报告落点（默认打印 stdout）")
+    ap.add_argument(
+        "--kind",
+        choices=(
+            KIND_CLOTHING,
+            KIND_RELATION,
+            KIND_Z_CONFLICT,
+            KIND_METABOLISM,
+            KIND_E_PROPOSAL,
+        ),
+        default=None,
+        help="只看一种待审类型（裸桶补衣用 clothing）",
+    )
     args = ap.parse_args()
 
     q = ReviewQueue(args.path)
-    md = render_md(q.list_pending())
+    md = render_md(q.list_pending(args.kind))
     if args.out:
         outp = Path(args.out)
         outp.parent.mkdir(parents=True, exist_ok=True)

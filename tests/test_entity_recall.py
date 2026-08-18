@@ -195,6 +195,7 @@ async def test_entity_only_channel_reuses_all_authority_filters(tmp_path, monkey
         *,
         mode,
         max_results,
+        force_keep_ids=None,
         allow_empty=False,
     ):
         return [bucket for bucket in values if bucket["id"] != "nsfw-bad"][:max_results]

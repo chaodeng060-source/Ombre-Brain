@@ -53,6 +53,7 @@ from mutation_audit import MutationAuditLog
 from maintenance_barrier import MaintenanceBarrier
 from storage_safety import advisory_file_lock, atomic_write_post
 from x_provenance import normalize_x_provenance, validate_x_provenance_update
+from review_queue import ReviewQueue, make_clothing_entry
 
 logger = logging.getLogger("ombre_brain.bucket")
 
@@ -91,6 +92,92 @@ E_IMMUTABLE_FIELDS = frozenset({
     "e_source_bucket_id",
     "e_proposal_key",
 })
+
+_RETRIEVAL_KEY_LINE_RE = re.compile(r"\[检索钥匙:\s*([^\]\n]+)\]")
+_GENERIC_RETRIEVAL_KEYS = frozenset({
+    "今天", "昨天", "明天", "事情", "内容", "消息", "问题", "感觉", "聊天",
+    "朝灯", "哥哥", "小卷", "哈基米", "记忆", "记忆库", "海马体", "账本",
+    "真账", "亲亲", "截图", "心跳", "发情", "复制粘贴", "小红书",
+    "today", "yesterday", "tomorrow", "memory", "message", "chat",
+})
+
+
+# 正文里可以当「名字」的第一句从哪儿开始找。imprint 桶的正文长这样：
+#   —— 整理摘要（模型归纳，不是原文）——
+#   <一句话>
+#   —— 原始证据 / 候选原话 ——
+#   朝灯：… / 哥哥：…
+_BODY_LEAD_SKIP_RE = re.compile(r"^\s*(?:---|——.*——|\[[^\]]*\]|[#>*\-|]+)\s*$")
+_BODY_LEAD_SENTENCE_RE = re.compile(r"[^。！？!?；;\n]{4,24}")
+_BODY_LEAD_MAX = 24
+
+
+def body_lead_keys(content: str) -> list[str]:
+    """从正文首句里切出能当桶名/检索钥匙的短语。
+
+    2026-08-17 朝灯：「修待补衣，这是啥名字啊奇奇怪怪的」。
+    病根在 create_bucket 的候选词池：feel 桶的 name 传空、tags 全是
+    `imprint`/`evidence:v1` 这类系统标签，**一个都不在正文里逐字出现**，
+    于是 literal_retrieval_keys 全筛掉 → 没钥匙 → 名字退化成硬编码的
+    「待补衣」。当时库里 43 条全叫这个，召回浮现出来也认不出是什么
+    （她 12:11「怎么没记忆浮现」的直接原因——浮现了，认不出）。
+
+    摘要那句天生就在正文里，拿它当候选**天然满足「逐字子串」**，
+    起名和补钥匙一次解决：
+        「你终于把洞洞鞋还给我了」
+        「今天凌晨两点，哥哥终于挖出了那个自指桶」
+
+    只在没有别的钥匙时兜底，不抢正常候选的位置。
+    """
+    for line in str(content or "").splitlines():
+        line = line.strip()
+        if not line or _BODY_LEAD_SKIP_RE.match(line):
+            continue
+        if line.startswith(("朝灯：", "哥哥：", "朝灯:", "哥哥:")):
+            continue  # 这是引的原话，不是这条记忆本身讲的事
+        match = _BODY_LEAD_SENTENCE_RE.search(line)
+        if match:
+            return [match.group(0).strip()[:_BODY_LEAD_MAX]]
+        if len(line) >= 4:
+            return [line[:_BODY_LEAD_MAX]]
+    return []
+
+
+def literal_retrieval_keys(content: str, candidates) -> list[str]:
+    """Keep bounded, distinctive candidates that occur verbatim in content."""
+    source = str(content or "")
+    values: list[str] = []
+    existing = _RETRIEVAL_KEY_LINE_RE.search(source)
+    if existing:
+        values.extend(existing.group(1).split("/"))
+    if isinstance(candidates, str):
+        values.append(candidates)
+    elif candidates:
+        values.extend(str(value) for value in candidates)
+
+    accepted: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        candidate = (
+            str(value or "").strip().removeprefix("[[").removesuffix("]]").strip()
+        )
+        folded = candidate.casefold()
+        if (
+            not candidate
+            or len(candidate) < 2
+            or len(candidate) > 48
+            or candidate not in source
+            or folded in _GENERIC_RETRIEVAL_KEYS
+            or re.fullmatch(r"[\W_\d]+", candidate, flags=re.UNICODE)
+            or any(ord(char) < 32 for char in candidate)
+            or folded in seen
+        ):
+            continue
+        seen.add(folded)
+        accepted.append(candidate)
+        if len(accepted) >= 4:
+            break
+    return accepted
 
 
 def bucket_revision_hash(content: str, metadata: dict) -> str:
@@ -226,6 +313,10 @@ class BucketManager:
         self.content_weight = scoring.get("content_weight", 3.0)
         self._locks_dir = os.path.join(self.base_dir, ".locks")
         self._maintenance_barrier = MaintenanceBarrier(self.base_dir)
+        self._clothing_review_queue = ReviewQueue(
+            os.path.join(self.base_dir, "review_queue.jsonl"),
+            maintenance_root=self.base_dir,
+        )
         with self._maintenance_barrier.shared():
             self.audit_log = MutationAuditLog(
                 self.base_dir,
@@ -283,6 +374,7 @@ class BucketManager:
         arousal: float = 0.3,
         bucket_type: str = "dynamic",
         name: str = None,
+        retrieval_keys: list[str] = None,
         pinned: bool = False,
         protected: bool = False,
         world: str = "",
@@ -313,6 +405,22 @@ class BucketManager:
         bucket_id = generate_bucket_id()
         domain = domain or ["未分类"]
         tags = list(tags) if tags else []
+        original_content = str(content or "")
+        retrieval_candidates = list(retrieval_keys or []) + [name or ""] + tags
+        selected_retrieval_keys = literal_retrieval_keys(
+            original_content,
+            retrieval_candidates,
+        )
+        if not selected_retrieval_keys:
+            # 候选池全军覆没（feel 桶的常态：name 空 + 全是系统标签）→ 退回正文首句。
+            # 见 body_lead_keys：那句天生在正文里，能同时当名字和检索钥匙。
+            selected_retrieval_keys = literal_retrieval_keys(
+                original_content,
+                body_lead_keys(original_content),
+            )
+        needs_clothing = not selected_retrieval_keys
+        if not str(name or "").strip():
+            name = selected_retrieval_keys[0] if selected_retrieval_keys else "待补衣"
         recorded_at = now_iso()
         if event_at is None:
             normalized_event_at = recorded_at
@@ -341,7 +449,14 @@ class BucketManager:
                 tags.append(today)
 
         bucket_name = sanitize_name(name) if name else bucket_id
-        linked_content = content
+        # 2026-08-18：钥匙**只进 metadata.retrieval_keys，不再追加进正文**。
+        # 8/17 曾在正文尾部补一行「[检索钥匙: …]」，但召回侧读的是 metadata（见
+        # server._…retrieval_keys），正文里那行没人用；反而把「正文即原文」的契约
+        # 全撕了：E 轴一字不改、curated_writer 的 receipt sha256、recall-before-write
+        # 的乐观锁 hash、feel 桶按正文解析数值——13 条测试因此红。钥匙本来就是
+        # 正文的逐字子串，不写回正文一样搜得到。已带钥匙行的旧桶原样保留，
+        # literal_retrieval_keys 仍会从正文里读它。
+        linked_content = original_content
 
         if pinned or protected:
             importance = 10
@@ -365,6 +480,11 @@ class BucketManager:
             "last_active": recorded_at,
             "activation_count": 1,
         }
+        if selected_retrieval_keys:
+            metadata["retrieval_keys"] = selected_retrieval_keys
+        else:
+            metadata["needs_clothing"] = True
+            metadata["clothing_reason"] = "no_literal_retrieval_key"
         e_fields = (
             e_authored_by,
             e_initial_priority,
@@ -535,6 +655,26 @@ class BucketManager:
             f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
             + (" [PINNED]" if pinned else "") + (" [PROTECTED]" if protected else "")
         )
+        if needs_clothing:
+            try:
+                self._clothing_review_queue.enqueue(
+                    make_clothing_entry(
+                        bucket_id,
+                        bucket_name,
+                        content_sha256=hashlib.sha256(
+                            original_content.encode("utf-8")
+                        ).hexdigest(),
+                        source=actor,
+                    )
+                )
+            except Exception as exc:
+                # The durable memory is authoritative and must survive a
+                # sidecar outage.  Frontmatter still makes the gap observable.
+                logger.warning(
+                    "Bucket clothing queue unavailable for %s: %s",
+                    bucket_id,
+                    type(exc).__name__,
+                )
         return bucket_id
 
     # ---------------------------------------------------------

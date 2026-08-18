@@ -550,6 +550,142 @@ async def test_ds_gate_subtractive_when_enabled(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ds_gate_force_keeps_exact_retrieval_key_rejected_by_model(monkeypatch):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+    called = 0
+
+    async def _create(**_kw):
+        nonlocal called
+        called += 1
+        msg = types.SimpleNamespace(content='{"keep": []}')
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+
+    monkeypatch.setattr(
+        server, "dehydrator", _fake_dehydrator_with_response(_create)
+    )
+    buckets = [
+        _bucket(
+            "target",
+            "晚上把这段翻译成我们俩的版本。\n\n"
+            "[检索钥匙: 翻译成我们俩的版本]",
+        ),
+        _bucket("noise", "另一条不相关工程记录。"),
+    ]
+    force_keep_ids = server._exact_retrieval_key_ids(
+        "翻译成我们俩的版本", buckets
+    )
+
+    selected = await server._ds_filter_candidates(
+        "翻译成我们俩的版本",
+        buckets,
+        mode="search",
+        max_results=2,
+        force_keep_ids=force_keep_ids,
+        allow_empty=True,
+    )
+
+    assert force_keep_ids == {"target"}
+    assert [bucket["id"] for bucket in selected] == ["target"]
+    assert called == 1
+
+
+@pytest.mark.asyncio
+async def test_ds_gate_forced_candidate_beyond_cap_replaces_non_forced(monkeypatch):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+
+    async def _create(**_kw):
+        msg = types.SimpleNamespace(content='{"keep": [0, 1, 2]}')
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+
+    monkeypatch.setattr(
+        server, "dehydrator", _fake_dehydrator_with_response(_create)
+    )
+    buckets = [
+        _bucket("a", "A"),
+        _bucket("b", "B"),
+        _bucket("forced", "C"),
+    ]
+
+    selected = await server._ds_filter_candidates(
+        "工程",
+        buckets,
+        mode="search",
+        max_results=2,
+        force_keep_ids={"forced"},
+        allow_empty=True,
+    )
+
+    assert [bucket["id"] for bucket in selected] == ["a", "forced"]
+    assert len(selected) == 2
+
+
+@pytest.mark.asyncio
+async def test_ds_gate_skips_deterministic_singleton_noop(monkeypatch):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+
+    async def _create(**_kw):
+        raise AssertionError("LLM must not be called for a required singleton")
+
+    monkeypatch.setattr(
+        server, "dehydrator", _fake_dehydrator_with_response(_create)
+    )
+    bucket = _bucket("a", "A")
+    selected = await server._ds_filter_candidates(
+        "工程", [bucket], mode="search", max_results=1, allow_empty=False
+    )
+    assert selected == [bucket]
+
+
+@pytest.mark.asyncio
+async def test_ds_gate_keeps_singleton_decision_when_empty_is_allowed(monkeypatch):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+    called = 0
+
+    async def _create(**_kw):
+        nonlocal called
+        called += 1
+        msg = types.SimpleNamespace(content='{"keep": []}')
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+
+    monkeypatch.setattr(
+        server, "dehydrator", _fake_dehydrator_with_response(_create)
+    )
+    selected = await server._ds_filter_candidates(
+        "无关查询", [_bucket("a", "A")], mode="search", max_results=1,
+        allow_empty=True,
+    )
+    assert selected == []
+    assert called == 1
+
+
+@pytest.mark.asyncio
+async def test_ds_gate_skips_when_all_candidates_are_forced(monkeypatch):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+
+    async def _create(**_kw):
+        raise AssertionError("LLM must not be called when every candidate is forced")
+
+    monkeypatch.setattr(
+        server, "dehydrator", _fake_dehydrator_with_response(_create)
+    )
+    buckets = [_bucket("a", "A"), _bucket("b", "B")]
+    selected = await server._ds_filter_candidates(
+        "工程",
+        buckets,
+        mode="search",
+        max_results=2,
+        force_keep_ids={"a", "b"},
+        allow_empty=True,
+    )
+    assert selected == buckets
+
+
+@pytest.mark.asyncio
 async def test_ds_gate_falls_back_to_capped_on_error(monkeypatch):
     monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
     monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
