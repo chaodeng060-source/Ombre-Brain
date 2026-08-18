@@ -8589,17 +8589,28 @@ if __name__ == "__main__":
 
         # --- Application-level keepalive: ping /health every 60s ---
         # --- 应用层保活：每 60 秒 ping 一次 /health，防止 Cloudflare Tunnel 空闲断连 ---
-        bind_host = os.environ.get("OMBRE_BIND_ADDRESS", "127.0.0.1").strip()
-        if bind_host not in {"127.0.0.1", "::1", "localhost"}:
-            raise RuntimeError(
-                "VPS disaster-recovery runtime only permits a loopback bind"
-            )
-        try:
-            host_port = int(os.environ.get("OMBRE_HOST_PORT", "18080"))
-        except ValueError as exc:
-            raise RuntimeError("OMBRE_HOST_PORT must be an integer") from exc
-        if not 1 <= host_port <= 65535:
-            raise RuntimeError("OMBRE_HOST_PORT is outside the valid range")
+        # 两种跑法，用 OMBRE_LOOPBACK_ONLY 明确分开：
+        #   · 容器（NAS，默认）：跟原来一样 0.0.0.0:8000，宿主 compose 再把 8000 映射到
+        #     127.0.0.1:8000。**不能**拿 OMBRE_BIND_ADDRESS 当开关——compose 会把 .env 里给
+        #     宿主端口用的 OMBRE_BIND_ADDRESS=127.0.0.1 原样传进容器，8/18 第一次部署就是
+        #     这么死的：容器里只听 127.0.0.1:18080，宿主映射的 8000 没人接。
+        #   · VPS 灾备单机（run-local.sh 设 OMBRE_LOOPBACK_ONLY=1）：只许 loopback，端口默认 18080。
+        loopback_only = os.environ.get("OMBRE_LOOPBACK_ONLY", "").strip().lower() in {"1", "true", "yes"}
+        if loopback_only:
+            bind_host = os.environ.get("OMBRE_BIND_ADDRESS", "127.0.0.1").strip()
+            if bind_host not in {"127.0.0.1", "::1", "localhost"}:
+                raise RuntimeError(
+                    "VPS disaster-recovery runtime only permits a loopback bind"
+                )
+            try:
+                host_port = int(os.environ.get("OMBRE_HOST_PORT", "18080"))
+            except ValueError as exc:
+                raise RuntimeError("OMBRE_HOST_PORT must be an integer") from exc
+            if not 1 <= host_port <= 65535:
+                raise RuntimeError("OMBRE_HOST_PORT is outside the valid range")
+        else:
+            bind_host, host_port = "0.0.0.0", 8000
+        keepalive_host = "localhost" if bind_host == "0.0.0.0" else bind_host
 
         async def _keepalive_loop():
             await asyncio.sleep(10)  # Wait for server to fully start
@@ -8607,7 +8618,7 @@ if __name__ == "__main__":
                 while True:
                     try:
                         await client.get(
-                            f"http://{bind_host}:{host_port}/health",
+                            f"http://{keepalive_host}:{host_port}/health",
                             timeout=5,
                         )
                         logger.debug("Keepalive ping OK / 保活 ping 成功")
