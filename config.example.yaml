@@ -294,6 +294,15 @@ review_gate:
   relation_review: true           # dangerous relations queue for named review; safe relations write directly
   fact_evolution_audit: true      # compatibility flag; conflicts stay as separate buckets until explicit Z apply
 
+# --- Fresh-window briefing / 新窗口开机包 ---
+# Automatic consumers use a deterministic stored-memory pack.  The generated
+# summarizer remains available only when an operator explicitly opts in.
+briefing:
+  generated_enabled: false
+  # Unmarked engineering status may enter the current-window pack only while
+  # it is explicitly unresolved and less than one event-day old.
+  unaudited_status_max_age_days: 1
+
 # --- Stage-0 query expansion / 查询扩展 ---
 # 只在回忆/关系/时间线意图上启用，精确事实查询保留原词，避免改写过头。
 # 无 dehydration API 时自动退化为只用原查询。

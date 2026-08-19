@@ -317,3 +317,35 @@ async def test_dirty_marks_coalesce_into_one_rate_limited_refresh(monkeypatch):
         task.cancel()
         with pytest.raises(server.asyncio.CancelledError):
             await task
+
+
+@pytest.mark.asyncio
+async def test_generated_briefing_disabled_forces_zero_model_boot_pack(monkeypatch):
+    manager = _FakeMgr()
+    dehydrator = _GoodDehydrator()
+    monkeypatch.setattr(server, "bucket_mgr", manager)
+    monkeypatch.setattr(server, "dehydrator", dehydrator)
+    monkeypatch.setitem(server.config, "briefing", {"generated_enabled": False})
+
+    result = await server.briefing(
+        max_chars=1500,
+        format="json",
+        session_id="fresh-window",
+        include_body_state=False,
+    )
+
+    payload = json.loads(result)
+    assert payload["mode"] == "deterministic"
+    assert payload["model_called"] is False
+    assert dehydrator.calls == []
+
+
+@pytest.mark.asyncio
+async def test_generated_briefing_disabled_does_not_start_refresh_worker(monkeypatch):
+    await server._stop_briefing_cache_refresh()
+    monkeypatch.setitem(server.config, "briefing", {"generated_enabled": False})
+
+    await server._start_briefing_cache_refresh()
+
+    assert server._briefing_refresh_task is None
+    assert server._briefing_refresh_event is None

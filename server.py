@@ -107,6 +107,7 @@ from fact_slots import (
 )
 from status_validity import (
     OperationalStatusValidityStore,
+    STATE_CURRENT as OPERATIONAL_STATE_CURRENT,
     STATE_HISTORICAL as OPERATIONAL_STATE_HISTORICAL,
     VIEW_CURRENT as OPERATIONAL_VIEW_CURRENT,
     VIEW_NEUTRAL as OPERATIONAL_VIEW_NEUTRAL,
@@ -6173,6 +6174,84 @@ def _created_within_days(b: dict, max_age_days: float, now: datetime = None) -> 
         return False
 
 
+def _filter_briefing_currentness(buckets: list[dict]) -> list[dict]:
+    """Keep only records safe to present as current fresh-window context.
+
+    Historical experiences remain available for dated recall.  This gate only
+    removes explicit stale-state conflicts from the fresh-window pack:
+    superseded/non-current facts and unaudited operational status snapshots.
+    """
+    candidates = list(buckets or [])
+    if _operational_status_validity_enabled():
+        try:
+            candidates = _get_operational_status_validity_store().attach(candidates)
+        except Exception as exc:
+            logger.warning(
+                "Briefing currentness marker lookup failed closed for status facts: %s",
+                type(exc).__name__,
+            )
+
+    kept: list[dict] = []
+    dropped = {
+        "superseded": 0,
+        "non_current_fact": 0,
+        "unaudited_status": 0,
+    }
+    for bucket in candidates:
+        if not isinstance(bucket, dict):
+            continue
+        meta = bucket.get("metadata", {}) or {}
+        if (
+            str(meta.get("superseded_by_bucket_id") or "").strip()
+            or str(meta.get("validity_superseded_by_bucket_id") or "").strip()
+        ):
+            dropped["superseded"] += 1
+            continue
+
+        if "fact_status" in meta:
+            fact_status = str(meta.get("fact_status") or "").strip().lower()
+            if fact_status != FACT_STATUS_CURRENT:
+                dropped["non_current_fact"] += 1
+                continue
+
+        status_label = operational_validity_label(
+            bucket,
+            view=OPERATIONAL_VIEW_CURRENT,
+        )
+        if status_label:
+            status_state = status_label.get("state")
+            if status_state != OPERATIONAL_STATE_CURRENT:
+                briefing_cfg = config.get("briefing", {}) or {}
+                try:
+                    fallback_days = float(
+                        briefing_cfg.get("unaudited_status_max_age_days", 1)
+                    )
+                except (TypeError, ValueError):
+                    fallback_days = 1.0
+                fresh_unresolved = (
+                    status_state == "unknown"
+                    and not bool(meta.get("resolved", False))
+                    and _created_within_days(
+                        bucket,
+                        max(0.0, min(fallback_days, 1.0)),
+                    )
+                )
+                if not fresh_unresolved:
+                    dropped["unaudited_status"] += 1
+                    continue
+        kept.append(bucket)
+
+    if any(dropped.values()):
+        logger.info(
+            "Briefing currentness gate removed stale candidates: "
+            "superseded=%d non_current_fact=%d unaudited_status=%d",
+            dropped["superseded"],
+            dropped["non_current_fact"],
+            dropped["unaudited_status"],
+        )
+    return kept
+
+
 def _event_age_label(b: dict, now: datetime = None) -> str:
     """简报素材里每个浮现桶的硬日期章——给 LLM 一个不可忽略的绝对时间锚。
 
@@ -6396,6 +6475,116 @@ def _append_anchor_index(text: str, anchor_index: str) -> str:
     if not anchor_index:
         return text
     return f"{text.rstrip()}\n\n{anchor_index}"
+
+
+def _generated_briefing_enabled() -> bool:
+    """Whether any automatic briefing path may call the generation model."""
+    briefing_cfg = config.get("briefing", {}) or {}
+    return bool(briefing_cfg.get("generated_enabled", True))
+
+
+def _format_deterministic_boot_hooks(
+    buckets: list[dict],
+    max_chars: int,
+) -> str:
+    """Build a bounded local hot index without invoking a generation model."""
+    budget = max(120, int(max_chars))
+    lines = ["以下是本地确定性记忆钩子；细节按 bucket id inspect 原文："]
+    seen: set[str] = set()
+    for bucket in buckets or []:
+        bucket_id = str(bucket.get("id") or "").strip()
+        if not bucket_id or bucket_id in seen:
+            continue
+        seen.add(bucket_id)
+        meta = bucket.get("metadata", {}) or {}
+        label = _anchor_label_for_bucket(bucket, max_chars=42)
+        event_at = str(event_at_from_metadata(meta) or "").strip()
+        date_label = event_at[:10] if event_at else "无确切日期"
+        summary = _bucket_navigator_summary(bucket, max_chars=88)
+        line = f"- [{bucket_id}] {label} | {date_label} | {summary}"
+        candidate = "\n".join([*lines, line])
+        if len(candidate) > budget:
+            remaining = budget - len("\n".join(lines)) - 1
+            if remaining >= 24:
+                lines.append(_clip_text(line, remaining))
+            break
+        lines.append(line)
+    if len(lines) == 1:
+        lines.append("- 当前没有可列入开机索引的记忆。")
+    return "\n".join(lines)[:budget]
+
+
+def _render_deterministic_boot_pack(
+    *,
+    time_header: str,
+    protected_verbatim: list[dict],
+    tier0_buckets: list[dict],
+    selected_buckets: list[dict],
+    anchor_index: str,
+    max_chars: int,
+    format: str,
+) -> str:
+    """Render a fresh-window pack from stored records only; no LLM path."""
+    hooks = _format_deterministic_boot_hooks(selected_buckets, max_chars)
+    if format != "json":
+        original_parts = [
+            _format_protected_verbatim(bucket)
+            for bucket in protected_verbatim
+        ]
+        original_parts.extend(
+            _format_dated_raw_slot_text(bucket)
+            for bucket in tier0_buckets
+        )
+        return "\n\n".join(
+            part for part in [f"# {time_header}", *original_parts, hooks] if part
+        )
+
+    slots: list[dict] = []
+    for bucket in protected_verbatim:
+        meta = bucket.get("metadata", {}) or {}
+        slots.append({
+            "tier": 0,
+            "protected": True,
+            "bucket_id": bucket["id"],
+            "label": meta.get("name", bucket["id"]),
+            "domain": meta.get("domain", []) or [],
+            "event_at": event_at_from_metadata(meta),
+            "created": event_at_from_metadata(meta),
+            "age_label": _event_age_label(bucket),
+            "text": _format_dated_raw_slot_text(bucket),
+            "warn": (
+                f"原文逐字、未压缩。触及须 inspect 桶 id={bucket['id']}；"
+                "禁止当 resolved/已完成/演的 处理。"
+            ),
+        })
+    for bucket in tier0_buckets:
+        meta = bucket.get("metadata", {}) or {}
+        slots.append({
+            "tier": 0,
+            "label": meta.get("name", bucket["id"]),
+            "bucket_id": bucket["id"],
+            "event_at": event_at_from_metadata(meta),
+            "created": event_at_from_metadata(meta),
+            "age_label": _event_age_label(bucket),
+            "text": _format_dated_raw_slot_text(bucket),
+        })
+    slots.append({
+        "tier": 1,
+        "source": "deterministic",
+        "label": "当前事实与未完成事项",
+        "text": hooks,
+    })
+    return json.dumps(
+        {
+            "time_header": time_header,
+            "mode": "deterministic",
+            "model_called": False,
+            "slots": slots,
+            "briefing": hooks,
+            "anchor_index": anchor_index,
+        },
+        ensure_ascii=False,
+    )
 
 
 # =============================================================
@@ -6689,6 +6878,9 @@ async def _start_briefing_cache_refresh() -> None:
     global _briefing_refresh_event, _briefing_refresh_task, _briefing_refresh_loop
     if _briefing_refresh_task is not None and not _briefing_refresh_task.done():
         return
+    if not _generated_briefing_enabled():
+        logger.info("Generated briefing disabled; background refresh worker not started")
+        return
     current_world = (config.get("current_world", "") or "").strip()
     _register_briefing_profile((1000, "", False, "", "text", current_world))
     _register_briefing_profile((1500, "", False, "", "json", current_world))
@@ -6736,11 +6928,14 @@ async def briefing(
     include_body_state: bool = True,
     reset_body_state: bool = False,
     format: str = "text",
+    deterministic: bool = False,
 ) -> str:
-    """开窗简报。聚合钉选+高权重未解决+最近活跃桶,LLM压缩为≤max_chars字简报,默认1000字。输出顺序:朝灯当前氛围/走向→最近因果链故事→活着的欠账→工程线→铁律。domain逗号分隔可过滤主题域。pinned_only=True只用钉选桶。session_id=同一会话内对感官刺激去重。include_body_state=False时只关闭外部身体状态块,不改变简报素材。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。format=text(默认)返回拼接好的简报字符串(向后兼容);format=json时把 tier==0 的桶单独剥出来作为 slots[] 返回原文、剩余桶继续走 LLM 压缩为 briefing 字段——治简报≠原文(#4 核心画像分离, 2026-05-30)。开窗调一次,省80%token。"""
+    """开窗记忆包。deterministic=True 时只做本地选择与钩子拼装，绝不调用 LLM。"""
     await _ensure_decay_background()
     max_chars = max(300, min(max_chars, 4000))
     format = "json" if format == "json" else "text"
+    if not _generated_briefing_enabled():
+        deterministic = True
     profile = _briefing_profile(
         max_chars,
         domain,
@@ -6748,9 +6943,10 @@ async def briefing(
         session_id,
         format,
     )
-    _register_briefing_profile(profile)
+    if not deterministic:
+        _register_briefing_profile(profile)
     is_background_refresh = _briefing_background_refresh.get()
-    if not is_background_refresh and not reset_body_state:
+    if not deterministic and not is_background_refresh and not reset_body_state:
         cached = _get_briefing_cache_entry(profile)
         if cached is not None:
             try:
@@ -6789,6 +6985,10 @@ async def briefing(
         if b["metadata"].get("type") == "feel"
         or world_matches(b["metadata"].get("world", ""), _wf_set)
     ]
+
+    # A fresh-window pack speaks in the present tense.  Explicitly old fact or
+    # status records stay searchable, but cannot masquerade as current context.
+    all_buckets = _filter_briefing_currentness(all_buckets)
 
     # --- Pinned/protected: always included as core principles ---
     # --- 钉选/protected:必入,作为核心准则 ---
@@ -6849,6 +7049,7 @@ async def briefing(
     time_header = _now_bj_header()
 
     briefing_buckets = pinned + top_unresolved + recent_window + prior_windows + top_feel
+    selected_for_boot = list(briefing_buckets)
     anchor_index = _format_anchor_index(briefing_buckets)
 
     # --- #3+#15 感情红线逐字保真（2026-05-30）---
@@ -6888,6 +7089,17 @@ async def briefing(
         prior_windows = [b for b in prior_windows if not _is_tier0(b)]
         top_feel = [b for b in top_feel if not _is_tier0(b)]
         briefing_buckets = pinned + top_unresolved + recent_window + prior_windows + top_feel
+
+    if deterministic:
+        return _render_deterministic_boot_pack(
+            time_header=time_header,
+            protected_verbatim=protected_verbatim,
+            tier0_buckets=tier0_buckets,
+            selected_buckets=selected_for_boot,
+            anchor_index=anchor_index,
+            max_chars=max_chars,
+            format=format,
+        )
 
     if not briefing_buckets:
         # 动态素材为空：不调 LLM，直接输出原文级内容（感情红线 protected + tier0 核心画像）
@@ -8739,6 +8951,7 @@ async def api_briefing(request):
         session_id = request.query_params.get("session_id", "")
         include_body_state = request.query_params.get("include_body_state", "true").lower() not in ("0", "false", "no", "off")
         reset_body_state = request.query_params.get("reset_body_state", "").lower() in ("1", "true", "yes", "on")
+        deterministic = request.query_params.get("deterministic", "").lower() in ("1", "true", "yes", "on")
         fmt = (request.query_params.get("format", "text") or "text").lower()
         if fmt not in ("text", "json"):
             fmt = "text"
@@ -8750,6 +8963,7 @@ async def api_briefing(request):
             include_body_state=include_body_state,
             reset_body_state=reset_body_state,
             format=fmt,
+            deterministic=deterministic,
         )
         if fmt == "json":
             # briefing() 已 json.dumps 出 UTF-8 字符串；整体过 redact 兜底（[REDACTED] 不含

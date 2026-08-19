@@ -37,6 +37,11 @@ class _FakeDehydrator:
         return "LLM_COMPRESSED_SENTINEL"
 
 
+class _ForbiddenDehydrator:
+    async def briefing(self, *_args, **_kwargs):
+        raise AssertionError("deterministic boot packs must never call the LLM")
+
+
 class _FakeMgr:
     def __init__(self, buckets):
         self.buckets = list(buckets)
@@ -148,3 +153,66 @@ async def test_protected_verbatim_limit_keeps_most_recent(monkeypatch, tmp_path)
     assert all(s["text"].startswith("📅 发生于") for s in pslots)
     assert "vow7" in ids and "vow6" in ids       # 最近的保真
     assert "vow0" not in ids and "vow1" not in ids  # 最老两条让位（仍走压缩 pool）
+
+
+@pytest.mark.asyncio
+async def test_deterministic_boot_pack_uses_local_hooks_without_llm(
+    monkeypatch, tmp_path,
+):
+    bucket = _pbucket(
+        "open-task",
+        json.dumps(
+            {"summary": "还有一件没收口的工程任务", "core_facts": ["事实原文"]},
+            ensure_ascii=False,
+        ),
+        ["daily"],
+        pinned=False,
+        created="2026-08-19T10:00:00+08:00",
+        last_active="2026-08-19T10:00:00+08:00",
+    )
+    _wire(monkeypatch, tmp_path, [bucket])
+    monkeypatch.setattr(server, "dehydrator", _ForbiddenDehydrator())
+
+    out = await server.briefing(
+        max_chars=500,
+        session_id="fresh-window",
+        include_body_state=False,
+        format="json",
+        deterministic=True,
+    )
+    data = json.loads(out)
+    local_slot = next(
+        slot for slot in data["slots"] if slot.get("source") == "deterministic"
+    )
+
+    assert data["mode"] == "deterministic"
+    assert data["model_called"] is False
+    assert "open-task" in local_slot["text"]
+    assert "还有一件没收口的工程任务" in local_slot["text"]
+    assert len(local_slot["text"]) <= 500
+
+
+@pytest.mark.asyncio
+async def test_api_briefing_forwards_deterministic_mode(monkeypatch):
+    seen = {}
+
+    async def fake_briefing(**kwargs):
+        seen.update(kwargs)
+        return json.dumps({"mode": "deterministic", "slots": []})
+
+    class _Request:
+        query_params = {
+            "max_chars": "700",
+            "format": "json",
+            "deterministic": "true",
+            "include_body_state": "false",
+        }
+
+    monkeypatch.setattr(server, "briefing", fake_briefing)
+
+    response = await server.api_briefing(_Request())
+
+    assert response.status_code == 200
+    assert seen["deterministic"] is True
+    assert seen["include_body_state"] is False
+    assert seen["max_chars"] == 700
