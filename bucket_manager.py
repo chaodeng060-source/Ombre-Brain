@@ -1454,7 +1454,20 @@ class BucketManager:
         if isinstance(domain, str):
             domain = [domain]
             
-        content = str(bucket.get("content", ""))[:1000]
+        full_content = str(bucket.get("content", ""))
+        content = full_content[:1000]
+
+        # Curated retrieval keys are literal, bounded phrases from this exact
+        # bucket body.  They must participate before the initial keyword pool
+        # is cut; a later force-keep cannot recover a bucket that never became
+        # a candidate.  Revalidate on read so malformed/manual metadata cannot
+        # manufacture a shortcut.
+        retrieval_keys = literal_retrieval_keys(
+            full_content,
+            meta.get("retrieval_keys", []),
+        )
+        if any(key.casefold() in query_lower for key in retrieval_keys):
+            return 1.0
 
         name_lower = str(name).lower()
         tags_lower = [str(t).lower() for t in tags]

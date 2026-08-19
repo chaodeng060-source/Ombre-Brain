@@ -1041,7 +1041,7 @@ def _draft(candidate_type, with_relation=False):
         ("event", {"X", "M"}),
         ("fact", {"X", "Z", "M"}),
         ("preference", {"X", "Z", "E", "M"}),
-        ("engineering_decision", {"X", "Z", "M"}),
+        ("engineering_decision", {"M"}),
         ("relationship_moment", {"X", "E", "M"}),
         ("risk_boundary", {"X", "Z", "E", "M"}),
     ],
@@ -1053,7 +1053,16 @@ def test_local_axis_route_is_deterministic(candidate_type, expected):
 def test_bound_relation_adds_y_to_local_axis_route():
     for candidate_type in CANDIDATE_TYPES:
         axes = route_candidate_axes(_draft(candidate_type, with_relation=True))
-        assert {"X", "M", "Y"} <= axes
+        if candidate_type == "engineering_decision":
+            assert axes == {"M"}
+        else:
+            assert {"X", "M", "Y"} <= axes
+
+
+def test_engineering_relation_hint_cannot_reopen_shared_memory_route():
+    assert route_candidate_axes(
+        _draft("engineering_decision", with_relation=True)
+    ) == {"M"}
 
 
 @pytest.mark.asyncio

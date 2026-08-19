@@ -371,6 +371,30 @@ async def test_event_run_completes_snapshot_chunk_x_and_report_only_m(
 
 
 @pytest.mark.asyncio
+async def test_engineering_decision_is_report_only_and_writes_no_shared_bucket(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path, candidate_type="engineering_decision")
+    harness.ledger.append_raw_event(
+        "room-main",
+        "engineering-1",
+        '{"message":"临时工具命令和 TODO 已记录在项目任务卡"}',
+    )
+
+    outcome = await harness.coordinator.run(
+        run_id="night-engineering-report-only",
+        cutoff=datetime.now(timezone.utc),
+    )
+
+    assert outcome.run.stage == "complete"
+    assert outcome.counts["candidates"] == 1
+    assert outcome.counts["m_computed"] == 1
+    assert outcome.counts.get("x_ready", 0) == 0
+    assert harness.curated.calls == []
+    assert {row.axis for row in harness.ledger.list_candidates("ready")} == {"M"}
+
+
+@pytest.mark.asyncio
 async def test_report_only_receipt_flush_yields_during_large_backlog(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

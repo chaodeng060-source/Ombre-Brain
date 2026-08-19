@@ -275,6 +275,35 @@ class TestSearchScoring:
         old = {"last_active": (datetime.now() - timedelta(days=30)).isoformat()}
         assert bucket_mgr._calc_time_score(recent) > bucket_mgr._calc_time_score(old)
 
+    def test_literal_retrieval_key_enters_initial_topic_pool(self, bucket_mgr):
+        bucket = {
+            "id": "memory-store",
+            "content": "记忆库已经从本地迁到远程海马体。",
+            "metadata": {
+                "name": "迁移记录",
+                "tags": [],
+                "domain": ["工程"],
+                "retrieval_keys": ["远程海马体"],
+            },
+        }
+
+        assert bucket_mgr._calc_topic_score("后来远程海马体怎么样了", bucket) == 1.0
+
+    def test_invalid_retrieval_keys_cannot_manufacture_exact_hit(self, bucket_mgr):
+        bucket = {
+            "id": "memory-store",
+            "content": "记忆库已经从本地迁到远程海马体。",
+            "metadata": {
+                "name": "迁移记录",
+                "tags": [],
+                "domain": ["工程"],
+                # 一个不在正文，一个属于通用词；两者都应被既有校验剔除。
+                "retrieval_keys": ["不存在的别名", "记忆库"],
+            },
+        }
+
+        assert bucket_mgr._calc_topic_score("不存在的别名", bucket) < 1.0
+
     @pytest.mark.asyncio
     async def test_resolved_bucket_penalized_in_normalized(self, populated_env):
         """Resolved buckets get ×0.3 in normalized score (breath-debug logic)."""

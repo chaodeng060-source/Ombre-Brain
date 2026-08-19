@@ -125,7 +125,10 @@ _TYPE_AXES = {
     "event": frozenset({"X", "M"}),
     "fact": frozenset({"X", "Z", "M"}),
     "preference": frozenset({"X", "Z", "E", "M"}),
-    "engineering_decision": frozenset({"X", "Z", "M"}),
+    # Project/tool/TODO state belongs in the repository and task ledger.  Keep
+    # only the report-only M receipt so night runs can account for the event
+    # without turning transient engineering chatter into shared memories.
+    "engineering_decision": frozenset({"M"}),
     "relationship_moment": frozenset({"X", "E", "M"}),
     "risk_boundary": frozenset({"X", "Z", "E", "M"}),
 }
@@ -192,6 +195,10 @@ def route_candidate_axes(candidate: CandidateDraft) -> frozenset[str]:
         raise ProposerContractError(
             "schema_candidate", "candidate type has no local axis route"
         )
+    # A relation hint on a technical draft must not reopen Y: Y dispatch also
+    # materializes an X source bucket before adding the relation.
+    if candidate.type == "engineering_decision":
+        return axes
     if candidate.relation_hints:
         return axes | {"Y"}
     return axes
@@ -633,7 +640,13 @@ class StrictOmbreProposer:
             "identical punctuation and whitespace; never paraphrase, "
             "summarize, translate, normalize, splice, or invent evidence. "
             "relation_hints must be empty when allowed_relation_targets is "
-            "empty. risk must be exactly normal or review."
+            "empty. Tool output, temporary TODOs, and routine project progress "
+            "are not memory candidates; durable work state belongs in the "
+            "project/task ledger. A durable technical decision may use "
+            "engineering_decision for report-only accounting, never as shared "
+            "memory. If the same chunk contains a genuine relationship turn, "
+            "emit that separately as relationship_moment. risk must be "
+            "exactly normal or review."
         )
         return f"{rules}\nINPUT={_canonical_json(payload)}"
 
