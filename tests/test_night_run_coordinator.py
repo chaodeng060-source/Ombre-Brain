@@ -115,6 +115,18 @@ class _AxisBucketManager:
     async def list_all(self, include_archive: bool = False):
         return list(self.buckets.values())
 
+    async def set_thread(
+        self,
+        bucket_id: str,
+        thread: str,
+        **_kwargs,
+    ) -> bool:
+        bucket = self.buckets.get(bucket_id)
+        if bucket is None:
+            return False
+        bucket.setdefault("metadata", {})["thread"] = thread
+        return True
+
     async def add_relation(
         self,
         source_id: str,
@@ -327,6 +339,17 @@ async def test_event_run_completes_snapshot_chunk_x_and_report_only_m(
     assert outcome.counts["proposer_attempted"] == 1
     assert outcome.counts["proposer_succeeded"] == 1
     assert outcome.counts["proposer_pending_after"] == 0
+    assert {
+        outcome.counts[key]
+        for key in (
+            "timeline_scanned",
+            "timeline_assigned",
+            "timeline_named",
+            "timeline_updated",
+            "timeline_new_lines",
+            "timeline_orphans",
+        )
+    } == {0}
     assert len(harness.curated.calls) == 1
     assert harness.curated.calls[0]["vector_policy"] == "required"
     assert (
@@ -1179,6 +1202,7 @@ async def test_real_x_write_retries_without_duplicate_bucket(
         curated=curated,
         decay_engine=decay,
         consolidation_engine=consolidation,
+        bucket_manager=bucket_mgr,
     )
     ledger.append_raw_event(
         "room-main",
@@ -1205,6 +1229,12 @@ async def test_real_x_write_retries_without_duplicate_bucket(
     )
 
     assert second.run.stage == "complete"
+    assert second.counts["timeline_scanned"] == 2
+    assert second.counts["timeline_assigned"] == 0
+    assert second.counts["timeline_named"] == 0
+    assert second.counts["timeline_updated"] == 0
+    assert second.counts["timeline_new_lines"] == 0
+    assert second.counts["timeline_orphans"] == 2
     assert embedding.calls == 2
     assert len(provider.prompts) == 1
     assert ledger.list_candidates("pending") == ()
@@ -1227,6 +1257,7 @@ async def test_real_x_write_retries_without_duplicate_bucket(
     assert [bucket["id"] for bucket in all_curated_buckets] == [
         curated_buckets[0]["id"]
     ]
+    assert curated_buckets[0]["metadata"]["thread"] == "other"
     seed_after = await bucket_mgr.get(seed_id)
     assert seed_after is not None
     assert seed_after["content"] == seed_before["content"]

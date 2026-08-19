@@ -236,6 +236,12 @@ def load_config(config_path: str = None) -> dict:
             "hop1_min_strength": 0.4,
             "hop2_min_strength": 0.7,
         },
+        "timeline_recall": {
+            # Exact-thread previous/next navigation. It consumes the existing
+            # max_results budget and is disabled without a named thread.
+            "enabled": True,
+            "neighbor_window": 1,
+        },
         # Optional deterministic Z-axis slots.  Empty registry means no bucket
         # beyond this audited baseline is treated as a versioned fact; models
         # cannot mint slot names.  A deployment may explicitly set registry: {}

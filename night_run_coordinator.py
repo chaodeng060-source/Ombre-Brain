@@ -61,6 +61,8 @@ from review_queue import (
 )
 from redact import redact_obj
 from snapshot_manager import SnapshotManager, SnapshotResult
+from bucket_manager import bucket_revision_hash
+from timeline_axis import run_timeline_sweep
 
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
@@ -409,6 +411,8 @@ class NightRunCoordinator:
                 await self._dispatch_pending(counts)
                 self._advance(run_id, "proposed", "dispatched", counts)
 
+                await self._run_timeline_sweep(counts)
+
                 await self._run_metabolism(counts)
                 self._advance(
                     run_id,
@@ -469,6 +473,35 @@ class NightRunCoordinator:
             raise NightRunCoordinatorError(
                 "metabolism.consolidation_mode_unsafe"
             )
+
+    async def _run_timeline_sweep(self, counts: dict[str, int]) -> None:
+        """Backfill X after snapshot+dispatch and before report-only M."""
+
+        if self.bucket_manager is None:
+            counts.update({
+                "timeline_scanned": 0,
+                "timeline_assigned": 0,
+                "timeline_named": 0,
+                "timeline_updated": 0,
+                "timeline_new_lines": 0,
+                "timeline_orphans": 0,
+            })
+            return
+        report = await run_timeline_sweep(
+            self.bucket_manager,
+            ledger_path=getattr(self.ledger, "path", None),
+            apply=True,
+            actor="lmc5:night:timeline-sweep",
+            revision_hash_provider=bucket_revision_hash,
+        )
+        counts.update({
+            "timeline_scanned": report.scanned_count,
+            "timeline_assigned": report.assigned_count,
+            "timeline_named": report.named_count,
+            "timeline_updated": report.updated_count,
+            "timeline_new_lines": report.new_line_count,
+            "timeline_orphans": report.orphan_count,
+        })
 
     def _seal_snapshot(
         self,
