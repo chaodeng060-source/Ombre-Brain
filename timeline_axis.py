@@ -164,7 +164,9 @@ def plan_timeline_assignments(
     Hints are counted for audit but never assigned. Typed ``in_thread`` edges
     may only propagate one unambiguous existing/reviewed label; an unanchored
     component or a component containing conflicting labels remains unchanged.
-    Existing named buckets are never silently renamed by this sweep.
+    Existing named buckets are preserved unless an explicit reviewed mapping
+    names their replacement.  Machine hints and graph propagation can never
+    rename an already named bucket.
     """
 
     candidates = [dict(bucket) for bucket in buckets if _eligible_bucket(bucket)]
@@ -187,10 +189,12 @@ def plan_timeline_assignments(
     for raw_bucket_id, raw_thread in (reviewed_threads_by_bucket or {}).items():
         bucket_id = str(raw_bucket_id)
         thread = normalize_thread_hint(raw_thread)
-        if (
-            bucket_id in by_id
-            and thread != OTHER_THREAD
-            and existing_threads[bucket_id] == OTHER_THREAD
+        explicit_incubator = (
+            isinstance(raw_thread, str)
+            and raw_thread.strip().casefold() == OTHER_THREAD
+        )
+        if bucket_id in by_id and (
+            thread != OTHER_THREAD or explicit_incubator
         ):
             desired[bucket_id] = thread
             reasons[bucket_id] = "explicit_review"

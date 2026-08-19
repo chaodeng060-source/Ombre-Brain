@@ -1265,6 +1265,77 @@ async def test_real_x_write_retries_without_duplicate_bucket(
 
 
 @pytest.mark.asyncio
+async def test_night_timeline_assigns_after_snapshot_and_reports_counts(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path, empty_provider=True)
+    marker = harness.source / "timeline-target.json"
+    marker.write_text('{"thread":"other"}', encoding="utf-8")
+    manager = _AxisBucketManager(
+        harness.coordinator.maintenance_barrier,
+        {
+            "anchor": {
+                "id": "anchor",
+                "content": "基础设施起点",
+                "metadata": {
+                    "id": "anchor",
+                    "type": "dynamic",
+                    "thread": "基础设施演进",
+                    "relations": [
+                        {"type": "in_thread", "target": "target"},
+                    ],
+                },
+            },
+            "target": {
+                "id": "target",
+                "content": "基础设施后续",
+                "metadata": {
+                    "id": "target",
+                    "type": "dynamic",
+                    "thread": "other",
+                    "relations": [],
+                },
+            },
+        },
+    )
+    original_set_thread = manager.set_thread
+
+    async def persist_thread(bucket_id: str, thread: str, **kwargs) -> bool:
+        changed = await original_set_thread(bucket_id, thread, **kwargs)
+        if changed and bucket_id == "target":
+            marker.write_text(
+                json.dumps({"thread": thread}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        return changed
+
+    manager.set_thread = persist_thread
+    harness.coordinator.bucket_manager = manager
+
+    outcome = await harness.coordinator.run(
+        run_id="night-timeline-snapshot-order",
+        cutoff=datetime.now(timezone.utc),
+    )
+
+    assert outcome.counts["timeline_scanned"] == 2
+    assert outcome.counts["timeline_assigned"] == 1
+    assert outcome.counts["timeline_named"] == 2
+    assert outcome.counts["timeline_updated"] == 1
+    assert outcome.counts["timeline_new_lines"] == 0
+    assert outcome.counts["timeline_orphans"] == 0
+    verified = harness.snapshots.verify_snapshot(
+        "night-timeline-snapshot-order",
+        expected_manifest_sha256=outcome.snapshot_manifest_sha256,
+    )
+    assert json.loads(
+        (verified.snapshot_path / "files" / marker.name).read_text("utf-8")
+    ) == {"thread": "other"}
+    assert json.loads(marker.read_text("utf-8")) == {
+        "thread": "基础设施演进",
+    }
+
+
+@pytest.mark.asyncio
 async def test_dispatch_retryable_candidate_does_not_block_later_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

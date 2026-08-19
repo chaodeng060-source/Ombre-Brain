@@ -39,6 +39,14 @@ def test_review_manifest_rejects_machine_lines_and_conflicts(tmp_path):
     with pytest.raises(ValueError, match="conflicting"):
         timeline_sweep_cli._load_reviewed_manifest(conflict)
 
+    incubator = _manifest(
+        tmp_path / "incubator.json",
+        [{"bucket_id": "a", "thread": "other"}],
+    )
+    assert timeline_sweep_cli._load_reviewed_manifest(incubator) == {
+        "a": "other",
+    }
+
 
 @pytest.mark.asyncio
 async def test_dry_run_and_snapshot_apply_share_one_reviewed_plan(

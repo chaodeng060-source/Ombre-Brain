@@ -100,6 +100,56 @@ def test_explicit_review_is_the_only_label_seed():
     assert plan.orphan_count == 1
 
 
+def test_explicit_review_can_correct_an_existing_named_thread():
+    buckets = [
+        _bucket(
+            "misfiled",
+            event_at="2026-07-01T09:00:00",
+            thread="工程演进",
+        ),
+    ]
+
+    plan = plan_timeline_assignments(
+        buckets,
+        reviewed_threads_by_bucket={"misfiled": "记忆治理"},
+    )
+
+    assert [(item.bucket_id, item.thread, item.reason) for item in plan.assignments] == [
+        ("misfiled", "记忆治理", "explicit_review"),
+    ]
+    assert plan.assigned_count == 0
+    assert plan.new_line_count == 1
+    assert plan.preserved_count == 0
+
+
+def test_explicit_review_can_return_a_misfiled_bucket_to_incubator():
+    buckets = [
+        _bucket(
+            "misfiled",
+            event_at="2026-07-01T09:00:00",
+            thread="工程演进",
+            relations=({"type": "in_thread", "target": "anchor"},),
+        ),
+        _bucket(
+            "anchor",
+            event_at="2026-07-20T09:00:00",
+            thread="工程演进",
+        ),
+    ]
+
+    plan = plan_timeline_assignments(
+        buckets,
+        reviewed_threads_by_bucket={"misfiled": "other"},
+    )
+
+    assert {item.bucket_id: item.thread for item in plan.assignments} == {
+        "anchor": "工程演进",
+        "misfiled": "other",
+    }
+    assert plan.assigned_count == 0
+    assert plan.orphan_count == 1
+
+
 def test_typed_in_thread_propagates_one_named_anchor_only():
     buckets = [
         _bucket(
@@ -254,12 +304,15 @@ async def test_sweep_writes_missing_legacy_thread_as_other():
             bucket["metadata"]["thread"] = thread
             return True
 
-    report = await run_timeline_sweep(Manager())
+    manager = Manager()
+    report = await run_timeline_sweep(manager)
+    repeated = await run_timeline_sweep(manager)
 
     assert writes == [("legacy", OTHER_THREAD)]
     assert report.updated_count == 1
     assert report.assigned_count == 0
     assert report.orphan_count == 1
+    assert repeated.updated_count == 0
 
 
 @pytest.mark.asyncio

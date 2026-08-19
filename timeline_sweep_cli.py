@@ -45,8 +45,13 @@ def _load_reviewed_manifest(path: Path | None) -> dict[str, str]:
         if not isinstance(row, Mapping):
             raise ValueError("review assignment must be an object")
         bucket_id = str(row.get("bucket_id") or "").strip()
-        thread = normalize_thread_hint(row.get("thread"))
-        if not bucket_id or thread == OTHER_THREAD:
+        raw_thread = row.get("thread")
+        thread = normalize_thread_hint(raw_thread)
+        explicit_incubator = (
+            isinstance(raw_thread, str)
+            and raw_thread.strip().casefold() == OTHER_THREAD
+        )
+        if not bucket_id or (thread == OTHER_THREAD and not explicit_incubator):
             raise ValueError("review assignment requires bucket_id and narrative thread")
         previous = reviewed.get(bucket_id)
         if previous is not None and previous != thread:

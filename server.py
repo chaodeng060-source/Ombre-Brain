@@ -122,6 +122,7 @@ from recall_support import (
     rank_within_relevance_bands,
     retain_original_query_supported_candidates,
 )
+from timeline_axis import timeline_neighbors
 from recall_receipt import RecallReceiptConflict, RecallReceiptStore, normalize_bucket_ids
 from e_axis_shadow import (
     EAxisShadowStore,
@@ -1104,6 +1105,98 @@ def _relation_recall_neighbors(
             1: threshold("hop1_min_strength", 0.4),
             2: threshold("hop2_min_strength", 0.7),
         },
+    )
+
+
+def _timeline_recall_neighbors(
+    buckets,
+    seed_ids,
+    *,
+    query: str,
+    intent: str,
+    world_filter,
+    domain_filter,
+    created_after,
+    created_before,
+    max_results: int,
+    excluded_ids=None,
+):
+    """Build bounded X navigation from displayed primary results."""
+
+    timeline_cfg = config.get("timeline_recall", {}) or {}
+    raw_enabled = timeline_cfg.get("enabled", True)
+    if isinstance(raw_enabled, str):
+        enabled = raw_enabled.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        enabled = bool(raw_enabled)
+    if not enabled or max_results <= 0:
+        return []
+    try:
+        neighbor_window = int(timeline_cfg.get("neighbor_window", 1))
+    except (TypeError, ValueError):
+        neighbor_window = 1
+    neighbor_window = max(0, min(neighbor_window, 4))
+    if neighbor_window == 0:
+        return []
+
+    candidates = [
+        bucket
+        for bucket in buckets
+        if isinstance(bucket, dict) and _is_main_recall_bucket(bucket)
+    ]
+    wf_set = (
+        {str(value).strip() for value in world_filter}
+        if world_filter is not None
+        else None
+    )
+    domain_set = {
+        str(value).strip().lower()
+        for value in (domain_filter or [])
+    }
+
+    def eligible(bucket):
+        metadata = bucket.get("metadata", {}) or {}
+        if wf_set is not None and not world_matches(
+            metadata.get("world", ""),
+            wf_set,
+        ):
+            return False
+        if domain_set:
+            bucket_domains = {
+                str(value).strip().lower()
+                for value in _metadata_list(metadata.get("domain", []))
+            }
+            if not bucket_domains.intersection(domain_set):
+                return False
+        if created_after is not None or created_before is not None:
+            from bucket_manager import _bucket_in_time_range
+
+            if not _bucket_in_time_range(
+                bucket,
+                created_after,
+                created_before,
+            ):
+                return False
+        return True
+
+    candidates = [bucket for bucket in candidates if eligible(bucket)]
+    candidates = _filter_z_fact_candidates(
+        candidates,
+        query=query,
+        intent=intent,
+    )
+    allowed_node_ids = {
+        str(bucket.get("id"))
+        for bucket in candidates
+        if bucket.get("id")
+    }
+    return timeline_neighbors(
+        buckets,
+        seed_ids,
+        neighbor_window=neighbor_window,
+        max_results=max_results,
+        allowed_node_ids=allowed_node_ids,
+        excluded_ids=excluded_ids,
     )
 
 
@@ -4205,6 +4298,58 @@ async def breath(
             force_keep_ids=_exact_retrieval_key_ids(recall_query, matches),
             allow_empty=allow_empty_recall,
         )
+
+    # Reserve one existing result slot only when a retained primary seed has
+    # a real same-thread neighbor. Queries without such a neighbor keep their
+    # pre-X result budget unchanged.
+    timeline_slot_reserved = False
+    timeline_buckets = []
+    timeline_fallback_matches = []
+    if max_results > 1 and matches:
+        try:
+            # Reuse the full per-request snapshot already loaded for keyword
+            # search; X must not add another 8k-bucket filesystem scan.
+            timeline_buckets = list(keyword_candidates)
+            primary_limit_with_timeline = max(
+                1,
+                max_results - len(state_link_candidates) - 1,
+            )
+            retained_primary = matches[:primary_limit_with_timeline]
+            retained_primary_ids = [
+                str(bucket.get("id") or "")
+                for bucket in retained_primary
+                if bucket.get("id")
+            ]
+            timeline_probe = _timeline_recall_neighbors(
+                timeline_buckets,
+                retained_primary_ids,
+                query=recall_query,
+                intent=intent_policy["intent"],
+                world_filter=world_filter,
+                domain_filter=domain_filter,
+                created_after=created_after,
+                created_before=created_before,
+                max_results=1,
+                excluded_ids=(
+                    set(retained_primary_ids)
+                    | {
+                        str(bucket.get("id") or "")
+                        for bucket in state_link_candidates
+                        if bucket.get("id")
+                    }
+                    | _session_seen_bucket_ids(timeline_buckets, session_id)
+                    | _load_session_seen_ids(session_id)
+                ),
+            )
+            if timeline_probe:
+                timeline_slot_reserved = True
+                timeline_fallback_matches = matches[primary_limit_with_timeline:]
+                matches = retained_primary
+        except Exception as exc:
+            logger.warning(
+                "Timeline preflight failed / 时间线预检失败: %s",
+                type(exc).__name__,
+            )
     with recall_stage("assembly"):
         set_recall_partial_result(_local_partial_recall_text(
             matches,
@@ -4287,6 +4432,196 @@ async def breath(
             logger.warning(f"Failed to dehydrate search result / 检索结果脱水失败: {e}")
             continue
 
+    # X and Y may expand only the primary RRF results. State or side evidence
+    # must not recursively become a timeline seed.
+    main_result_ids = tuple(result_ids)
+
+    # --- X-axis thread navigation: bounded previous/next supporting context ---
+    # X consumes exactly the slot proven by preflight before Z/Y can claim it.
+    # If rendering fails, primary fallback is restored before Z is assembled,
+    # preserving the original primary-first selection and dedup semantics.
+    remaining_timeline_slots = min(1, max(0, max_results - len(result_ids)))
+    timeline_rendered = False
+    if (
+        timeline_slot_reserved
+        and main_result_ids
+        and remaining_timeline_slots
+        and token_used < max_tokens
+    ):
+        timeline_msgs = []
+        try:
+            timeline_by_id = {
+                str(bucket.get("id")): bucket
+                for bucket in timeline_buckets
+                if isinstance(bucket, dict) and bucket.get("id")
+            }
+            timeline_found = _timeline_recall_neighbors(
+                timeline_buckets,
+                main_result_ids,
+                query=recall_query,
+                intent=intent_policy["intent"],
+                world_filter=world_filter,
+                domain_filter=domain_filter,
+                created_after=created_after,
+                created_before=created_before,
+                max_results=remaining_timeline_slots,
+                excluded_ids=(
+                    set(result_ids)
+                    | {
+                        str(bucket.get("id") or "")
+                        for bucket in state_link_candidates
+                        if bucket.get("id")
+                    }
+                    | _session_seen_bucket_ids(timeline_buckets, session_id)
+                    | _load_session_seen_ids(session_id)
+                ),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Timeline expansion failed / 时间线扩展失败: %s",
+                type(exc).__name__,
+            )
+            timeline_found = []
+            timeline_by_id = {}
+
+        for timeline_neighbor in timeline_found:
+            if token_used >= max_tokens or len(result_ids) >= max_results:
+                break
+            neighbor = timeline_by_id.get(timeline_neighbor.bucket_id)
+            if not neighbor:
+                continue
+            try:
+                fingerprint = default_content_fingerprint(
+                    str(neighbor.get("content") or "")
+                )
+                if fingerprint and fingerprint in selected_content_fingerprints:
+                    continue
+                clean_meta = {
+                    key: value
+                    for key, value in neighbor["metadata"].items()
+                    if key != "tags"
+                }
+                summary = await _dehydrate_for_recall(
+                    strip_wikilinks(neighbor["content"]),
+                    clean_meta,
+                    bucket=neighbor,
+                )
+                summary_tokens = count_tokens_approx(summary)
+                if token_used + summary_tokens > max_tokens:
+                    break
+                prefix = _recall_prefix(
+                    timeline_neighbor.bucket_id,
+                    "association",
+                    "x_timeline",
+                    relation=(
+                        f"{timeline_neighbor.thread}:"
+                        f"{timeline_neighbor.direction}:"
+                        f"d{timeline_neighbor.distance}"
+                        f"←{timeline_neighbor.via_id}"
+                    ),
+                    bucket=neighbor,
+                    state_profile=state_profile,
+                )
+                timeline_msgs.append(f"{prefix} {summary}")
+                token_used += summary_tokens
+                result_buckets.append(neighbor)
+                result_ids.append(timeline_neighbor.bucket_id)
+                if fingerprint:
+                    selected_content_fingerprints.add(fingerprint)
+                capture = _breath_candidate_capture.get()
+                if isinstance(capture, list) and len(capture) < max_results:
+                    capture.append({
+                        "id": timeline_neighbor.bucket_id,
+                        "summary": summary,
+                    })
+            except Exception as exc:
+                logger.warning(
+                    "Failed to dehydrate timeline neighbor: %s",
+                    type(exc).__name__,
+                )
+                continue
+        if timeline_msgs:
+            timeline_rendered = True
+            results.append(
+                "--- 时间线前后文（supporting only，不可替代主证据） ---\n"
+                + "\n---\n".join(timeline_msgs)
+            )
+            set_recall_partial_result("\n---\n".join(results))
+
+    # Preflight only proves structural adjacency.  If the neighbor cannot be
+    # rendered (duplicate body, token budget, or dehydration error), restore
+    # the primary candidates held back for the tentative X slot.  A failed X
+    # expansion must be observationally equivalent to the pre-X path.
+    if timeline_slot_reserved and not timeline_rendered:
+        restored_main_messages = []
+        restored_main_ids = []
+        for bucket in timeline_fallback_matches:
+            if token_used >= max_tokens or len(result_ids) >= max_results:
+                break
+            bucket_id = str(bucket.get("id") or "")
+            if not bucket_id or bucket_id in result_ids:
+                continue
+            try:
+                clean_meta = {
+                    key: value
+                    for key, value in bucket["metadata"].items()
+                    if key != "tags"
+                }
+                if q_valence is not None and "valence" in clean_meta:
+                    original_v = float(clean_meta.get("valence", 0.5))
+                    shift = (q_valence - 0.5) * 0.2
+                    clean_meta["valence"] = max(
+                        0.0,
+                        min(1.0, original_v + shift),
+                    )
+                summary = await _dehydrate_for_recall(
+                    strip_wikilinks(bucket["content"]),
+                    clean_meta,
+                    bucket=bucket,
+                )
+                summary_tokens = count_tokens_approx(summary)
+                if token_used + summary_tokens > max_tokens:
+                    break
+                marker = "[实体关联]" if bucket.get("entity_match") else (
+                    "[语义关联]" if bucket.get("vector_match") else ""
+                )
+                prefix = _recall_prefix(
+                    bucket_id,
+                    "main",
+                    "curated_rrf",
+                    marker=marker,
+                    bucket=bucket,
+                    state_profile=state_profile,
+                )
+                restored_main_messages.append(f"{prefix} {summary}")
+                restored_main_ids.append(bucket_id)
+                token_used += summary_tokens
+                result_buckets.append(bucket)
+                result_ids.append(bucket_id)
+                fingerprint = default_content_fingerprint(
+                    str(bucket.get("content") or "")
+                )
+                if fingerprint:
+                    selected_content_fingerprints.add(fingerprint)
+                if bucket.get("_e_axis_annotation") is not None:
+                    selected_e_evidence.append((
+                        bucket["_e_axis_annotation"],
+                        float(bucket.get("_e_axis_resonance", 0.0) or 0.0),
+                    ))
+                capture = _breath_candidate_capture.get()
+                if isinstance(capture, list) and len(capture) < max_results:
+                    capture.append({"id": bucket_id, "summary": summary})
+            except Exception as exc:
+                logger.warning(
+                    "Failed to restore primary after timeline miss: %s",
+                    type(exc).__name__,
+                )
+                continue
+        if restored_main_messages:
+            results.extend(restored_main_messages)
+            main_result_ids = tuple((*main_result_ids, *restored_main_ids))
+            set_recall_partial_result("\n---\n".join(results))
+
     # --- Z lifecycle state links: explicit current/history transition evidence ---
     # This is a bounded overlay over reviewed reciprocal links.  It does not
     # enter RRF, touch generic Y edges, or alter the underlying vector index.
@@ -4354,7 +4689,7 @@ async def breath(
     )
     if (
         intent_policy["relation_depth"] >= 1
-        and result_ids
+        and (main_result_ids if timeline_rendered else result_ids)
         and token_used < max_tokens
         and relation_neighbor_cap
     ):
@@ -4373,7 +4708,7 @@ async def breath(
             }
             relation_neighbors = _relation_recall_neighbors(
                 graph_buckets,
-                result_ids,
+                main_result_ids if timeline_rendered else result_ids,
                 query=recall_query,
                 intent=intent_policy["intent"],
                 world_filter=world_filter,
@@ -4383,7 +4718,12 @@ async def breath(
                 max_depth=intent_policy["relation_depth"],
                 max_results=relation_neighbor_cap,
                 excluded_ids=(
-                    _session_seen_bucket_ids(graph_buckets, session_id)
+                    (
+                        set(result_ids)
+                        if timeline_rendered
+                        else set()
+                    )
+                    | _session_seen_bucket_ids(graph_buckets, session_id)
                     | _load_session_seen_ids(session_id)
                 ),
             )
@@ -4465,6 +4805,8 @@ async def breath(
             limit=e_recall_cfg.side_channel_scan_limit,
         )
         for e_bucket_id in prelim_ids:
+            if timeline_rendered and len(result_ids) >= max_results:
+                break
             if len(e_side_messages) >= e_recall_cfg.side_channel_limit:
                 break
             if e_bucket_id in excluded_e_ids:
