@@ -277,28 +277,40 @@ def test_recall_prefix_is_unchanged_for_neutral_query(monkeypatch):
     assert prefix == "[bucket_id:new]"
 
 
-def test_state_overlay_disable_restores_pre_overlay_transition_filter(monkeypatch):
+def test_state_overlay_disable_keeps_explicit_slot_gate_only(monkeypatch):
+    """关掉 state_aware_recall 后，Z 闸仍然只在查询**明确命中**已登记槽时启用。
+
+    2026-08-19 复核 P1-3 之前，这条测试断言「主色怎么变化的？」（叙事 cue、未被判为明确命中）
+    在 overlay 关闭时也会把 historical 删掉——那是把空 fact_keys 当「所有槽」的旧 bug，
+    违反 docs/Z_AXIS_FACT_SLOTS.md「只有明确命中 fact_key 才启用」。现在：
+    - 叙事问法（变化/以前）：开关都不删；
+    - 明确的现状问法（现在主色是什么）：开关都只压该槽 historical。
+    """
     _enable_state_overlay(monkeypatch)
     historical = _bucket("old", "historical")
 
-    enabled = server._filter_z_fact_candidates(
-        [historical],
-        query="主色怎么变化的？",
-        intent="fact",
+    enabled_narrative = server._filter_z_fact_candidates(
+        [historical], query="主色怎么变化的？", intent="fact",
+    )
+    enabled_exact = server._filter_z_fact_candidates(
+        [historical], query="现在主色是什么", intent="fact",
     )
     monkeypatch.setitem(
         server.config,
         "state_aware_recall",
         {"enabled": False},
     )
-    disabled = server._filter_z_fact_candidates(
-        [historical],
-        query="主色怎么变化的？",
-        intent="fact",
+    disabled_narrative = server._filter_z_fact_candidates(
+        [historical], query="主色怎么变化的？", intent="fact",
+    )
+    disabled_exact = server._filter_z_fact_candidates(
+        [historical], query="现在主色是什么", intent="fact",
     )
 
-    assert enabled == [historical]
-    assert disabled == []
+    assert enabled_narrative == [historical]
+    assert disabled_narrative == [historical]
+    assert enabled_exact == []
+    assert disabled_exact == []
 
 
 @pytest.mark.asyncio

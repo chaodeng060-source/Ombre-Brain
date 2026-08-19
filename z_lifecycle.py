@@ -339,18 +339,31 @@ class ZLifecycleTransaction:
                     raise ZLifecycleStateError(
                         "pending review item changed during approval"
                     )
-            except Exception:
+            except Exception as exc:
                 durable = self.review_queue.get(key)
                 if durable and durable.get("status") == STATUS_APPLIED:
                     # The queue rewrite may have committed before a trailing
                     # filesystem error surfaced.  Once the durable verdict is
                     # applied, recovery must finish the targets, never roll the
-                    # approved decision back underneath the ledger.
+                    # approved decision back underneath the ledger — and the
+                    # caller must be told the truth: the approval *did* commit
+                    # (2026-08-19 review P2: re-raising here made the API
+                    # answer 503 / memory_mutated=false for a durable commit).
                     self._write_targets(transaction_dir, manifest)
                     manifest["state"] = "committed"
+                    manifest["recovered_after_error"] = (
+                        f"{type(exc).__name__}: {exc}"[:300]
+                    )
                     self._write_manifest(transaction_dir, manifest)
-                else:
-                    self._restore_originals(transaction_dir, manifest)
+                    return {
+                        "key": key,
+                        "status": STATUS_APPLIED,
+                        "changed": True,
+                        "current_bucket_id": current_id,
+                        "historical_bucket_id": historical_id,
+                        "recovered_after_error": manifest["recovered_after_error"],
+                    }
+                self._restore_originals(transaction_dir, manifest)
                 raise
 
             manifest["state"] = "committed"

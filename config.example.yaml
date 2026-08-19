@@ -349,6 +349,9 @@ relation_recall:
 # fact_status 仅允许 current/historical/contested；resolved 仍是注意力状态，不表示事实过期。
 fact_slots:
   enabled: true
+  # 夜跑检出的同槽新旧候选是否自动进待审队列（pending，人批准前绝不改桶）。
+  # 缺省 true（2026-08-19：上游合同「候选先进 audit」；关掉 = 闭环不存在）。只在误报淹没人审时设 false。
+  auto_enqueue_z_candidates: true
   registry:
     preference.ui.primary_color:
       aliases: [主色]
@@ -382,6 +385,14 @@ fact_slots:
       types: [dynamic]
       name_contains: [本地模型, 模型名, 模型选型, 换模型, 本地 LLM]
       value_patterns: ['\b(qwen[0-9][a-z0-9._:-]*)', '\b(glm-?[a-z0-9._-]+)', '\b(deepseek-[a-z0-9._-]+)', '\b(llama[0-9][a-z0-9._:-]*)', '\b(gemma[0-9]?[a-z0-9._:-]*)']
+    # --- 2026-08-18 23:5x 朝灯定方向：「过时的就是那些工程相关的（进度类）」——工程进度状态槽。
+    # 只给人工提候选（tools/ombre_z_review.py candidate）与批准后召回压旧用；不设 value_patterns，
+    # 自动候选不会用它成对（值配对只认声明了 value_patterns 的槽）。name_contains 宽是故意的：
+    # 压制只对被人批准标 historical 的桶生效，别的桶不受影响。
+    engineering.progress.state:
+      aliases: [进度, 状态, 待办, 工程进度]
+      types: [dynamic]
+      name_contains: [待, 未, 阻塞, 上线, 修复, 完成, 进度, 重启, 同步, 卡在, 落地, 交接, 收尾]
 
 # --- World axis / 世界轴 ---
 # 用来隔离不同剧情世界的记忆。日常聊天的桶 world 留空（不属于任何世界）；

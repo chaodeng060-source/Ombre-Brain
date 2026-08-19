@@ -250,7 +250,15 @@ def _query_contains_label(query: str, label: str) -> bool:
 
 
 def is_fact_slot_exempt(bucket: dict) -> bool:
-    """Return whether a bucket is outside automatic Z-axis semantics."""
+    """Return whether a bucket is outside automatic Z-axis semantics.
+
+    This is the single protection gate shared by the scanner
+    (``fact_conflicts.is_z_scan_candidate``), the candidate API and the
+    apply-lifecycle re-validation, so the three layers cannot drift apart.
+    2026-08-19 review (xiaojuan P1-2): ``permanent`` (type or flag) and
+    ``nsfw``/``is_nsfw`` were only excluded by the scanner, so a manual
+    candidate + approve could still write ``fact_status`` on them.
+    """
     meta = _metadata(bucket)
     bucket_type = str(meta.get("type") or "").strip().lower()
     domains = {value.strip().lower() for value in _metadata_list(meta.get("domain"))}
@@ -258,6 +266,10 @@ def is_fact_slot_exempt(bucket: dict) -> bool:
     return bool(
         meta.get("pinned")
         or meta.get("protected")
+        or meta.get("permanent")
+        or meta.get("nsfw")
+        or meta.get("is_nsfw")
+        or bucket_type == "permanent"
         or bucket_type in NARRATIVE_FACT_TYPES
         or domains & protected_domains
     )
@@ -426,6 +438,13 @@ def filter_fact_slot_candidates(
     Unknown keys and invalid statuses fail open so a bad migration cannot make
     memories disappear.  Protected and narrative buckets are always retained.
     ``resolved`` is deliberately ignored: it controls attention, not truth age.
+
+    The filter only engages when the query explicitly hit at least one
+    registered ``fact_key`` (docs/Z_AXIS_FACT_SLOTS.md: 「只有查询明确命中已登记
+    fact_key 时才启用；普通回忆保持原排序与原输出」).  An empty/unknown key set
+    therefore fails open instead of being read as "every slot" — 2026-08-19
+    review P1-3: a neutral fact query such as 「具体地址是多少」 used to drop
+    every registered historical bucket, breaking 「非 Z 查询 top5 不变」.
     """
     candidates = list(buckets)
     if intent != "fact" or not normalize_fact_slot_registry(registry):
@@ -436,6 +455,8 @@ def filter_fact_slot_candidates(
         for raw_key in (fact_keys or [])
         if (key := registered_fact_key(raw_key, registry)) is not None
     }
+    if not requested_keys:
+        return candidates
     kept: list[dict] = []
     for bucket in candidates:
         if is_fact_slot_exempt(bucket):
@@ -445,7 +466,7 @@ def filter_fact_slot_candidates(
         canonical = registered_fact_key(meta.get("fact_key"), registry)
         applies = fact_slot_applies_to_bucket(canonical, bucket, registry)
         status = str(meta.get("fact_status") or FACT_STATUS_CURRENT).strip().lower()
-        slot_is_requested = not requested_keys or canonical in requested_keys
+        slot_is_requested = canonical in requested_keys
         if applies and slot_is_requested and status == FACT_STATUS_HISTORICAL:
             continue
         kept.append(bucket)

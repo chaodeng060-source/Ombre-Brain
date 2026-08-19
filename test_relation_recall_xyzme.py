@@ -135,12 +135,22 @@ def test_y_axis_cannot_reintroduce_filtered_historical_fact(monkeypatch):
         ),
     ]
 
+    # 明确命中「城市」槽：Y 轴扩展不能把被 Z 闸压掉的 historical 再带回来。
     found = _neighbors(
+        buckets,
+        query="现在城市是哪个",
+        intent="fact",
+    )
+    assert [item.bucket_id for item in found] == ["current"]
+
+    # 2026-08-19 复核 P1-3：没命中任何已登记槽的 fact 查询，Z 闸不启用（fail-open），
+    # Y 轴扩展照常带回两端——旧断言把空 fact_keys 当「所有槽」过滤是 bug。
+    found_neutral = _neighbors(
         buckets,
         query="具体地址是多少",
         intent="fact",
     )
-    assert [item.bucket_id for item in found] == ["current"]
+    assert sorted(item.bucket_id for item in found_neutral) == ["current", "old"]
 
 
 def test_y_axis_honors_session_dedup_and_scalar_config(monkeypatch):

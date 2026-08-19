@@ -21,6 +21,8 @@ NUMBER_CONFLICT_RE = re.compile(
 NEGATION_CONFLICT_RE = re.compile(r"\b(no|not|never|none|without|cancelled|canceled)\b|不再|不是|没有|没|无|取消|别|不要")
 WIKILINK_RE = re.compile(r"\[\[([^\]|]+)(?:\|([^\]]+))?\]\]")
 
+# Kept for backwards-compatible imports; the live gate is fact_slots.PROTECTED_FACT_DOMAINS
+# via is_fact_slot_exempt (see is_z_scan_candidate).
 PROTECTED_Z_SCAN_DOMAINS = frozenset({"恋爱", "纪念日", "约定", "家庭", "自省", "feel"})
 
 
@@ -112,15 +114,20 @@ def _domains(meta: dict) -> list[str]:
 
 
 def is_z_scan_candidate(bucket: dict) -> bool:
+    """Scanner-side eligibility.
+
+    Protection (pinned/protected/permanent/nsfw/narrative types/protected
+    domains) is delegated to ``fact_slots.is_fact_slot_exempt`` so the
+    scanner, the candidate API and apply-lifecycle share one gate
+    (2026-08-19 review P1-2).  The scanner additionally skips ``resolved``
+    buckets and empty content, which are scan-only concerns.
+    """
+    from fact_slots import is_fact_slot_exempt  # local import: fact_slots must not import us
+
     meta = bucket.get("metadata", {}) or {}
-    domains = set(_domains(meta))
-    if meta.get("resolved") or meta.get("pinned") or meta.get("protected") or meta.get("permanent"):
+    if meta.get("resolved"):
         return False
-    if meta.get("type") in {"feel", "permanent"}:
-        return False
-    if meta.get("nsfw") or meta.get("is_nsfw"):
-        return False
-    if domains & PROTECTED_Z_SCAN_DOMAINS:
+    if is_fact_slot_exempt(bucket):
         return False
     return bool(bucket.get("content"))
 

@@ -7921,6 +7921,26 @@ async def _apply_review_queue_lifecycle(body):
             "Z lifecycle transaction failed: %s",
             type(exc).__name__,
         )
+        # 2026-08-19 review P2: the receipt must follow the durable ledger.  If the
+        # review queue already recorded `applied`, the approval committed even
+        # though a trailing step blew up (recovery finishes the targets on the
+        # next start); answering "nothing changed" here would be a lie.
+        durable = None
+        try:
+            durable = _get_z_lifecycle_transaction().review_queue.get(key)
+        except Exception:  # noqa: BLE001 — best effort, never mask the original error
+            durable = None
+        if durable and durable.get("status") == "applied":
+            return JSONResponse({
+                "ok": True,
+                "key": key,
+                "status": "applied",
+                "changed": True,
+                "memory_mutated": True,
+                "queue_mutated": True,
+                "recovery_pending": True,
+                "error": f"trailing step failed after durable commit: {type(exc).__name__}",
+            })
         return JSONResponse({
             "error": "Z lifecycle transaction failed closed",
             "memory_mutated": False,

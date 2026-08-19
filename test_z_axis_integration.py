@@ -49,9 +49,10 @@ def test_exact_fact_recall_hides_only_registered_historical(monkeypatch):
         _bucket("protected", key="profile.city", status="historical", protected=True),
     ]
 
+    # 明确命中已登记槽（「城市」）：只压该槽的 historical；contested / 未注册 / protected 都留。
     kept = server._filter_z_fact_candidates(
         buckets,
-        query="具体地址是多少",
+        query="现在城市是哪个",
         intent="fact",
     )
 
@@ -61,6 +62,17 @@ def test_exact_fact_recall_hides_only_registered_historical(monkeypatch):
         "unknown",
         "protected",
     ]
+
+    # 2026-08-19 复核 P1-3：没有命中任何已登记槽的 fact 查询（「具体地址是多少」对只有
+    # 「城市」的注册表是 neutral / fact_keys=()）必须 fail-open——一个 historical 都不删。
+    # 旧断言把空 fact_keys 当「所有槽」过滤，违反 docs/Z_AXIS_FACT_SLOTS.md「只有明确命中
+    # fact_key 才启用」与「非 Z 查询 top5 不变」。
+    untouched = server._filter_z_fact_candidates(
+        buckets,
+        query="具体地址是多少",
+        intent="fact",
+    )
+    assert [bucket["id"] for bucket in untouched] == [bucket["id"] for bucket in buckets]
 
 
 def test_history_and_non_fact_queries_keep_historical(monkeypatch):

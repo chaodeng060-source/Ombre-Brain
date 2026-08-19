@@ -81,10 +81,12 @@ def run_nightly_patrol(
             maintenance_root=buckets_dir,
         )
         queued = patrol_module.enqueue_metabolism_suggestions(report, queue)
-        # Z 轴：同槽新旧候选只入待审队列；fact_status 只有人批准后才会变。
-        # 默认关：2026-08-18 真库 dry-run 三轮候选抽样误报率过高，报告里看得到、
-        # 但不灌进 review_pending；config.fact_slots.auto_enqueue_z_candidates: true 才入队。
-        auto_z = bool((cfg.get("fact_slots", {}) or {}).get("auto_enqueue_z_candidates", False))
+        # Z 轴：同槽新旧候选只入待审队列（pending）；fact_status 只有人批准后才会变。
+        # 默认开（2026-08-19，复核 P1-1）：上游合同是「矛盾/覆盖候选先进入 audit，不直接改库」，
+        # audit 就是 review_queue——不入队 = 闭环不存在。8/18 关掉是因为上下文配对误报 100%；
+        # 改成值配对后真实夜巡候选已降到个位数（VPS 8/19 04:32 为 2），入队只是 pending、人审
+        # 拒绝即可、不碰桶。config.fact_slots.auto_enqueue_z_candidates: false 可显式关。
+        auto_z = bool((cfg.get("fact_slots", {}) or {}).get("auto_enqueue_z_candidates", True))
         queued_z = patrol_module.enqueue_z_pair_candidates(report, queue) if auto_z else 0
         report_path = runs_dir / f"{run_id}.md"
         atomic_write_text(report_path, rendered + "\n")
