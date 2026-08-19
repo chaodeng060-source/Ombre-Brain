@@ -241,6 +241,28 @@ async def test_sweep_backfills_other_and_reviewed_threads_idempotently(bucket_mg
 
 
 @pytest.mark.asyncio
+async def test_sweep_writes_missing_legacy_thread_as_other():
+    bucket = _bucket("legacy", event_at="2026-06-01T00:00:00+08:00")
+    writes = []
+
+    class Manager:
+        async def list_all(self, include_archive=False):
+            return [bucket]
+
+        async def set_thread(self, bucket_id, thread, **_kwargs):
+            writes.append((bucket_id, thread))
+            bucket["metadata"]["thread"] = thread
+            return True
+
+    report = await run_timeline_sweep(Manager())
+
+    assert writes == [("legacy", OTHER_THREAD)]
+    assert report.updated_count == 1
+    assert report.assigned_count == 0
+    assert report.orphan_count == 1
+
+
+@pytest.mark.asyncio
 async def test_thread_write_rejects_stale_revision(bucket_mgr):
     bucket_id = await bucket_mgr.create(
         content="最初正文",
