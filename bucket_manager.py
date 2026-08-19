@@ -54,6 +54,7 @@ from maintenance_barrier import MaintenanceBarrier
 from storage_safety import advisory_file_lock, atomic_write_post
 from x_provenance import normalize_x_provenance, validate_x_provenance_update
 from review_queue import ReviewQueue, make_clothing_entry
+from timeline_axis import normalize_thread
 
 logger = logging.getLogger("ombre_brain.bucket")
 
@@ -378,6 +379,7 @@ class BucketManager:
         pinned: bool = False,
         protected: bool = False,
         world: str = "",
+        thread: str = "other",
         chord_tag: str = None,
         tier: int = None,
         sense: list[str] = None,
@@ -479,6 +481,7 @@ class BucketManager:
             "created": normalized_event_at,
             "last_active": recorded_at,
             "activation_count": 1,
+            "thread": normalize_thread(thread),
         }
         if selected_retrieval_keys:
             metadata["retrieval_keys"] = selected_retrieval_keys
@@ -755,6 +758,61 @@ class BucketManager:
                 self.audit_log.fail(event_id, exc)
                 logger.warning(
                     "Failed to persist recall dehydration metadata for %s: %s",
+                    bucket_id,
+                    type(exc).__name__,
+                )
+                return False
+
+    async def set_thread(
+        self,
+        bucket_id: str,
+        thread: str,
+        *,
+        actor: str = "system:timeline",
+        expected_revision_hash: str = "",
+    ) -> bool:
+        """Persist only the X-axis thread without touching activity metadata."""
+
+        normalized = normalize_thread(thread)
+        async with self._write_guard(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return False
+            event_id = None
+            try:
+                post = self._safe_load_post(file_path)
+                if expected_revision_hash:
+                    actual_revision_hash = bucket_revision_hash(
+                        post.content,
+                        post.metadata,
+                    )
+                    if actual_revision_hash != expected_revision_hash:
+                        logger.warning(
+                            "Bucket revision changed before thread assignment: %s",
+                            bucket_id,
+                        )
+                        return False
+                if normalize_thread(post.get("thread")) == normalized and (
+                    post.get("thread") == normalized
+                ):
+                    return True
+                before = self._post_snapshot(post, file_path)
+                post["thread"] = normalized
+                event_id = self.audit_log.begin(
+                    actor=actor,
+                    action="set_thread",
+                    bucket_id=bucket_id,
+                    before=before,
+                    after=self._post_snapshot(post, file_path),
+                    details={"changed_fields": ["thread"]},
+                )
+                self._atomic_write_post(file_path, post)
+                self.audit_log.commit(event_id)
+                return True
+            except Exception as exc:
+                self.audit_log.fail(event_id, exc)
+                logger.error(
+                    "Failed to assign timeline thread for %s: %s",
                     bucket_id,
                     type(exc).__name__,
                 )
