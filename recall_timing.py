@@ -37,6 +37,7 @@ _RECALL_METRIC_MODES = {
     "vector_cache_rows_loaded": "sum",
     "vector_cache_rows_reused": "sum",
     "vector_cache_rows_removed": "sum",
+    "vector_pg_rows": "sum",
     "vector_entries_scanned": "sum",
     "vector_stored_segments_scanned": "sum",
     "vector_segment_comparisons": "sum",
