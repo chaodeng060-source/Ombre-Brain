@@ -2023,6 +2023,37 @@ _DEHYDRATE_BACKFILL_PENDING: set[str] = set()
 _DEHYDRATE_BACKFILL_SEM = asyncio.Semaphore(2)
 
 
+async def _extend_e_axis_cache_after_summary_write(token_pre) -> None:
+    """Re-key the E-axis cache after a summary-only frontmatter write.
+
+    cache_recall_dehydration touches only ``dehydrated_summary`` /
+    ``dehydrated_content_hash`` — fields the E grouping never reads — yet the
+    write moves the directory snapshot and would evict the cache, forcing the
+    next beat back onto a full-library rescan (the two perf fixes fighting
+    each other).  Extension is gated on ``token_pre`` (snapshot taken before
+    the write) still matching the cache: if any real bucket write slipped in
+    before ours, the tokens disagree and we leave eviction to do its job.
+    The remaining race (another write between our write and the token read
+    below) can only delay one freshly-authored E row until the next write —
+    it cannot corrupt existing rows, because summary writes never change the
+    fields the grouping reads.
+    """
+    cache = _E_AXIS_ROWS_CACHE
+    if token_pre is None or cache["token"] != token_pre:
+        return
+    token_fn = getattr(bucket_mgr, "list_all_snapshot_token", None)
+    if not callable(token_fn):
+        return
+    try:
+        cache["token"] = await token_fn(include_archive=False)
+    except Exception as exc:
+        logger.warning(
+            "E-axis cache token extension failed; next beat rebuilds: %s",
+            type(exc).__name__,
+        )
+        cache["token"] = None
+
+
 def _schedule_recall_dehydration_backfill(bucket_id: str, content: str, body_hash: str) -> None:
     """Compute the LLM summary off the recall path and persist it for next beat."""
     if not bucket_id or bucket_id in _DEHYDRATE_BACKFILL_PENDING:
@@ -2040,11 +2071,19 @@ def _schedule_recall_dehydration_backfill(bucket_id: str, content: str, body_has
                     return
                 writer = getattr(bucket_mgr, "cache_recall_dehydration", None)
                 if callable(writer):
-                    await writer(
+                    token_fn = getattr(bucket_mgr, "list_all_snapshot_token", None)
+                    token_pre = (
+                        await token_fn(include_archive=False)
+                        if callable(token_fn)
+                        else None
+                    )
+                    persisted = await writer(
                         bucket_id,
                         expected_content_hash=body_hash,
                         summary=raw_summary,
                     )
+                    if persisted:
+                        await _extend_e_axis_cache_after_summary_write(token_pre)
         except Exception as exc:
             logger.warning(
                 "Async recall dehydration backfill failed for %s: %s",

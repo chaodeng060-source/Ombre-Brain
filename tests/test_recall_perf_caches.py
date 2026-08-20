@@ -200,6 +200,98 @@ def test_async_fallback_disabled_keeps_synchronous_path(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_backfill_write_extends_e_axis_cache_instead_of_evicting(monkeypatch):
+    """夏刀互搏回归：补写 summary 不得炸掉 E 轴小抽屉（16:11 实测抓到的）。"""
+    dehy = _SlowDehydrator()
+
+    class _TokenWriterMgr(_WriterMgr):
+        def __init__(self):
+            super().__init__()
+            self.token = ("key", ("snap", 1))
+
+        async def list_all_snapshot_token(self, include_archive=False, include_nsfw=None):
+            return self.token
+
+        async def cache_recall_dehydration(self, bucket_id, *, expected_content_hash, summary):
+            await super().cache_recall_dehydration(
+                bucket_id,
+                expected_content_hash=expected_content_hash,
+                summary=summary,
+            )
+            self.token = ("key", ("snap", 2))  # frontmatter write moves the tree
+            return True
+
+    mgr = _TokenWriterMgr()
+    monkeypatch.setattr(server, "dehydrator", dehy)
+    monkeypatch.setattr(server, "bucket_mgr", mgr)
+    monkeypatch.setattr(server, "config", {"dehydration": {}})
+    monkeypatch.delenv("OMBRE_RECALL_DEHYDRATE_ASYNC", raising=False)
+    server._DEHYDRATE_BACKFILL_PENDING.clear()
+    server._E_AXIS_ROWS_CACHE["token"] = ("key", ("snap", 1))
+    server._E_AXIS_ROWS_CACHE["cfg"] = (True, 0.3)
+    server._E_AXIS_ROWS_CACHE["rows"] = {"kept": ()}
+
+    body = "补写不该赶走 E 轴缓存的桶正文 " * 20
+
+    async def scenario():
+        await server._dehydrate_for_recall(
+            body, {}, bucket=_fresh_bucket(body), allow_async_fallback=True,
+        )
+        for _ in range(20):
+            if mgr.writes:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.02)
+        # Cache token followed the write instead of being left stale/evicted.
+        assert server._E_AXIS_ROWS_CACHE["token"] == ("key", ("snap", 2))
+        assert server._E_AXIS_ROWS_CACHE["rows"] == {"kept": ()}
+    asyncio.run(scenario())
+    _reset_e_cache()
+
+
+def test_backfill_write_does_not_extend_when_world_moved_first(monkeypatch):
+    """写前世界已变（真新桶插队）→ 不续期，让失效正常发生。"""
+    dehy = _SlowDehydrator()
+
+    class _TokenWriterMgr(_WriterMgr):
+        def __init__(self):
+            super().__init__()
+            self.token = ("key", ("snap", 5))  # already ahead of the cache
+
+        async def list_all_snapshot_token(self, include_archive=False, include_nsfw=None):
+            return self.token
+
+        async def cache_recall_dehydration(self, bucket_id, **kwargs):
+            await super().cache_recall_dehydration(bucket_id, **kwargs)
+            return True
+
+    mgr = _TokenWriterMgr()
+    monkeypatch.setattr(server, "dehydrator", dehy)
+    monkeypatch.setattr(server, "bucket_mgr", mgr)
+    monkeypatch.setattr(server, "config", {"dehydration": {}})
+    monkeypatch.delenv("OMBRE_RECALL_DEHYDRATE_ASYNC", raising=False)
+    server._DEHYDRATE_BACKFILL_PENDING.clear()
+    stale_token = ("key", ("snap", 1))
+    server._E_AXIS_ROWS_CACHE["token"] = stale_token
+    server._E_AXIS_ROWS_CACHE["cfg"] = (True, 0.3)
+    server._E_AXIS_ROWS_CACHE["rows"] = {"stale": ()}
+
+    body = "世界已变时不许续期的桶正文 " * 20
+
+    async def scenario():
+        await server._dehydrate_for_recall(
+            body, {}, bucket=_fresh_bucket(body), allow_async_fallback=True,
+        )
+        for _ in range(20):
+            if mgr.writes:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.02)
+        assert server._E_AXIS_ROWS_CACHE["token"] == stale_token  # untouched
+    asyncio.run(scenario())
+    _reset_e_cache()
+
+
 def test_recall_callers_without_flag_never_degrade(monkeypatch):
     """briefing/breath 路径不传 allow_async_fallback，永远拿完整摘要。"""
     dehy = _SlowDehydrator()
