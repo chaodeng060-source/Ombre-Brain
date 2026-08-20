@@ -3,6 +3,8 @@
 # 根治"开窗只啃脱水简报→把恋爱/约定当 resolved/演的 读"
 # ============================================================
 import json
+from datetime import datetime, timedelta
+
 import pytest
 
 import server
@@ -159,6 +161,11 @@ async def test_protected_verbatim_limit_keeps_most_recent(monkeypatch, tmp_path)
 async def test_deterministic_boot_pack_uses_local_hooks_without_llm(
     monkeypatch, tmp_path,
 ):
+    # Unaudited status snapshots only enter the boot pack while fresh
+    # (created within briefing.unaudited_status_max_age_days, capped at 1 day).
+    # A literal date here rots into a red test once the clock passes it —
+    # exactly how this test broke on 2026-08-20 after shipping green on 08-19.
+    fresh_created = (datetime.now().astimezone() - timedelta(hours=2)).isoformat()
     bucket = _pbucket(
         "open-task",
         json.dumps(
@@ -167,8 +174,8 @@ async def test_deterministic_boot_pack_uses_local_hooks_without_llm(
         ),
         ["daily"],
         pinned=False,
-        created="2026-08-19T10:00:00+08:00",
-        last_active="2026-08-19T10:00:00+08:00",
+        created=fresh_created,
+        last_active=fresh_created,
     )
     _wire(monkeypatch, tmp_path, [bucket])
     monkeypatch.setattr(server, "dehydrator", _ForbiddenDehydrator())
