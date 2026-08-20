@@ -810,3 +810,43 @@ async def test_breath_search_emits_image_content_end_to_end(tmp_path, monkeypatc
     assert any(isinstance(c, ImageContent) for c in result)
     assert isinstance(result[0], TextContent)
     assert "https://pub-test.r2.dev/anchor.png" in captured
+
+
+@pytest.mark.asyncio
+async def test_ds_filter_output_budget_survives_reasoning_models(monkeypatch):
+    """精排的输出预算必须扛得住会先推理的模型。
+
+    2026-08-20 精排从 deepseek-chat 换成 apiroute 上的 gemini-3.7-flash 后，
+    隐藏推理把当时写死的 max_tokens=200 全部吃光：finish_reason="length"、
+    completion_tokens=196 而 message.content 只剩 3~19 字符，
+    _parse_ds_keep_indices 必然返回 None → 每次调用都回退 stub，
+    当天 22:11-23:33 连续 12 次无效 / 21 次回退，精排等于没有。
+
+    实测（.work/probe_rerank_fix.py 真实打 API）证明：
+    传 extra_body={"thinking":{"type":"disabled"}} 对 gemini 无效（输出 0 字符），
+    唯一有效的修法就是把预算给够。所以这里锁的是预算下限，
+    不是锁某个具体供应商的开关。
+    """
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+
+    seen = {}
+
+    async def _create(**kw):
+        seen.update(kw)
+        msg = types.SimpleNamespace(content='{"keep": [0]}')
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+
+    monkeypatch.setattr(server, "dehydrator", _fake_dehydrator_with_response(_create))
+    await server._ds_filter_candidates(
+        "查询", [_bucket("a", "A"), _bucket("b", "B")], mode="search", max_results=2
+    )
+
+    assert "max_tokens" in seen, "精排请求必须显式带 max_tokens"
+    assert seen["max_tokens"] >= 1000, (
+        f"精排输出预算只有 {seen['max_tokens']}，会推理的模型光思考就要 ~200-350 token，"
+        "预算不足会让 content 被截断、解析失败、静默回退 stub（2026-08-20 真实事故）"
+    )
+    assert seen["max_tokens"] == server.DS_FILTER_MAX_TOKENS, (
+        "预算必须走 DS_FILTER_MAX_TOKENS 常量，不许再写死字面量"
+    )

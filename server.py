@@ -1295,6 +1295,16 @@ mcp = FastMCP(
 BREATH_RECALL_POOL_SIZE = 20
 BREATH_DEFAULT_MAX_RESULTS = 8
 BREATH_DEFAULT_MAX_TOKENS = 6000
+# 精排过滤器的输出预算。原值 200 —— 对不吐思考链的 DeepSeek 够用，
+# 但换到会先推理的模型（2026-08-20 朝灯把精排换成 apiroute 上的
+# gemini-3.7-flash）之后，隐藏推理把 200 全吃光：finish_reason="length"、
+# completion_tokens=196 而 content 只剩 3~19 字符，解析必然失败、
+# 每次都回退 stub —— 当天 22:11-23:33 连续 12 次无效 / 21 次回退，无一幸免。
+# 实测四变体（.work/probe_rerank_fix.py，真实打 API）：
+#   mt=200 失败 · mt=200+extra_body{"thinking":"disabled"} 仍失败（gemini 不认
+#   这个 DeepSeek 扩展参数，输出 0 字符）· mt=2000 通过 · mt=2000+关思考 通过但多烧 token。
+# 结论：靠关思考不行，只能给够预算。这里不按域名/模型名猜，直接给足。
+DS_FILTER_MAX_TOKENS = 2000
 PULSE_NAV_SUMMARY_CHARS = 110
 MCP_IMAGE_MAX_ITEMS = 3
 MCP_IMAGE_MAX_BYTES = 900_000
@@ -1777,7 +1787,7 @@ async def _ds_semantic_select(
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        max_tokens=200,
+        max_tokens=DS_FILTER_MAX_TOKENS,
         temperature=0.0,
     )
     raw = resp.choices[0].message.content if resp.choices else ""
