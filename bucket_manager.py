@@ -55,6 +55,7 @@ from storage_safety import advisory_file_lock, atomic_write_post
 from x_provenance import normalize_x_provenance, validate_x_provenance_update
 from review_queue import ReviewQueue, make_clothing_entry
 from timeline_axis import normalize_thread
+from pg_mirror_queue import PgMirrorQueue
 
 logger = logging.getLogger("ombre_brain.bucket")
 
@@ -324,6 +325,7 @@ class BucketManager:
                 config.get("audit", {}),
             )
         self._bucket_locks: dict[str, asyncio.Lock] = {}
+        self.pg_mirror_queue = PgMirrorQueue(config)
 
     def _lock_for(self, bucket_id: str) -> asyncio.Lock:
         lock = self._bucket_locks.get(bucket_id)
@@ -355,6 +357,14 @@ class BucketManager:
     def _atomic_write_post(self, file_path: str, post) -> None:
         atomic_write_post(file_path, post)
         self.invalidate_list_all_cache()
+        # PostgreSQL is a derived vector mirror.  Queueing happens only after
+        # the authoritative Markdown replacement succeeds and never decides
+        # whether that write succeeds.
+        self.pg_mirror_queue.enqueue(
+            str(post.metadata.get("id") or ""),
+            action="dirty",
+            source="bucket_manager:after-write",
+        )
 
     def invalidate_list_all_cache(self) -> None:
         """Drop parsed bucket snapshots after a durable in-process mutation."""
@@ -1157,6 +1167,11 @@ class BucketManager:
                 os.remove(file_path)
                 self._bucket_path_cache.pop(bucket_id, None)
                 self.invalidate_list_all_cache()
+                self.pg_mirror_queue.enqueue(
+                    bucket_id,
+                    action="delete",
+                    source=actor,
+                )
                 self.audit_log.commit(event_id)
             except Exception as e:
                 self.audit_log.fail(event_id, e)

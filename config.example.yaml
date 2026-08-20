@@ -194,6 +194,19 @@ embedding:
   enabled: true                   # Enable embedding / 启用向量化
   model: "gemini-embedding-001"   # Embedding model / 向量化模型
 
+# --- PostgreSQL mirror write queue / PostgreSQL 镜像写入队列 ---
+# Optional write-side mirror. SQLite remains the recall authority and PostgreSQL
+# failures only retain pending mutations for retry; they never fail bucket writes.
+# 可选写侧镜像。SQLite 仍是召回权威；PG 故障只会保留待重试项，不会阻断写桶。
+pg_mirror:
+  enabled: false                  # env: OMBRE_PG_MIRROR_ENABLED
+  database: "ombre_mirror"
+  psql_path: "psql"
+  queue_path: ""                 # defaults to <buckets_dir>/.pg_mirror/queue.sqlite3
+  dimension: 1024
+  batch_size: 100
+  retry_seconds: 30
+
 # --- Scoring weights / 检索权重参数 ---
 # total = topic(×4) + emotion(×2) + time(×1.5) + importance(×1)
 scoring_weights:

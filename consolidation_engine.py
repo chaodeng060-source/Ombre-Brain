@@ -527,6 +527,7 @@ class ConsolidationEngine:
                 valence=0.5,
                 arousal=0.2,
                 bucket_type="dynamic",
+                actor="night:consolidation",
             )
         except Exception as e:
             logger.error(f"Failed to write consolidation report / 写报告失败: {e}")

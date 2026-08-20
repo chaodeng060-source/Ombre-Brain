@@ -145,6 +145,7 @@ from e_axis_recall import (
 )
 from r2_storage import r2_storage
 from sensory_engine import SensoryEngine, format_body_state_block, senses_from_sensory
+from pg_mirror_queue import PgMirrorWorker
 from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
     world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
@@ -224,6 +225,7 @@ bucket_mgr = BucketManager(config)                  # Bucket manager / 记忆桶
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 embedding_engine = EmbeddingEngine(config)            # Embedding engine / 向量化引擎
+pg_mirror_worker = PgMirrorWorker(bucket_mgr.pg_mirror_queue)
 consolidation_engine = ConsolidationEngine(config, bucket_mgr, embedding_engine)  # Consolidation engine / 整理引擎（夜班）
 # Narrative layer (kernel 3): Event -> Episode -> Saga. Episode owns the loop,
 # runs saga consolidation after building episodes each cycle.
@@ -1273,11 +1275,13 @@ def _recall_prefix(
 @asynccontextmanager
 async def _server_lifespan(_server):
     """Own process-wide background tasks without delaying server readiness."""
+    await pg_mirror_worker.start()
     await _start_briefing_cache_refresh()
     try:
         yield {}
     finally:
         await _stop_briefing_cache_refresh()
+        await pg_mirror_worker.stop()
 
 
 mcp = FastMCP(
@@ -9373,11 +9377,13 @@ if __name__ == "__main__":
         @asynccontextmanager
         async def _uvicorn_lifespan(app):
             async with _transport_lifespan(app):
+                await pg_mirror_worker.start()
                 await _start_briefing_cache_refresh()
                 try:
                     yield
                 finally:
                     await _stop_briefing_cache_refresh()
+                    await pg_mirror_worker.stop()
 
         _app.router.lifespan_context = _uvicorn_lifespan
 

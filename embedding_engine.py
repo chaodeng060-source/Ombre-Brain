@@ -23,6 +23,7 @@ import httpx
 from openai import AsyncOpenAI
 
 from maintenance_barrier import MaintenanceBarrier
+from pg_mirror_queue import PgMirrorQueue
 from recall_timing import recall_stage, record_recall_metric
 from redact import redact_embedding_input
 
@@ -73,6 +74,7 @@ class EmbeddingEngine:
         db_path = os.path.join(config["buckets_dir"], "embeddings.db")
         self.db_path = db_path
         self._maintenance_barrier = MaintenanceBarrier(config["buckets_dir"])
+        self.pg_mirror_queue = PgMirrorQueue(config)
         self._vector_cache_signature = None
         self._vector_cache_entries = None
         self._vector_cache_records = None
@@ -244,6 +246,13 @@ class EmbeddingEngine:
                 )
                 conn.commit()
         self._invalidate_vector_cache()
+        mirror_queue = getattr(self, "pg_mirror_queue", None)
+        if mirror_queue is not None:
+            mirror_queue.enqueue(
+                bucket_id,
+                action="upsert",
+                source="embedding:store",
+            )
 
     def delete_embedding(self, bucket_id: str):
         with self._maintenance_barrier.shared():
@@ -254,6 +263,13 @@ class EmbeddingEngine:
                 )
                 conn.commit()
         self._invalidate_vector_cache()
+        mirror_queue = getattr(self, "pg_mirror_queue", None)
+        if mirror_queue is not None:
+            mirror_queue.enqueue(
+                bucket_id,
+                action="delete",
+                source="embedding:delete",
+            )
 
     async def get_embedding(self, bucket_id: str) -> list[float] | None:
         with closing(sqlite3.connect(self.db_path)) as conn:
