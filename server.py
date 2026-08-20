@@ -2187,11 +2187,21 @@ async def _dehydrate_for_recall(
         persisted = False
         if callable(writer):
             try:
+                token_fn = getattr(bucket_mgr, "list_all_snapshot_token", None)
+                token_pre = (
+                    await token_fn(include_archive=False)
+                    if callable(token_fn)
+                    else None
+                )
                 persisted = await writer(
                     str(bucket.get("id") or ""),
                     expected_content_hash=body_hash,
                     summary=raw_summary,
                 )
+                if persisted:
+                    # Same summary-only write as the async backfill path: keep
+                    # the E-axis cache alive instead of letting this evict it.
+                    await _extend_e_axis_cache_after_summary_write(token_pre)
             except Exception as exc:
                 logger.warning(
                     "Recall summary frontmatter write failed for %s: %s",
