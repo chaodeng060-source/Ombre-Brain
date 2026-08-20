@@ -305,7 +305,11 @@ def test_posture_is_explicitly_non_factual():
 def test_breath_wires_live_e_after_authority_filters():
     breath = _function_source(ROOT / "server.py", "breath")
     assert "load_e_axis_recall_config" in breath
-    assert "group_primary_authored_buckets" in breath
+    # Grouping moved behind the snapshot-keyed cache (2026-08-20 latency fix);
+    # the wiring contract holds through the pair of assertions below.
+    assert "_e_axis_rows_cached" in breath
+    cached_helper = _function_source(ROOT / "server.py", "_e_axis_rows_cached")
+    assert "group_primary_authored_buckets" in cached_helper
     assert "_get_e_axis_shadow_store" not in breath
     assert "select_current_annotation" in breath
     assert "apply_resonance_tie_break" in breath

@@ -1982,6 +1982,81 @@ async def _tool_result_with_optional_images(
     return [TextContent(type="text", text=text), *images]
 
 
+_E_AXIS_ROWS_CACHE: dict[str, object] = {"token": None, "cfg": None, "rows": {}}
+
+
+async def _e_axis_rows_cached(e_recall_cfg) -> dict:
+    """Serve E-axis grouping from a snapshot-keyed cache of its tiny result.
+
+    E projection only needs the few primary-authored buckets, but list_all()
+    deep-copies the whole library per call; that copy dominated query_prep
+    (4-5s per beat at ~12k buckets).  The cache key reuses the directory
+    snapshot list_all() itself invalidates on, so any bucket write refreshes
+    this view naturally and E behaviour stays byte-identical.
+    """
+    token_fn = getattr(bucket_mgr, "list_all_snapshot_token", None)
+    cfg_key = (e_recall_cfg.enabled, e_recall_cfg.min_confidence)
+    token = await token_fn(include_archive=False) if callable(token_fn) else None
+    cache = _E_AXIS_ROWS_CACHE
+    if token is not None and cache["token"] == token and cache["cfg"] == cfg_key:
+        return cache["rows"]  # read-only rows; projection never mutates them
+    rows = group_primary_authored_buckets(
+        await bucket_mgr.list_all(include_archive=False),
+        e_recall_cfg,
+    )
+    if token is not None:
+        cache["token"] = token
+        cache["cfg"] = cfg_key
+        cache["rows"] = rows
+    return rows
+
+
+def _recall_dehydrate_async_enabled() -> bool:
+    cfg = config.get("dehydration", {}) or {}
+    if cfg.get("recall_async_backfill_enabled") is False:
+        return False
+    flag = os.environ.get("OMBRE_RECALL_DEHYDRATE_ASYNC", "1").strip().lower()
+    return flag not in {"0", "false", "off"}
+
+
+_DEHYDRATE_BACKFILL_PENDING: set[str] = set()
+_DEHYDRATE_BACKFILL_SEM = asyncio.Semaphore(2)
+
+
+def _schedule_recall_dehydration_backfill(bucket_id: str, content: str, body_hash: str) -> None:
+    """Compute the LLM summary off the recall path and persist it for next beat."""
+    if not bucket_id or bucket_id in _DEHYDRATE_BACKFILL_PENDING:
+        return
+    _DEHYDRATE_BACKFILL_PENDING.add(bucket_id)
+
+    async def _run() -> None:
+        try:
+            async with _DEHYDRATE_BACKFILL_SEM:
+                with_source = getattr(dehydrator, "dehydrate_with_source", None)
+                if not callable(with_source):
+                    return
+                raw_summary, _source = await with_source(content, None, write_cache=False)
+                if not isinstance(raw_summary, str) or len(raw_summary.strip()) < 10:
+                    return
+                writer = getattr(bucket_mgr, "cache_recall_dehydration", None)
+                if callable(writer):
+                    await writer(
+                        bucket_id,
+                        expected_content_hash=body_hash,
+                        summary=raw_summary,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Async recall dehydration backfill failed for %s: %s",
+                bucket_id,
+                type(exc).__name__,
+            )
+        finally:
+            _DEHYDRATE_BACKFILL_PENDING.discard(bucket_id)
+
+    asyncio.create_task(_run())
+
+
 def _frontmatter_dehydration_cache_enabled() -> bool:
     cfg = config.get("dehydration", {}) or {}
     return cfg.get("recall_frontmatter_cache_enabled", True) is not False
@@ -1992,6 +2067,7 @@ async def _dehydrate_for_recall(
     metadata: dict,
     *,
     bucket: dict | None = None,
+    allow_async_fallback: bool = False,
 ) -> str:
     """Render recall text and persist only its derived bucket summary.
 
@@ -2019,6 +2095,22 @@ async def _dehydrate_for_recall(
         if callable(formatter):
             return formatter(stored_summary.strip(), metadata)
         return stored_summary.strip()
+
+    if cache_enabled and bucket and allow_async_fallback and _recall_dehydrate_async_enabled():
+        # Recall beats must not wait on a live LLM summary.  Serve a truncated
+        # body now, push the real dehydration to a background task that writes
+        # the frontmatter cache, and let the next beat hit it.  Quality dips
+        # once per bucket, latency spike disappears every time.
+        fallback_id = str(bucket.get("id") or "")
+        if fallback_id:
+            _schedule_recall_dehydration_backfill(fallback_id, content, body_hash)
+            record_recall_dehydration("passthrough_async")
+            squashed = " ".join(content.split())
+            fallback = squashed[:300] + ("…" if len(squashed) > 300 else "")
+            formatter = getattr(dehydrator, "format_dehydration_summary", None)
+            if callable(formatter):
+                return formatter(fallback, metadata)
+            return fallback
 
     with_source = getattr(dehydrator, "dehydrate_with_source", None)
     if callable(with_source):
@@ -3906,11 +3998,7 @@ async def breath(
                 valence_01=q_valence,
                 arousal=q_arousal,
             )
-            e_buckets = await bucket_mgr.list_all(include_archive=False)
-            e_rows_by_bucket = group_primary_authored_buckets(
-                e_buckets,
-                e_recall_cfg,
-            )
+            e_rows_by_bucket = await _e_axis_rows_cached(e_recall_cfg)
     except Exception as exc:
         # E is an optional behavioural projection.  A corrupt ledger or bad
         # live config fails closed to the relevance-first legacy path instead
@@ -4377,7 +4465,16 @@ async def breath(
                 original_v = float(clean_meta.get("valence", 0.5))
                 shift = (q_valence - 0.5) * 0.2  # ±0.1 max shift
                 clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
-            summary = await _dehydrate_for_recall(strip_wikilinks(bucket["content"]), clean_meta, bucket=bucket)
+            # Only live chat beats (conversation/reflex) may trade one beat of
+            # summary quality for latency — they retry next beat and sit under
+            # the 11s injection deadline.  Explicit search (MCP breath, Y walk)
+            # keeps the synchronous full summary and its read-only contracts.
+            summary = await _dehydrate_for_recall(
+                strip_wikilinks(bucket["content"]),
+                clean_meta,
+                bucket=bucket,
+                allow_async_fallback=recall_policy in {"conversation", "reflex"},
+            )
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
                 break

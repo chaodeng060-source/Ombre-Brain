@@ -1563,6 +1563,27 @@ class BucketManager:
     # ---------------------------------------------------------
     # List all buckets
     # ---------------------------------------------------------
+    async def list_all_snapshot_token(
+        self,
+        include_archive: bool = False,
+        include_nsfw: bool | None = None,
+    ) -> tuple:
+        """Cheap freshness token for consumers caching views derived from list_all().
+
+        Runs the same directory snapshot list_all() uses for invalidation without
+        loading or copying any bucket bodies.  Equal tokens (same key + snapshot)
+        guarantee list_all() content is unchanged.
+        """
+        if include_nsfw is None:
+            include_nsfw = getattr(self, "nsfw_active", False)
+        dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir]
+        if include_archive:
+            dirs.append(self.archive_dir)
+        if include_nsfw:
+            dirs.append(self.nsfw_dir)
+        _, snapshot = await self._bucket_tree_snapshot(dirs)
+        return ((bool(include_archive), bool(include_nsfw)), snapshot)
+
     async def list_all(self, include_archive: bool = False, include_nsfw: bool | None = None) -> list[dict]:
         # include_nsfw=None → 跟随当前世界状态 self.nsfw_active（switch_world 维护）；
         # 显式 True/False 可覆盖（如 dashboard 管理界面传 True 看全部）。

@@ -22,6 +22,7 @@ _DEHYDRATION_OUTCOMES = frozenset({
     "backfilled",
     "computed",
     "passthrough",
+    "passthrough_async",
     "persist_failed",
 })
 _RECALL_METRIC_MODES = {

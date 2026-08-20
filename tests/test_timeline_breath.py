@@ -509,10 +509,10 @@ async def test_unrenderable_timeline_neighbor_restores_primary_tail(
     if failure == "dehydrate":
         original = server._dehydrate_for_recall
 
-        async def fail_neighbor(content, metadata, *, bucket=None):
+        async def fail_neighbor(content, metadata, *, bucket=None, **kwargs):
             if bucket and bucket.get("id") == "neighbor":
                 raise RuntimeError("neighbor dehydration failed")
-            return await original(content, metadata, bucket=bucket)
+            return await original(content, metadata, bucket=bucket, **kwargs)
 
         monkeypatch.setattr(server, "_dehydrate_for_recall", fail_neighbor)
 
