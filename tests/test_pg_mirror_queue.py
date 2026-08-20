@@ -5,6 +5,7 @@ import copy
 import hashlib
 import json
 import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -32,6 +33,16 @@ def _mirror_config(test_config: dict) -> dict:
 
 def _pending(manager: BucketManager):
     return manager.pg_mirror_queue.pending(limit=20)
+
+
+def _write_bucket(test_config: dict, rel_path: str, bucket_id: str, body: str):
+    path = Path(test_config["buckets_dir"]) / rel_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"---\nid: {bucket_id}\nname: contract fixture\n---\n{body}",
+        encoding="utf-8",
+    )
+    return path
 
 
 @pytest.mark.asyncio
@@ -187,6 +198,13 @@ def test_successful_incremental_drain_writes_all_segments_and_acks(
     monkeypatch,
 ):
     config = _mirror_config(test_config)
+    body = "正文第一行\n含 ' 单引号的第二行"
+    body_path = _write_bucket(
+        config,
+        "dynamic/测试/not-derived-from-id.md",
+        "two-segment-bucket",
+        body,
+    )
     engine = EmbeddingEngine(config)
     engine._store_embedding(
         "two-segment-bucket",
@@ -209,14 +227,163 @@ def test_successful_incremental_drain_writes_all_segments_and_acks(
         "remaining": 0,
     }
     assert len(scripts) == 1
+    assert scripts[0].count("BEGIN;") == 1
+    assert scripts[0].count("COMMIT;") == 1
     assert "DELETE FROM ombre_vectors" in scripts[0]
+    assert "DELETE FROM ombre_bodies" in scripts[0]
     assert "INSERT INTO ombre_vectors" in scripts[0]
+    assert "INSERT INTO ombre_bodies" in scripts[0]
     assert scripts[0].count("::halfvec(1024)") == 2
+    assert hashlib.sha256(body.encode("utf-8")).hexdigest() in scripts[0]
+    assert str(body_path.relative_to(Path(config["buckets_dir"]))) in scripts[0]
+    assert "正文第一行\n含 '' 单引号的第二行" in scripts[0]
+
+
+def test_body_insert_failure_keeps_both_tables_in_one_failed_transaction(
+    test_config,
+    monkeypatch,
+):
+    config = _mirror_config(test_config)
+    _write_bucket(config, "dynamic/测试/atomic.md", "atomic-bucket", "原子正文")
+    engine = EmbeddingEngine(config)
+    engine._store_embedding("atomic-bucket", [[0.25] * 1024])
+    commands: list[list[str]] = []
+    scripts: list[str] = []
+
+    def fail_body_insert(command, **kwargs):
+        commands.append(command)
+        scripts.append(kwargs["input"])
+        return SimpleNamespace(returncode=1, stderr="body constraint failed")
+
+    monkeypatch.setattr(mirror_module.subprocess, "run", fail_body_insert)
+
+    result = engine.pg_mirror_queue.drain_once()
+
+    assert result == {
+        "status": "deferred",
+        "processed": 0,
+        "failed": 1,
+        "remaining": 1,
+    }
+    assert len(scripts) == 1
+    assert scripts[0].count("BEGIN;") == 1
+    assert scripts[0].count("COMMIT;") == 1
+    assert "INSERT INTO ombre_vectors" in scripts[0]
+    assert "INSERT INTO ombre_bodies" in scripts[0]
+    assert "ON_ERROR_STOP=1" in commands[0]
+    assert engine.pg_mirror_queue.pending(limit=1)[0].bucket_id == "atomic-bucket"
+
+
+def test_dirty_bucket_without_embedding_still_mirrors_its_body(
+    test_config,
+    monkeypatch,
+):
+    config = _mirror_config(test_config)
+    _write_bucket(
+        config,
+        "dynamic/测试/body-only.md",
+        "body-only",
+        "没有向量的桶也属于正文全量合同。",
+    )
+    queue = PgMirrorQueue(config)
+    assert queue.enqueue("body-only", action="dirty", source="test")
+    scripts: list[str] = []
+
+    def fake_psql(_command, **kwargs):
+        scripts.append(kwargs["input"])
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(mirror_module.subprocess, "run", fake_psql)
+
+    result = queue.drain_once()
+
+    assert result["processed"] == 1
+    assert result["remaining"] == 0
+    assert len(scripts) == 1
+    assert "DELETE FROM ombre_vectors" in scripts[0]
+    assert "INSERT INTO ombre_vectors" not in scripts[0]
+    assert "INSERT INTO ombre_bodies" in scripts[0]
+
+
+def test_delete_removes_vector_and_body_in_the_same_transaction(
+    test_config,
+    monkeypatch,
+):
+    queue = PgMirrorQueue(_mirror_config(test_config))
+    assert queue.enqueue("deleted-bucket", action="delete", source="test")
+    scripts: list[str] = []
+
+    def fake_psql(_command, **kwargs):
+        scripts.append(kwargs["input"])
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(mirror_module.subprocess, "run", fake_psql)
+
+    result = queue.drain_once()
+
+    assert result["processed"] == 1
+    assert result["remaining"] == 0
+    assert len(scripts) == 1
+    assert scripts[0].count("BEGIN;") == 1
+    assert scripts[0].count("COMMIT;") == 1
+    assert "DELETE FROM ombre_vectors" in scripts[0]
+    assert "DELETE FROM ombre_bodies" in scripts[0]
+    assert "INSERT INTO" not in scripts[0]
+
+
+def test_frontmatter_id_is_the_only_bucket_identity(
+    test_config,
+    monkeypatch,
+):
+    config = _mirror_config(test_config)
+    _write_bucket(
+        config,
+        "dynamic/测试/arbitrary-name.md",
+        "frontmatter-real",
+        "只有 frontmatter id 能认出我。",
+    )
+    patrol = Path(config["buckets_dir"]) / ".lmc5" / "巡检_fake-report.md"
+    patrol.parent.mkdir(parents=True)
+    patrol.write_text("# 巡检报告，不是桶\n", encoding="utf-8")
+    snapshot = (
+        Path(config["buckets_dir"])
+        / "dynamic"
+        / "测试"
+        / "current.original_snapshot-fake.md"
+    )
+    snapshot.write_text("---\nkind: transaction-snapshot\n---\n不是桶\n", encoding="utf-8")
+
+    engine = EmbeddingEngine(config)
+    for bucket_id in ("frontmatter-real", "fake-report", "snapshot-fake"):
+        engine._store_embedding(bucket_id, [[0.25] * 1024])
+    scripts: list[str] = []
+
+    def fake_psql(_command, **kwargs):
+        scripts.append(kwargs["input"])
+        return SimpleNamespace(returncode=0, stderr="")
+
+    monkeypatch.setattr(mirror_module.subprocess, "run", fake_psql)
+
+    result = engine.pg_mirror_queue.drain_once()
+
+    assert result["processed"] == 1
+    assert result["failed"] == 2
+    assert result["remaining"] == 2
+    assert len(scripts) == 1
+    assert "frontmatter-real" in scripts[0]
+    assert "fake-report" not in scripts[0]
+    assert "snapshot-fake" not in scripts[0]
 
 
 @pytest.mark.asyncio
 async def test_pg_unavailable_retains_queue_and_sqlite_vector_recall(test_config):
     config = _mirror_config(test_config)
+    _write_bucket(
+        config,
+        "dynamic/测试/sqlite-stays-live.md",
+        "sqlite-stays-live",
+        "PG 不可用时正文真源和 SQLite 召回都保持可用。",
+    )
     engine = EmbeddingEngine(config)
     engine.enabled = True
     vector = [0.25] * 1024
@@ -259,6 +426,13 @@ def test_poison_item_backs_off_without_starving_later_writes(
 ):
     config = _mirror_config(test_config)
     config["pg_mirror"]["batch_size"] = 1
+    for bucket_id in ("aaa-poison", "zzz-good-a", "zzz-good-b"):
+        _write_bucket(
+            config,
+            f"dynamic/测试/{bucket_id}.md",
+            bucket_id,
+            f"{bucket_id} 正文",
+        )
     queue = PgMirrorQueue(config)
     with sqlite3.connect(queue.embedding_db) as connection:
         connection.execute(

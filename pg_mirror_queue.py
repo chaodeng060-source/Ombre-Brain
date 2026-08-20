@@ -1,18 +1,21 @@
-"""Durable, fail-soft SQLite -> PostgreSQL vector mirror queue.
+"""Durable, fail-soft Markdown/SQLite -> PostgreSQL mirror queue.
 
 Markdown and the local SQLite embedding store remain authoritative.  Bucket
-writes only enqueue a bucket id; a background worker mirrors the latest SQLite
-record to PostgreSQL.  PostgreSQL/psql failures therefore leave a local retry
-row and never participate in the memory write or recall path.
+writes only enqueue a bucket id; a background worker mirrors the latest body
+and vector in one PostgreSQL transaction.  PostgreSQL/psql failures therefore
+leave a local retry row and never participate in the memory write or recall
+path.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -23,6 +26,12 @@ from pathlib import Path
 
 
 logger = logging.getLogger("ombre_brain.pg_mirror")
+
+_FRONTMATTER_BLOCK = re.compile(r"\A---\s*\n(.*?)\n---\s*(?:\n|\Z)", re.S)
+_FRONTMATTER_ID = re.compile(
+    r"^id:\s*['\"]?([A-Za-z0-9_-]+)['\"]?\s*$",
+    re.M,
+)
 
 
 class PgMirrorItemError(ValueError):
@@ -60,6 +69,17 @@ class PendingMutation:
     next_retry_at: float
 
 
+@dataclass(frozen=True)
+class BucketBody:
+    bucket_id: str
+    body: str
+    body_sha256: str
+    body_bytes: int
+    rel_path: str
+    source_mtime: str
+    mtime_ns: int
+
+
 class PgMirrorQueue:
     """Coalescing on-disk queue plus one-batch PostgreSQL drain."""
 
@@ -73,6 +93,8 @@ class PgMirrorQueue:
             if queue_path
             else buckets_dir / ".pg_mirror" / "queue.sqlite3"
         )
+        self.buckets_dir = buckets_dir
+        self._body_path_cache: dict[str, Path] = {}
         self.embedding_db = buckets_dir / "embeddings.db"
         self.database = str(mirror.get("database") or "ombre_mirror")
         self.psql_path = str(mirror.get("psql_path") or "psql")
@@ -260,6 +282,85 @@ class PgMirrorQueue:
             return None
         return str(row[0]), str(row[1] or "")
 
+    @staticmethod
+    def _frontmatter_bucket_id(text: str) -> tuple[str, int] | None:
+        block = _FRONTMATTER_BLOCK.match(text)
+        if block is None:
+            return None
+        id_match = _FRONTMATTER_ID.search(block.group(1))
+        if id_match is None:
+            return None
+        return id_match.group(1), block.end()
+
+    def _read_body_file(self, path: Path, bucket_id: str) -> BucketBody | None:
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+                stat = os.fstat(handle.fileno())
+        except OSError:
+            return None
+        parsed = self._frontmatter_bucket_id(text)
+        if parsed is None or parsed[0] != bucket_id:
+            return None
+        body = text[parsed[1]:]
+        raw = body.encode("utf-8")
+        try:
+            rel_path = str(path.relative_to(self.buckets_dir))
+        except ValueError:
+            return None
+        return BucketBody(
+            bucket_id=bucket_id,
+            body=body,
+            body_sha256=hashlib.sha256(raw).hexdigest(),
+            body_bytes=len(raw),
+            rel_path=rel_path,
+            source_mtime=datetime.fromtimestamp(
+                stat.st_mtime,
+                tz=timezone.utc,
+            ).astimezone().isoformat(timespec="seconds"),
+            mtime_ns=stat.st_mtime_ns,
+        )
+
+    def _load_body_source(self, bucket_id: str) -> BucketBody | None:
+        """Find a Markdown bucket by frontmatter id, never by filename identity."""
+        cached = self._body_path_cache.get(bucket_id)
+        if cached is not None:
+            source = self._read_body_file(cached, bucket_id)
+            if source is not None:
+                return source
+            self._body_path_cache.pop(bucket_id, None)
+
+        # BucketManager names ordinary files with the id suffix.  That is only
+        # a lookup hint: every candidate is accepted solely after its
+        # frontmatter id matches.  Reports and transaction snapshots therefore
+        # cannot become buckets just because their filename looks similar.
+        paths = list(self.buckets_dir.rglob("*.md"))
+        hinted: list[BucketBody] = []
+        suffix = f"_{bucket_id}"
+        for path in paths:
+            if path.stem != bucket_id and not path.stem.endswith(suffix):
+                continue
+            source = self._read_body_file(path, bucket_id)
+            if source is not None:
+                hinted.append(source)
+        if hinted:
+            source = max(hinted, key=lambda row: row.mtime_ns)
+            self._body_path_cache[bucket_id] = self.buckets_dir / source.rel_path
+            return source
+
+        # Manual moves and renamed files are valid.  Fall back to the same
+        # frontmatter-id scan used by the full body mirror contract.
+        found: list[BucketBody] = []
+        for path in paths:
+            source = self._read_body_file(path, bucket_id)
+            if source is not None:
+                found.append(source)
+        if not found:
+            return None
+        source = max(found, key=lambda row: row.mtime_ns)
+        self._body_path_cache[bucket_id] = self.buckets_dir / source.rel_path
+        return source
+
     def _segments(self, embedding_json: str) -> list[str]:
         try:
             value = json.loads(embedding_json)
@@ -317,26 +418,50 @@ class PgMirrorQueue:
         self._run_psql(
             "BEGIN;\n"
             f"DELETE FROM ombre_vectors WHERE bucket_id = {_sql_literal(bucket_id)};\n"
+            f"DELETE FROM ombre_bodies WHERE bucket_id = {_sql_literal(bucket_id)};\n"
             "COMMIT;\n"
         )
 
-    def _upsert_pg(self, bucket_id: str, embedding_json: str, updated_at: str) -> None:
-        segments = self._segments(embedding_json)
-        rows = ",\n".join(
-            "(" + ", ".join((
-                _sql_literal(bucket_id),
-                str(index),
-                _sql_literal(vector) + f"::halfvec({self.dimension})",
-                _sql_literal(updated_at),
-            )) + ")"
-            for index, vector in enumerate(segments)
-        )
+    def _upsert_pg(
+        self,
+        bucket_id: str,
+        embedding_json: str | None,
+        updated_at: str,
+        body: BucketBody,
+    ) -> None:
+        vector_insert = ""
+        if embedding_json is not None:
+            segments = self._segments(embedding_json)
+            rows = ",\n".join(
+                "(" + ", ".join((
+                    _sql_literal(bucket_id),
+                    str(index),
+                    _sql_literal(vector) + f"::halfvec({self.dimension})",
+                    _sql_literal(updated_at),
+                )) + ")"
+                for index, vector in enumerate(segments)
+            )
+            vector_insert = (
+                "INSERT INTO ombre_vectors "
+                "(bucket_id, segment_idx, embedding, source_updated_at) VALUES\n"
+                f"{rows};\n"
+            )
+        body_row = "(" + ", ".join((
+            _sql_literal(bucket_id),
+            _sql_literal(body.body),
+            _sql_literal(body.body_sha256),
+            str(body.body_bytes),
+            _sql_literal(body.rel_path),
+            _sql_literal(body.source_mtime),
+        )) + ")"
         self._run_psql(
             "BEGIN;\n"
             f"DELETE FROM ombre_vectors WHERE bucket_id = {_sql_literal(bucket_id)};\n"
-            "INSERT INTO ombre_vectors "
-            "(bucket_id, segment_idx, embedding, source_updated_at) VALUES\n"
-            f"{rows};\n"
+            f"{vector_insert}"
+            f"DELETE FROM ombre_bodies WHERE bucket_id = {_sql_literal(bucket_id)};\n"
+            "INSERT INTO ombre_bodies "
+            "(bucket_id, body, body_sha256, body_bytes, rel_path, source_mtime) VALUES\n"
+            f"{body_row};\n"
             "COMMIT;\n"
         )
 
@@ -344,15 +469,21 @@ class PgMirrorQueue:
         if item.action == "delete":
             self._delete_pg(item.bucket_id)
             return
+        body = self._load_body_source(item.bucket_id)
+        if body is None:
+            raise PgMirrorItemError("source Markdown bucket is missing")
         source = self._load_source(item.bucket_id)
         if source is None:
             # A Markdown create is queued before its embedding API call.  The
-            # later SQLite commit enqueues an explicit upsert.  Metadata-only
-            # buckets with no vector need no PostgreSQL row.
+            # body still belongs in PostgreSQL immediately.  The later SQLite
+            # commit enqueues an explicit upsert that adds the vector in the
+            # same transaction.  An explicit upsert without a vector remains
+            # poison because its promised source record is missing.
             if item.action == "dirty":
+                self._upsert_pg(item.bucket_id, None, "", body)
                 return
             raise PgMirrorItemError("source embedding is missing")
-        self._upsert_pg(item.bucket_id, source[0], source[1])
+        self._upsert_pg(item.bucket_id, source[0], source[1], body)
 
     def drain_once(self) -> dict[str, int | str]:
         if not self.enabled:
