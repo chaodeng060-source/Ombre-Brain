@@ -15,6 +15,7 @@ import math
 import os
 import sqlite3
 import subprocess
+import time
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,6 +23,14 @@ from pathlib import Path
 
 
 logger = logging.getLogger("ombre_brain.pg_mirror")
+
+
+class PgMirrorItemError(ValueError):
+    """One bucket cannot be mirrored until its source data changes."""
+
+
+class PgMirrorUnavailable(RuntimeError):
+    """The PostgreSQL transport or mirror schema is currently unavailable."""
 
 
 def _now_iso() -> str:
@@ -48,6 +57,7 @@ class PendingMutation:
     enqueued_at: str
     attempts: int
     last_error: str
+    next_retry_at: float
 
 
 class PgMirrorQueue:
@@ -93,10 +103,20 @@ class PgMirrorQueue:
                     revision INTEGER NOT NULL,
                     enqueued_at TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT NOT NULL DEFAULT ''
+                    last_error TEXT NOT NULL DEFAULT '',
+                    next_retry_at REAL NOT NULL DEFAULT 0
                 )
                 """
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(pending)")
+            }
+            if "next_retry_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE pending "
+                    "ADD COLUMN next_retry_at REAL NOT NULL DEFAULT 0"
+                )
             connection.commit()
 
     def enqueue(
@@ -121,15 +141,16 @@ class PgMirrorQueue:
                     """
                     INSERT INTO pending (
                         bucket_id, action, source, revision, enqueued_at,
-                        attempts, last_error
-                    ) VALUES (?, ?, ?, 1, ?, 0, '')
+                        attempts, last_error, next_retry_at
+                    ) VALUES (?, ?, ?, 1, ?, 0, '', 0)
                     ON CONFLICT(bucket_id) DO UPDATE SET
                         action = excluded.action,
                         source = excluded.source,
                         revision = pending.revision + 1,
                         enqueued_at = excluded.enqueued_at,
                         attempts = 0,
-                        last_error = ''
+                        last_error = '',
+                        next_retry_at = 0
                     """,
                     (bucket_id, action, source, _now_iso()),
                 )
@@ -151,12 +172,29 @@ class PgMirrorQueue:
             rows = connection.execute(
                 """
                 SELECT bucket_id, action, source, revision, enqueued_at,
-                       attempts, last_error
+                       attempts, last_error, next_retry_at
                   FROM pending
                  ORDER BY enqueued_at, bucket_id
                  LIMIT ?
                 """,
                 (limit,),
+            ).fetchall()
+        return [PendingMutation(**dict(row)) for row in rows]
+
+    def _ready(self, *, limit: int) -> list[PendingMutation]:
+        """Return due rows while leaving deferred poison rows observable."""
+
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT bucket_id, action, source, revision, enqueued_at,
+                       attempts, last_error, next_retry_at
+                  FROM pending
+                 WHERE next_retry_at <= ?
+                 ORDER BY enqueued_at, bucket_id
+                 LIMIT ?
+                """,
+                (time.time(), max(1, int(limit))),
             ).fetchall()
         return [PendingMutation(**dict(row)) for row in rows]
 
@@ -176,16 +214,36 @@ class PgMirrorQueue:
             )
             connection.commit()
 
-    def _record_failure(self, item: PendingMutation, exc: Exception) -> None:
+    def _record_failure(
+        self,
+        item: PendingMutation,
+        exc: Exception,
+        *,
+        defer_item: bool,
+    ) -> None:
         message = f"{type(exc).__name__}: {exc}"[:500]
+        next_retry_at = 0.0
+        if defer_item:
+            delay = min(
+                max(1.0, self.retry_seconds) * (2 ** min(item.attempts, 8)),
+                3600.0,
+            )
+            next_retry_at = time.time() + delay
         with closing(self._connect()) as connection:
             connection.execute(
                 """
                 UPDATE pending
-                   SET attempts = attempts + 1, last_error = ?
+                   SET attempts = attempts + 1,
+                       last_error = ?,
+                       next_retry_at = ?
                  WHERE bucket_id = ? AND revision = ?
                 """,
-                (message, item.bucket_id, item.revision),
+                (
+                    message,
+                    next_retry_at,
+                    item.bucket_id,
+                    item.revision,
+                ),
             )
             connection.commit()
 
@@ -203,44 +261,57 @@ class PgMirrorQueue:
         return str(row[0]), str(row[1] or "")
 
     def _segments(self, embedding_json: str) -> list[str]:
-        value = json.loads(embedding_json)
+        try:
+            value = json.loads(embedding_json)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise PgMirrorItemError("embedding is not valid JSON") from exc
         if not isinstance(value, list) or not value:
-            raise ValueError("embedding is empty")
+            raise PgMirrorItemError("embedding is empty")
         segments = value if isinstance(value[0], list) else [value]
         encoded: list[str] = []
         for index, segment in enumerate(segments):
             if not isinstance(segment, list) or len(segment) != self.dimension:
                 size = len(segment) if isinstance(segment, list) else -1
-                raise ValueError(
+                raise PgMirrorItemError(
                     f"segment {index} dim {size} != {self.dimension}"
                 )
             numbers: list[str] = []
             for raw in segment:
-                number = float(raw)
+                try:
+                    number = float(raw)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise PgMirrorItemError(
+                        f"segment {index} contains a non-number"
+                    ) from exc
                 if not math.isfinite(number):
-                    raise ValueError("embedding contains a non-finite value")
+                    raise PgMirrorItemError(
+                        "embedding contains a non-finite value"
+                    )
                 numbers.append(repr(number))
             encoded.append("[" + ",".join(numbers) + "]")
         return encoded
 
     def _run_psql(self, script: str) -> None:
-        result = subprocess.run(
-            [
-                self.psql_path,
-                "-d",
-                self.database,
-                "-X",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-q",
-            ],
-            input=script,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    self.psql_path,
+                    "-d",
+                    self.database,
+                    "-X",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-q",
+                ],
+                input=script,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise PgMirrorUnavailable(type(exc).__name__) from exc
         if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "psql failed")
+            raise PgMirrorUnavailable(result.stderr.strip() or "psql failed")
 
     def _delete_pg(self, bucket_id: str) -> None:
         self._run_psql(
@@ -280,7 +351,7 @@ class PgMirrorQueue:
             # buckets with no vector need no PostgreSQL row.
             if item.action == "dirty":
                 return
-            raise RuntimeError("source embedding is missing")
+            raise PgMirrorItemError("source embedding is missing")
         self._upsert_pg(item.bucket_id, source[0], source[1])
 
     def drain_once(self) -> dict[str, int | str]:
@@ -288,22 +359,25 @@ class PgMirrorQueue:
             return {"status": "disabled", "processed": 0, "failed": 0, "remaining": 0}
         processed = 0
         failed = 0
-        for item in self.pending(limit=self.batch_size):
+        for item in self._ready(limit=self.batch_size):
             try:
                 self._apply(item)
                 self._ack(item)
                 processed += 1
             except Exception as exc:
-                self._record_failure(item, exc)
+                item_error = isinstance(exc, PgMirrorItemError)
+                self._record_failure(item, exc, defer_item=item_error)
                 failed += 1
                 logger.warning(
                     "PG mirror sync deferred for %s: %s",
                     item.bucket_id,
                     type(exc).__name__,
                 )
-                # One unavailable local PG would fail the whole batch.  Keep
-                # the remaining rows untouched and retry on the next interval.
-                break
+                if not item_error:
+                    # One unavailable local PG would fail the whole batch.
+                    # Leave this row due so the next cycle probes PG once,
+                    # rather than walking and failing every queued bucket.
+                    break
         return {
             "status": "deferred" if failed else "ok",
             "processed": processed,
@@ -335,9 +409,19 @@ class PgMirrorWorker:
             await task
         except asyncio.CancelledError:
             pass
+        except Exception as exc:
+            logger.warning(
+                "PG mirror worker stopped after prior failure: %s",
+                type(exc).__name__,
+            )
 
     async def _run(self) -> None:
         logger.info("PG mirror worker started")
         while True:
-            await asyncio.to_thread(self.queue.drain_once)
+            try:
+                await asyncio.to_thread(self.queue.drain_once)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("PG mirror worker cycle failed; retrying")
             await asyncio.sleep(self.queue.retry_seconds)

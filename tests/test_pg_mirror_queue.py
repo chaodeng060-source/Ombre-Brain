@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
+import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -248,3 +251,86 @@ def test_queue_is_durable_and_coalesces_newer_writes(test_config):
     assert rows[0].action == "upsert"
     assert rows[0].source == "embedding:store"
     assert rows[0].revision == 2
+
+
+def test_poison_item_backs_off_without_starving_later_writes(
+    test_config,
+    monkeypatch,
+):
+    config = _mirror_config(test_config)
+    config["pg_mirror"]["batch_size"] = 1
+    queue = PgMirrorQueue(config)
+    with sqlite3.connect(queue.embedding_db) as connection:
+        connection.execute(
+            "CREATE TABLE embeddings "
+            "(bucket_id TEXT PRIMARY KEY, embedding TEXT, updated_at TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO embeddings VALUES (?, ?, ?)",
+            [
+                ("aaa-poison", json.dumps([0.1] * 7), "2026-08-20T22:00:00Z"),
+                ("zzz-good-a", json.dumps([0.1] * 1024), "2026-08-20T22:00:00Z"),
+                ("zzz-good-b", json.dumps([0.2] * 1024), "2026-08-20T22:00:00Z"),
+            ],
+        )
+        connection.commit()
+    for bucket_id in ("aaa-poison", "zzz-good-a", "zzz-good-b"):
+        assert queue.enqueue(bucket_id, action="upsert", source="test")
+
+    monkeypatch.setattr(
+        mirror_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stderr=""),
+    )
+
+    first = queue.drain_once()
+    second = queue.drain_once()
+    third = queue.drain_once()
+
+    assert first["failed"] == 1
+    assert second["processed"] == 1
+    assert third["processed"] == 1
+    rows = queue.pending(limit=10)
+    assert [(row.bucket_id, row.attempts) for row in rows] == [
+        ("aaa-poison", 1)
+    ]
+    assert rows[0].next_retry_at > 0
+
+
+@pytest.mark.asyncio
+async def test_worker_recovers_after_one_queue_exception(test_config):
+    queue = PgMirrorQueue(_mirror_config(test_config))
+    queue.retry_seconds = 0.01
+    calls = 0
+
+    def flaky_drain():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return {"status": "ok", "processed": 0, "failed": 0, "remaining": 0}
+
+    queue.drain_once = flaky_drain
+    worker = mirror_module.PgMirrorWorker(queue)
+    await worker.start()
+    await asyncio.sleep(0.08)
+
+    assert calls >= 2
+    assert worker._task is not None
+    assert not worker._task.done()
+    await worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_worker_stop_swallows_an_already_failed_task(test_config):
+    queue = PgMirrorQueue(_mirror_config(test_config))
+    worker = mirror_module.PgMirrorWorker(queue)
+
+    async def failed_task():
+        raise sqlite3.OperationalError("old worker failure")
+
+    worker._task = asyncio.create_task(failed_task())
+    await asyncio.sleep(0)
+
+    await worker.stop()
+    assert worker._task is None
