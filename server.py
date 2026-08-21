@@ -1759,6 +1759,31 @@ def _cap_candidates_preserving_forced(
     return selected
 
 
+# 2026-08-21 削 ds_filter 耗时：gemini 时代单次判断 2.6-3.7s 且与候选数无关
+# （ids_in=2 与 5 实测同价）——是模型固定思考成本，压 prompt 削不动；关思考
+# 8/20 已试死（见 DS_FILTER_MAX_TOKENS 注释）。代码侧唯一确定安全的浪费是
+# 重复判断：同 query + 同候选 = 同一段 prompt 字节 = 同一个判断请求，
+# temperature=0 下 memo 命中等价于重放同一次判断。key 覆盖全部 prompt 字节
+# （query、每条候选 name/snippet 前 200 字符），内容一变即自然 miss；
+# keep / max_results 不进 key 也不受影响——它们只在本地并集/截断生效，
+# 从不进模型。TTL 只为限内存，不为新鲜度。并发同 key 同时 miss 时各打
+# 各的（等于现状），不加锁。
+_DS_SELECT_CACHE: dict[str, tuple[float, list[int]]] = {}
+
+
+def _ds_select_cache_config() -> tuple[float, int]:
+    """(ttl_sec, max_entries)；TTL<=0 整体关闭。每次现读 env，测试可随时拨。"""
+    try:
+        ttl = float(os.getenv("OMBRE_DS_FILTER_CACHE_TTL", "600"))
+    except ValueError:
+        ttl = 600.0
+    try:
+        max_entries = int(os.getenv("OMBRE_DS_FILTER_CACHE_MAX", "256"))
+    except ValueError:
+        max_entries = 256
+    return ttl, max(1, max_entries)
+
+
 async def _ds_semantic_select(
     query: str,
     buckets: list[dict],
@@ -1781,26 +1806,45 @@ async def _ds_semantic_select(
         "宁可多留也别漏掉明显相关的；只剔除与查询确实无关的。"
     )
     user_prompt = f"查询：{redact_embedding_input(query)}\n\n候选：\n" + "\n".join(lines)
-    resp = await client.chat.completions.create(
-        model=getattr(dehydrator, "model", "deepseek-chat"),
-        messages=[
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        max_tokens=DS_FILTER_MAX_TOKENS,
-        temperature=0.0,
-    )
-    raw = resp.choices[0].message.content if resp.choices else ""
-    idxs = _parse_ds_keep_indices(raw, len(buckets))
-    if idxs is None:
-        logger.error(
-            "DS filter received invalid DeepSeek response raw_chars=%d "
-            "raw_sha256=%s response=%s",
-            len(raw),
-            hashlib.sha256(raw.encode("utf-8")).hexdigest(),
-            _safe_chat_completion_diagnostics(resp),
+    cache_key = hashlib.sha256(
+        (sys_prompt + "\x00" + user_prompt).encode("utf-8")
+    ).hexdigest()
+    ttl, max_entries = _ds_select_cache_config()
+    idxs: list[int] | None = None
+    cached = _DS_SELECT_CACHE.get(cache_key)
+    if ttl > 0 and cached is not None and cached[0] + ttl >= time.monotonic():
+        idxs = list(cached[1])
+        del _DS_SELECT_CACHE[cache_key]  # 命中即续位（LRU）
+        _DS_SELECT_CACHE[cache_key] = (cached[0], idxs)
+        logger.info(
+            "DS filter cache hit key=%s keep=%d entries=%d",
+            cache_key[:12], len(idxs), len(_DS_SELECT_CACHE),
         )
-        raise ValueError("invalid DeepSeek recall selection payload")
+    if idxs is None:
+        resp = await client.chat.completions.create(
+            model=getattr(dehydrator, "model", "deepseek-chat"),
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=DS_FILTER_MAX_TOKENS,
+            temperature=0.0,
+        )
+        raw = resp.choices[0].message.content if resp.choices else ""
+        idxs = _parse_ds_keep_indices(raw, len(buckets))
+        if idxs is None:
+            logger.error(
+                "DS filter received invalid DeepSeek response raw_chars=%d "
+                "raw_sha256=%s response=%s",
+                len(raw),
+                hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                _safe_chat_completion_diagnostics(resp),
+            )
+            raise ValueError("invalid DeepSeek recall selection payload")
+        if ttl > 0:
+            if len(_DS_SELECT_CACHE) >= max_entries:
+                _DS_SELECT_CACHE.pop(next(iter(_DS_SELECT_CACHE)))
+            _DS_SELECT_CACHE[cache_key] = (time.monotonic(), list(idxs))
     keep_idx = set(idxs)
     selected = [
         b for i, b in enumerate(buckets)
