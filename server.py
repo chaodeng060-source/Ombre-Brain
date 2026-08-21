@@ -1997,6 +1997,7 @@ async def _tool_result_with_optional_images(
 
 
 _E_AXIS_ROWS_CACHE: dict[str, object] = {"token": None, "cfg": None, "rows": {}}
+_E_AXIS_ROWS_REBUILD_LOCK = asyncio.Lock()
 
 
 async def _e_axis_rows_cached(e_recall_cfg) -> dict:
@@ -2007,21 +2008,38 @@ async def _e_axis_rows_cached(e_recall_cfg) -> dict:
     (4-5s per beat at ~12k buckets).  The cache key reuses the directory
     snapshot list_all() itself invalidates on, so any bucket write refreshes
     this view naturally and E behaviour stays byte-identical.
+
+    2026-08-21 single-flight: a miss used to send every concurrent beat into
+    its own full-library deep copy — 4s each piling into 48s+ and blowing the
+    breath deadline (three total recall blackouts that afternoon).  On a miss
+    one caller rebuilds inside the lock; the others wait, re-check, and serve
+    the winner's rows.  Key semantics unchanged: snapshot token + cfg, any
+    bucket write still invalidates naturally.
     """
     token_fn = getattr(bucket_mgr, "list_all_snapshot_token", None)
+
+    async def _current_token() -> object:
+        return await token_fn(include_archive=False) if callable(token_fn) else None
+
     cfg_key = (e_recall_cfg.enabled, e_recall_cfg.min_confidence)
-    token = await token_fn(include_archive=False) if callable(token_fn) else None
     cache = _E_AXIS_ROWS_CACHE
+    token = await _current_token()
     if token is not None and cache["token"] == token and cache["cfg"] == cfg_key:
         return cache["rows"]  # read-only rows; projection never mutates them
-    rows = group_primary_authored_buckets(
-        await bucket_mgr.list_all(include_archive=False),
-        e_recall_cfg,
-    )
-    if token is not None:
-        cache["token"] = token
-        cache["cfg"] = cfg_key
-        cache["rows"] = rows
+    async with _E_AXIS_ROWS_REBUILD_LOCK:
+        # Double-check: while queueing, the winner may have rebuilt a newer
+        # view already; re-read the token so waiters never re-copy the library.
+        token = await _current_token()
+        if token is not None and cache["token"] == token and cache["cfg"] == cfg_key:
+            return cache["rows"]
+        rows = group_primary_authored_buckets(
+            await bucket_mgr.list_all(include_archive=False),
+            e_recall_cfg,
+        )
+        if token is not None:
+            cache["token"] = token
+            cache["cfg"] = cfg_key
+            cache["rows"] = rows
     return rows
 
 

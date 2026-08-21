@@ -66,6 +66,9 @@ def _reset_e_cache():
     server._E_AXIS_ROWS_CACHE["token"] = None
     server._E_AXIS_ROWS_CACHE["cfg"] = None
     server._E_AXIS_ROWS_CACHE["rows"] = {}
+    # asyncio.Lock 绑定首次争用它的事件循环；每个测试 asyncio.run() 都是新
+    # 循环，不换新锁的话第二个碰锁的测试会炸 "bound to a different event loop"。
+    server._E_AXIS_ROWS_REBUILD_LOCK = asyncio.Lock()
 
 
 def test_e_rows_cache_skips_list_all_when_snapshot_unchanged(monkeypatch, e_cfg):
@@ -106,6 +109,60 @@ def test_e_rows_cache_invalidates_on_config_change(monkeypatch, e_cfg):
         stricter = EAxisRecallConfig(enabled=True, min_confidence=0.9)
         await server._e_axis_rows_cached(stricter)
         assert mgr.list_all_calls == 2
+    asyncio.run(scenario())
+    _reset_e_cache()
+
+
+class _SlowCopyMgr(_CountingMgr):
+    """list_all 慢如真实全库深拷贝（4-5s 的替身），并记录峰值并发。"""
+
+    def __init__(self):
+        super().__init__()
+        self.inside = 0
+        self.max_inside = 0
+
+    async def list_all(self, include_archive=False, include_nsfw=None):
+        self.list_all_calls += 1
+        self.inside += 1
+        self.max_inside = max(self.max_inside, self.inside)
+        try:
+            await asyncio.sleep(0.05)
+            return list(self.buckets)
+        finally:
+            self.inside -= 1
+
+
+def test_e_rows_cache_single_flight_on_concurrent_miss(monkeypatch, e_cfg):
+    """并发 miss 只许一个人拷全库，其余等赢家——8/21 三次 48s 堆积的病。"""
+    mgr = _SlowCopyMgr()
+    monkeypatch.setattr(server, "bucket_mgr", mgr)
+    _reset_e_cache()
+
+    async def scenario():
+        results = await asyncio.gather(
+            *(server._e_axis_rows_cached(e_cfg) for _ in range(6))
+        )
+        assert all(r == results[0] for r in results)
+        assert mgr.max_inside == 1      # 任何时刻只有一份全库拷贝在跑
+        assert mgr.list_all_calls == 1  # 排队的吃赢家的结果，不重拷
+    asyncio.run(scenario())
+    _reset_e_cache()
+
+
+def test_e_rows_cache_rebuilds_once_after_write_under_concurrency(monkeypatch, e_cfg):
+    """写入使 token 变化后缓存确实失效，且并发 miss 整批只重载一次。"""
+    mgr = _SlowCopyMgr()
+    monkeypatch.setattr(server, "bucket_mgr", mgr)
+    _reset_e_cache()
+
+    async def scenario():
+        await server._e_axis_rows_cached(e_cfg)  # 冷启动建缓存
+        mgr.token = ("key", ("snap", 2))         # 一次真实 bucket 写入
+        await asyncio.gather(
+            *(server._e_axis_rows_cached(e_cfg) for _ in range(6))
+        )
+        assert mgr.list_all_calls == 2           # 失效发生 + 整批只重载一次
+        assert mgr.max_inside == 1
     asyncio.run(scenario())
     _reset_e_cache()
 
