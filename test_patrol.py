@@ -133,6 +133,40 @@ def test_load_buckets_ignores_internal_reports_and_backups_in_live_vault():
     assert ids == {"live"}
 
 
+def test_patrol_enumerates_all_noncanonical_filename_shapes_without_mutation():
+    with tempfile.TemporaryDirectory() as d:
+        files = [
+            _write(d, "dynamic/正常标题_2026-08-27_a1b2c3d4e5f6.md",
+                   "---\nid: a1b2c3d4e5f6\nname: 正常标题\n---\nnormal\n"),
+            _write(d, "dynamic/b1b2c3d4e5f6.md",
+                   "---\nid: b1b2c3d4e5f6\nname: b1b2c3d4e5f6\n---\npure\n"),
+            _write(d, "dynamic/c1b2c3d4e5f6_c1b2c3d4e5f6.md",
+                   "---\nid: c1b2c3d4e5f6\nname: 旧标题\n---\nrepeated\n"),
+            _write(d, "dynamic/错尾_d1b2c3d4e5f6.md",
+                   "---\nid: e1b2c3d4e5f6\nname: 错尾\n---\nmismatch\n"),
+            _write(d, "dynamic/没有ID尾巴.md",
+                   "---\nid: f1b2c3d4e5f6\nname: 没有ID尾巴\n---\nmissing\n"),
+            _write(d, "dynamic/非法ID.md",
+                   "---\nid: short\nname: 非法ID\n---\ninvalid\n"),
+        ]
+        before = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
+        report = patrol.patrol(Path(d), datetime(2026, 8, 27, 0, 0, 0))
+        rendered = patrol.render_md(report, Path(d), datetime(2026, 8, 27, 0, 0, 0))
+        after = {path: hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
+
+    assert report["filename_shape_counts"] == {
+        "id_suffix_mismatch": 1,
+        "invalid_or_missing_frontmatter_id": 1,
+        "missing_id_suffix": 1,
+        "pure_id": 1,
+        "repeated_id": 1,
+    }
+    assert len(report["filename_anomalies"]) == 5
+    assert "c1b2c3d4e5f6_c1b2c3d4e5f6.md" in rendered
+    assert "没有ID尾巴.md" in rendered
+    assert before == after
+
+
 # ---- 端到端：保护域 resolved + 陈旧重要 都命中，且不炸 ----
 def test_patrol_end_to_end_flags():
     with tempfile.TemporaryDirectory() as d:

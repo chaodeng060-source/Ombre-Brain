@@ -391,6 +391,10 @@ def _load_buckets(buckets_dir: Path) -> list[dict]:
                 "id": meta.get("id", p.stem),
                 "metadata": meta,
                 "content": post.content,
+                "source_kind": "markdown",
+                "source_path": str(p.relative_to(buckets_dir)),
+                "source_basename": p.name,
+                "frontmatter_id": meta.get("id"),
             })
         except Exception as e:  # 坏文件也是巡检要报的
             out.append({"__broken__": str(p.name), "__error__": str(e)})
@@ -418,8 +422,52 @@ def _load_buckets(buckets_dir: Path) -> list[dict]:
             "id": data.get("id") or meta.get("id") or p.stem,
             "metadata": dict(meta),
             "content": data.get("content", "") or "",
+            "source_kind": "snapshot",
         })
     return out
+
+
+_BUCKET_ID_RE = re.compile(r"^[0-9a-fA-F]{12}$")
+_FILENAME_ID_SUFFIX_RE = re.compile(r"(?:^|_)([0-9a-fA-F]{12})$")
+
+
+def _bucket_filename_shape(bucket: dict) -> str | None:
+    """Classify non-canonical Markdown bucket filenames; snapshots are skipped."""
+    if bucket.get("source_kind") != "markdown":
+        return None
+    raw_id = str(bucket.get("frontmatter_id") or "")
+    if not _BUCKET_ID_RE.fullmatch(raw_id):
+        return "invalid_or_missing_frontmatter_id"
+    stem = Path(str(bucket.get("source_basename") or "")).stem
+    if stem.lower() == raw_id.lower():
+        return "pure_id"
+    if stem.lower() == f"{raw_id}_{raw_id}".lower():
+        return "repeated_id"
+    suffix = f"_{raw_id}".lower()
+    if stem.lower().endswith(suffix) and stem[: -len(suffix)]:
+        return None
+    suffix_match = _FILENAME_ID_SUFFIX_RE.search(stem)
+    if suffix_match and suffix_match.group(1).lower() != raw_id.lower():
+        return "id_suffix_mismatch"
+    return "missing_id_suffix"
+
+
+def _audit_bucket_filename_shapes(buckets: list[dict]) -> tuple[list[dict], dict[str, int]]:
+    anomalies: list[dict] = []
+    counts: Counter = Counter()
+    for bucket in buckets:
+        shape = _bucket_filename_shape(bucket)
+        if shape is None:
+            continue
+        counts[shape] += 1
+        anomalies.append({
+            "id": str(bucket.get("frontmatter_id") or bucket.get("id") or ""),
+            "name": bucket.get("metadata", {}).get("name", "(无名)"),
+            "path": str(bucket.get("source_path") or bucket.get("source_basename") or ""),
+            "shape": shape,
+        })
+    anomalies.sort(key=lambda item: (item["shape"], item["path"]))
+    return anomalies, dict(sorted(counts.items()))
 
 
 def _parse_dt(s) -> datetime | None:
@@ -676,6 +724,7 @@ def patrol(
     raw = _load_buckets(buckets_dir)
     broken = [b for b in raw if b.get("__broken__")]
     buckets = [b for b in raw if not b.get("__broken__")]
+    filename_anomalies, filename_shape_counts = _audit_bucket_filename_shapes(buckets)
     curated_without_vector, vector_audit = _scan_curated_without_vector(
         buckets,
         embeddings_path or (buckets_dir / "embeddings.db"),
@@ -799,6 +848,8 @@ def patrol(
         "broken": broken,
         "by_type": dict(by_type.most_common()),
         "by_domain": dict(by_domain.most_common(12)),
+        "filename_shape_counts": filename_shape_counts,
+        "filename_anomalies": filename_anomalies,
         "dangling": dangling,
         "non_reciprocal": non_reciprocal,
         "self_loops": self_loops,
@@ -833,6 +884,20 @@ def render_md(report: dict, buckets_dir: Path, now: datetime) -> str:
         L.append(f"- ⚠️ 坏文件：**{len(report['broken'])}** 个 —— {[b['__broken__'] for b in report['broken']]}")
     L.append(f"- 按类型：{report['by_type']}")
     L.append(f"- 按 domain（Top12）：{report['by_domain']}")
+    L.append("")
+
+    filename_anomalies = report.get("filename_anomalies", [])
+    L.append(f"## 🗂️ 异常桶文件名（{len(filename_anomalies)}）")
+    L.append(f"- 形状计数：{report.get('filename_shape_counts', {})}")
+    if not filename_anomalies:
+        L.append("- ✅ 全部 Markdown 桶均为有标题且以自身 ID 结尾的规范文件名")
+    else:
+        # 这是数据体检清单，不套通用 section() 的 30 条截断；必须能枚举全量异常。
+        for item in filename_anomalies:
+            L.append(
+                f"- `{item['shape']}` · `{item['id'] or '?'}` · "
+                f"`{item['path']}` · {item['name']}"
+            )
     L.append("")
 
     L.append(f"## 📋 M轴待审建议（{len(report['suggestions'])}）")
