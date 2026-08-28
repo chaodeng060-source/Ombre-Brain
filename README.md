@@ -333,8 +333,14 @@ breath(query="昵称")
 `next_cursor` 调用 `breath(output_mode="signal", cursor="...")` 会继续同一份快照，
 不会重新检索或重排。
 
+片段按当前 query 从最终入选候选的原文中确定性选取，不做改写；候选上的临时时间有效性
+也会随信号快照冻结。桶没有真实 provenance 字段时来源明确显示 `unknown`，不会用主题域
+冒充。若检索失败或候选无法生成信号条目，返回会带 `error`，后者同时标记
+`partial=true`，不会伪装成确定的空结果。
+
 需要完整正文时调用 `inspect(bucket_id="...", signal_snapshot_id="...")`。只有实际
-展开的快照成员才写入 `memory_signal_read` 回执；只出现在瘦索引里的其他桶不算已读。
+展开的快照成员才写入 `memory_signal_read` 回执并进入对应 session 的已读去重；只出现在
+瘦索引里的其他桶不算已读。
 默认 `output_mode="full"` 的 `breath` 行为和返回格式保持不变。快照只在当前服务进程内
 短期保存，过期或重启后的 cursor 会明确返回错误，重新搜索即可。
 

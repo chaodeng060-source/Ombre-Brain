@@ -38,6 +38,7 @@ import hmac
 import random
 import logging
 import asyncio
+import copy
 import contextvars
 import threading
 import base64
@@ -267,6 +268,10 @@ _breath_candidate_capture = contextvars.ContextVar(
     "ombre_breath_candidate_capture",
     default=None,
 )
+_breath_session_seen_writes_enabled = contextvars.ContextVar(
+    "ombre_breath_session_seen_writes_enabled",
+    default=True,
+)
 _memory_signal_store = MemorySignalStore()
 
 
@@ -290,6 +295,7 @@ def _capture_breath_candidate(
         return
     capture.append({
         "id": bucket_id,
+        "bucket": copy.deepcopy(bucket),
         "summary": str(summary or ""),
         "reason": str(reason or "ranked"),
     })
@@ -1497,6 +1503,8 @@ def _load_session_seen_ids(session_id: str) -> set[str]:
 
 
 def _remember_session_seen_ids(session_id: str, bucket_ids: list[str]) -> None:
+    if not _breath_session_seen_writes_enabled.get():
+        return
     if not session_id or not session_id.strip() or not bucket_ids:
         return
     try:
@@ -5356,8 +5364,10 @@ async def _breath_tool(
 
     capture: list[dict] = []
     capture_token = _breath_candidate_capture.set(capture)
+    seen_writes_token = _breath_session_seen_writes_enabled.set(False)
+    core_result = None
     try:
-        await breath(
+        core_result = await breath(
             query=query,
             max_tokens=max_tokens,
             domain=domain,
@@ -5374,29 +5384,65 @@ async def _breath_tool(
             include_body_state=False,
             reset_body_state=False,
         )
+    except Exception as exc:
+        logger.warning("Memory Signal recall failed: %s", type(exc).__name__)
+        return json.dumps({
+            "mode": "signal",
+            "entries": [],
+            "partial": False,
+            "has_more": False,
+            "next_cursor": "",
+            "error": "recall_failed",
+        }, ensure_ascii=False, separators=(",", ":"))
     finally:
+        _breath_session_seen_writes_enabled.reset(seen_writes_token)
         _breath_candidate_capture.reset(capture_token)
 
+    if isinstance(core_result, str) and core_result.strip() in {
+        "检索过程出错，请稍后重试。",
+        "读取 feel 失败。",
+    }:
+        return json.dumps({
+            "mode": "signal",
+            "entries": [],
+            "partial": False,
+            "has_more": False,
+            "next_cursor": "",
+            "error": "recall_failed",
+        }, ensure_ascii=False, separators=(",", ":"))
+
     signal_entries = []
+    skipped_count = 0
     for item in capture:
         bucket_id = str(item.get("id") or "").strip()
         if not bucket_id:
+            skipped_count += 1
             continue
         try:
-            bucket = await bucket_mgr.get(bucket_id)
-            if not bucket:
-                continue
+            bucket = item.get("bucket")
+            if not isinstance(bucket, dict):
+                raise ValueError("captured_bucket_missing")
             signal_entries.append(build_signal_entry(
                 bucket,
                 reason=str(item.get("reason") or "ranked"),
+                query=query,
+                match_text=str(item.get("summary") or ""),
             ))
         except Exception as exc:
+            skipped_count += 1
             logger.warning(
                 "Memory Signal skipped candidate %s: %s",
                 bucket_id,
                 type(exc).__name__,
             )
-    page = _memory_signal_store.create(signal_entries, page_size=page_size)
+    page = _memory_signal_store.create(
+        signal_entries,
+        page_size=page_size,
+        session_id=session_id,
+        partial=skipped_count > 0,
+        error="signal_entry_build_failed" if skipped_count else "",
+        skipped_count=skipped_count,
+    )
     return json.dumps(page, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -6091,10 +6137,12 @@ async def inspect(bucket_id: str, signal_snapshot_id: str = "") -> str:
 
     result = f"{header}\n\n--- 正文 ---\n{content}{rel_block}"
     if signal_snapshot_id:
-        tracked = _memory_signal_store.mark_expanded(
+        tracked, signal_session_id = _memory_signal_store.mark_expanded_with_session(
             signal_snapshot_id,
             bucket["id"],
         )
+        if tracked and signal_session_id:
+            _remember_session_seen_ids(signal_session_id, [bucket["id"]])
         result += (
             "\n\n---\n"
             "[memory_signal_read "

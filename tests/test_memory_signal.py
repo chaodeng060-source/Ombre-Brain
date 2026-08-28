@@ -1,4 +1,5 @@
 import json
+from contextlib import nullcontext
 
 import pytest
 
@@ -55,6 +56,31 @@ def test_signal_entry_marks_long_exact_snippet_partial():
     assert entry.partial is True
     assert entry.line.endswith("[partial]")
     assert "「这是一条必须保留原词序的完整证据。" in entry.line
+
+
+def test_signal_entry_uses_honest_unknown_source_without_provenance():
+    entry = build_signal_entry(
+        _bucket("feedfacefeed", "没有来源字段的原文。"),
+        reason="semantic",
+    )
+
+    assert "[src:unknown]" in entry.line
+    assert "[src:工程]" not in entry.line
+    assert "[src:dynamic]" not in entry.line
+
+
+def test_signal_entry_selects_query_relevant_verbatim_sentence():
+    entry = build_signal_entry(
+        _bucket(
+            "beadbeadbead",
+            "这是与查询无关的开场。真正命中的证据是海马体已经迁移完成。",
+        ),
+        reason="lexical",
+        query="海马体",
+    )
+
+    assert "真正命中的证据是海马体已经迁移完成。" in entry.line
+    assert "这是与查询无关的开场。" not in entry.line
 
 
 def test_snapshot_cursor_is_fixed_and_does_not_rerank_mutated_inputs():
@@ -176,14 +202,24 @@ async def test_breath_signal_cursor_reuses_snapshot_without_second_search(monkey
     async def _full(**kwargs):
         full_calls.append(kwargs)
         server._breath_candidate_capture.get().extend([
-            {"id": "111111111111", "summary": "脱水一", "reason": "lexical"},
-            {"id": "222222222222", "summary": "脱水二", "reason": "semantic"},
+            {
+                "id": "111111111111",
+                "bucket": buckets["111111111111"],
+                "summary": "脱水一",
+                "reason": "lexical",
+            },
+            {
+                "id": "222222222222",
+                "bucket": buckets["222222222222"],
+                "summary": "脱水二",
+                "reason": "semantic",
+            },
         ])
         return "很长的旧式完整返回"
 
     class _Manager:
         async def get(self, bucket_id):
-            return buckets.get(bucket_id)
+            raise AssertionError(f"signal snapshot must not reread {bucket_id}")
 
     monkeypatch.setattr(server, "_memory_signal_store", store)
     monkeypatch.setattr(server, "breath", _full)
@@ -210,6 +246,157 @@ async def test_breath_signal_cursor_reuses_snapshot_without_second_search(monkey
     assert "第一页固定原文" in first["entries"][0]
     assert "第二页固定原文" in second["entries"][0]
     assert "搜索后才变动" not in second["entries"][0]
+
+
+@pytest.mark.asyncio
+async def test_breath_signal_freezes_transient_validity_overlay(monkeypatch):
+    store = MemorySignalStore(ttl_seconds=60, max_snapshots=4)
+    selected = _bucket(
+        "abcabcabcabc",
+        "海马体旧地址只用于历史审计。",
+        validity_state="historical",
+    )
+
+    async def _full(**_kwargs):
+        server._capture_breath_candidate(
+            selected,
+            "旧地址历史审计",
+            reason="lexical",
+            limit=1,
+        )
+        selected["metadata"].pop("validity_state")
+        return "旧式完整返回"
+
+    class _Manager:
+        async def get(self, bucket_id):
+            raise AssertionError(f"signal snapshot must not reread {bucket_id}")
+
+    monkeypatch.setattr(server, "_memory_signal_store", store)
+    monkeypatch.setattr(server, "breath", _full)
+    monkeypatch.setattr(server, "bucket_mgr", _Manager())
+
+    result = json.loads(await server._breath_tool(
+        query="海马体旧地址",
+        output_mode="signal",
+        max_results=1,
+    ))
+
+    assert "[time:historical@2026-08-28]" in result["entries"][0]
+
+
+@pytest.mark.asyncio
+async def test_signal_does_not_mark_session_seen_until_valid_inspect(monkeypatch):
+    store = MemorySignalStore(ttl_seconds=60, max_snapshots=4)
+    first_bucket = _bucket("111111111111", "第一条完整正文。")
+    second_bucket = _bucket("222222222222", "第二条完整正文。")
+
+    class _History:
+        def __init__(self):
+            self.marked = []
+
+        def mark(self, session_id, keys):
+            self.marked.append((session_id, tuple(keys)))
+
+    history = _History()
+
+    async def _full(**kwargs):
+        server._capture_breath_candidate(
+            first_bucket,
+            "第一条",
+            reason="lexical",
+            limit=2,
+        )
+        server._capture_breath_candidate(
+            second_bucket,
+            "第二条",
+            reason="semantic",
+            limit=2,
+        )
+        server._remember_session_seen_ids(
+            kwargs["session_id"],
+            [first_bucket["id"], second_bucket["id"]],
+        )
+        return "旧式完整返回"
+
+    class _Manager:
+        async def get(self, bucket_id):
+            return {
+                first_bucket["id"]: first_bucket,
+                second_bucket["id"]: second_bucket,
+            }.get(bucket_id)
+
+    monkeypatch.setattr(server, "_memory_signal_store", store)
+    monkeypatch.setattr(server, "breath", _full)
+    monkeypatch.setattr(server, "bucket_mgr", _Manager())
+    monkeypatch.setattr(server, "_session_recall_history", lambda: history)
+    monkeypatch.setattr(server, "shared_acceptance_write_guard", nullcontext)
+    monkeypatch.setattr(server.decay_engine, "calculate_score", lambda _meta: 1.25)
+
+    page = json.loads(await server._breath_tool(
+        query="完整正文",
+        output_mode="signal",
+        session_id="signal-session",
+        max_results=2,
+    ))
+
+    assert history.marked == []
+    assert store.expanded_ids(page["snapshot_id"]) == ()
+
+    await server.inspect(
+        first_bucket["id"],
+        signal_snapshot_id=page["snapshot_id"],
+    )
+
+    assert store.expanded_ids(page["snapshot_id"]) == (first_bucket["id"],)
+    assert len(history.marked) == 1
+    assert history.marked[0][0] == "signal-session"
+    assert any(first_bucket["id"] in key for key in history.marked[0][1])
+    assert all(second_bucket["id"] not in key for key in history.marked[0][1])
+
+
+@pytest.mark.asyncio
+async def test_signal_reports_core_recall_failure_instead_of_complete_empty(monkeypatch):
+    async def _failed(**_kwargs):
+        return "检索过程出错，请稍后重试。"
+
+    monkeypatch.setattr(server, "breath", _failed)
+
+    result = json.loads(await server._breath_tool(
+        query="海马体迁移",
+        output_mode="signal",
+    ))
+
+    assert result["entries"] == []
+    assert result["partial"] is False
+    assert result["error"] == "recall_failed"
+
+
+@pytest.mark.asyncio
+async def test_signal_marks_candidate_render_loss_partial(monkeypatch):
+    store = MemorySignalStore(ttl_seconds=60, max_snapshots=4)
+    good = _bucket("111111111111", "可用原文。")
+    bad = _bucket("x" * 200, "无法装进信号行的原文。")
+
+    async def _full(**_kwargs):
+        server._breath_candidate_capture.get().extend([
+            {"id": good["id"], "bucket": good, "summary": "可用", "reason": "lexical"},
+            {"id": bad["id"], "bucket": bad, "summary": "过长", "reason": "semantic"},
+        ])
+        return "旧式完整返回"
+
+    monkeypatch.setattr(server, "_memory_signal_store", store)
+    monkeypatch.setattr(server, "breath", _full)
+
+    result = json.loads(await server._breath_tool(
+        query="原文",
+        output_mode="signal",
+        max_results=2,
+    ))
+
+    assert len(result["entries"]) == 1
+    assert result["partial"] is True
+    assert result["error"] == "signal_entry_build_failed"
+    assert result["skipped_count"] == 1
 
 
 @pytest.mark.asyncio

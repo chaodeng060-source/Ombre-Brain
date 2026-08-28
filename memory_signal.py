@@ -41,6 +41,10 @@ class _Snapshot:
     created_at: float
     page_size: int
     entries: tuple[SignalEntry, ...]
+    session_id: str = ""
+    base_partial: bool = False
+    error: str = ""
+    skipped_count: int = 0
     expanded: dict[str, None] = field(default_factory=dict)
 
 
@@ -59,12 +63,7 @@ def _source_label(metadata: dict) -> str:
     explicit = metadata.get("source") or metadata.get("source_agent")
     if explicit:
         return _field(explicit, 18)
-    domains = metadata.get("domain") or []
-    if isinstance(domains, str):
-        domains = [domains]
-    if isinstance(domains, list) and domains:
-        return _field(domains[0], 18)
-    return _field(metadata.get("type") or "bucket", 18)
+    return "unknown"
 
 
 def _time_status(metadata: dict) -> str:
@@ -78,18 +77,62 @@ def _time_status(metadata: dict) -> str:
     return _field(f"{state}@{date}", 28)
 
 
-def _first_sentence(content: str) -> str:
+def _sentences(content: str) -> list[str]:
     text = _one_line(redact_text(strip_wikilinks(content or "")))
     if not text:
-        return "(empty)"
-    match = re.match(r".*?[。！？!?](?:[”’」』】）)]?)(?=.|$)", text)
-    return match.group(0) if match else text
+        return ["(empty)"]
+    sentences = re.findall(
+        r"[^。！？!?]+[。！？!?](?:[”’」』】）)]?)?|[^。！？!?]+$",
+        text,
+    )
+    return [sentence.strip() for sentence in sentences if sentence.strip()] or [text]
+
+
+def _search_terms(value: object) -> tuple[str, ...]:
+    text = _one_line(value).casefold()
+    terms: set[str] = set()
+    for token in re.findall(r"[a-z0-9][a-z0-9_.-]{1,}|[\u3400-\u9fff]+", text):
+        if re.fullmatch(r"[\u3400-\u9fff]+", token):
+            if len(token) < 2:
+                continue
+            terms.add(token)
+            for width in range(min(4, len(token)), 1, -1):
+                terms.update(
+                    token[index:index + width]
+                    for index in range(0, len(token) - width + 1)
+                )
+        else:
+            terms.add(token)
+    return tuple(sorted(terms, key=lambda term: (-len(term), term)))
+
+
+def _best_matching_sentence(sentences: list[str], terms: tuple[str, ...]) -> str | None:
+    best_sentence = None
+    best_score = 0
+    for sentence in sentences:
+        folded = sentence.casefold()
+        score = sum(len(term) * len(term) for term in terms if term in folded)
+        if score > best_score:
+            best_sentence = sentence
+            best_score = score
+    return best_sentence
+
+
+def _relevant_sentence(content: str, *, query: str = "", match_text: str = "") -> str:
+    sentences = _sentences(content)
+    query_match = _best_matching_sentence(sentences, _search_terms(query))
+    if query_match is not None:
+        return query_match
+    summary_match = _best_matching_sentence(sentences, _search_terms(match_text))
+    return summary_match if summary_match is not None else sentences[0]
 
 
 def build_signal_entry(
     bucket: dict,
     *,
     reason: str,
+    query: str = "",
+    match_text: str = "",
     max_chars: int = SIGNAL_LINE_MAX_CHARS,
 ) -> SignalEntry:
     """Build one source-derived signal line without summarising or rewriting."""
@@ -105,7 +148,11 @@ def build_signal_entry(
         f"[time:{_time_status(metadata)}]"
         f"[why:{_field(reason or 'ranked', 16)}]"
     )
-    sentence = _first_sentence(str(bucket.get("content") or ""))
+    sentence = _relevant_sentence(
+        str(bucket.get("content") or ""),
+        query=query,
+        match_text=match_text,
+    )
     full_content = _one_line(
         redact_text(strip_wikilinks(str(bucket.get("content") or "")))
     )
@@ -163,6 +210,10 @@ class MemorySignalStore:
         entries: Iterable[SignalEntry],
         *,
         page_size: int = SIGNAL_DEFAULT_PAGE_SIZE,
+        session_id: str = "",
+        partial: bool = False,
+        error: str = "",
+        skipped_count: int = 0,
     ) -> dict:
         size = max(1, min(int(page_size), SIGNAL_MAX_PAGE_SIZE))
         deduped: list[SignalEntry] = []
@@ -179,6 +230,10 @@ class MemorySignalStore:
             created_at=now,
             page_size=size,
             entries=tuple(deduped),
+            session_id=str(session_id or "").strip(),
+            base_partial=bool(partial),
+            error=str(error or "").strip(),
+            skipped_count=max(0, int(skipped_count)),
         )
         with self._lock:
             self._prune_locked(now)
@@ -204,14 +259,23 @@ class MemorySignalStore:
         stop = min(len(snapshot.entries), offset + snapshot.page_size)
         page_entries = snapshot.entries[offset:stop]
         has_more = stop < len(snapshot.entries)
-        return {
+        result = {
             "mode": "signal",
             "snapshot_id": snapshot.snapshot_id,
             "entries": [entry.line for entry in page_entries],
-            "partial": has_more or any(entry.partial for entry in page_entries),
+            "partial": (
+                snapshot.base_partial
+                or has_more
+                or any(entry.partial for entry in page_entries)
+            ),
             "has_more": has_more,
             "next_cursor": self._cursor(snapshot.snapshot_id, stop) if has_more else "",
         }
+        if snapshot.error:
+            result["error"] = snapshot.error
+        if snapshot.skipped_count:
+            result["skipped_count"] = snapshot.skipped_count
+        return result
 
     def page(self, cursor: str) -> dict:
         try:
@@ -225,18 +289,29 @@ class MemorySignalStore:
             snapshot = self._snapshot_locked(snapshot_id)
             return self._render_locked(snapshot, offset=offset)
 
-    def mark_expanded(self, snapshot_id: str, bucket_id: str) -> bool:
+    def mark_expanded_with_session(
+        self,
+        snapshot_id: str,
+        bucket_id: str,
+    ) -> tuple[bool, str]:
         with self._lock:
             try:
                 snapshot = self._snapshot_locked(str(snapshot_id or ""))
             except MemorySignalCursorError:
-                return False
+                return False, ""
             member_ids = {entry.bucket_id for entry in snapshot.entries}
             normalized = str(bucket_id or "").strip()
             if normalized not in member_ids:
-                return False
+                return False, ""
             snapshot.expanded.setdefault(normalized, None)
-            return True
+            return True, snapshot.session_id
+
+    def mark_expanded(self, snapshot_id: str, bucket_id: str) -> bool:
+        tracked, _session_id = self.mark_expanded_with_session(
+            snapshot_id,
+            bucket_id,
+        )
+        return tracked
 
     def expanded_ids(self, snapshot_id: str) -> tuple[str, ...]:
         with self._lock:
