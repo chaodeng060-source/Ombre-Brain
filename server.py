@@ -125,6 +125,11 @@ from recall_support import (
 )
 from timeline_axis import timeline_neighbors
 from recall_receipt import RecallReceiptConflict, RecallReceiptStore, normalize_bucket_ids
+from memory_signal import (
+    MemorySignalCursorError,
+    MemorySignalStore,
+    build_signal_entry,
+)
 from e_axis_shadow import (
     EAxisShadowStore,
     build_failure_record,
@@ -262,10 +267,32 @@ _breath_candidate_capture = contextvars.ContextVar(
     "ombre_breath_candidate_capture",
     default=None,
 )
+_memory_signal_store = MemorySignalStore()
 
 
 class RecallOperationalError(RuntimeError):
     """A required recall channel failed instead of returning valid evidence."""
+
+
+def _capture_breath_candidate(
+    bucket: dict,
+    summary: str,
+    *,
+    reason: str,
+    limit: int,
+) -> None:
+    """Capture only candidates that survived the established breath pipeline."""
+    capture = _breath_candidate_capture.get()
+    if not isinstance(capture, list) or len(capture) >= max(1, int(limit)):
+        return
+    bucket_id = str(bucket.get("id") or "").strip()
+    if not bucket_id or any(item.get("id") == bucket_id for item in capture if isinstance(item, dict)):
+        return
+    capture.append({
+        "id": bucket_id,
+        "summary": str(summary or ""),
+        "reason": str(reason or "ranked"),
+    })
 
 
 def _get_recall_receipt_store() -> RecallReceiptStore:
@@ -3854,7 +3881,6 @@ async def _auto_infer_edges(
 # With args: search by keyword + emotion coordinates
 # 有参数：按关键词+情感坐标检索记忆
 # =============================================================
-@mcp.tool()
 async def breath(
     query: str = "",
     max_tokens: int = BREATH_DEFAULT_MAX_TOKENS,
@@ -4091,6 +4117,12 @@ async def breath(
                 entry = f"[{created}] [bucket_id:{f['id']}]\n{strip_wikilinks(f['content'])}"
                 results.append(entry)
                 shown_feels.append(f)
+                _capture_breath_candidate(
+                    f,
+                    strip_wikilinks(f["content"]),
+                    reason="feel",
+                    limit=max_results,
+                )
                 if count_tokens_approx("\n---\n".join(results)) > max_tokens:
                     break
             text = "=== 你留下的 feel ===\n" + "\n---\n".join(results)
@@ -4603,9 +4635,17 @@ async def breath(
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
                 break
-            capture = _breath_candidate_capture.get()
-            if isinstance(capture, list) and len(capture) < max_results:
-                capture.append({"id": bucket["id"], "summary": summary})
+            reason = (
+                "entity" if bucket.get("entity_match")
+                else "semantic" if bucket.get("vector_match")
+                else "lexical"
+            )
+            _capture_breath_candidate(
+                bucket,
+                summary,
+                reason=reason,
+                limit=max_results,
+            )
             # Recall is read-only with respect to memory buckets.  Rendering a
             # search hit must not refresh last_active / activation_count or
             # trigger touch()'s bounded time ripple into neighboring buckets.
@@ -4751,12 +4791,12 @@ async def breath(
                 result_ids.append(timeline_neighbor.bucket_id)
                 if fingerprint:
                     selected_content_fingerprints.add(fingerprint)
-                capture = _breath_candidate_capture.get()
-                if isinstance(capture, list) and len(capture) < max_results:
-                    capture.append({
-                        "id": timeline_neighbor.bucket_id,
-                        "summary": summary,
-                    })
+                _capture_breath_candidate(
+                    neighbor,
+                    summary,
+                    reason="timeline",
+                    limit=max_results,
+                )
             except Exception as exc:
                 logger.warning(
                     "Failed to dehydrate timeline neighbor: %s",
@@ -4831,9 +4871,17 @@ async def breath(
                         bucket["_e_axis_annotation"],
                         float(bucket.get("_e_axis_resonance", 0.0) or 0.0),
                     ))
-                capture = _breath_candidate_capture.get()
-                if isinstance(capture, list) and len(capture) < max_results:
-                    capture.append({"id": bucket_id, "summary": summary})
+                reason = (
+                    "entity" if bucket.get("entity_match")
+                    else "semantic" if bucket.get("vector_match")
+                    else "lexical"
+                )
+                _capture_breath_candidate(
+                    bucket,
+                    summary,
+                    reason=reason,
+                    limit=max_results,
+                )
             except Exception as exc:
                 logger.warning(
                     "Failed to restore primary after timeline miss: %s",
@@ -4888,9 +4936,12 @@ async def breath(
             result_ids.append(state_bucket_id)
             if fingerprint:
                 selected_content_fingerprints.add(fingerprint)
-            capture = _breath_candidate_capture.get()
-            if isinstance(capture, list) and len(capture) < max_results:
-                capture.append({"id": state_bucket_id, "summary": summary})
+            _capture_breath_candidate(
+                state_bucket,
+                summary,
+                reason="state",
+                limit=max_results,
+            )
         except Exception as exc:
             logger.warning(
                 "Failed to render Z state-link evidence: %s",
@@ -4995,6 +5046,12 @@ async def breath(
                 token_used += summary_tokens
                 result_buckets.append(neighbor)
                 result_ids.append(relation_neighbor.bucket_id)
+                _capture_breath_candidate(
+                    neighbor,
+                    summary,
+                    reason="relation",
+                    limit=max_results,
+                )
                 if fingerprint:
                     selected_content_fingerprints.add(fingerprint)
             except Exception as exc:
@@ -5095,6 +5152,12 @@ async def breath(
                 token_used += summary_tokens
                 result_buckets.append(e_bucket)
                 result_ids.append(e_bucket_id)
+                _capture_breath_candidate(
+                    e_bucket,
+                    summary,
+                    reason="emotion",
+                    limit=max_results,
+                )
                 if fingerprint:
                     selected_content_fingerprints.add(fingerprint)
                 excluded_e_ids.add(e_bucket_id)
@@ -5166,6 +5229,12 @@ async def breath(
                     drift_results.append(f"[surface_type: random] {prefix}\n{summary}")
                     result_buckets.append(b)
                     result_ids.append(b["id"])
+                    _capture_breath_candidate(
+                        b,
+                        summary,
+                        reason="random",
+                        limit=max_results,
+                    )
                 if drift_results:
                     results.append("--- 忽然想起来 ---\n" + "\n---\n".join(drift_results))
         except Exception as e:
@@ -5203,6 +5272,132 @@ async def breath(
     _remember_session_seen_ids(session_id, result_ids)
     finish_recall_stage("assembly")
     return await _tool_result_with_optional_images(text, result_buckets, include_images)
+
+
+@mcp.tool(name="breath")
+async def _breath_tool(
+    query: str = "",
+    max_tokens: int = BREATH_DEFAULT_MAX_TOKENS,
+    domain: str = "",
+    valence: float = -1,
+    arousal: float = -1,
+    max_results: int = BREATH_DEFAULT_MAX_RESULTS,
+    world: str = "",
+    relation_depth: int = 1,
+    since: str = "",
+    until: str = "",
+    session_id: str = "",
+    policy: str = "search",
+    include_images: bool = True,
+    include_body_state: bool = True,
+    reset_body_state: bool = False,
+    output_mode: str = "full",
+    cursor: str = "",
+    page_size: int = 5,
+) -> str | list[TextContent | ImageContent]:
+    """检索记忆；默认 full 保持原返回，signal 返回可按 cursor 续读的瘦索引。
+
+    signal 第一屏只含桶 ID、来源、时间状态、命中原因和逐字片段；需要
+    完整正文时再用 ``inspect(bucket_id, signal_snapshot_id)`` 展开。
+    """
+    mode = str(output_mode or "full").strip().lower()
+    if mode == "full":
+        return await breath(
+            query=query,
+            max_tokens=max_tokens,
+            domain=domain,
+            valence=valence,
+            arousal=arousal,
+            max_results=max_results,
+            world=world,
+            relation_depth=relation_depth,
+            since=since,
+            until=until,
+            session_id=session_id,
+            policy=policy,
+            include_images=include_images,
+            include_body_state=include_body_state,
+            reset_body_state=reset_body_state,
+        )
+
+    if mode != "signal":
+        return json.dumps({
+            "mode": "signal",
+            "entries": [],
+            "partial": False,
+            "has_more": False,
+            "next_cursor": "",
+            "error": "unsupported_output_mode",
+        }, ensure_ascii=False, separators=(",", ":"))
+
+    if cursor:
+        try:
+            page = _memory_signal_store.page(cursor)
+        except MemorySignalCursorError as exc:
+            page = {
+                "mode": "signal",
+                "entries": [],
+                "partial": False,
+                "has_more": False,
+                "next_cursor": "",
+                "error": str(exc),
+            }
+        return json.dumps(page, ensure_ascii=False, separators=(",", ":"))
+
+    if not query or not query.strip():
+        return json.dumps({
+            "mode": "signal",
+            "entries": [],
+            "partial": False,
+            "has_more": False,
+            "next_cursor": "",
+            "error": "query_required",
+        }, ensure_ascii=False, separators=(",", ":"))
+
+    capture: list[dict] = []
+    capture_token = _breath_candidate_capture.set(capture)
+    try:
+        await breath(
+            query=query,
+            max_tokens=max_tokens,
+            domain=domain,
+            valence=valence,
+            arousal=arousal,
+            max_results=max_results,
+            world=world,
+            relation_depth=relation_depth,
+            since=since,
+            until=until,
+            session_id=session_id,
+            policy=policy,
+            include_images=False,
+            include_body_state=False,
+            reset_body_state=False,
+        )
+    finally:
+        _breath_candidate_capture.reset(capture_token)
+
+    signal_entries = []
+    for item in capture:
+        bucket_id = str(item.get("id") or "").strip()
+        if not bucket_id:
+            continue
+        try:
+            bucket = await bucket_mgr.get(bucket_id)
+            if not bucket:
+                continue
+            signal_entries.append(build_signal_entry(
+                bucket,
+                reason=str(item.get("reason") or "ranked"),
+            ))
+        except Exception as exc:
+            logger.warning(
+                "Memory Signal skipped candidate %s: %s",
+                bucket_id,
+                type(exc).__name__,
+            )
+    page = _memory_signal_store.create(signal_entries, page_size=page_size)
+    return json.dumps(page, ensure_ascii=False, separators=(",", ":"))
 
 
 # =============================================================
@@ -5842,8 +6037,8 @@ async def trace(
 # 绕过浮现/检索；用于已知 ID、需要看原文的工程操作（整合、编辑、审查）。
 # =============================================================
 @mcp.tool()
-async def inspect(bucket_id: str) -> str:
-    """按 ID 查看记忆桶完整内容（不脱水）。用于整合/编辑/审查时需看原文的工程操作。"""
+async def inspect(bucket_id: str, signal_snapshot_id: str = "") -> str:
+    """按 ID 查看完整原文；signal_snapshot_id 仅记录这一次实际展开。"""
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
 
@@ -5894,7 +6089,19 @@ async def inspect(bucket_id: str) -> str:
                 rel_lines.append(f"  - {r.get('type', '?')} → {r.get('target', '?')}{note_str}")
     rel_block = ("\n\n关系边:\n" + "\n".join(rel_lines)) if rel_lines else ""
 
-    return f"{header}\n\n--- 正文 ---\n{content}{rel_block}"
+    result = f"{header}\n\n--- 正文 ---\n{content}{rel_block}"
+    if signal_snapshot_id:
+        tracked = _memory_signal_store.mark_expanded(
+            signal_snapshot_id,
+            bucket["id"],
+        )
+        result += (
+            "\n\n---\n"
+            "[memory_signal_read "
+            f"tracked:{str(tracked).lower()} "
+            f"bucket_id:{bucket['id']} partial:false]"
+        )
+    return result
 
 
 # =============================================================

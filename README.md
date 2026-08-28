@@ -325,6 +325,19 @@ breath(query="昵称")
     返回 ≤20 条结果
 ```
 
+### Memory Signal 两阶段读取
+
+主动深搜可以显式使用 `breath(query="...", output_mode="signal", page_size=5)`。
+第一屏只返回固定快照中的瘦条目：桶 ID、来源、时间状态、命中原因和一句原文片段；
+每条不超过 120 字。`partial=true` 表示当前条目有截断或快照仍有下一页，使用返回的
+`next_cursor` 调用 `breath(output_mode="signal", cursor="...")` 会继续同一份快照，
+不会重新检索或重排。
+
+需要完整正文时调用 `inspect(bucket_id="...", signal_snapshot_id="...")`。只有实际
+展开的快照成员才写入 `memory_signal_read` 回执；只出现在瘦索引里的其他桶不算已读。
+默认 `output_mode="full"` 的 `breath` 行为和返回格式保持不变。快照只在当前服务进程内
+短期保存，过期或重启后的 cursor 会明确返回错误，重新搜索即可。
+
 6 个 MCP 工具 / 6 MCP tools:
 
 | 工具 Tool | 作用 Purpose |
