@@ -267,6 +267,59 @@ def _p95(values: list[float]) -> float | None:
     return round(ordered[index], 6)
 
 
+def _expected_final_swaps(
+    receipt: dict[str, Any],
+    selection: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Replay receipt-approved pairs with Twin's all-or-nothing fallback."""
+
+    guard_by_id = {
+        guard["id"]: guard for guard in receipt["candidate_guards"]
+    }
+    baseline = list(selection["arms"]["b"])
+    working = list(baseline)
+    expected: list[dict[str, Any]] = []
+    for proposed in receipt["swaps"]:
+        demoted_id = proposed["demoted_id"]
+        promoted_id = proposed["promoted_id"]
+        if demoted_id not in working or promoted_id not in working:
+            return [], baseline
+        to_index = working.index(demoted_id)
+        from_index = working.index(promoted_id)
+        if from_index != to_index + 1:
+            return [], baseline
+        promoted_guard = guard_by_id[promoted_id]
+        demoted_guard = guard_by_id[demoted_id]
+        shared_locks = set(promoted_guard["event_lock_digests"]) & set(
+            demoted_guard["event_lock_digests"]
+        )
+        safe = (
+            proposed["event_lock_digest"] in shared_locks
+            and not promoted_guard["is_factual"]
+            and not demoted_guard["is_factual"]
+            and promoted_guard["author_match"]
+            and demoted_guard["author_match"]
+            and promoted_guard["e_admissibility"] == "admissible"
+            and demoted_guard["e_admissibility"] == "admissible"
+            and promoted_guard["e_resonance_milli"] + 30
+            >= demoted_guard["e_resonance_milli"]
+        )
+        if not safe:
+            return [], baseline
+        expected.append({
+            "promoted_id": promoted_id,
+            "demoted_id": demoted_id,
+            "from_index": from_index,
+            "to_index": to_index,
+            "event_lock_digest": proposed["event_lock_digest"],
+        })
+        working[to_index], working[from_index] = (
+            working[from_index],
+            working[to_index],
+        )
+    return expected, working
+
+
 def evaluate(
     receipts: list[dict[str, Any]],
     selections: list[dict[str, Any]],
@@ -349,6 +402,14 @@ def evaluate(
         for arm in ("a", "b", "c"):
             if len(selection["arms"][arm]) > receipt["first_screen_limit"]:
                 raise ValueError("final selection exceeds its visible cutoff")
+        expected_applied_swaps, expected_final_c = _expected_final_swaps(
+            receipt,
+            selection,
+        )
+        if selection["applied_swaps"] != expected_applied_swaps:
+            raise ValueError("final applied swaps are not bound to the shadow receipt")
+        if selection["arms"]["c"] != expected_final_c:
+            raise ValueError("final C is not the validated receipt replay over final B")
         # Twin runs one deterministic local filter/reranker over each frozen
         # arm.  Equal arm inputs therefore must have equal outputs.  Enforcing
         # this sound invariant prevents a selection row from manufacturing a
@@ -393,6 +454,8 @@ def evaluate(
     hard_violations = 0
     external_api_delta = 0
     case_ids: list[str] = []
+    unscorable_reason_counts: dict[str, int] = {}
+    unscorable_turn_count = 0
     for digest, gold in gold_by_digest.items():
         receipt = selected_receipt_by_digest.get(digest)
         selection = selection_by_digest.get(digest)
@@ -411,6 +474,35 @@ def evaluate(
             raise ValueError(f"gold expected id is outside pool for {gold['case_id']}")
         if receipt["diagnostics"]["same_candidate_pool"] is not True:
             raise ValueError(f"receipt arms do not share a pool for {gold['case_id']}")
+
+        attempts = selected_attempts_by_digest[digest]
+        latencies.append(sum(
+            float(attempt["request_path_delta_ms"])
+            for attempt in attempts
+        ) + float(selection["request_path_delta_ms"]))
+        hard_violations += sum(
+            int(attempt["diagnostics"]["hard_violation_count"])
+            for attempt in attempts
+        )
+        external_api_delta += sum(
+            int(attempt["diagnostics"]["external_api_delta"])
+            for attempt in attempts
+        )
+        unscorable_statuses = {
+            attempt["a_cohort_status"]
+            for attempt in attempts
+            if attempt["a_cohort_status"] != "pure_semantic"
+        }
+        if selection["final_input_cohort_status"] != "pure_same_cohort":
+            unscorable_statuses.add(selection["final_input_cohort_status"])
+        unscorable_statuses = sorted(unscorable_statuses)
+        if unscorable_statuses:
+            unscorable_turn_count += 1
+            for reason in unscorable_statuses:
+                unscorable_reason_counts[reason] = (
+                    unscorable_reason_counts.get(reason, 0) + 1
+                )
+            continue
 
         case_ids.append(gold["case_id"])
         acceptable = set(gold["acceptable_ids"])
@@ -432,20 +524,6 @@ def evaluate(
                 arm_totals["predicted_zero_correct"] += int(
                     gold["expected_zero"]
                 )
-        attempts = selected_attempts_by_digest[digest]
-        latencies.append(sum(
-            float(attempt["request_path_delta_ms"])
-            for attempt in attempts
-        ) + float(selection["request_path_delta_ms"]))
-        hard_violations += sum(
-            int(attempt["diagnostics"]["hard_violation_count"])
-            for attempt in attempts
-        )
-        external_api_delta += sum(
-            int(attempt["diagnostics"]["external_api_delta"])
-            for attempt in attempts
-        )
-
     metrics = {}
     for arm, values in totals.items():
         metrics[arm] = {
@@ -518,12 +596,23 @@ def evaluate(
         "p95_request_path_delta_within_budget": (
             p95_delta is not None and p95_delta <= p95_budget_ms
         ),
+        "all_turns_scorable": not unscorable_reason_counts,
     }
     mechanical_candidate_pass = all(gates.values())
     if scored < min_cases:
         status = "inconclusive"
+    elif mechanical_candidate_pass:
+        status = "candidate_for_named_review"
+    elif all(
+        passed
+        for name, passed in gates.items()
+        if name != "completeness_strictly_better"
+    ):
+        # Final B and C are required to have the same candidate set, so the
+        # set-based completeness gate cannot be established by this version.
+        status = "inconclusive"
     else:
-        status = "candidate_for_named_review" if mechanical_candidate_pass else "failed"
+        status = "failed"
     return {
         "schema": "e_chord_shadow_eval.v1",
         "status": status,
@@ -550,6 +639,9 @@ def evaluate(
         "p95_budget_ms": float(p95_budget_ms),
         "hard_violation_count": hard_violations,
         "external_api_delta": external_api_delta,
+        "unscorable_turn_count": unscorable_turn_count,
+        "unscorable_reason_counts": dict(sorted(unscorable_reason_counts.items())),
+        "completeness_gate_reachable": False,
         "gates": gates,
     }
 

@@ -428,6 +428,8 @@ async def test_real_breath_changes_close_order_and_injects_posture(
     monkeypatch.setattr(server, "_backfill_started", True)
     monkeypatch.setattr(server, "_entity_store", None)
 
+    ds_inputs = []
+
     async def passthrough(
         _query,
         values,
@@ -437,6 +439,7 @@ async def test_real_breath_changes_close_order_and_injects_posture(
         force_keep_ids=None,
         allow_empty=False,
     ):
+        ds_inputs.append([row["id"] for row in values])
         return values[:max_results]
 
     monkeypatch.setattr(server, "_ds_filter_candidates", passthrough)
@@ -457,6 +460,9 @@ async def test_real_breath_changes_close_order_and_injects_posture(
         pytest.fail("breath did not return within integration-test timeout")
     result = task.result()
 
+    # Shadow capture must not reorder or widen the production DS prompt.  The
+    # existing E-aware served order remains byte-for-byte the DS input.
+    assert ds_inputs == [["comforting", "cheerful"]]
     assert result.index("bucket_id:comforting") < result.index(
         "bucket_id:cheerful"
     )

@@ -98,6 +98,22 @@ _FACT_MARKERS = frozenset({
     "z_fact_key",
 })
 _FROZEN_BAND_KEY = "_e_chord_relevance_band_id"
+_E_ADMISSIBILITY_FLOOR = 0.55
+_E_POLARITY_NEUTRAL_BAND = 0.25
+_E_RESONANCE_MAX_REGRESSION_MILLI = 30
+_E_ADMISSIBILITY_VALUES = frozenset({
+    "missing_annotation",
+    "below_resonance",
+    "opposite_affect",
+    "admissible",
+})
+_DS_DECISION_SOURCES = frozenset({
+    "disabled",
+    "deterministic_noop",
+    "model",
+    "fallback",
+    "unobserved",
+})
 
 
 def _finite(value: object) -> float | None:
@@ -361,6 +377,77 @@ def _base_score(candidate: Mapping[str, object]) -> float | None:
     return _finite(candidate.get("_non_relevance_tie_break_score"))
 
 
+def _polarity(value: object) -> int:
+    number = _finite(value)
+    if number is None or not -1.0 <= number <= 1.0:
+        return 0
+    if abs(number) < _E_POLARITY_NEUTRAL_BAND:
+        return 0
+    return 1 if number > 0 else -1
+
+
+def _e_admissibility_status(
+    *,
+    has_e_annotation: bool,
+    e_resonance_milli: int,
+    e_resonance_floor_milli: int,
+    input_polarity: int,
+    experience_polarity: int,
+) -> str:
+    if not has_e_annotation:
+        return "missing_annotation"
+    if e_resonance_milli < e_resonance_floor_milli:
+        return "below_resonance"
+    if (
+        input_polarity != 0
+        and experience_polarity != 0
+        and input_polarity != experience_polarity
+    ):
+        return "opposite_affect"
+    return "admissible"
+
+
+def _candidate_e_guard(candidate: Mapping[str, object]) -> dict[str, object]:
+    """Return the text-free, independently recomputable existing-E guard."""
+
+    annotation_valence = _finite(_annotation_value(candidate, "valence"))
+    query_valence = _finite(candidate.get("_e_axis_query_valence"))
+    resonance = _finite(candidate.get("_e_axis_resonance"))
+    floor = _finite(candidate.get("_e_axis_admissibility_floor"))
+    usable = (
+        annotation_valence is not None
+        and -1.0 <= annotation_valence <= 1.0
+        and query_valence is not None
+        and -1.0 <= query_valence <= 1.0
+        and resonance is not None
+        and 0.0 <= resonance <= 1.0
+        and floor is not None
+        and _E_ADMISSIBILITY_FLOOR <= floor <= 1.0
+    )
+    resonance_milli = round((resonance if resonance is not None else 0.0) * 1000)
+    floor_milli = round(
+        max(_E_ADMISSIBILITY_FLOOR, floor if floor is not None else 0.0) * 1000
+    )
+    resonance_milli = max(0, min(1000, resonance_milli))
+    floor_milli = max(round(_E_ADMISSIBILITY_FLOOR * 1000), min(1000, floor_milli))
+    input_polarity = _polarity(query_valence)
+    experience_polarity = _polarity(annotation_valence)
+    return {
+        "has_e_annotation": usable,
+        "e_resonance_milli": resonance_milli,
+        "e_resonance_floor_milli": floor_milli,
+        "input_polarity": input_polarity,
+        "experience_polarity": experience_polarity,
+        "e_admissibility": _e_admissibility_status(
+            has_e_annotation=usable,
+            e_resonance_milli=resonance_milli,
+            e_resonance_floor_milli=floor_milli,
+            input_polarity=input_polarity,
+            experience_polarity=experience_polarity,
+        ),
+    }
+
+
 def frozen_relevance_band_ids(
     candidates: Sequence[Mapping[str, object]],
     band_width: float,
@@ -503,6 +590,23 @@ def propose_chord_reorder(
             _append_reason(skipped, "factual")
             index += 1
             continue
+        left_e_guard = _candidate_e_guard(left)
+        right_e_guard = _candidate_e_guard(right)
+        if (
+            left_e_guard["e_admissibility"] != "admissible"
+            or right_e_guard["e_admissibility"] != "admissible"
+        ):
+            _append_reason(skipped, "e_admissibility")
+            index += 1
+            continue
+        if (
+            int(right_e_guard["e_resonance_milli"])
+            + _E_RESONANCE_MAX_REGRESSION_MILLI
+            < int(left_e_guard["e_resonance_milli"])
+        ):
+            _append_reason(skipped, "e_resonance")
+            index += 1
+            continue
         left_score = _base_score(left)
         right_score = _base_score(right)
         if (
@@ -563,6 +667,26 @@ def _ids(candidates: Sequence[Mapping[str, object]]) -> tuple[str, ...]:
     return tuple(_candidate_id(candidate) for candidate in candidates)
 
 
+def _a_cohort_status(
+    pre_e_cohort_ids: Sequence[str],
+    post_e_cohort_ids: Sequence[str],
+    b_ids: Sequence[str],
+    ds_decision_source: str,
+) -> str:
+    if ds_decision_source not in {"disabled", "deterministic_noop"}:
+        return f"unscorable_ds_{ds_decision_source}"
+    if (
+        len(pre_e_cohort_ids) != len(post_e_cohort_ids)
+        or len(post_e_cohort_ids) != len(b_ids)
+        or set(pre_e_cohort_ids) != set(post_e_cohort_ids)
+        or set(post_e_cohort_ids) != set(b_ids)
+    ):
+        return "unscorable_cohort_drift"
+    if tuple(post_e_cohort_ids) != tuple(b_ids):
+        return "unscorable_downstream_order"
+    return "pure_semantic"
+
+
 def _projection_digest(chord: LiveChord) -> str:
     body = {
         "schema": LIVE_SCHEMA,
@@ -597,6 +721,9 @@ def build_shadow_receipt(
     *,
     chord: LiveChord | None,
     payload_status: str,
+    pre_e_cohort_ids: Sequence[str],
+    post_e_cohort_ids: Sequence[str],
+    ds_decision_source: str,
     a_candidates: Sequence[Mapping[str, object]],
     b_candidates: Sequence[Mapping[str, object]],
     proposal: ShadowProposal,
@@ -618,9 +745,27 @@ def build_shadow_receipt(
         raise ValueError("recorded_at_ms must be a non-negative integer")
     if type(payload_status) is not str or not payload_status or len(payload_status) > 80:
         raise ValueError("payload_status is invalid")
+    if ds_decision_source not in _DS_DECISION_SOURCES:
+        raise ValueError("ds_decision_source is invalid")
 
-    a_ids = _ids(a_candidates)
+    declared_a_ids = _ids(a_candidates)
     b_ids = _ids(b_candidates)
+    pre_e_ids = tuple(pre_e_cohort_ids)
+    post_e_ids = tuple(post_e_cohort_ids)
+    cohort_status = _a_cohort_status(
+        pre_e_ids,
+        post_e_ids,
+        b_ids,
+        ds_decision_source,
+    )
+    if cohort_status == "pure_semantic":
+        if declared_a_ids != pre_e_ids:
+            raise ValueError("pure semantic A does not match frozen pre-E cohort")
+        a_ids = pre_e_ids
+    else:
+        # Never serialize a post-hoc ablation as a semantic baseline.  The
+        # evaluator excludes this turn; B is a neutral placeholder for A.
+        a_ids = b_ids
     relevance_band_ids = [_frozen_band(candidate) for candidate in b_candidates]
     candidate_guards = [
         {
@@ -631,6 +776,7 @@ def build_shadow_receipt(
                 _annotation_value(candidate, "authored_by") == chord.e_authored_by
                 if chord is not None else False
             ),
+            **_candidate_e_guard(candidate),
         }
         for candidate in b_candidates
     ]
@@ -666,6 +812,14 @@ def build_shadow_receipt(
             hard_violations.add("fact_move")
         if not promoted_guard.get("author_match") or not demoted_guard.get("author_match"):
             hard_violations.add("cross_author_move")
+        if (
+            promoted_guard.get("e_admissibility") != "admissible"
+            or demoted_guard.get("e_admissibility") != "admissible"
+            or int(promoted_guard.get("e_resonance_milli", 0))
+            + _E_RESONANCE_MAX_REGRESSION_MILLI
+            < int(demoted_guard.get("e_resonance_milli", 0))
+        ):
+            hard_violations.add("e_admissibility_move")
 
     return {
         "schema": RECEIPT_SCHEMA,
@@ -680,6 +834,10 @@ def build_shadow_receipt(
         "facet_count": len(chord.facets) if chord is not None else 0,
         "attempt_index": attempt_index,
         "first_screen_limit": first_screen_limit,
+        "pre_e_cohort_ids": list(pre_e_ids),
+        "post_e_cohort_ids": list(post_e_ids),
+        "a_cohort_status": cohort_status,
+        "ds_decision_source": ds_decision_source,
         "pool_ids": list(b_ids),
         "relevance_band_ids": relevance_band_ids,
         "candidate_guards": candidate_guards,
@@ -714,6 +872,9 @@ def build_shadow_receipt(
             ),
             "fact_moves": int("fact_move" in hard_violations),
             "cross_author_moves": int("cross_author_move" in hard_violations),
+            "e_admissibility_moves": int(
+                "e_admissibility_move" in hard_violations
+            ),
             "zero_to_nonzero": int("zero_to_nonzero" in hard_violations),
             "external_api_delta": 0,
             "hard_violation_count": len(hard_violations),
@@ -735,6 +896,10 @@ _RECEIPT_KEYS = frozenset({
     "facet_count",
     "attempt_index",
     "first_screen_limit",
+    "pre_e_cohort_ids",
+    "post_e_cohort_ids",
+    "a_cohort_status",
+    "ds_decision_source",
     "pool_ids",
     "relevance_band_ids",
     "candidate_guards",
@@ -752,6 +917,7 @@ _DIAGNOSTIC_KEYS = frozenset({
     "cross_event_moves",
     "fact_moves",
     "cross_author_moves",
+    "e_admissibility_moves",
     "cross_relevance_moves",
     "zero_to_nonzero",
     "external_api_delta",
@@ -769,6 +935,12 @@ _CANDIDATE_GUARD_KEYS = frozenset({
     "event_lock_digests",
     "is_factual",
     "author_match",
+    "has_e_annotation",
+    "e_resonance_milli",
+    "e_resonance_floor_milli",
+    "input_polarity",
+    "experience_polarity",
+    "e_admissibility",
 })
 _HEX16_RE = re.compile(r"^[0-9a-f]{16}$")
 _MACHINE_REASON_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,79}$")
@@ -827,7 +999,20 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
         or not 0 <= row["first_screen_limit"] <= 50
     ):
         raise ValueError("invalid E chord receipt contract")
+    pre_e_cohort_ids = _validated_id_list(row.get("pre_e_cohort_ids"))
+    post_e_cohort_ids = _validated_id_list(row.get("post_e_cohort_ids"))
+    ds_decision_source = row.get("ds_decision_source")
+    if ds_decision_source not in _DS_DECISION_SOURCES:
+        raise ValueError("invalid E chord receipt contract")
     pool_ids = _validated_id_list(row.get("pool_ids"))
+    expected_cohort_status = _a_cohort_status(
+        pre_e_cohort_ids,
+        post_e_cohort_ids,
+        pool_ids,
+        ds_decision_source,
+    )
+    if row.get("a_cohort_status") != expected_cohort_status:
+        raise ValueError("invalid E chord receipt contract")
     relevance_band_ids = row.get("relevance_band_ids")
     if (
         type(relevance_band_ids) is not list
@@ -856,9 +1041,32 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
             )
             or type(guard.get("is_factual")) is not bool
             or type(guard.get("author_match")) is not bool
+            or type(guard.get("has_e_annotation")) is not bool
+            or type(guard.get("e_resonance_milli")) is not int
+            or not 0 <= guard["e_resonance_milli"] <= 1000
+            or type(guard.get("e_resonance_floor_milli")) is not int
+            or not round(_E_ADMISSIBILITY_FLOOR * 1000)
+            <= guard["e_resonance_floor_milli"] <= 1000
+            or type(guard.get("input_polarity")) is not int
+            or guard["input_polarity"] not in {-1, 0, 1}
+            or type(guard.get("experience_polarity")) is not int
+            or guard["experience_polarity"] not in {-1, 0, 1}
+            or guard.get("e_admissibility") not in _E_ADMISSIBILITY_VALUES
+            or guard["e_admissibility"] != _e_admissibility_status(
+                has_e_annotation=guard["has_e_annotation"],
+                e_resonance_milli=guard["e_resonance_milli"],
+                e_resonance_floor_milli=guard["e_resonance_floor_milli"],
+                input_polarity=guard["input_polarity"],
+                experience_polarity=guard["experience_polarity"],
+            )
         ):
             raise ValueError("invalid E chord receipt contract")
         guard_by_id[bucket_id] = guard
+    if candidate_guards and (
+        len({guard["input_polarity"] for guard in candidate_guards}) != 1
+        or len({guard["e_resonance_floor_milli"] for guard in candidate_guards}) != 1
+    ):
+        raise ValueError("invalid E chord receipt contract")
     if type(row.get("swaps")) is not list or len(row["swaps"]) > len(pool_ids) // 2:
         raise ValueError("invalid E chord receipt contract")
     reconstructed_c = list(pool_ids)
@@ -867,6 +1075,7 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
     recomputed_cross_event_moves = 0
     recomputed_fact_moves = 0
     recomputed_cross_author_moves = 0
+    recomputed_e_admissibility_moves = 0
     for swap in row["swaps"]:
         if type(swap) is not dict or set(swap) != _SWAP_KEYS:
             raise ValueError("invalid E chord receipt contract")
@@ -895,6 +1104,14 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
             recomputed_fact_moves = 1
         if not promoted_guard["author_match"] or not demoted_guard["author_match"]:
             recomputed_cross_author_moves = 1
+        if (
+            promoted_guard["e_admissibility"] != "admissible"
+            or demoted_guard["e_admissibility"] != "admissible"
+            or promoted_guard["e_resonance_milli"]
+            + _E_RESONANCE_MAX_REGRESSION_MILLI
+            < demoted_guard["e_resonance_milli"]
+        ):
+            recomputed_e_admissibility_moves = 1
         if (
             reconstructed_c[swap["to_index"]] != swap["demoted_id"]
             or reconstructed_c[swap["from_index"]] != swap["promoted_id"]
@@ -931,6 +1148,13 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
         raise ValueError("invalid E chord receipt contract")
     if row["arms"]["c"] != reconstructed_c:
         raise ValueError("invalid E chord receipt contract")
+    if row["a_cohort_status"] == "pure_semantic":
+        if row["arms"]["a"] != pre_e_cohort_ids:
+            raise ValueError("invalid E chord receipt contract")
+    elif row["arms"]["a"] != row["arms"]["b"]:
+        # An unscorable turn gets a neutral B placeholder, never a fabricated
+        # "pure semantic" arm.
+        raise ValueError("invalid E chord receipt contract")
     same_pool = all(
         len(row["arms"][arm]) == len(pool_ids)
         and set(row["arms"][arm]) == set(pool_ids)
@@ -952,6 +1176,7 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
         "cross_relevance_moves",
         "fact_moves",
         "cross_author_moves",
+        "e_admissibility_moves",
         "zero_to_nonzero",
         "external_api_delta",
     }
@@ -973,6 +1198,8 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
         or diagnostics["cross_event_moves"] != recomputed_cross_event_moves
         or diagnostics["fact_moves"] != recomputed_fact_moves
         or diagnostics["cross_author_moves"] != recomputed_cross_author_moves
+        or diagnostics["e_admissibility_moves"]
+        != recomputed_e_admissibility_moves
     ):
         raise ValueError("invalid E chord receipt contract")
     recomputed_displacement = max(
@@ -991,6 +1218,7 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
         + diagnostics["cross_relevance_moves"]
         + diagnostics["fact_moves"]
         + diagnostics["cross_author_moves"]
+        + diagnostics["e_admissibility_moves"]
         + diagnostics["zero_to_nonzero"]
     )
     if diagnostics["hard_violation_count"] != expected_hard_count:
@@ -1065,9 +1293,12 @@ _FINAL_SELECTION_KEYS = frozenset({
     "projection_digest",
     "attempt_index",
     "pool_ids",
+    "final_input_cohort_ids",
+    "final_input_cohort_status",
     "final_injected_ids",
     "outside_pool_ids",
     "arms",
+    "applied_swaps",
     "request_path_delta_ms",
 })
 
@@ -1093,6 +1324,20 @@ def validate_final_selection(value: object) -> dict[str, Any]:
     ):
         raise ValueError("invalid E chord final selection contract")
     pool_ids = _validated_id_list(value.get("pool_ids"))
+    final_input_ids = _validated_id_list(value.get("final_input_cohort_ids"))
+    if len(final_input_ids) > 50 or not set(final_input_ids) <= set(pool_ids):
+        raise ValueError("invalid E chord final selection contract")
+    if final_input_ids != [
+        bucket_id for bucket_id in pool_ids if bucket_id in set(final_input_ids)
+    ]:
+        raise ValueError("invalid E chord final selection contract")
+    expected_final_cohort_status = (
+        "pure_same_cohort"
+        if final_input_ids == pool_ids
+        else "unscorable_final_cohort_drift"
+    )
+    if value.get("final_input_cohort_status") != expected_final_cohort_status:
+        raise ValueError("invalid E chord final selection contract")
     final_ids = _validated_id_list(value.get("final_injected_ids"))
     outside_ids = _validated_id_list(value.get("outside_pool_ids"))
     if len(final_ids) > 32 or len(outside_ids) > 32:
@@ -1108,6 +1353,53 @@ def validate_final_selection(value: object) -> dict[str, Any]:
         if len(arm_ids) > 32 or not set(arm_ids) <= pool:
             raise ValueError("invalid E chord final selection contract")
     if arms["b"] != [bucket_id for bucket_id in final_ids if bucket_id in pool]:
+        raise ValueError("invalid E chord final selection contract")
+    if (
+        expected_final_cohort_status != "pure_same_cohort"
+        and arms["a"] != arms["b"]
+    ):
+        raise ValueError("invalid E chord final selection contract")
+    if len(arms["c"]) != len(arms["b"]) or set(arms["c"]) != set(arms["b"]):
+        raise ValueError("invalid E chord final selection contract")
+    applied_swaps = value.get("applied_swaps")
+    if type(applied_swaps) is not list or len(applied_swaps) > len(arms["b"]) // 2:
+        raise ValueError("invalid E chord final selection contract")
+    reconstructed_c = list(arms["b"])
+    used_event_locks: set[str] = set()
+    moved_ids: set[str] = set()
+    for swap in applied_swaps:
+        if type(swap) is not dict or set(swap) != _SWAP_KEYS:
+            raise ValueError("invalid E chord final selection contract")
+        promoted_id = swap.get("promoted_id")
+        demoted_id = swap.get("demoted_id")
+        from_index = swap.get("from_index")
+        to_index = swap.get("to_index")
+        event_lock_digest = swap.get("event_lock_digest")
+        if (
+            _safe_id(promoted_id) is None
+            or _safe_id(demoted_id) is None
+            or promoted_id not in reconstructed_c
+            or demoted_id not in reconstructed_c
+            or type(from_index) is not int
+            or type(to_index) is not int
+            or from_index != to_index + 1
+            or not 0 <= to_index < from_index < len(reconstructed_c)
+            or type(event_lock_digest) is not str
+            or _HEX16_RE.fullmatch(event_lock_digest) is None
+            or reconstructed_c[to_index] != demoted_id
+            or reconstructed_c[from_index] != promoted_id
+            or event_lock_digest in used_event_locks
+            or promoted_id in moved_ids
+            or demoted_id in moved_ids
+        ):
+            raise ValueError("invalid E chord final selection contract")
+        reconstructed_c[to_index], reconstructed_c[from_index] = (
+            reconstructed_c[from_index],
+            reconstructed_c[to_index],
+        )
+        used_event_locks.add(event_lock_digest)
+        moved_ids.update((promoted_id, demoted_id))
+    if arms["c"] != reconstructed_c:
         raise ValueError("invalid E chord final selection contract")
     elapsed = _finite(value.get("request_path_delta_ms"))
     if elapsed is None or elapsed < 0:

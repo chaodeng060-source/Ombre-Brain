@@ -76,6 +76,9 @@ def _candidate(
     relevance=0.8,
     relevance_band=0,
     fact=False,
+    query_valence=0.0,
+    experience_valence=0.0,
+    e_resonance=0.8,
 ):
     metadata = {"event_id": event, "type": "experience"}
     if fact:
@@ -91,7 +94,11 @@ def _candidate(
             "response_tendency": tendency,
             "confidence": 0.9,
             "authored_by": author,
+            "valence": experience_valence,
         },
+        "_e_axis_query_valence": query_valence,
+        "_e_axis_resonance": e_resonance,
+        "_e_axis_admissibility_floor": 0.55,
     }
 
 
@@ -104,12 +111,19 @@ def _final_selection(**overrides):
         "projection_digest": "c" * 64,
         "attempt_index": 0,
         "pool_ids": ["one"],
+        "final_input_cohort_ids": ["one"],
+        "final_input_cohort_status": "pure_same_cohort",
         "final_injected_ids": [],
         "outside_pool_ids": [],
         "arms": {"a": [], "b": [], "c": []},
+        "applied_swaps": [],
         "request_path_delta_ms": 0.25,
     }
     value.update(overrides)
+    if "final_input_cohort_ids" not in overrides:
+        value["final_input_cohort_ids"] = list(value["pool_ids"])
+    if "final_input_cohort_status" not in overrides:
+        value["final_input_cohort_status"] = "pure_same_cohort"
     return value
 
 
@@ -213,6 +227,58 @@ def test_wrong_event_wrong_author_fact_and_far_tie_never_move(left, right, reaso
     assert reason in proposal.skipped_reasons
 
 
+def test_same_event_opposite_affect_near_tie_is_not_e_admissible():
+    rows = [
+        _candidate(
+            "correct-affect",
+            tendency="engage",
+            e_score=0.51,
+            query_valence=-0.8,
+            experience_valence=-0.7,
+            e_resonance=0.9,
+        ),
+        _candidate(
+            "opposite-affect",
+            tendency="comfort",
+            e_score=0.50,
+            query_valence=-0.8,
+            experience_valence=0.8,
+            e_resonance=0.2,
+        ),
+    ]
+
+    proposal = propose_chord_reorder(rows, _parse(), near_tie_epsilon=0.03)
+
+    assert proposal.c_ids == proposal.b_ids
+    assert "e_admissibility" in proposal.skipped_reasons
+
+
+def test_chord_cannot_promote_materially_weaker_existing_e_resonance():
+    rows = [
+        _candidate(
+            "stronger-e",
+            tendency="engage",
+            e_score=0.51,
+            query_valence=-0.8,
+            experience_valence=-0.7,
+            e_resonance=0.90,
+        ),
+        _candidate(
+            "weaker-e",
+            tendency="comfort",
+            e_score=0.50,
+            query_valence=-0.8,
+            experience_valence=-0.6,
+            e_resonance=0.70,
+        ),
+    ]
+
+    proposal = propose_chord_reorder(rows, _parse(), near_tie_epsilon=0.03)
+
+    assert proposal.c_ids == proposal.b_ids
+    assert "e_resonance" in proposal.skipped_reasons
+
+
 def test_missing_explicit_event_lock_and_zero_candidates_are_noops():
     unlocked = [_candidate("left"), _candidate("right", tendency="comfort")]
     for row in unlocked:
@@ -303,6 +369,9 @@ def test_receipt_has_same_frozen_pool_and_no_private_text_or_session_identifiers
     receipt = build_shadow_receipt(
         chord=_parse(),
         payload_status="accepted",
+        pre_e_cohort_ids=["comfort", "plain"],
+        post_e_cohort_ids=["plain", "comfort"],
+        ds_decision_source="disabled",
         a_candidates=list(reversed(b_rows)),
         b_candidates=b_rows,
         proposal=proposal,
@@ -342,6 +411,9 @@ def test_receipt_validator_rejects_tampered_candidate_policy_guards():
     receipt = build_shadow_receipt(
         chord=chord,
         payload_status="accepted",
+        pre_e_cohort_ids=["plain", "comfort"],
+        post_e_cohort_ids=["plain", "comfort"],
+        ds_decision_source="disabled",
         a_candidates=rows,
         b_candidates=rows,
         proposal=propose_chord_reorder(rows, chord, near_tie_epsilon=0.03),
@@ -356,6 +428,115 @@ def test_receipt_validator_rejects_tampered_candidate_policy_guards():
     with pytest.raises(ValueError, match="receipt contract"):
         validate_shadow_receipt(tampered)
 
+    tampered = copy.deepcopy(receipt)
+    tampered["candidate_guards"][1]["e_admissibility"] = "opposite_affect"
+    with pytest.raises(ValueError, match="receipt contract"):
+        validate_shadow_receipt(tampered)
+
+
+def test_a_cohort_fails_closed_for_model_ds_and_membership_drift():
+    from e_chord_shadow import validate_shadow_receipt
+
+    rows = [
+        _candidate("plain", tendency="engage", e_score=0.52),
+        _candidate("comfort", tendency="comfort", e_score=0.50),
+    ]
+    chord = _parse()
+    proposal = propose_chord_reorder(rows, chord, near_tie_epsilon=0.03)
+
+    model = build_shadow_receipt(
+        chord=chord,
+        payload_status="accepted",
+        pre_e_cohort_ids=["comfort", "plain"],
+        post_e_cohort_ids=["plain", "comfort"],
+        ds_decision_source="model",
+        a_candidates=list(reversed(rows)),
+        b_candidates=rows,
+        proposal=proposal,
+        attempt_index=0,
+        first_screen_limit=1,
+        request_path_delta_ms=0.1,
+        recorded_at_ms=NOW_MS,
+    )
+    assert model["a_cohort_status"] == "unscorable_ds_model"
+    assert model["arms"]["a"] == model["arms"]["b"]
+    assert validate_shadow_receipt(model) is model
+
+    drift = build_shadow_receipt(
+        chord=chord,
+        payload_status="accepted",
+        pre_e_cohort_ids=["comfort", "plain", "dropped"],
+        post_e_cohort_ids=["plain", "comfort"],
+        ds_decision_source="disabled",
+        a_candidates=list(reversed(rows)),
+        b_candidates=rows,
+        proposal=proposal,
+        attempt_index=0,
+        first_screen_limit=1,
+        request_path_delta_ms=0.1,
+        recorded_at_ms=NOW_MS,
+    )
+    assert drift["a_cohort_status"] == "unscorable_cohort_drift"
+    assert drift["arms"]["a"] == drift["arms"]["b"]
+    assert validate_shadow_receipt(drift) is drift
+
+
+def test_a_cohort_fails_closed_when_a_downstream_gate_only_reorders_b():
+    from e_chord_shadow import _a_cohort_status
+
+    assert _a_cohort_status(
+        ["current", "other", "historical"],
+        ["current", "other", "historical"],
+        ["historical", "current", "other"],
+        "disabled",
+    ) == "unscorable_downstream_order"
+
+
+@pytest.mark.asyncio
+async def test_existing_ds_call_records_decision_source_without_a_second_call(
+    monkeypatch,
+):
+    import server
+
+    rows = [_candidate("a"), _candidate("b")]
+    capture = {}
+    token = server._ds_filter_decision_capture.set(capture)
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "0")
+    try:
+        await server._ds_filter_candidates(
+            "same query",
+            rows,
+            mode="search",
+            max_results=2,
+        )
+    finally:
+        server._ds_filter_decision_capture.reset(token)
+    assert capture == {"source": "disabled"}
+
+    calls = 0
+
+    async def one_model_decision(_query, buckets, _keep, _max_results):
+        nonlocal calls
+        calls += 1
+        return buckets
+
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+    monkeypatch.setattr(server, "_ds_semantic_select", one_model_decision)
+    capture = {}
+    token = server._ds_filter_decision_capture.set(capture)
+    try:
+        await server._ds_filter_candidates(
+            "same query",
+            rows,
+            mode="search",
+            max_results=2,
+        )
+    finally:
+        server._ds_filter_decision_capture.reset(token)
+    assert calls == 1
+    assert capture == {"source": "model"}
+
 
 def test_private_ledger_is_append_only_and_mode_hardened(tmp_path):
     chord = _parse()
@@ -364,6 +545,9 @@ def test_private_ledger_is_append_only_and_mode_hardened(tmp_path):
     receipt = build_shadow_receipt(
         chord=chord,
         payload_status="accepted",
+        pre_e_cohort_ids=["one"],
+        post_e_cohort_ids=["one"],
+        ds_decision_source="disabled",
         a_candidates=rows,
         b_candidates=rows,
         proposal=proposal,
@@ -389,6 +573,9 @@ def test_private_ledger_serializes_concurrent_background_appends(tmp_path):
     receipt = build_shadow_receipt(
         chord=chord,
         payload_status="accepted",
+        pre_e_cohort_ids=["one"],
+        post_e_cohort_ids=["one"],
+        ds_decision_source="disabled",
         a_candidates=rows,
         b_candidates=rows,
         proposal=propose_chord_reorder(rows, chord),
@@ -415,6 +602,9 @@ def test_ledger_rejects_raw_text_and_nonfinite_receipts(tmp_path):
     valid = build_shadow_receipt(
         chord=chord,
         payload_status="accepted",
+        pre_e_cohort_ids=["one"],
+        post_e_cohort_ids=["one"],
+        ds_decision_source="disabled",
         a_candidates=rows,
         b_candidates=rows,
         proposal=propose_chord_reorder(rows, chord),
@@ -451,6 +641,25 @@ def test_final_selection_ledger_is_private_idempotent_and_conflict_safe(tmp_path
 def test_final_selection_validator_binds_actual_injection_and_pool_boundary():
     assert validate_final_selection(_final_selection())["arms"]["b"] == []
 
+    drift = _final_selection(
+        pool_ids=["one", "two"],
+        final_input_cohort_ids=["one"],
+        final_input_cohort_status="unscorable_final_cohort_drift",
+        final_injected_ids=["one"],
+        arms={"a": ["one"], "b": ["one"], "c": ["one"]},
+    )
+    assert validate_final_selection(drift)["final_input_cohort_ids"] == ["one"]
+
+    forged_status = copy.deepcopy(drift)
+    forged_status["final_input_cohort_status"] = "pure_same_cohort"
+    with pytest.raises(ValueError, match="final selection contract"):
+        validate_final_selection(forged_status)
+
+    fabricated_a = copy.deepcopy(drift)
+    fabricated_a["arms"]["a"] = ["two"]
+    with pytest.raises(ValueError, match="final selection contract"):
+        validate_final_selection(fabricated_a)
+
     mismatched = _final_selection(final_injected_ids=["one"])
     with pytest.raises(ValueError, match="final selection contract"):
         validate_final_selection(mismatched)
@@ -460,6 +669,36 @@ def test_final_selection_validator_binds_actual_injection_and_pool_boundary():
         outside_pool_ids=["other"],
     )
     assert validate_final_selection(outside)["outside_pool_ids"] == ["other"]
+
+
+def test_final_selection_validator_reconstructs_only_declared_boundary_swaps():
+    swap = {
+        "promoted_id": "b",
+        "demoted_id": "a",
+        "from_index": 1,
+        "to_index": 0,
+        "event_lock_digest": "0" * 16,
+    }
+    valid = _final_selection(
+        pool_ids=["a", "b", "c"],
+        final_injected_ids=["a", "b", "c"],
+        arms={"a": ["a", "b", "c"], "b": ["a", "b", "c"], "c": ["b", "a", "c"]},
+        applied_swaps=[swap],
+    )
+    assert validate_final_selection(valid)["arms"]["c"] == ["b", "a", "c"]
+
+    forged = copy.deepcopy(valid)
+    forged["arms"]["c"] = ["b", "c", "a"]
+    with pytest.raises(ValueError, match="final selection contract"):
+        validate_final_selection(forged)
+
+    zero_to_nonzero = _final_selection(
+        pool_ids=["a", "b"],
+        arms={"a": [], "b": [], "c": ["b"]},
+        applied_swaps=[],
+    )
+    with pytest.raises(ValueError, match="final selection contract"):
+        validate_final_selection(zero_to_nonzero)
 
 
 def test_server_shadow_hook_keeps_served_b_and_writes_one_text_free_receipt(
@@ -496,7 +735,10 @@ def test_server_shadow_hook_keeps_served_b_and_writes_one_text_free_receipt(
             raw_chord=payload,
             expected_turn_id="turn-abc123",
             expected_agent_id="claude",
+            a_candidates=list(reversed(rows)),
+            post_e_candidates=rows,
             b_candidates=rows,
+            ds_decision_source="disabled",
             chord_config=load_e_chord_shadow_config(server.config),
             prelude_elapsed_ms=0.0,
             attempt_index=0,
@@ -510,10 +752,69 @@ def test_server_shadow_hook_keeps_served_b_and_writes_one_text_free_receipt(
 
     assert rows == before
     assert receipt is not None
+    assert receipt["arms"]["a"] == ["comfort", "plain"]
     assert receipt["arms"]["b"] == ["plain", "comfort"]
     assert receipt["arms"]["c"] == ["comfort", "plain"]
     assert written == [receipt]
     assert written[0]["diagnostics"]["external_api_delta"] == 0
+
+
+def test_server_shadow_hook_marks_post_e_state_reorder_unscorable(monkeypatch):
+    import server
+
+    written = []
+
+    class _Ledger:
+        def append(self, row):
+            written.append(copy.deepcopy(row))
+
+    async def _inline_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    pre_and_post_e = [
+        _candidate("current"),
+        _candidate("other"),
+        _candidate("historical"),
+    ]
+    post_state_b = [
+        pre_and_post_e[2],
+        pre_and_post_e[0],
+        pre_and_post_e[1],
+    ]
+    monkeypatch.setitem(server.config, "e_chord_shadow", {
+        "enabled": True,
+        "mode": "shadow",
+        "near_tie_epsilon": 0.03,
+        "max_age_ms": 30_000,
+    })
+    monkeypatch.setattr(server, "_get_e_chord_shadow_ledger", lambda: _Ledger())
+    monkeypatch.setattr(server.asyncio, "to_thread", _inline_to_thread)
+
+    async def _run():
+        receipt = await server._record_e_chord_shadow(
+            raw_chord=_payload(captured_at_ms=int(server.time.time() * 1000)),
+            expected_turn_id="turn-abc123",
+            expected_agent_id="claude",
+            a_candidates=pre_and_post_e,
+            post_e_candidates=pre_and_post_e,
+            b_candidates=post_state_b,
+            ds_decision_source="disabled",
+            chord_config=load_e_chord_shadow_config(server.config),
+            prelude_elapsed_ms=0.0,
+            attempt_index=0,
+            first_screen_limit=3,
+        )
+        if server._e_chord_shadow_write_tasks:
+            await asyncio.gather(*tuple(server._e_chord_shadow_write_tasks))
+        return receipt
+
+    receipt = asyncio.run(_run())
+
+    assert receipt is not None
+    assert receipt["a_cohort_status"] == "unscorable_downstream_order"
+    assert receipt["arms"]["a"] == receipt["arms"]["b"]
+    assert receipt["post_e_cohort_ids"] == ["current", "other", "historical"]
+    assert written == [receipt]
 
 
 def test_server_shadow_hook_rejects_cross_turn_projection_without_writing(
@@ -543,7 +844,10 @@ def test_server_shadow_hook_rejects_cross_turn_projection_without_writing(
         raw_chord=_payload(captured_at_ms=int(server.time.time() * 1000)),
         expected_turn_id="another-turn",
         expected_agent_id="claude",
+        a_candidates=[_candidate("one")],
+        post_e_candidates=[_candidate("one")],
         b_candidates=[_candidate("one")],
+        ds_decision_source="disabled",
         chord_config=load_e_chord_shadow_config(server.config),
         prelude_elapsed_ms=0.0,
         attempt_index=0,

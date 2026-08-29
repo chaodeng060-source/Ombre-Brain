@@ -2,38 +2,71 @@
 
 This feature is deliberately not a new recall channel. Twin attaches one
 `live_chord.v1` object to the existing `/api/breath` request. Ombre validates
-that object against the same request's turn and agent, waits until all semantic,
-state, session, anchor and DS filters have produced the retained candidate pool,
-and then computes a private arm-C proposal. The `/api/breath` response carries
+that object against the same request's turn and agent, freezes a pre-E cohort,
+then waits until all existing E, state, session, anchor and DS filters have
+produced the retained candidate pool and computes a private arm-C proposal. The `/api/breath` response carries
 that text-free proposal back to Twin, but the served list remains arm B.
 
 ## Ordering boundary
 
-The three arms use the exact same retained candidate objects:
+The receipt distinguishes an honest baseline from an unscorable placeholder:
 
-- A: existing relevance and non-E tie score, recomputed over B's frozen pool;
+- A: relevance plus the non-E tie score, frozen before existing E ordering and
+  before every later first-wins or subtractive gate;
 - B: the current E-aware order that production already uses;
 - C: B plus the chord proposal, recorded but never returned.
+
+`pre_e_cohort_ids` records that original text-free cohort, while
+`post_e_cohort_ids` freezes the order immediately after existing-E ranking and
+before every downstream gate. A receipt may say
+`a_cohort_status=pure_semantic` only when final B exactly matches that post-E
+order, all three cohorts have the same IDs, and the existing DS path reports
+`disabled` or `deterministic_noop`. A real
+model-derived DS decision, a DS fallback, an unobserved decision source, or any
+membership or order change from cap/dedupe/session/anchor/fact gates makes the whole turn
+`unscorable_*`. In that case `arms.a` is canonically set to B, never presented
+as a post-hoc "pure semantic" ablation. The existing DS prompt, candidate cap,
+served B result and number of provider calls are unchanged; the shadow adds no
+second decision call and never widens the existing prompt.
 
 C can swap only adjacent candidates. Both candidates must already be
 primary-authored E records by the chord's reviewed author identity, share an explicit
 `event_id` or `episode_id`, be non-factual, and fall within
 `near_tie_epsilon` under B. They must also share the relevance-band ID frozen
-before any subtractive DS/session gate; bands are never reconstructed from a
-filtered subset. A matching response tendency contributes a
+before any subtractive gate; bands are never reconstructed from a filtered
+subset. Each candidate must pass the recorded existing-E admissibility guard:
+an authenticated E annotation is present, resonance is at least the configured
+floor (never below 0.55), and non-neutral input/experience polarities do not
+oppose each other. The promoted candidate's resonance may be at most 0.03 below
+the demoted candidate's. The guard stores only booleans, integer milli-scores
+and `-1/0/1` polarities; the validator recomputes its enum. A matching response tendency contributes a
 non-negative affinity. C may make at most one adjacent swap per event lock and
 no candidate may move more than one position. It cannot add a candidate, revive
 a filtered result, cross an event lock, move a fact, or turn zero candidates
 into a non-zero result.
 
 Ombre's retained top-k is not treated as the visible prompt. Twin still applies
-its existing scene/domain/noise filters and local reranker. It replays the same
-post-filter blocks through the frozen A/B/C orderings, verifies that B exactly
-matches the IDs actually committed to the prompt, and attaches one text-free
+its existing scene/domain/noise filters, local reranker, dedupe and prompt
+cutoff. Final C is derived only from the IDs actually committed as final B:
+Twin applies the validated receipt pairs only when every pair survives and
+remains adjacent in demoted/promoted order. If any pair is missing, separated,
+or unsafe, the entire final C arm falls back to B with no applied swaps.
+Cutoff-excluded IDs can never enter C. Consequently final B and C have exactly
+the same length and candidate set, empty B implies empty C, unrelated IDs never
+move, and facts never move. Twin records the applied pairs with the exact fields
+`promoted_id`, `demoted_id`, `from_index`, `to_index`, and
+`event_lock_digest`; indices are positions in final B immediately before that
+swap and must satisfy `from_index=to_index+1`. It verifies that B exactly matches
+the IDs actually committed to the prompt, and attaches one text-free
 `e_chord_final_selection.v1` object to the existing `/api/recall-receipt`
 request. Empty final injection is recorded too. An ID outside the frozen pool
 is retained as an explicit diagnostic and makes the case unscorable; it is
 never silently discarded. No extra external/provider API is introduced.
+`final_input_cohort_ids` freezes the primary B order after Twin's local filters
+but before its final reranker. Only an exact ordered match with the Ombre pool
+may use `final_input_cohort_status=pure_same_cohort`. Any membership or order
+drift is `unscorable_final_cohort_drift`, forces final A=B, and is excluded
+from quality scoring while its full latency remains in P95.
 Non-empty recall reuses the existing background `/api/recall-receipt` call;
 an empty final selection uses that same internal endpoint so the zero can be
 audited even though there are no activation IDs.
@@ -57,7 +90,8 @@ turn and agent. Window retries reuse the same immutable projection and carry
 monotonic attempt indices. The final-selection receipt names the one attempt
 Twin actually served; missing, duplicate or later attempts fail closed.
 Evaluation sums every attempted Ombre proposal plus Twin's final local
-simulation when computing added latency.
+simulation when computing added latency, including turns whose quality arms
+are excluded as unscorable.
 
 The private Ombre attempt ledger lives at
 `<buckets_dir>/.axis/e-chord-shadow.jsonl`; Twin's authoritative post-filter
@@ -68,6 +102,7 @@ conflicting rows for one projection are rejected. Attempt-ledger fsync runs in
 an observed background task, not on the recall response path; worker-side file
 locking is blocking so concurrent turns serialize instead of dropping samples.
 The ledgers store only candidate IDs, frozen relevance band IDs, A/B/C ordering,
+cohort/DS decision status, applied swap metadata, existing-E guard integers,
 opaque source-turn, projection and event-lock digests, bounded diagnostics and
 measured request-path shadow overhead. They store no
 query, memory body, drive key, motivation, session scope or turn ID. The code
@@ -105,20 +140,27 @@ receipt, final selection and gold digest sets to match exactly. It rejects
 partial or selective gold, ambiguous retries, pool drift, mutated source lines,
 non-finite values, duplicate case/turn/digest keys and any non-zero
 external-call delta. A final selection must follow its selected attempt in
-time, stay within the declared visible cutoff, and identical shadow-arm inputs
-must produce identical Twin outputs; otherwise the batch is rejected. Metrics
+time, stay within the declared visible cutoff, reconstruct C exactly from final
+B plus receipt-bound safe swaps, and preserve the final B candidate set.
+Factual, cross-event, cross-author, non-admissible or fabricated applied swaps
+are rejected. Unscorable A cohorts are excluded turn-by-turn and reported by
+reason count. Metrics
 come only from Twin's final A/B/C selections, not
 Ombre's pre-Twin top-k. It reports precision, noise, completeness, gold-zero
 recall (`correct_zero_rate`) and predicted-zero precision, plus nearest-rank P95
 of every attempt and final-selection overhead.
 
-A mechanically good cohort needs at least 20 fully labelled natural turns, C
-precision and both zero metrics no worse than B, strictly better completeness,
+A mechanically good cohort would need at least 20 fully labelled natural turns,
+C precision and both zero metrics no worse than B, strictly better completeness,
 no higher noise, no hard violation, no outside-pool injection, zero
-external-call delta and P95 within budget. Even then the tool returns
-`candidate_for_named_review`, never `eligible_for_live`; exit code 3 requires a
-named independent reviewer. `failed` and `inconclusive` also return non-zero, so
-automation cannot confuse a candidate or unscored cohort with live approval.
+external-call delta and P95 within budget. This contract deliberately requires
+final B and C to have the same set, so set-based precision, noise and
+completeness are identical and the strict completeness-improvement gate is
+unreachable. The current evaluator therefore remains `inconclusive` and cannot
+authorize live use, even with a clean 20-turn cohort. `candidate_for_named_review`
+is retained only as a future schema gate; `eligible_for_live` is always false.
+All statuses return non-zero, so automation cannot confuse an unscored cohort
+with live approval.
 `annotated_by` is auditable attribution, not a cryptographic human signature;
 the required named Claude/human final review remains an independent release
 approval and cannot be replaced by the evaluator itself.

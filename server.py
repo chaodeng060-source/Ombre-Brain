@@ -283,6 +283,10 @@ _e_chord_shadow_response_capture = contextvars.ContextVar(
     "ombre_e_chord_shadow_response_capture",
     default=None,
 )
+_ds_filter_decision_capture = contextvars.ContextVar(
+    "ombre_ds_filter_decision_capture",
+    default=None,
+)
 
 
 class RecallOperationalError(RuntimeError):
@@ -1955,12 +1959,25 @@ async def _ds_filter_candidates(
     明确采用 Anchor 对话策略并传入 ``allow_empty=True`` 时，合法 ``keep: []``
     才会安静返回空。
     """
+    decision_capture = _ds_filter_decision_capture.get()
+
+    def record_decision(source: str) -> None:
+        if isinstance(decision_capture, dict):
+            decision_capture["source"] = source
+
     if max_results <= 0:
+        record_decision("deterministic_noop")
         return []
     keep = force_keep_ids or set()
     capped = _cap_candidates_preserving_forced(candidates, keep, max_results)
+    gate_enabled = _ds_gate_enabled(mode)
 
-    if not _ds_gate_enabled(mode) or not query or not capped:
+    if not gate_enabled or not query or not capped:
+        record_decision(
+            "disabled"
+            if not gate_enabled or not query
+            else "deterministic_noop"
+        )
         logger.debug(
             "DS filter stub mode=%s query=%r input=%d output=%d",
             mode,
@@ -1978,6 +1995,7 @@ async def _ds_filter_candidates(
     if (len(capped) == 1 and not allow_empty) or all(
         bucket.get("id") in keep for bucket in capped
     ):
+        record_decision("deterministic_noop")
         logger.debug(
             "DS filter deterministic no-op mode=%s query=%r capped=%d",
             mode,
@@ -1992,6 +2010,7 @@ async def _ds_filter_candidates(
             timeout=_ds_gate_timeout(),
         )
     except Exception as e:
+        record_decision("fallback")
         logger.warning(
             "DS filter fell back to stub / 门控回退裁剪集合 (%s): %s",
             type(e).__name__, e,
@@ -1999,6 +2018,7 @@ async def _ds_filter_candidates(
         return capped
 
     result = kept if kept or allow_empty else capped
+    record_decision("model")
     logger.info(
         "DS filter mode=%s query=%r input=%d capped=%d kept=%d",
         mode, query[:80], len(candidates), len(capped), len(result),
@@ -3943,7 +3963,10 @@ async def _record_e_chord_shadow(
     raw_chord: object,
     expected_turn_id: str,
     expected_agent_id: str,
+    a_candidates: list[dict],
+    post_e_candidates: list[dict],
     b_candidates: list[dict],
+    ds_decision_source: str,
     chord_config: EChordShadowConfig,
     prelude_elapsed_ms: float,
     attempt_index: int,
@@ -3966,13 +3989,6 @@ async def _record_e_chord_shadow(
         logger.info("E chord shadow payload rejected: %s", payload_status)
         return None
 
-    # A is recomputed only over B's already-retained frozen candidate objects.
-    # It removes the current E tie-break signal but does not re-run retrieval,
-    # query expansion, embeddings, DS, or any external model.
-    a_candidates = rank_within_frozen_relevance_bands(
-        list(b_candidates),
-        score_key="_pre_e_tie_break_score",
-    )
     proposal = propose_chord_reorder(
         b_candidates,
         chord,
@@ -3981,6 +3997,13 @@ async def _record_e_chord_shadow(
     receipt = build_shadow_receipt(
         chord=chord,
         payload_status=payload_status,
+        pre_e_cohort_ids=[
+            str(candidate.get("id") or "") for candidate in a_candidates
+        ],
+        post_e_cohort_ids=[
+            str(candidate.get("id") or "") for candidate in post_e_candidates
+        ],
+        ds_decision_source=ds_decision_source,
         a_candidates=a_candidates,
         b_candidates=b_candidates,
         proposal=proposal,
@@ -4604,16 +4627,42 @@ async def breath(
     )
     chord_shadow_config = None
     chord_shadow_prelude_ms = 0.0
+    chord_shadow_a_candidates: list[dict] = []
+    chord_shadow_post_e_candidates: list[dict] = []
+    chord_shadow_ds_decision_source = "unobserved"
     if live_chord is not None:
         try:
             candidate_config = load_e_chord_shadow_config(config)
             if candidate_config.enabled:
                 chord_shadow_started_at = time.perf_counter()
+                admissibility_floor = max(
+                    0.55,
+                    float(
+                        e_recall_cfg.side_channel_min_resonance
+                        if e_recall_cfg is not None else 0.55
+                    ),
+                )
                 band_by_id = frozen_relevance_band_ids(matches, fused_band)
                 for bucket in matches:
+                    bucket["_e_axis_query_valence"] = (
+                        e_query_emotion.valence
+                        if e_query_emotion is not None else None
+                    )
+                    bucket["_e_axis_admissibility_floor"] = admissibility_floor
                     bucket_id = str(bucket.get("id") or "")
                     if bucket_id in band_by_id:
                         bucket["_e_chord_relevance_band_id"] = band_by_id[bucket_id]
+                # Freeze the only honest semantic A before existing-E order
+                # and every later first-wins/subtractive gate.  If those gates
+                # change membership or DS makes a model/fallback decision, the
+                # receipt marks the turn unscorable rather than rebuilding A
+                # post hoc from B.
+                chord_shadow_a_candidates = list(
+                    rank_within_frozen_relevance_bands(
+                        matches,
+                        score_key="_pre_e_tie_break_score",
+                    )
+                )
                 chord_shadow_prelude_ms = (
                     time.perf_counter() - chord_shadow_started_at
                 ) * 1000
@@ -4635,6 +4684,12 @@ async def breath(
         ),
         band_width=fused_band,
     )
+    if chord_shadow_config is not None:
+        post_e_freeze_started_at = time.perf_counter()
+        chord_shadow_post_e_candidates = list(matches)
+        chord_shadow_prelude_ms += (
+            time.perf_counter() - post_e_freeze_started_at
+        ) * 1000
 
     matches, content_suppressed, content_fingerprint_errors = _dedupe_recall_content(matches)
     if content_suppressed or content_fingerprint_errors:
@@ -4686,14 +4741,40 @@ async def breath(
             state_profile=state_profile,
         ))
     with recall_stage("ds_filter"):
-        matches = await _ds_filter_candidates(
-            recall_query,
-            matches,
-            mode="search",
-            max_results=max(0, max_results - len(state_link_candidates)),
-            force_keep_ids=_exact_retrieval_key_ids(recall_query, matches),
-            allow_empty=allow_empty_recall,
-        )
+        if chord_shadow_config is None:
+            matches = await _ds_filter_candidates(
+                recall_query,
+                matches,
+                mode="search",
+                max_results=max(0, max_results - len(state_link_candidates)),
+                force_keep_ids=_exact_retrieval_key_ids(recall_query, matches),
+                allow_empty=allow_empty_recall,
+            )
+        else:
+            ds_decision_capture: dict[str, str] = {}
+            ds_capture_token = _ds_filter_decision_capture.set(
+                ds_decision_capture
+            )
+            try:
+                matches = await _ds_filter_candidates(
+                    recall_query,
+                    matches,
+                    mode="search",
+                    max_results=max(
+                        0,
+                        max_results - len(state_link_candidates),
+                    ),
+                    force_keep_ids=_exact_retrieval_key_ids(
+                        recall_query,
+                        matches,
+                    ),
+                    allow_empty=allow_empty_recall,
+                )
+            finally:
+                _ds_filter_decision_capture.reset(ds_capture_token)
+            chord_shadow_ds_decision_source = str(
+                ds_decision_capture.get("source") or "unobserved"
+            )
     # Freeze the full post-DS pool before X can reserve a displayed slot.  Arm
     # C still never escapes this pool; the actual displayed primary cutoff is
     # known only after X preflight and token/dehydration rendering below.
@@ -5046,7 +5127,10 @@ async def breath(
                 raw_chord=live_chord,
                 expected_turn_id=str(turn_id or ""),
                 expected_agent_id=str(agent_id or ""),
+                a_candidates=chord_shadow_a_candidates,
+                post_e_candidates=chord_shadow_post_e_candidates,
                 b_candidates=chord_shadow_b_candidates,
+                ds_decision_source=chord_shadow_ds_decision_source,
                 chord_config=chord_shadow_config,
                 prelude_elapsed_ms=chord_shadow_prelude_ms,
                 attempt_index=attempt,

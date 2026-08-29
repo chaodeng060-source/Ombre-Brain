@@ -53,6 +53,10 @@ def _receipt(digest, *, pool, a, b, c, latency=0.2, attempt_index=0):
         "facet_count": 1,
         "attempt_index": attempt_index,
         "first_screen_limit": 1,
+        "pre_e_cohort_ids": list(a_arm),
+        "post_e_cohort_ids": list(b_arm),
+        "a_cohort_status": "pure_semantic",
+        "ds_decision_source": "disabled",
         "pool_ids": list(pool),
         "relevance_band_ids": [0 for _bucket_id in pool],
         "candidate_guards": [
@@ -61,6 +65,12 @@ def _receipt(digest, *, pool, a, b, c, latency=0.2, attempt_index=0):
                 "event_lock_digests": ["0" * 16],
                 "is_factual": False,
                 "author_match": True,
+                "has_e_annotation": True,
+                "e_resonance_milli": 800,
+                "e_resonance_floor_milli": 550,
+                "input_polarity": 0,
+                "experience_polarity": 0,
+                "e_admissibility": "admissible",
             }
             for bucket_id in pool
         ],
@@ -76,6 +86,7 @@ def _receipt(digest, *, pool, a, b, c, latency=0.2, attempt_index=0):
             "cross_relevance_moves": 0,
             "fact_moves": 0,
             "cross_author_moves": 0,
+            "e_admissibility_moves": 0,
             "zero_to_nonzero": 0,
             "external_api_delta": 0,
             "hard_violation_count": 0,
@@ -92,13 +103,44 @@ def _selection(
     c=None,
     latency=0.0,
     outside=None,
+    final_input=None,
 ):
     outside = list(outside or [])
     arms = {
         "a": list(receipt["first_screen"]["a"] if a is None else a),
         "b": list(receipt["first_screen"]["b"] if b is None else b),
-        "c": list(receipt["first_screen"]["c"] if c is None else c),
+        "c": [],
     }
+    applied_swaps = []
+    baseline_c = list(arms["b"])
+    expected_c = list(baseline_c)
+    for proposed in receipt["swaps"]:
+        demoted = proposed["demoted_id"]
+        promoted = proposed["promoted_id"]
+        if demoted not in expected_c or promoted not in expected_c:
+            applied_swaps = []
+            expected_c = baseline_c
+            break
+        to_index = expected_c.index(demoted)
+        from_index = expected_c.index(promoted)
+        if from_index != to_index + 1:
+            applied_swaps = []
+            expected_c = baseline_c
+            break
+        applied_swaps.append({
+            "promoted_id": promoted,
+            "demoted_id": demoted,
+            "from_index": from_index,
+            "to_index": to_index,
+            "event_lock_digest": proposed["event_lock_digest"],
+        })
+        expected_c[to_index], expected_c[from_index] = (
+            expected_c[from_index], expected_c[to_index]
+        )
+    arms["c"] = list(expected_c if c is None else c)
+    final_input_ids = list(
+        receipt["pool_ids"] if final_input is None else final_input
+    )
     return {
         "schema": "e_chord_final_selection.v1",
         "recorded_at_ms": receipt["recorded_at_ms"] + 10,
@@ -107,9 +149,16 @@ def _selection(
         "projection_digest": receipt["projection_digest"],
         "attempt_index": receipt["attempt_index"],
         "pool_ids": list(receipt["pool_ids"]),
+        "final_input_cohort_ids": final_input_ids,
+        "final_input_cohort_status": (
+            "pure_same_cohort"
+            if final_input_ids == receipt["pool_ids"]
+            else "unscorable_final_cohort_drift"
+        ),
         "final_injected_ids": arms["b"] + outside,
         "outside_pool_ids": outside,
         "arms": arms,
+        "applied_swaps": applied_swaps,
         "request_path_delta_ms": latency,
     }
 
@@ -139,7 +188,7 @@ def _gold(digest, *, case_id, expected, acceptable, noise, zero=False):
     }
 
 
-def test_evaluator_scores_same_pool_and_requires_strict_completeness_gain():
+def test_evaluator_same_final_set_is_inconclusive_for_completeness():
     first_digest = "a" * 64
     zero_digest = "b" * 64
     receipts = [
@@ -187,14 +236,14 @@ def test_evaluator_scores_same_pool_and_requires_strict_completeness_gain():
         verified_source_turn_digests={row["source_turn_digest"] for row in gold},
     )
 
-    assert report["status"] == "candidate_for_named_review"
+    assert report["status"] == "inconclusive"
     assert report["eligible_for_live"] is False
-    assert report["mechanical_candidate_pass"] is True
+    assert report["mechanical_candidate_pass"] is False
     assert report["named_review_required"] is True
     assert report["metrics"]["b"]["completeness"] == 0.0
-    assert report["metrics"]["c"]["completeness"] == 1.0
+    assert report["metrics"]["c"]["completeness"] == 0.0
     assert report["metrics"]["b"]["noise_rate"] == 1.0
-    assert report["metrics"]["c"]["noise_rate"] == 0.0
+    assert report["metrics"]["c"]["noise_rate"] == 1.0
     assert report["metrics"]["c"]["correct_zero_rate"] == 1.0
     assert report["metrics"]["c"]["predicted_zero_precision"] == 1.0
     assert report["p95_request_path_delta_ms"] == 0.5
@@ -244,10 +293,10 @@ def test_window_retry_scores_final_attempt_and_sums_all_attempt_latency():
     assert report["evaluated_turn_count"] == 1
     assert report["retry_receipt_count"] == 1
     assert report["p95_request_path_delta_ms"] == 1.2
-    assert report["metrics"]["c"]["completeness"] == 1.0
+    assert report["metrics"]["c"]["completeness"] == 0.0
 
 
-def test_equal_shadow_arms_cannot_claim_different_final_c_gain():
+def test_final_c_cannot_import_a_cutoff_outside_id():
     digest = "1" * 64
     receipt = _receipt(
         digest,
@@ -274,9 +323,161 @@ def test_equal_shadow_arms_cannot_claim_different_final_c_gain():
             verified_source_turn_digests={gold["source_turn_digest"]},
         )
     except ValueError as exc:
-        assert "equal shadow arms" in str(exc)
+        assert "final selection contract" in str(exc)
     else:
-        raise AssertionError("an unchanged C arm cannot claim a different final result")
+        raise AssertionError("final C cannot import an ID outside final B")
+
+
+def test_final_c_collapses_to_b_when_any_receipt_pair_is_lost():
+    receipt = _receipt(
+        "e" * 64,
+        pool=["a", "b", "c", "d"],
+        a=["a"],
+        b=["a"],
+        c=["a"],
+    )
+    receipt["swaps"] = [
+        {
+            "promoted_id": "b",
+            "demoted_id": "a",
+            "from_index": 1,
+            "to_index": 0,
+            "event_lock_digest": "0" * 16,
+        },
+        {
+            "promoted_id": "d",
+            "demoted_id": "c",
+            "from_index": 3,
+            "to_index": 2,
+            "event_lock_digest": "1" * 16,
+        },
+    ]
+    for bucket_id in ("c", "d"):
+        receipt["candidate_guards"][receipt["pool_ids"].index(bucket_id)][
+            "event_lock_digests"
+        ] = ["1" * 16]
+    selection = {"arms": {"b": ["a", "b", "d"]}}
+
+    applied, final_c = EVAL._expected_final_swaps(receipt, selection)
+
+    assert applied == []
+    assert final_c == ["a", "b", "d"]
+
+
+def test_final_selection_cannot_apply_a_factual_receipt_swap():
+    digest = "9" * 64
+    receipt = _receipt(
+        digest,
+        pool=["fact", "other"],
+        a=["fact"],
+        b=["fact"],
+        c=["other"],
+    )
+    receipt["candidate_guards"][0]["is_factual"] = True
+    receipt["diagnostics"]["fact_moves"] = 1
+    receipt["diagnostics"]["hard_violation_count"] = 1
+    receipt["first_screen_limit"] = 2
+    receipt["first_screen"] = copy.deepcopy(receipt["arms"])
+    selection = _selection(receipt)
+    gold = _gold(
+        digest,
+        case_id="natural-fact-drift",
+        expected=["fact"],
+        acceptable=["fact", "other"],
+        noise=[],
+    )
+
+    try:
+        EVAL.evaluate(
+            [receipt],
+            [selection],
+            [gold],
+            min_cases=1,
+            verified_source_turn_digests={gold["source_turn_digest"]},
+        )
+    except ValueError as exc:
+        assert "applied swaps" in str(exc)
+    else:
+        raise AssertionError("a factual candidate cannot move in final C")
+
+
+def test_unscorable_model_ds_turn_is_excluded_and_reported():
+    digest = "4" * 64
+    receipt = _receipt(
+        digest,
+        pool=["expected"],
+        a=["expected"],
+        b=["expected"],
+        c=["expected"],
+    )
+    receipt["ds_decision_source"] = "model"
+    receipt["a_cohort_status"] = "unscorable_ds_model"
+    receipt["arms"]["a"] = list(receipt["arms"]["b"])
+    receipt["first_screen"]["a"] = list(receipt["first_screen"]["b"])
+    gold = _gold(
+        digest,
+        case_id="natural-model-ds",
+        expected=["expected"],
+        acceptable=["expected"],
+        noise=[],
+    )
+
+    report = EVAL.evaluate(
+        [receipt],
+        [_selection(receipt)],
+        [gold],
+        min_cases=1,
+        verified_source_turn_digests={gold["source_turn_digest"]},
+    )
+
+    assert report["status"] == "inconclusive"
+    assert report["scorable_cases"] == 0
+    assert report["unscorable_turn_count"] == 1
+    assert report["unscorable_reason_counts"] == {
+        "unscorable_ds_model": 1
+    }
+    assert report["p95_request_path_delta_ms"] == 0.2
+
+
+def test_final_input_cohort_drift_is_excluded_but_kept_in_p95():
+    digest = "6" * 64
+    receipt = _receipt(
+        digest,
+        pool=["b-first", "a-second", "a-true-first"],
+        a=["a-true-first"],
+        b=["b-first"],
+        c=["b-first"],
+        latency=0.2,
+    )
+    selection = _selection(
+        receipt,
+        a=["b-first"],
+        b=["b-first"],
+        c=["b-first"],
+        latency=0.3,
+        final_input=["b-first"],
+    )
+    gold = _gold(
+        digest,
+        case_id="natural-final-input-drift",
+        expected=["a-true-first"],
+        acceptable=["b-first", "a-second", "a-true-first"],
+        noise=[],
+    )
+
+    report = EVAL.evaluate(
+        [receipt],
+        [selection],
+        [gold],
+        min_cases=1,
+        verified_source_turn_digests={gold["source_turn_digest"]},
+    )
+
+    assert report["scorable_cases"] == 0
+    assert report["unscorable_reason_counts"] == {
+        "unscorable_final_cohort_drift": 1,
+    }
+    assert report["p95_request_path_delta_ms"] == 0.5
 
 
 def test_final_selection_must_follow_receipt_time_and_visible_cutoff():
