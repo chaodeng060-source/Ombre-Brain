@@ -5595,7 +5595,8 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
             f"action={'merged' if is_merged else 'created'}"
         )
         action = "合并" if is_merged else "新建"
-        return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}"
+        _bid_suffix = f" [{_bid}]" if _bid else ""
+        return f"{action} → {result_name} | {','.join(analysis.get('domain', []))} V{analysis.get('valence', 0.5):.1f}/A{analysis.get('arousal', 0.3):.1f}{_bid_suffix}"
 
     # --- Step 1: let API split and organize / 让 API 拆分整理 ---
     try:
@@ -5659,11 +5660,12 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
                 entities=item.get("entities", []),
             )
 
+            _bid_suffix = f" [{_bid}]" if _bid else ""
             if is_merged:
-                results.append(f"📎{result_name}")
+                results.append(f"📎{result_name}{_bid_suffix}")
                 merged += 1
             else:
-                results.append(f"📝{item.get('name') or result_name}")
+                results.append(f"📝{item.get('name') or result_name}{_bid_suffix}")
                 created += 1
         except Exception as e:
             logger.warning(
