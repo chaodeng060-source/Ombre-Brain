@@ -1,0 +1,96 @@
+{
+  "schema": "e_chord_shadow_baseline.v1",
+  "as_of": "2026-08-29",
+  "status": "inconclusive",
+  "eligible_for_live": false,
+  "scorable_cases": 0,
+  "minimum_cases": 20,
+  "metrics": {
+    "a": {
+      "precision": null,
+      "noise_rate": null,
+      "completeness": null,
+      "correct_zero_rate": null,
+      "predicted_zero_precision": null
+    },
+    "b": {
+      "precision": null,
+      "noise_rate": null,
+      "completeness": null,
+      "correct_zero_rate": null,
+      "predicted_zero_precision": null
+    },
+    "c": {
+      "precision": null,
+      "noise_rate": null,
+      "completeness": null,
+      "correct_zero_rate": null,
+      "predicted_zero_precision": null
+    }
+  },
+  "p95_request_path_delta_ms": null,
+  "historical_coverage": {
+    "primary_authored_e_buckets": 51,
+    "e_author_breakdown": {
+      "哥哥": 49,
+      "claude": 1,
+      "xiaojuan": 1
+    },
+    "claude_author_eligible_e_buckets": 49,
+    "excluded_by_author_identity": 2,
+    "primary_authored_e_buckets_with_event_or_episode_lock": 0,
+    "eligible_same_event_e_pairs": 0,
+    "manual_human_gold_cases": 21,
+    "manual_gold_unique_expected_ids": 24,
+    "manual_gold_expected_ids_intersecting_primary_e": 0,
+    "exact_natural_trace_turns_with_e_candidates_all_conversations": 62,
+    "exact_natural_trace_turns_with_e_candidates_claude_dm": 43,
+    "claude_dm_unique_e_candidate_ids": 31,
+    "claude_dm_turns_with_e_retained": 14,
+    "claude_dm_unique_e_retained_ids": 13,
+    "claude_dm_turns_with_two_or_more_e_candidates": 2
+  },
+  "evidence_manifest": {
+    "derived_at": "2026-08-29T16:24:57+08:00",
+    "derivation": "Read-only scan. Gold counts are the union of expected_bucket_ids in the five manual batches. E coverage scans Markdown frontmatter for e_authored_by and explicit event_id/episode_id. Natural trace counts bind persisted user turns to recall_trace by exact prepared-query SHA/time, then intersect ids_in/ids_out with the frozen 51-ID E manifest.",
+    "e_bucket_root": "data/ombre-vps-runtime/data",
+    "e_bucket_manifest_sha256": "bccbe49e6bf48de054e36c3c3c3b697368e9f72dab67078cdd4a7a0b80d2fa6f",
+    "gold_expected_id_set_sha256": "9a0480070f7093a370ea3a88423e26e0686bac7682af01fddff93cbb05e653ed",
+    "inputs": [
+      {"path": "data/evals/lmc5_true_breath_manual_batch1.jsonl", "rows": 4, "sha256": "eb9354db78c0344406b64f5441a902d7758c6de47f64cd73a6fcd398a80e6a57"},
+      {"path": "data/evals/lmc5_true_breath_manual_batch2.jsonl", "rows": 5, "sha256": "b545c5204cc843cbcb27fa53d7b4dfc2ef0f7032e9f377c96a9cd6b2d2637103"},
+      {"path": "data/evals/lmc5_true_breath_manual_batch3.jsonl", "rows": 3, "sha256": "9b7ba2cbfdee7a9422dc866ed259db9adf60b251e2a7e843b53e413b69eb9768"},
+      {"path": "data/evals/lmc5_true_breath_manual_batch4.jsonl", "rows": 8, "sha256": "a4f4e53afba18d16a763a539945e1ac9812a1c8aa59ef40799d09096e4f7dc36"},
+      {"path": "data/evals/lmc5_true_breath_manual_batch5.jsonl", "rows": 1, "sha256": "4772cf5d21cb1fe180ef5c1a864f8a2c6066e9894ce24c4f032a48b39b2eac61"},
+      {"path": "data/recall_trace.jsonl", "rows": 2955, "sha256": "a19074e4643c0d1edfc7ddd5b4cc35c74788a9f7f5c64c1ae012014576955bae"}
+    ]
+  },
+  "unscorable_reasons": [
+    "The 21 existing human-gold cases have zero expected-ID overlap with the 51 primary-authored E buckets.",
+    "Historical recall_trace rows retain only post-retrieval ids_in/ids_out and do not contain the frozen pre-E score pool needed to reconstruct arm A.",
+    "Only two exact Claude-DM natural turns contain two or more E candidates, so the existing trace cannot support a 20-case bounded reorder comparison.",
+    "No historical row contains a contemporaneous arm C proposal because the shadow receipt did not yet exist.",
+    "Any same-set order change introduced after existing-E ranking is explicitly unscorable, so lifecycle or other downstream ordering cannot be attributed to E.",
+    "Any membership or order drift before Twin's final local reranker is also unscorable, so a B-derived survivor subset cannot be presented as pure-semantic A.",
+    "The current 51 primary-authored E buckets contain no event_id or episode_id, so the bounded C arm is necessarily a no-op until an audited event-link writer exists.",
+    "Final C must preserve final B's exact candidate set, so set-based completeness cannot be strictly better in this schema."
+  ],
+  "gate": {
+    "minimum_20_natural_human_gold_cases": false,
+    "complete_cohort_match": false,
+    "natural_evidence_verified": false,
+    "explicit_event_lock_cohort_present": false,
+    "same_frozen_pool_for_a_b_c": false,
+    "final_b_c_same_candidate_set": true,
+    "completeness_gate_reachable": false,
+    "precision_not_worse_than_b": null,
+    "noise_not_worse_than_b": null,
+    "completeness_strictly_better_than_b": null,
+    "correct_zero_not_worse_than_b": null,
+    "predicted_zero_precision_not_worse_than_b": null,
+    "hard_violations_zero": null,
+    "external_api_delta_zero": true,
+    "p95_request_path_delta_within_budget": null
+  },
+  "decision": "Remain disabled and shadow-only. First add an audited authoritative event-link source without weakening the same-event gate; then collect at least 20 future natural turns with complete human gold over the text-free frozen receipt pool. The current same-set final B/C contract can measure rank-sensitive effects but cannot satisfy the existing set-based strict-completeness gate, so a separately reviewed metric/schema revision is required before any live decision."
+}

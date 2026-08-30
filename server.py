@@ -132,6 +132,19 @@ from e_axis_shadow import (
     normalize_min_confidence,
     strict_json_loads,
 )
+from e_chord_shadow import (
+    EChordFinalSelectionLedger,
+    EChordShadowConfig,
+    EChordShadowLedger,
+    build_shadow_receipt,
+    frozen_relevance_band_ids,
+    load_e_chord_shadow_config,
+    parse_live_chord,
+    propose_chord_reorder,
+    rank_within_frozen_relevance_bands,
+    validate_shadow_receipt,
+    validate_final_selection,
+)
 from e_axis_recall import (
     apply_resonance_tie_break,
     derive_response_posture,
@@ -242,6 +255,10 @@ _review_queue = None
 _z_lifecycle_transaction = None
 _relation_approval_transaction = None
 _e_axis_shadow_store = None
+_e_chord_shadow_ledger = None
+_e_chord_final_selection_ledger = None
+_e_chord_shadow_write_tasks: set[asyncio.Task] = set()
+_e_chord_shadow_write_tasks_lock = threading.Lock()
 _lmc5_ledger = None
 _entity_store = None
 _entity_store_key = None
@@ -260,6 +277,14 @@ _strict_recall_errors = contextvars.ContextVar(
 )
 _breath_candidate_capture = contextvars.ContextVar(
     "ombre_breath_candidate_capture",
+    default=None,
+)
+_e_chord_shadow_response_capture = contextvars.ContextVar(
+    "ombre_e_chord_shadow_response_capture",
+    default=None,
+)
+_ds_filter_decision_capture = contextvars.ContextVar(
+    "ombre_ds_filter_decision_capture",
     default=None,
 )
 
@@ -587,6 +612,69 @@ def _get_e_axis_shadow_store() -> EAxisShadowStore:
             maintenance_root=config["buckets_dir"],
         )
     return _e_axis_shadow_store
+
+
+def _get_e_chord_shadow_ledger() -> EChordShadowLedger:
+    """Bind the text-free chord receipt to its own private sidecar."""
+
+    global _e_chord_shadow_ledger
+    path = os.path.join(
+        config["buckets_dir"],
+        ".axis",
+        "e-chord-shadow.jsonl",
+    )
+    if (
+        _e_chord_shadow_ledger is None
+        or os.fspath(_e_chord_shadow_ledger.path) != os.path.abspath(path)
+    ):
+        _e_chord_shadow_ledger = EChordShadowLedger(path)
+    return _e_chord_shadow_ledger
+
+
+def _get_e_chord_final_selection_ledger() -> EChordFinalSelectionLedger:
+    """Bind Twin's final post-filter selection to a separate private sidecar."""
+
+    global _e_chord_final_selection_ledger
+    path = os.path.join(
+        config["buckets_dir"],
+        ".axis",
+        "e-chord-final-selection.jsonl",
+    )
+    if (
+        _e_chord_final_selection_ledger is None
+        or os.fspath(_e_chord_final_selection_ledger.path) != os.path.abspath(path)
+    ):
+        _e_chord_final_selection_ledger = EChordFinalSelectionLedger(path)
+    return _e_chord_final_selection_ledger
+
+
+async def _persist_e_chord_shadow_receipt(receipt: dict) -> None:
+    """Write shadow telemetry off the recall response path."""
+
+    await asyncio.to_thread(_get_e_chord_shadow_ledger().append, receipt)
+
+
+def _schedule_e_chord_shadow_receipt(receipt: dict) -> None:
+    """Retain and observe a best-effort append task without awaiting fsync."""
+
+    task = asyncio.create_task(_persist_e_chord_shadow_receipt(receipt))
+    with _e_chord_shadow_write_tasks_lock:
+        _e_chord_shadow_write_tasks.add(task)
+
+    def _done(completed: asyncio.Task) -> None:
+        with _e_chord_shadow_write_tasks_lock:
+            _e_chord_shadow_write_tasks.discard(completed)
+        if completed.cancelled():
+            return
+        try:
+            completed.result()
+        except Exception as exc:
+            logger.warning(
+                "E chord shadow receipt append failed: %s",
+                type(exc).__name__,
+            )
+
+    task.add_done_callback(_done)
 
 
 def _get_lmc5_ledger() -> LMC5Ledger:
@@ -1871,12 +1959,25 @@ async def _ds_filter_candidates(
     明确采用 Anchor 对话策略并传入 ``allow_empty=True`` 时，合法 ``keep: []``
     才会安静返回空。
     """
+    decision_capture = _ds_filter_decision_capture.get()
+
+    def record_decision(source: str) -> None:
+        if isinstance(decision_capture, dict):
+            decision_capture["source"] = source
+
     if max_results <= 0:
+        record_decision("deterministic_noop")
         return []
     keep = force_keep_ids or set()
     capped = _cap_candidates_preserving_forced(candidates, keep, max_results)
+    gate_enabled = _ds_gate_enabled(mode)
 
-    if not _ds_gate_enabled(mode) or not query or not capped:
+    if not gate_enabled or not query or not capped:
+        record_decision(
+            "disabled"
+            if not gate_enabled or not query
+            else "deterministic_noop"
+        )
         logger.debug(
             "DS filter stub mode=%s query=%r input=%d output=%d",
             mode,
@@ -1894,6 +1995,7 @@ async def _ds_filter_candidates(
     if (len(capped) == 1 and not allow_empty) or all(
         bucket.get("id") in keep for bucket in capped
     ):
+        record_decision("deterministic_noop")
         logger.debug(
             "DS filter deterministic no-op mode=%s query=%r capped=%d",
             mode,
@@ -1908,6 +2010,7 @@ async def _ds_filter_candidates(
             timeout=_ds_gate_timeout(),
         )
     except Exception as e:
+        record_decision("fallback")
         logger.warning(
             "DS filter fell back to stub / 门控回退裁剪集合 (%s): %s",
             type(e).__name__, e,
@@ -1915,6 +2018,7 @@ async def _ds_filter_candidates(
         return capped
 
     result = kept if kept or allow_empty else capped
+    record_decision("model")
     logger.info(
         "DS filter mode=%s query=%r input=%d capped=%d kept=%d",
         mode, query[:80], len(candidates), len(capped), len(result),
@@ -3854,6 +3958,80 @@ async def _auto_infer_edges(
 # With args: search by keyword + emotion coordinates
 # 有参数：按关键词+情感坐标检索记忆
 # =============================================================
+async def _record_e_chord_shadow(
+    *,
+    raw_chord: object,
+    expected_turn_id: str,
+    expected_agent_id: str,
+    expected_session_id: str,
+    a_candidates: list[dict],
+    post_e_candidates: list[dict],
+    b_candidates: list[dict],
+    ds_decision_source: str,
+    chord_config: EChordShadowConfig,
+    prelude_elapsed_ms: float,
+    attempt_index: int,
+    first_screen_limit: int,
+) -> dict | None:
+    """Schedule one A/B/C receipt while leaving served B untouched."""
+
+    if not chord_config.enabled or raw_chord is None:
+        return None
+    started_at = time.perf_counter()
+    recorded_at_ms = int(time.time() * 1000)
+    chord, payload_status = parse_live_chord(
+        raw_chord,
+        expected_turn_id=expected_turn_id,
+        expected_agent_id=expected_agent_id,
+        expected_session_id=expected_session_id,
+        now_ms=recorded_at_ms,
+        max_age_ms=chord_config.max_age_ms,
+    )
+    if chord is None:
+        logger.info("E chord shadow payload rejected: %s", payload_status)
+        return None
+
+    proposal = propose_chord_reorder(
+        b_candidates,
+        chord,
+        near_tie_epsilon=chord_config.near_tie_epsilon,
+    )
+    receipt = build_shadow_receipt(
+        chord=chord,
+        payload_status=payload_status,
+        pre_e_cohort_ids=[
+            str(candidate.get("id") or "") for candidate in a_candidates
+        ],
+        post_e_cohort_ids=[
+            str(candidate.get("id") or "") for candidate in post_e_candidates
+        ],
+        ds_decision_source=ds_decision_source,
+        a_candidates=a_candidates,
+        b_candidates=b_candidates,
+        proposal=proposal,
+        attempt_index=attempt_index,
+        first_screen_limit=max(0, min(first_screen_limit, 50)),
+        request_path_delta_ms=0.0,
+        recorded_at_ms=recorded_at_ms,
+    )
+    # Validate before enqueue.  The append/fsync itself is deliberately
+    # off-path, so this measured delta covers every synchronous shadow step
+    # added to the request: frozen-band work, parsing, A/C computation and
+    # receipt construction/validation.  Set it before task creation so the
+    # background writer can never race ahead and persist the temporary zero.
+    validate_shadow_receipt(receipt)
+    receipt["request_path_delta_ms"] = round(
+        max(0.0, float(prelude_elapsed_ms))
+        + (time.perf_counter() - started_at) * 1000,
+        6,
+    )
+    response_capture = _e_chord_shadow_response_capture.get()
+    if isinstance(response_capture, dict):
+        response_capture["receipt"] = receipt
+    _schedule_e_chord_shadow_receipt(receipt)
+    return receipt
+
+
 @mcp.tool()
 async def breath(
     query: str = "",
@@ -3871,6 +4049,11 @@ async def breath(
     include_images: bool = True,
     include_body_state: bool = True,
     reset_body_state: bool = False,
+    live_chord: object = None,
+    turn_id: str = "",
+    agent_id: str = "",
+    e_chord_attempt: int = 0,
+    first_screen_limit: int = 0,
 ) -> str | list[TextContent | ImageContent]:
     """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认6000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制注入数量上限(默认8,最大50; 内部仍先召回20条给过滤器)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿安全关系边双向召回邻居的跳数(默认1,0=关闭,最大2)，关联证据单独列出且不改变主排序。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。session_id=同一会话内对已浮现动态桶去重。include_images=True时,白名单图桶会随文本返回 MCP image content。include_body_state=False时只关闭外部身体状态块,不改变记忆检索。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。"""
     with recall_stage("setup"):
@@ -4404,6 +4587,9 @@ async def breath(
         intent_multiplier = bucket_intent_score_multiplier(b, intent_policy)
         if intent_multiplier != 1.0:
             tie_break_score *= intent_multiplier
+        # Arm A freezes the same retained pool before the existing E
+        # resonance adjustment.  This score is request-local metadata only.
+        b["_pre_e_tie_break_score"] = round(tie_break_score, 6)
         if e_recall_cfg is not None and e_query_emotion is not None:
             try:
                 e_annotation = select_current_annotation(
@@ -4441,6 +4627,53 @@ async def breath(
             )
         ),
     )
+    chord_shadow_config = None
+    chord_shadow_prelude_ms = 0.0
+    chord_shadow_a_candidates: list[dict] = []
+    chord_shadow_post_e_candidates: list[dict] = []
+    chord_shadow_ds_decision_source = "unobserved"
+    if live_chord is not None:
+        try:
+            candidate_config = load_e_chord_shadow_config(config)
+            if candidate_config.enabled:
+                chord_shadow_started_at = time.perf_counter()
+                admissibility_floor = max(
+                    0.55,
+                    float(
+                        e_recall_cfg.side_channel_min_resonance
+                        if e_recall_cfg is not None else 0.55
+                    ),
+                )
+                band_by_id = frozen_relevance_band_ids(matches, fused_band)
+                for bucket in matches:
+                    bucket["_e_axis_query_valence"] = (
+                        e_query_emotion.valence
+                        if e_query_emotion is not None else None
+                    )
+                    bucket["_e_axis_admissibility_floor"] = admissibility_floor
+                    bucket_id = str(bucket.get("id") or "")
+                    if bucket_id in band_by_id:
+                        bucket["_e_chord_relevance_band_id"] = band_by_id[bucket_id]
+                # Freeze the only honest semantic A before existing-E order
+                # and every later first-wins/subtractive gate.  If those gates
+                # change membership or DS makes a model/fallback decision, the
+                # receipt marks the turn unscorable rather than rebuilding A
+                # post hoc from B.
+                chord_shadow_a_candidates = list(
+                    rank_within_frozen_relevance_bands(
+                        matches,
+                        score_key="_pre_e_tie_break_score",
+                    )
+                )
+                chord_shadow_prelude_ms = (
+                    time.perf_counter() - chord_shadow_started_at
+                ) * 1000
+                chord_shadow_config = candidate_config
+        except Exception as exc:
+            logger.warning(
+                "E chord frozen-band setup skipped: %s",
+                type(exc).__name__,
+            )
     matches = rank_within_relevance_bands(
         matches,
         relevance_score=lambda bucket: bucket.get(
@@ -4453,6 +4686,12 @@ async def breath(
         ),
         band_width=fused_band,
     )
+    if chord_shadow_config is not None:
+        post_e_freeze_started_at = time.perf_counter()
+        chord_shadow_post_e_candidates = list(matches)
+        chord_shadow_prelude_ms += (
+            time.perf_counter() - post_e_freeze_started_at
+        ) * 1000
 
     matches, content_suppressed, content_fingerprint_errors = _dedupe_recall_content(matches)
     if content_suppressed or content_fingerprint_errors:
@@ -4504,14 +4743,44 @@ async def breath(
             state_profile=state_profile,
         ))
     with recall_stage("ds_filter"):
-        matches = await _ds_filter_candidates(
-            recall_query,
-            matches,
-            mode="search",
-            max_results=max(0, max_results - len(state_link_candidates)),
-            force_keep_ids=_exact_retrieval_key_ids(recall_query, matches),
-            allow_empty=allow_empty_recall,
-        )
+        if chord_shadow_config is None:
+            matches = await _ds_filter_candidates(
+                recall_query,
+                matches,
+                mode="search",
+                max_results=max(0, max_results - len(state_link_candidates)),
+                force_keep_ids=_exact_retrieval_key_ids(recall_query, matches),
+                allow_empty=allow_empty_recall,
+            )
+        else:
+            ds_decision_capture: dict[str, str] = {}
+            ds_capture_token = _ds_filter_decision_capture.set(
+                ds_decision_capture
+            )
+            try:
+                matches = await _ds_filter_candidates(
+                    recall_query,
+                    matches,
+                    mode="search",
+                    max_results=max(
+                        0,
+                        max_results - len(state_link_candidates),
+                    ),
+                    force_keep_ids=_exact_retrieval_key_ids(
+                        recall_query,
+                        matches,
+                    ),
+                    allow_empty=allow_empty_recall,
+                )
+            finally:
+                _ds_filter_decision_capture.reset(ds_capture_token)
+            chord_shadow_ds_decision_source = str(
+                ds_decision_capture.get("source") or "unobserved"
+            )
+    # Freeze the full post-DS pool before X can reserve a displayed slot.  Arm
+    # C still never escapes this pool; the actual displayed primary cutoff is
+    # known only after X preflight and token/dehydration rendering below.
+    chord_shadow_b_candidates = list(matches)
 
     # Reserve one existing result slot only when a retained primary seed has
     # a real same-thread neighbor. Queries without such a neighbor keep their
@@ -4844,6 +5113,39 @@ async def breath(
             results.extend(restored_main_messages)
             main_result_ids = tuple((*main_result_ids, *restored_main_ids))
             set_recall_partial_result("\n---\n".join(results))
+
+    # Shadow-only arm C: all semantic/state/session/anchor/DS gates have run,
+    # and the visible primary cutoff now reflects X reservation plus actual
+    # token/dehydration rendering.  The retained B pool is never replaced by C.
+    if live_chord is not None and chord_shadow_config is not None:
+        try:
+            requested_screen = int(first_screen_limit)
+            attempt = int(e_chord_attempt)
+            if not 1 <= requested_screen <= max_results:
+                raise ValueError("invalid first_screen_limit")
+            if not 0 <= attempt <= 3:
+                raise ValueError("invalid e_chord_attempt")
+            await _record_e_chord_shadow(
+                raw_chord=live_chord,
+                expected_turn_id=str(turn_id or ""),
+                expected_agent_id=str(agent_id or ""),
+                expected_session_id=str(session_id or ""),
+                a_candidates=chord_shadow_a_candidates,
+                post_e_candidates=chord_shadow_post_e_candidates,
+                b_candidates=chord_shadow_b_candidates,
+                ds_decision_source=chord_shadow_ds_decision_source,
+                chord_config=chord_shadow_config,
+                prelude_elapsed_ms=chord_shadow_prelude_ms,
+                attempt_index=attempt,
+                first_screen_limit=min(requested_screen, len(main_result_ids)),
+            )
+        except Exception as exc:
+            # Receipt availability cannot change factual recall or the served
+            # ordering.  Shadow storage/config failures are therefore fail-open.
+            logger.warning(
+                "E chord shadow skipped; served recall unchanged: %s",
+                type(exc).__name__,
+            )
 
     # --- Z lifecycle state links: explicit current/history transition evidence ---
     # This is a bounded overlay over reviewed reciprocal links.  It does not
@@ -8940,6 +9242,10 @@ async def api_breath(request):
     requested_policy = str(body.get("policy") or "search").strip().lower()
     recall_policy = _normalize_anchor_recall_policy(requested_policy)
     timing_token = begin_recall_timing()
+    e_chord_response_capture: dict[str, object] = {}
+    e_chord_capture_token = _e_chord_shadow_response_capture.set(
+        e_chord_response_capture
+    )
     breath_task = None
     partial = False
     try:
@@ -8960,6 +9266,11 @@ async def api_breath(request):
                 include_images=False,
                 include_body_state=False,
                 reset_body_state=False,
+                live_chord=body.get("live_chord"),
+                turn_id=str(body.get("turn_id") or "")[:160],
+                agent_id=str(body.get("agent_id") or "")[:160],
+                e_chord_attempt=_int_arg("e_chord_attempt", 0),
+                first_screen_limit=_int_arg("first_screen_limit", 0),
             ))
             done, _pending = await asyncio.wait(
                 {breath_task},
@@ -9000,6 +9311,7 @@ async def api_breath(request):
         )
         logger.info("breath_timing=%s", json.dumps(timing, sort_keys=True))
     finally:
+        _e_chord_shadow_response_capture.reset(e_chord_capture_token)
         reset_recall_timing(timing_token)
 
     if isinstance(result, str):
@@ -9011,12 +9323,16 @@ async def api_breath(request):
         )
     else:
         text = str(result)
-    return JSONResponse({
+    response_payload = {
         "raw": text,
         "policy": recall_policy,
         "partial": partial,
         "timing": timing,
-    })
+    }
+    shadow_receipt = e_chord_response_capture.get("receipt")
+    if isinstance(shadow_receipt, dict):
+        response_payload["e_chord_shadow"] = shadow_receipt
+    return JSONResponse(response_payload)
 
 
 @mcp.custom_route("/api/recall-receipt", methods=["POST"])
@@ -9025,8 +9341,10 @@ async def api_recall_receipt(request):
 
     ``breath`` remains read-only.  This separate write endpoint is best-effort
     from the caller's perspective: a failed receipt must never suppress the
-    recall text or the assistant response.  No query or memory content enters
-    the receipt ledger.
+    recall text or the assistant response.  The same call may carry Twin's
+    text-free final E-chord selection, including an empty injection; it is
+    persisted separately from activation state.  No query or memory content
+    enters either ledger.
     """
     from starlette.responses import JSONResponse
 
@@ -9040,8 +9358,37 @@ async def api_recall_receipt(request):
     raw_ids = body.get("bucket_ids") or []
     if isinstance(raw_ids, str):
         raw_ids = [part.strip() for part in raw_ids.split(",") if part.strip()]
+    raw_selection = body.get("e_chord_selection")
+    selection = None
+    selection_appended = False
     try:
         bucket_ids = normalize_bucket_ids(raw_ids)
+        if not event_id or len(event_id) > 512:
+            raise ValueError("invalid event_id")
+        if raw_selection is not None:
+            selection = validate_final_selection(raw_selection)
+            if selection["final_injected_ids"] != list(bucket_ids):
+                raise ValueError(
+                    "E chord final selection does not match injected bucket_ids"
+                )
+            selection_appended = await asyncio.to_thread(
+                _get_e_chord_final_selection_ledger().append,
+                selection,
+            )
+        if not bucket_ids:
+            if selection is None:
+                raise ValueError("bucket_ids required")
+            return JSONResponse({
+                "ok": True,
+                "event_id": event_id,
+                "duplicate": not selection_appended,
+                "selection_recorded": True,
+                "applied_now": 0,
+                "failed": [],
+                "status": "complete",
+                "applied": 0,
+                "pending": 0,
+            })
         store = _get_recall_receipt_store()
         begun = store.begin(
             event_id,
@@ -9082,6 +9429,7 @@ async def api_recall_receipt(request):
         "ok": not failed,
         "event_id": event_id,
         "duplicate": bool(begun["duplicate"]),
+        "selection_recorded": selection is not None,
         "applied_now": applied_now,
         "failed": failed,
         **status,

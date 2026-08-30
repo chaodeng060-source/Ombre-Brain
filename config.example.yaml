@@ -128,8 +128,9 @@ e_axis_shadow:
 # 只消费主对话 AI 亲自写入桶内的 E 元数据与不可变初始优先级。DeepSeek 等模型
 # 的 E0/shadow 行永远只是 proposal，不参与正式召回。投影只在既有相关性窄带内
 # 细排；显式情绪查询最多补 1 条 supporting experience，并注入回应姿态。
-# breath 默认只使用 e_authored_by=claude；共享服务上的其他 AI 必须显式传
-# 自己的 author id，绝不把一个 AI 的第一人称体验投影给另一个 AI。
+# E 作者身份取桶内不可变 e_authored_by；当前已验收的 Claude 主资产作者值为“哥哥”。
+# 和弦影子另行核对 agent_id=claude → e_authored_by=哥哥 的版本化映射，绝不把
+# 一个 AI 的第一人称体验投影给另一个 AI。
 # 它不能覆盖事实或跨过 Z 轴；关闭 enabled 即恢复旧召回，不改账本/桶。
 e_axis_recall:
   enabled: true
@@ -141,6 +142,17 @@ e_axis_recall:
   side_channel_limit: 1              # 显式情绪查询的额外旁证，0..2
   side_channel_scan_limit: 128       # 先按 E 分数预排，再逐桶验 digest/Z/world/domain
   side_channel_min_resonance: 0.55
+
+# --- Desire chord x E recall / 欲望和弦 × E 召回影子 ---
+# 默认关闭且只允许 mode=shadow。它读取 Twin 同一 breath 请求携带的无文本 top-2
+# motivation/hunger 投影，只在语义、Z、session、anchor、DS 已保留的同事件 E 近邻间
+# 生成 C 臂相邻调序提案。真实返回始终保持现有 B 臂；Twin 会在原有
+# recall-receipt 调用中回传最终筛噪后的 text-free A/B/C 选择；不新增检索/API/embedding。
+e_chord_shadow:
+  enabled: false
+  mode: shadow
+  near_tie_epsilon: 0.03             # 仅当前 E tie score 差值不超过此值
+  max_age_ms: 30000                  # 拒绝旧轮/串窗投影，允许范围 1000..120000
 
 # --- Decay parameters / 记忆衰减参数 ---
 # 计算艾宾浩斯衰减候选；是否自动归档由 metabolism.mode 控制。
