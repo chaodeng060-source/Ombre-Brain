@@ -212,6 +212,7 @@ from recall_timing import (
     finish_recall_stage,
     recall_stage,
     record_recall_dehydration,
+    record_recall_ds_gate,
     record_recall_metric,
     record_recall_stage,
     reset_recall_timing,
@@ -2054,12 +2055,19 @@ async def _ds_semantic_select(
         raw = resp.choices[0].message.content if resp.choices else ""
         idxs = _parse_ds_keep_indices(raw, len(buckets))
         if idxs is None:
+            # Preserve the provider-refusal category needed for diagnosis without
+            # writing arbitrary model output into logs.
+            raw_head = (
+                "provider-refusal:<redacted>"
+                if raw.startswith("provider-refusal:")
+                else "<redacted>"
+            )
             logger.error(
                 "DS filter received invalid DeepSeek response raw_chars=%d "
                 "raw_sha256=%s raw_head=%r response=%s",
                 len(raw),
                 hashlib.sha256(raw.encode("utf-8")).hexdigest(),
-                raw[:500],
+                raw_head,
                 _safe_chat_completion_diagnostics(resp),
             )
             raise ValueError("invalid DeepSeek recall selection payload")
@@ -2095,23 +2103,33 @@ async def _ds_filter_candidates(
     """
     decision_capture = _ds_filter_decision_capture.get()
 
-    def record_decision(source: str) -> None:
+    def record_decision(
+        source: str,
+        outcome: str,
+        input_count: int,
+        output_count: int,
+    ) -> None:
         if isinstance(decision_capture, dict):
             decision_capture["source"] = source
+        record_recall_ds_gate(outcome, input_count, output_count)
 
     if max_results <= 0:
-        record_decision("deterministic_noop")
+        record_decision("deterministic_noop", "noop", 0, 0)
         return []
     keep = force_keep_ids or set()
     capped = _cap_candidates_preserving_forced(candidates, keep, max_results)
     gate_enabled = _ds_gate_enabled(mode)
 
     if not gate_enabled or not query or not capped:
-        record_decision(
-            "disabled"
-            if not gate_enabled or not query
-            else "deterministic_noop"
-        )
+        if not gate_enabled or not query:
+            record_decision("disabled", "disabled", len(capped), len(capped))
+        else:
+            record_decision(
+                "deterministic_noop",
+                "noop",
+                len(capped),
+                len(capped),
+            )
         logger.debug(
             "DS filter stub mode=%s query=%r input=%d output=%d",
             mode,
@@ -2129,7 +2147,12 @@ async def _ds_filter_candidates(
     if (len(capped) == 1 and not allow_empty) or all(
         bucket.get("id") in keep for bucket in capped
     ):
-        record_decision("deterministic_noop")
+        record_decision(
+            "deterministic_noop",
+            "noop",
+            len(capped),
+            len(capped),
+        )
         logger.debug(
             "DS filter deterministic no-op mode=%s query=%r capped=%d",
             mode,
@@ -2143,8 +2166,15 @@ async def _ds_filter_candidates(
             _ds_semantic_select(query, capped, keep, max_results),
             timeout=_ds_gate_timeout(),
         )
+    except asyncio.TimeoutError as e:
+        record_decision("fallback", "timeout", len(capped), len(capped))
+        logger.warning(
+            "DS filter fell back to stub / 门控回退裁剪集合 (%s): %s",
+            type(e).__name__, e,
+        )
+        return capped
     except Exception as e:
-        record_decision("fallback")
+        record_decision("fallback", "error", len(capped), len(capped))
         logger.warning(
             "DS filter fell back to stub / 门控回退裁剪集合 (%s): %s",
             type(e).__name__, e,
@@ -2152,7 +2182,7 @@ async def _ds_filter_candidates(
         return capped
 
     result = kept if kept or allow_empty else capped
-    record_decision("model")
+    record_decision("model", "ok", len(capped), len(result))
     logger.info(
         "DS filter mode=%s query=%r input=%d capped=%d kept=%d",
         mode, query[:80], len(candidates), len(capped), len(result),

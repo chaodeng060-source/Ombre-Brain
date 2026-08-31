@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import types
@@ -7,6 +8,11 @@ from mcp.types import ImageContent, TextContent
 
 import server
 from dehydrator import DEHYDRATE_PROMPT
+from recall_timing import (
+    begin_recall_timing,
+    finish_recall_timing,
+    reset_recall_timing,
+)
 
 
 def _bucket(
@@ -598,6 +604,113 @@ def _fake_dehydrator_with_response(create_fn):
             )
         ),
     )
+
+
+async def _run_ds_gate_with_timing(*args, **kwargs):
+    token = begin_recall_timing()
+    try:
+        selected = await server._ds_filter_candidates(*args, **kwargs)
+        timing = finish_recall_timing(status="ok", partial=False)
+    finally:
+        reset_recall_timing(token)
+    return selected, timing
+
+
+@pytest.mark.asyncio
+async def test_ds_gate_trace_records_disabled_stub(monkeypatch):
+    monkeypatch.delenv("OMBRE_DS_FILTER_ENABLED", raising=False)
+    buckets = [_bucket("a", "A"), _bucket("b", "B"), _bucket("c", "C")]
+
+    selected, timing = await _run_ds_gate_with_timing(
+        "query", buckets, mode="search", max_results=2
+    )
+
+    assert [bucket["id"] for bucket in selected] == ["a", "b"]
+    assert timing["ds_gate_outcome"] == "disabled"
+    assert timing["ds_gate_in"] == 2
+    assert timing["ds_gate_out"] == 2
+
+
+@pytest.mark.asyncio
+async def test_ds_gate_trace_records_deterministic_noop(monkeypatch):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+
+    async def should_not_run(*_args, **_kwargs):
+        raise AssertionError("semantic selector must not run for a required singleton")
+
+    monkeypatch.setattr(server, "_ds_semantic_select", should_not_run)
+    bucket = _bucket("a", "A")
+    selected, timing = await _run_ds_gate_with_timing(
+        "query", [bucket], mode="search", max_results=1
+    )
+
+    assert selected == [bucket]
+    assert timing["ds_gate_outcome"] == "noop"
+    assert timing["ds_gate_in"] == 1
+    assert timing["ds_gate_out"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ds_gate_trace_records_normal_kept_result(monkeypatch):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+
+    async def keep_first(_query, buckets, _keep, _max_results):
+        return buckets[:1]
+
+    monkeypatch.setattr(server, "_ds_semantic_select", keep_first)
+    buckets = [_bucket("a", "A"), _bucket("b", "B")]
+    selected, timing = await _run_ds_gate_with_timing(
+        "query", buckets, mode="search", max_results=2
+    )
+
+    assert [bucket["id"] for bucket in selected] == ["a"]
+    assert timing["ds_gate_outcome"] == "ok"
+    assert timing["ds_gate_in"] == 2
+    assert timing["ds_gate_out"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ds_gate_trace_records_wait_for_timeout_and_fails_open(monkeypatch):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+    monkeypatch.setattr(server, "_ds_gate_timeout", lambda: 0.001)
+
+    async def never_finishes(_query, _buckets, _keep, _max_results):
+        await asyncio.sleep(60)
+        raise AssertionError("wait_for must cancel this selector")
+
+    monkeypatch.setattr(server, "_ds_semantic_select", never_finishes)
+    buckets = [_bucket("a", "A"), _bucket("b", "B"), _bucket("c", "C")]
+    selected, timing = await _run_ds_gate_with_timing(
+        "query", buckets, mode="search", max_results=2
+    )
+
+    assert [bucket["id"] for bucket in selected] == ["a", "b"]
+    assert timing["ds_gate_outcome"] == "timeout"
+    assert timing["ds_gate_in"] == 2
+    assert timing["ds_gate_out"] == 2
+
+
+@pytest.mark.asyncio
+async def test_ds_gate_trace_records_non_timeout_error_and_fails_open(monkeypatch):
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+
+    async def crashes(_query, _buckets, _keep, _max_results):
+        raise RuntimeError("provider failed")
+
+    monkeypatch.setattr(server, "_ds_semantic_select", crashes)
+    buckets = [_bucket("a", "A"), _bucket("b", "B"), _bucket("c", "C")]
+    selected, timing = await _run_ds_gate_with_timing(
+        "query", buckets, mode="search", max_results=2
+    )
+
+    assert [bucket["id"] for bucket in selected] == ["a", "b"]
+    assert timing["ds_gate_outcome"] == "error"
+    assert timing["ds_gate_in"] == 2
+    assert timing["ds_gate_out"] == 2
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,13 @@ _DEHYDRATION_OUTCOMES = frozenset({
     "passthrough_async",
     "persist_failed",
 })
+_DS_GATE_OUTCOMES = frozenset({
+    "ok",
+    "timeout",
+    "error",
+    "noop",
+    "disabled",
+})
 _RECALL_METRIC_MODES = {
     "query_angle_count": "max",
     "keyword_bucket_count": "max",
@@ -145,6 +152,24 @@ def record_recall_metric(name: str, value: int) -> None:
         metrics[name] = int(metrics.get(name, 0)) + number
 
 
+def record_recall_ds_gate(
+    outcome: str,
+    input_count: int,
+    output_count: int,
+) -> None:
+    """Record the content-free semantic-gate result for this recall request."""
+    if outcome not in _DS_GATE_OUTCOMES:
+        raise ValueError(f"unknown ds gate outcome: {outcome}")
+    state = _recall_timing.get()
+    if not isinstance(state, dict):
+        return
+    state["ds_gate"] = {
+        "outcome": outcome,
+        "input_count": max(0, int(input_count)),
+        "output_count": max(0, int(output_count)),
+    }
+
+
 def start_recall_stage(name: str) -> None:
     state = _recall_timing.get()
     if not isinstance(state, dict):
@@ -211,7 +236,7 @@ def finish_recall_timing(*, status: str, partial: bool) -> dict:
             )
             entry["calls"] = int(entry["calls"]) + 1
     attributed_ms = sum(entry["elapsed_ms"] for entry in stages.values())
-    return {
+    receipt = {
         "schema_version": SCHEMA_VERSION,
         "request_id": state["request_id"],
         "status": status,
@@ -230,3 +255,14 @@ def finish_recall_timing(*, status: str, partial: bool) -> dict:
             if name in _DEHYDRATION_OUTCOMES and int(count) > 0
         },
     }
+    ds_gate = state.get("ds_gate")
+    if (
+        isinstance(ds_gate, dict)
+        and ds_gate.get("outcome") in _DS_GATE_OUTCOMES
+    ):
+        receipt.update({
+            "ds_gate_outcome": ds_gate["outcome"],
+            "ds_gate_in": max(0, int(ds_gate.get("input_count", 0))),
+            "ds_gate_out": max(0, int(ds_gate.get("output_count", 0))),
+        })
+    return receipt
