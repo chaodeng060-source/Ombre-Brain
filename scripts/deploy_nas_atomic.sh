@@ -101,7 +101,14 @@ SHA256_BIN="${SHA256_BIN:-sha256sum}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 GIT_BIN="${GIT_BIN:-git}"
 FLOCK_BIN="${FLOCK_BIN:-flock}"
+HEALTH_WAIT_SECONDS="${OMBRE_HEALTH_WAIT_SECONDS:-180}"
 BACKUP_SCRIPT="$(cd "$(dirname "$0")" && pwd)/backup_nas_data.sh"
+
+[[ "$HEALTH_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]] &&
+  ((HEALTH_WAIT_SECONDS >= 30 && HEALTH_WAIT_SECONDS <= 600)) || {
+  echo "invalid OMBRE_HEALTH_WAIT_SECONDS: $HEALTH_WAIT_SECONDS" >&2
+  exit 2
+}
 
 exec 8>"$OMBRE_MUTATION_LOCK_FILE"
 "$FLOCK_BIN" -n 8 || {
@@ -341,8 +348,8 @@ if [[ -e "$OMBRE_DEPLOYMENT_ANCHOR_FILE" ]]; then
 fi
 
 wait_health() {
-  local i
-  for i in $(seq 1 30); do
+  local deadline=$((SECONDS + HEALTH_WAIT_SECONDS))
+  while ((SECONDS < deadline)); do
     if "$CURL_BIN" -fsS --max-time 3 "$OMBRE_HEALTH_URL" >/dev/null; then
       return 0
     fi

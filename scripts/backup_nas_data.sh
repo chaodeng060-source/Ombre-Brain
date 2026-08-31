@@ -76,6 +76,7 @@ TAR_BIN="${TAR_BIN:-tar}"
 REALPATH_BIN="${REALPATH_BIN:-realpath}"
 FLOCK_BIN="${FLOCK_BIN:-flock}"
 KEEP="${OMBRE_BACKUP_KEEP:-7}"
+HEALTH_WAIT_SECONDS="${OMBRE_HEALTH_WAIT_SECONDS:-180}"
 
 if [[ -n "${OMBRE_MUTATION_LOCK_HELD_FD:-}" ]]; then
   [[ "$OMBRE_MUTATION_LOCK_HELD_FD" =~ ^[0-9]+$ ]]
@@ -98,6 +99,11 @@ fi
 
 [[ "$KEEP" =~ ^[1-9][0-9]*$ ]] || {
   echo "invalid OMBRE_BACKUP_KEEP: $KEEP" >&2
+  exit 2
+}
+[[ "$HEALTH_WAIT_SECONDS" =~ ^[1-9][0-9]*$ ]] &&
+  ((HEALTH_WAIT_SECONDS >= 30 && HEALTH_WAIT_SECONDS <= 600)) || {
+  echo "invalid OMBRE_HEALTH_WAIT_SECONDS: $HEALTH_WAIT_SECONDS" >&2
   exit 2
 }
 
@@ -146,8 +152,8 @@ restore_check="$OMBRE_BACKUP_ROOT/.restore-check-$stamp"
 stopped=0
 
 wait_health() {
-  local i
-  for i in $(seq 1 30); do
+  local deadline=$((SECONDS + HEALTH_WAIT_SECONDS))
+  while ((SECONDS < deadline)); do
     if "$CURL_BIN" -fsS --max-time 3 "$OMBRE_HEALTH_URL" >/dev/null; then
       return 0
     fi
