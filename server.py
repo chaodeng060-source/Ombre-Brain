@@ -1806,6 +1806,25 @@ def _filter_anchor_policy_candidates(
         scored,
         len(kept),
     )
+    # 2026-08-31 朝灯令「没有相关内容就不该召回」。当天 14 轮真实日志里 11 轮 kept==input，
+    # 0.25 这条线几乎没拦住任何东西，但日志只记条数、不记分数，线该往哪挪全靠猜。
+    # 这里只补分数来源明细（纯观测，不改判定、不改阈值），攒够真实分布再定新线。
+    logger.info(
+        "anchor_gate_scores=%s",
+        json.dumps(
+            [
+                {
+                    "id": str(bucket.get("id", ""))[:12],
+                    "s": bucket.get("_anchor_adapted_relevance_score"),
+                    "lit": bucket.get("_literal_relevance_score"),
+                    "vec": bucket.get("_original_vector_relevance_score"),
+                    "ent": bool(bucket.get("entity_match")),
+                }
+                for bucket in candidates
+            ],
+            ensure_ascii=False,
+        ),
+    )
     return kept
 
 
