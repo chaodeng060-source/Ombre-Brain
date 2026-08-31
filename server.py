@@ -3684,6 +3684,7 @@ async def _create_operational_status_successor(
     chord_tag: str,
     detected_senses: list,
     entities: list[dict] | None,
+    x_provenance: dict | None = None,
 ) -> tuple[str, str, bool]:
     """Preserve both status snapshots and atomically mark their validity.
 
@@ -3703,6 +3704,7 @@ async def _create_operational_status_successor(
             world=world,
             chord_tag=chord_tag,
             sense=detected_senses or None,
+            x_provenance=x_provenance,
             actor="grow:recall-before-write:status-successor",
         )
         try:
@@ -3773,6 +3775,7 @@ async def _merge_or_create(
     require_self_contained: bool = False,
     recall_before_write: bool = False,
     entities: list[dict] | None = None,
+    x_provenance: dict | None = None,
 ) -> tuple[str, str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -3836,6 +3839,7 @@ async def _merge_or_create(
                         chord_tag=chord_tag,
                         detected_senses=detected_senses,
                         entities=entities,
+                        x_provenance=x_provenance,
                     )
 
                 replacement = content
@@ -4022,6 +4026,7 @@ async def _merge_or_create(
             world=world,
             chord_tag=chord_tag,
             sense=detected_senses or None,
+            x_provenance=x_provenance,
         )
         # --- Generate embedding for new bucket ---
         # 扫盘 #10：失败留痕，否则新桶语义检索召不回且无任何日志线索
@@ -6794,6 +6799,16 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
     if not content or not content.strip():
         return "内容为空，无法整理。"
 
+    # Every bucket produced by one grow call derives from the same caller
+    # payload.  Persist that fact at creation time so the deterministic Y
+    # linker can connect sibling buckets without inventing a session/event ID.
+    grow_x_provenance = {
+        "source_kind": "external",
+        "source_digest": hashlib.sha256(
+            content.strip().encode("utf-8")
+        ).hexdigest(),
+    }
+
     # --- Resolve effective world / 解析当前批次的 world 归属 ---
     effective_world = (world or "").strip() or (config.get("current_world", "") or "").strip()
 
@@ -6837,6 +6852,7 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
             require_self_contained=True,
             recall_before_write=True,
             entities=analysis.get("entities", []),
+            x_provenance=grow_x_provenance,
         )
         _ela_m = time.perf_counter() - _t_m
         _mark_briefing_cache_dirty(
@@ -6912,6 +6928,7 @@ async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
                 require_self_contained=True,
                 recall_before_write=True,
                 entities=item.get("entities", []),
+                x_provenance=grow_x_provenance,
             )
 
             _bid_suffix = f" [{_bid}]" if _bid else ""
