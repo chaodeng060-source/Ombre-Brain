@@ -42,7 +42,9 @@ _RECALL_METRIC_MODES = {
     "vector_stored_segments_scanned": "sum",
     "vector_segment_comparisons": "sum",
     "vector_invalid_rows": "sum",
+    "vector_pg_shadow_busy_skips": "sum",
     "vector_dimension": "max",
+    "curated_lexical_shadow_timeouts": "sum",
 }
 
 
@@ -55,8 +57,18 @@ def begin_recall_timing() -> contextvars.Token:
         "active_stages": {},
         "dehydration": {},
         "metrics": {},
+        "degraded": False,
     }
     return _recall_timing.set(state)
+
+
+def get_recall_request_id() -> str:
+    """Return the current content-free request correlation id."""
+    state = _recall_timing.get()
+    if not isinstance(state, dict):
+        return ""
+    request_id = state.get("request_id")
+    return request_id if isinstance(request_id, str) else ""
 
 
 def reset_recall_timing(token: contextvars.Token) -> None:
@@ -75,6 +87,18 @@ def get_recall_partial_result() -> str:
         return ""
     value = state.get("partial_result")
     return value if isinstance(value, str) else ""
+
+
+def mark_recall_partial() -> None:
+    """Mark a completed recall as degraded without storing query content."""
+    state = _recall_timing.get()
+    if isinstance(state, dict):
+        state["degraded"] = True
+
+
+def recall_is_partial() -> bool:
+    state = _recall_timing.get()
+    return bool(state.get("degraded", False)) if isinstance(state, dict) else False
 
 
 def record_recall_stage(name: str, elapsed_seconds: float) -> None:

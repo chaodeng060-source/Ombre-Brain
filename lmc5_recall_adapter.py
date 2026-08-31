@@ -1,8 +1,7 @@
-"""Thin Ombre adapter for the vendored LMC-5 recall fusion.
+"""Thin Ombre adapter for the vendored LMC-5 score fusion.
 
-Retrieval stays in Ombre because its stores and guards are asynchronous and
-production-specific. Only the rank fusion and cross-channel id merge are
-delegated to the byte-identical upstream module.
+The adapter keeps Ombre's asynchronous stores and authority guards in place.
+Only cross-channel score fusion is delegated to the vendored upstream module.
 """
 
 from __future__ import annotations
@@ -11,19 +10,26 @@ from typing import Any
 
 from vendor.lmc5_pgvector.recall_pipeline import RecallHit, RecallPipeline
 
+_FUSION_MODES = frozenset({"raw", "minmax", "rrf"})
+
 
 def fuse_ranked_channels(
     channels: list[tuple[list[tuple[Any, Any]], float]],
     *,
     k: int = 60,
+    fusion: str = "rrf",
 ) -> list[tuple[Any, float]]:
-    """Fuse Ombre ranked bucket channels through upstream LMC-5 RRF.
+    """Fuse ranked Ombre bucket channels through upstream LMC-5.
 
-    Ombre bucket ids are strings while upstream ids are integers. The mapping
-    is call-local and deterministic. Duplicate positions are represented by
-    disposable sentinel hits so a duplicate still consumes its original rank
-    without casting a second vote, exactly matching Ombre's previous contract.
+    ``rrf`` is the production-compatible default and deliberately uses only
+    the caller's within-channel order. ``raw`` and ``minmax`` preserve each
+    item's real source score; replacing those scores with positional numbers
+    would make the three upstream modes a false comparison.
     """
+    normalized_fusion = str(fusion or "rrf").strip().lower()
+    if normalized_fusion not in _FUSION_MODES:
+        raise ValueError(f"unsupported LMC-5 fusion mode: {fusion!r}")
+
     source_to_upstream: dict[Any, int] = {}
     upstream_to_source: dict[int, Any] = {}
     adapted_channels: list[tuple[str, list[RecallHit]]] = []
@@ -41,6 +47,11 @@ def fuse_ranked_channels(
         for position, item in enumerate(ranked_items):
             source_id = item[0]
             if source_id in seen_in_channel:
+                if normalized_fusion != "rrf":
+                    # raw/minmax compare actual scores; a disposable duplicate
+                    # would change the channel's min/max span. Keep the first
+                    # occurrence and drop later copies instead.
+                    continue
                 upstream_id = next_sentinel_id
                 next_sentinel_id -= 1
             else:
@@ -51,14 +62,17 @@ def fuse_ranked_channels(
                     next_source_id += 1
                 upstream_id = source_to_upstream[source_id]
 
-            # Upstream ranks by hit.score before applying RRF. Synthetic scores
-            # preserve the caller's supplied order; source scores stay unused.
+            adapted_score = (
+                float(item_count - position)
+                if normalized_fusion == "rrf"
+                else float(item[1])
+            )
             hits.append(
                 RecallHit(
                     source_id=upstream_id,
                     title="",
                     content="",
-                    score=float(item_count - position),
+                    score=adapted_score,
                     channel=channel_name,
                     metadata={"namespace": "curated"},
                 )
@@ -66,7 +80,7 @@ def fuse_ranked_channels(
         adapted_channels.append((channel_name, hits))
 
     pipeline = RecallPipeline(
-        fusion="rrf",
+        fusion=normalized_fusion,
         channel_weights=channel_weights,
         rrf_k=int(k),
         content_fingerprint=None,

@@ -149,6 +149,68 @@ class EpisodeEngine:
                 claimed.add(str(sid))
         return claimed
 
+    def _cluster_prepared_snapshot(
+        self,
+        buckets,
+        prepared_entries,
+        now: datetime,
+    ) -> list[list[dict]]:
+        """Pure CPU clustering over immutable resident inputs."""
+        claimed: set[str] = set()
+        for bucket in buckets:
+            if bucket.get("metadata", {}).get("type") != "episode":
+                continue
+            for source_id in bucket.get("metadata", {}).get("source_buckets") or []:
+                claimed.add(str(source_id))
+
+        prepared_by_id = dict(prepared_entries)
+        candidates: list[dict] = []
+        for bucket in buckets:
+            meta = bucket.get("metadata", {})
+            bucket_id = str(bucket.get("id", ""))
+            if self._is_exempt(meta) or bucket_id in claimed:
+                continue
+            created = self._created_dt(meta)
+            if created is None:
+                continue
+            if (now - created).total_seconds() / 86400 > self.lookback_days:
+                continue
+            if bucket_id not in prepared_by_id:
+                continue
+            candidates.append({**bucket, "_dt": created})
+
+        if len(candidates) < self.min_cluster:
+            return []
+        candidates.sort(key=lambda bucket: bucket["_dt"], reverse=True)
+        remaining = {bucket["id"]: bucket for bucket in candidates}
+        clusters: list[list[dict]] = []
+
+        for seed in candidates:
+            if seed["id"] not in remaining:
+                continue
+            del remaining[seed["id"]]
+            cluster = [seed]
+            seed_embedding = prepared_by_id[seed["id"]]
+            seed_created = seed["_dt"]
+            for other in list(remaining.values()):
+                if len(cluster) >= self.max_cluster:
+                    break
+                if abs((seed_created - other["_dt"]).total_seconds()) / 86400 > self.span_days:
+                    continue
+                try:
+                    similarity = self.embedding_engine._max_prepared_similarity(
+                        seed_embedding,
+                        prepared_by_id[other["id"]],
+                    )
+                except Exception:
+                    continue
+                if similarity >= self.sim_threshold:
+                    cluster.append(other)
+                    del remaining[other["id"]]
+            if len(cluster) >= self.min_cluster:
+                clusters.append(cluster)
+        return clusters
+
     # ---------------------------------------------------------
     # Build episode candidate clusters from recent unclaimed Event buckets.
     # Greedy, seed = most recent; pull in semantically-close events within span.
@@ -158,6 +220,48 @@ class EpisodeEngine:
         if not (self.embedding_engine and self.embedding_engine.enabled):
             logger.info("[Episode] embedding disabled, skip / 向量未启用，跳过")
             return []
+        snapshot_borrow = getattr(self.bucket_mgr, "borrow_recall_snapshot", None)
+        prepared_vectors = getattr(
+            self.embedding_engine,
+            "borrow_recall_vectors",
+            None,
+        )
+        prepared_similarity = getattr(
+            self.embedding_engine,
+            "_max_prepared_similarity",
+            None,
+        )
+        if (
+            callable(snapshot_borrow)
+            and callable(prepared_vectors)
+            and callable(prepared_similarity)
+        ):
+            try:
+                buckets = await snapshot_borrow(include_archive=False)
+                embeddings = prepared_vectors()
+                if embeddings is None:
+                    logger.info(
+                        "[Episode] resident vectors are cold, skip cycle"
+                    )
+                    return []
+                return await asyncio.to_thread(
+                    self._cluster_prepared_snapshot,
+                    buckets,
+                    embeddings,
+                    datetime.now(),
+                )
+            except Exception as exc:
+                # Episode maintenance is optional.  Never fall back to a full
+                # library scan in the request event loop when the resident
+                # inputs are unavailable.
+                logger.warning(
+                    "[Episode] resident clustering unavailable, skip cycle: %s",
+                    type(exc).__name__,
+                )
+                return []
+
+        # Compatibility fallback for lightweight embedders used by existing
+        # tests and external integrations.  Production has the resident APIs.
         try:
             buckets = await self.bucket_mgr.list_all(include_archive=False)
         except Exception as e:

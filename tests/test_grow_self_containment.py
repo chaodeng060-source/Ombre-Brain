@@ -206,6 +206,55 @@ async def test_quoted_named_self_preserves_quote_without_api(test_config):
     assert create.calls == []
 
 
+@pytest.mark.parametrize("pronoun", ["我", "你"])
+@pytest.mark.asyncio
+async def test_resident_pronoun_in_quote_is_preserved_without_api(
+    test_config,
+    pronoun,
+):
+    dehydrator, create = _dehydrator(test_config, "unused")
+    content = f"[[朝灯]]记录：「{pronoun}会继续写。」"
+
+    result = await dehydrator.ensure_self_contained(
+        content,
+        source_context=content,
+    )
+
+    assert result == content
+    assert create.calls == []
+
+
+@pytest.mark.asyncio
+async def test_quoted_calendar_word_needs_explicit_date_anchor(test_config):
+    from dehydrator import SelfContainmentError, find_unresolved_references
+
+    anchored = "2026-08-22，[[朝灯]]说：「今天完成测试。」"
+    unanchored = "[[朝灯]]说：「今天完成测试。」"
+    assert find_unresolved_references(anchored) == []
+    assert find_unresolved_references(unanchored) == ["今天"]
+
+    dehydrator, create = _dehydrator(test_config, "unused")
+    assert await dehydrator.ensure_self_contained(
+        anchored,
+        source_context=anchored,
+    ) == anchored
+    with pytest.raises(SelfContainmentError, match="逐字引语"):
+        await dehydrator.ensure_self_contained(
+            unanchored,
+            source_context=unanchored,
+        )
+    assert create.calls == []
+
+
+def test_prompts_pin_resident_entity_mapping_and_keep_third_party_strict():
+    from dehydrator import DIGEST_PROMPT, SELF_CONTAIN_PROMPT
+
+    for prompt in (DIGEST_PROMPT, SELF_CONTAIN_PROMPT):
+        assert "第一人称" in prompt and "哥哥" in prompt
+        assert "第二人称" in prompt and "朝灯" in prompt
+        assert "他/她" in prompt
+
+
 @pytest.mark.parametrize(
     "quote",
     [

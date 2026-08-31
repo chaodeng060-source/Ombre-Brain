@@ -10,6 +10,7 @@
 
 import os
 import json
+import hashlib
 import math
 import time
 import sqlite3
@@ -23,8 +24,11 @@ import httpx
 from openai import AsyncOpenAI
 
 from maintenance_barrier import MaintenanceBarrier
-from pg_mirror_queue import PgMirrorQueue
-from recall_timing import recall_stage, record_recall_metric
+from recall_timing import (
+    get_recall_request_id,
+    recall_stage,
+    record_recall_metric,
+)
 from redact import redact_embedding_input
 
 logger = logging.getLogger("ombre_brain.embedding")
@@ -74,7 +78,6 @@ class EmbeddingEngine:
         db_path = os.path.join(config["buckets_dir"], "embeddings.db")
         self.db_path = db_path
         self._maintenance_barrier = MaintenanceBarrier(config["buckets_dir"])
-        self.pg_mirror_queue = PgMirrorQueue(config)
         self._vector_cache_signature = None
         self._vector_cache_entries = None
         self._vector_cache_records = None
@@ -82,6 +85,11 @@ class EmbeddingEngine:
         self._vector_cache_lock = asyncio.Lock()
         self._vector_cache_observer = None
         self._vector_cache_observer_identity = None
+        # A process can host several MCP/ASGI lifespans.  The warm connection
+        # and local vector cache are paid once per process, never once per
+        # transport session.
+        self._recall_prewarm_lock = asyncio.Lock()
+        self._recall_prewarm_result: dict | None = None
 
         # --- Optional dedicated proxy ONLY for embedding traffic ---
         # --- 仅给 embedding 流量挂的专用代理（不碰 DeepSeek/R2 直连）---
@@ -215,9 +223,17 @@ class EmbeddingEngine:
 
         truncated = redact_embedding_input(text)[:2000]
         try:
-            response = await self.client.embeddings.create(
-                model=self.model,
-                input=truncated,
+            # The SDK/httpx timeout is per socket phase, not a total
+            # wall-clock budget.  Keep the existing configured timeout as the
+            # single source of truth, and add an asyncio total deadline around
+            # the exact same request.  Once the event loop is healthy this
+            # guarantees a stalled endpoint fails soft before breath's budget.
+            response = await asyncio.wait_for(
+                self.client.embeddings.create(
+                    model=self.model,
+                    input=truncated,
+                ),
+                timeout=self.timeout,
             )
             self._consec_fail = 0  # success resets the breaker
             if response.data and len(response.data) > 0:
@@ -236,6 +252,54 @@ class EmbeddingEngine:
             is_timeout = isinstance(e, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException))
             return [], "timeout" if is_timeout else "error"
 
+    async def prewarm_recall(self) -> dict:
+        """Warm the local vector cache and one real query connection once."""
+        if self._recall_prewarm_result is not None:
+            return dict(self._recall_prewarm_result)
+        async with self._recall_prewarm_lock:
+            if self._recall_prewarm_result is not None:
+                return dict(self._recall_prewarm_result)
+
+            vector_rows = 0
+            try:
+                vector_rows = len(await self._get_cached_vectors())
+            except Exception as exc:
+                logger.warning(
+                    "Embedding vector-cache prewarm unavailable: %s",
+                    type(exc).__name__,
+                )
+
+            embedding_status = "error"
+            embedding_ready = False
+            try:
+                vector, embedding_status = await self._generate_embedding_with_status(
+                    "Ombre recall connection warmup"
+                )
+                embedding_ready = bool(vector) and embedding_status == "ok"
+            except Exception as exc:
+                logger.warning(
+                    "Embedding connection prewarm unavailable: %s",
+                    type(exc).__name__,
+                )
+
+            self._recall_prewarm_result = {
+                "embedding_ready": embedding_ready,
+                "embedding_status": embedding_status,
+                "vector_rows": vector_rows,
+            }
+            return dict(self._recall_prewarm_result)
+
+    def borrow_recall_vectors(self):
+        """Borrow the warm immutable vector generation without rebuilding."""
+        self._ensure_vector_cache_state()
+        signature = self._vector_store_signature()
+        if (
+            self._vector_cache_entries is not None
+            and self._vector_cache_signature == signature
+        ):
+            return self._vector_cache_entries
+        return None
+
     def _store_embedding(self, bucket_id: str, embedding: list[float]):
         from utils import now_iso
         with self._maintenance_barrier.shared():
@@ -246,13 +310,6 @@ class EmbeddingEngine:
                 )
                 conn.commit()
         self._invalidate_vector_cache()
-        mirror_queue = getattr(self, "pg_mirror_queue", None)
-        if mirror_queue is not None:
-            mirror_queue.enqueue(
-                bucket_id,
-                action="upsert",
-                source="embedding:store",
-            )
 
     def delete_embedding(self, bucket_id: str):
         with self._maintenance_barrier.shared():
@@ -263,13 +320,6 @@ class EmbeddingEngine:
                 )
                 conn.commit()
         self._invalidate_vector_cache()
-        mirror_queue = getattr(self, "pg_mirror_queue", None)
-        if mirror_queue is not None:
-            mirror_queue.enqueue(
-                bucket_id,
-                action="delete",
-                source="embedding:delete",
-            )
 
     async def get_embedding(self, bucket_id: str) -> list[float] | None:
         with closing(sqlite3.connect(self.db_path)) as conn:
@@ -327,6 +377,12 @@ class EmbeddingEngine:
         if self._pg_recall_enabled():
             pg_results = await self._search_similar_pg(query_embedding, top_k)
             if pg_results is not None:
+                self._schedule_pg_vector_shadow(
+                    query,
+                    query_embedding,
+                    pg_results,
+                    top_k,
+                )
                 return pg_results, "ok"
 
         with recall_stage("vector_cache_load"):
@@ -381,15 +437,195 @@ class EmbeddingEngine:
             "1", "true", "yes", "on",
         }
 
+    def _pg_recall_mode(self) -> str:
+        """Select the indexable HNSW query or the exact full-scan rollback."""
+        mode = os.environ.get("OMBRE_PG_RECALL_MODE", "hnsw").strip().lower()
+        if mode not in {"hnsw", "exact"}:
+            logger.warning("Unknown PG recall mode %r; using exact rollback", mode)
+            return "exact"
+        return mode
+
+    @staticmethod
+    def _pg_hnsw_ef_search(candidate_limit: int) -> int:
+        """Return a pgvector-valid search pool large enough for segment dedupe."""
+        try:
+            configured = int(
+                os.environ.get("OMBRE_PG_RECALL_HNSW_EF_SEARCH", "240")
+            )
+        except ValueError:
+            configured = 240
+        # pgvector's supported range is 1..1000.  The measured default 240 is
+        # the first tested value that kept all 20x20 exact bucket IDs on the
+        # 2026-08-27 production-vector replay.  Wider top-k calls must still
+        # expose at least one candidate slot per requested segment row.
+        return min(1000, max(1, configured, int(candidate_limit)))
+
+    def _pg_vector_shadow_enabled(self) -> bool:
+        """Run the expensive parity scan only outside fusion collection."""
+        fusion_shadow = os.environ.get(
+            "OMBRE_UPSTREAM_FUSION_SHADOW",
+            "0",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if fusion_shadow:
+            # The fusion shadow already reuses the production PG-vector IDs.
+            # A second 12k-row SQLite cosine scan adds no fusion evidence and
+            # was measured at 12-14 seconds per natural recall.
+            return False
+        return os.environ.get("OMBRE_PG_VECTOR_SHADOW", "0").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+
+    def _schedule_pg_vector_shadow(
+        self,
+        query: str,
+        query_embedding,
+        pg_results: list[tuple[str, float]],
+        top_k: int,
+    ) -> None:
+        """Start at most one background local comparison.
+
+        The already-generated query embedding is reused. The request returns
+        the unchanged PG result immediately; the SQLite scan runs in a worker
+        thread and never performs another model/API call.
+        """
+        if not self._pg_vector_shadow_enabled():
+            return
+        current = getattr(self, "_pg_vector_shadow_task", None)
+        if current is not None and not current.done():
+            record_recall_metric("vector_pg_shadow_busy_skips", 1)
+            logger.info(
+                "pg_vector_shadow_busy=%s",
+                json.dumps(
+                    {
+                        "request_id": get_recall_request_id(),
+                        "status": "busy_skip",
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+            return
+        self._pg_vector_shadow_task = asyncio.create_task(
+            self._run_pg_vector_shadow(
+                query,
+                list(query_embedding),
+                list(pg_results),
+                int(top_k),
+            )
+        )
+
+    def _scan_sqlite_shadow(self, query_embedding, top_k: int):
+        """Read and compare one consistent SQLite snapshot in a worker thread."""
+        prepared_query = self._prepare_embedding_record(query_embedding)
+        results: list[tuple[str, float]] = []
+        invalid_rows = 0
+        rows_scanned = 0
+        uri = Path(self.db_path).resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as conn:
+            conn.execute("BEGIN")
+            rows = conn.execute(
+                "SELECT bucket_id, embedding FROM embeddings ORDER BY rowid"
+            )
+            for bucket_id, raw_embedding in rows:
+                rows_scanned += 1
+                try:
+                    stored = self._prepare_embedding_record(json.loads(raw_embedding))
+                    similarity = self._max_prepared_similarity(prepared_query, stored)
+                    results.append((str(bucket_id), float(similarity)))
+                except Exception:
+                    invalid_rows += 1
+        results.sort(key=lambda item: item[1], reverse=True)
+        return results[:top_k], rows_scanned, invalid_rows
+
+    async def _run_pg_vector_shadow(
+        self,
+        query: str,
+        query_embedding,
+        pg_results: list[tuple[str, float]],
+        top_k: int,
+    ) -> None:
+        started_at = time.perf_counter()
+        try:
+            sqlite_results, rows_scanned, invalid_rows = await asyncio.to_thread(
+                self._scan_sqlite_shadow,
+                query_embedding,
+                top_k,
+            )
+            pg_ids = [bucket_id for bucket_id, _score in pg_results]
+            sqlite_ids = [bucket_id for bucket_id, _score in sqlite_results]
+            logger.info(
+                "pg_vector_shadow=%s",
+                json.dumps(
+                    {
+                        "request_id": get_recall_request_id(),
+                        "query_sha": hashlib.sha256(
+                            str(query).encode("utf-8")
+                        ).hexdigest()[:12],
+                        "pg": [
+                            [str(bucket_id), round(float(score), 8)]
+                            for bucket_id, score in pg_results
+                        ],
+                        "sqlite": [
+                            [str(bucket_id), round(float(score), 8)]
+                            for bucket_id, score in sqlite_results
+                        ],
+                        "overlap": len(set(pg_ids) & set(sqlite_ids)),
+                        "rows_scanned": rows_scanned,
+                        "invalid_rows": invalid_rows,
+                        "elapsed_ms": round(
+                            (time.perf_counter() - started_at) * 1000.0,
+                            3,
+                        ),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "PG vector shadow failed without changing live result: %s",
+                type(exc).__name__,
+            )
+
+    @staticmethod
+    def _rank_pg_segment_rows(
+        rows,
+        top_k: int,
+    ) -> list[tuple[str, float]]:
+        """Collapse ANN segment candidates with the exact bucket max contract."""
+        best_distance: dict[str, float] = {}
+        for bucket_id, raw_distance in rows:
+            normalized_id = str(bucket_id)
+            distance = float(raw_distance)
+            previous = best_distance.get(normalized_id)
+            if previous is None or distance < previous:
+                best_distance[normalized_id] = distance
+        ranked = sorted(
+            best_distance.items(),
+            key=lambda item: (item[1], item[0]),
+        )[:top_k]
+        return [
+            (bucket_id, 1.0 - distance)
+            for bucket_id, distance in ranked
+        ]
+
     async def _search_similar_pg(
         self, query_embedding, top_k: int
     ) -> list[tuple[str, float]] | None:
-        """走 PG 的 ivfflat 索引取 top_k，失败返回 None 让调用方回落扫表。
+        """Use an indexable segment ANN query, with exact PG as rollback.
 
-        口径必须与扫表一致：一个桶可能有多段向量，取该桶所有段里最近的那段
-        （MIN(距离)），再按距离升序 —— 对应扫表侧的 _max_prepared_similarity。
-        余弦距离 <=> 与相似度的关系是 sim = 1 - distance。
+        Buckets can hold up to ``_MAX_CHUNKS`` segments.  The HNSW query first
+        fetches ``top_k * _MAX_CHUNKS`` nearest segments, then restores the
+        long-standing bucket contract by taking each bucket's minimum distance.
+        ``OMBRE_PG_RECALL_MODE=exact`` keeps the previous grouped full scan.
         """
+        requested = int(top_k)
+        if requested <= 0:
+            return []
+        mode = self._pg_recall_mode()
         dsn = os.environ.get("OMBRE_PG_RECALL_DSN", "postgresql:///ombre_mirror")
         try:
             probes = int(os.environ.get("OMBRE_PG_RECALL_PROBES", "40"))
@@ -408,13 +644,28 @@ class EmbeddingEngine:
                     dsn, connect_timeout=5
                 ) as conn:
                     async with conn.cursor() as cur:
-                        await cur.execute(f"SET ivfflat.probes = {probes}")
-                        await cur.execute(
-                            "SELECT bucket_id, MIN(embedding <=> %s::halfvec) AS d "
-                            "FROM ombre_vectors GROUP BY bucket_id "
-                            "ORDER BY d LIMIT %s",
-                            (literal, top_k),
-                        )
+                        if mode == "hnsw":
+                            candidate_limit = requested * max(1, int(self._MAX_CHUNKS))
+                            ef_search = self._pg_hnsw_ef_search(candidate_limit)
+                            await cur.execute(
+                                f"SET LOCAL hnsw.ef_search = {ef_search}"
+                            )
+                            await cur.execute(
+                                "SELECT bucket_id, "
+                                "(embedding::vector(1024)) <=> %s::vector(1024) AS d "
+                                "FROM ombre_vectors "
+                                "ORDER BY (embedding::vector(1024)) "
+                                "<=> %s::vector(1024) LIMIT %s",
+                                (literal, literal, candidate_limit),
+                            )
+                        else:
+                            await cur.execute(f"SET ivfflat.probes = {probes}")
+                            await cur.execute(
+                                "SELECT bucket_id, MIN(embedding <=> %s::halfvec) AS d "
+                                "FROM ombre_vectors GROUP BY bucket_id "
+                                "ORDER BY d, bucket_id LIMIT %s",
+                                (literal, requested),
+                            )
                         rows = await cur.fetchall()
         except Exception as exc:                                    # noqa: BLE001
             logger.warning(f"PG recall failed ({type(exc).__name__}: {exc}); 回落扫表")
@@ -426,8 +677,13 @@ class EmbeddingEngine:
             logger.warning("PG recall returned no rows; 回落扫表")
             return None
 
-        record_recall_metric("vector_pg_rows", len(rows))
-        return [(str(bid), 1.0 - float(dist)) for bid, dist in rows]
+        results = (
+            self._rank_pg_segment_rows(rows, requested)
+            if mode == "hnsw"
+            else [(str(bid), 1.0 - float(dist)) for bid, dist in rows]
+        )
+        record_recall_metric("vector_pg_rows", len(results))
+        return results
 
     def _ensure_vector_cache_state(self) -> None:
         """Initialize cache fields for legacy tests that bypass __init__."""

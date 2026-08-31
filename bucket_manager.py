@@ -33,6 +33,7 @@ import os
 import math
 import logging
 import re
+import time
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -41,7 +42,7 @@ from typing import Optional
 
 import frontmatter
 import jieba
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process
 
 from utils import (
     generate_bucket_id, sanitize_name, safe_path, now_iso, world_matches,
@@ -55,9 +56,13 @@ from storage_safety import advisory_file_lock, atomic_write_post
 from x_provenance import normalize_x_provenance, validate_x_provenance_update
 from review_queue import ReviewQueue, make_clothing_entry
 from timeline_axis import normalize_thread
-from pg_mirror_queue import PgMirrorQueue
+from bm25_index import BM25Index
 
 logger = logging.getLogger("ombre_brain.bucket")
+
+# Production 2026-08-27 replay: a 600-second start-to-start window reduced
+# 13 request-dirty full rebuilds to 6 while bounding lexical generation lag.
+_DEFAULT_BM25_REBUILD_MIN_INTERVAL_SEC = 600.0
 
 # Recall scans are intentionally exact, but they must not monopolize the
 # request event loop long enough to defeat /api/breath's wall-clock deadline.
@@ -78,6 +83,12 @@ _BucketTreeSnapshot = tuple[_BucketFileRevision, ...]
 RECALL_DERIVED_METADATA_FIELDS = frozenset({
     "dehydrated_summary",
     "dehydrated_content_hash",
+})
+BM25_CORPUS_FIELDS = frozenset({
+    "content",
+    "name",
+    "tags",
+    "domain",
 })
 E_RESPONSE_TENDENCIES = frozenset({"comfort", "engage", "withdraw", "alert"})
 E_GROWTH_DELTAS = frozenset({"growth", "stable", "setback"})
@@ -269,6 +280,15 @@ class BucketManager:
         # 自动失效回退全扫，外部手动建的新文件走 miss 全扫也能找到——不需要主动失效钩子。
         self._bucket_path_cache: dict[str, str] = {}
 
+        # Z 轴 currentness 覆盖表（z_lifecycle 审批产出的只读旁路，保护域桶不动元数据）。
+        # 排序层在 search() 消费：historical 桶降权，同一件事新版才压得过旧版。mtime 缓存。
+        self._z_overrides_path = os.path.join(
+            self.base_dir,
+            "z_currentness_overrides.jsonl",
+        )
+        self._z_historical_cache: frozenset = frozenset()
+        self._z_overrides_mtime: float = -1.0
+
         # list_all is the hot read path for recall.  Keep parsed frontmatter in
         # process, but validate every hit against a cheap path/mtime/size tree
         # snapshot so direct NAS/Obsidian edits remain visible without a TTL.
@@ -280,6 +300,34 @@ class BucketManager:
         ] = {}
         self._list_all_cache_generation = 0
         self._list_all_cache_lock = asyncio.Lock()
+
+        # Recall needs a read-only resident view, not list_all()'s defensive
+        # full-library deepcopy on every request.  Each key points at an
+        # immutable tuple; writers replace the tuple after the durable file
+        # operation, so concurrent readers keep a stable old view.  Direct
+        # Obsidian/NAS edits are reconciled by a coalesced worker-thread scan.
+        self._recall_snapshot_cache: dict[
+            tuple[bool, bool],
+            tuple[dict, ...],
+        ] = {}
+        self._recall_snapshot_generation: dict[tuple[bool, bool], int] = {}
+        self._recall_snapshot_disk_token: dict[
+            tuple[bool, bool],
+            _BucketTreeSnapshot | None,
+        ] = {}
+        self._recall_snapshot_lock = asyncio.Lock()
+        self._recall_snapshot_refresh_tasks: dict[
+            tuple[bool, bool],
+            asyncio.Task,
+        ] = {}
+        self._recall_snapshot_refresh_due: dict[tuple[bool, bool], float] = {}
+        try:
+            refresh_sec = float(
+                matching_cfg.get("recall_snapshot_refresh_sec", 30.0)
+            )
+        except (TypeError, ValueError):
+            refresh_sec = 30.0
+        self._recall_snapshot_refresh_sec = max(5.0, refresh_sec)
 
         # _calc_topic_score used to run jieba for the identical query once per
         # bucket.  Cache only the deterministic tokenization, not any score or
@@ -312,7 +360,44 @@ class BucketManager:
         self.w_emotion = scoring.get("emotion_resonance", 2.0)
         self.w_time = scoring.get("time_proximity", 2.5)
         self.w_importance = scoring.get("importance", 1.0)
+        self.w_bm25 = scoring.get("bm25_weight", 1.5)
         self.content_weight = scoring.get("content_weight", 3.0)
+        mode = os.environ.get("OMBRE_BM25_MODE", "off").strip().lower()
+        self._bm25_mode = mode if mode in {"off", "shadow", "live"} else "off"
+        # Keep the upstream atomic-generation lifecycle, but coalesce dirty
+        # writes behind a minimum start-to-start interval. Requests always use the
+        # last complete generation; only startup prewarm is intentionally inline.
+        self._bm25 = BM25Index()
+        self._bm25_dirty = True
+        self._bm25_rebuilding = False
+        self._bm25_generation = 0
+        raw_bm25_rebuild_interval = os.environ.get(
+            "OMBRE_BM25_REBUILD_MIN_INTERVAL_SEC",
+            matching_cfg.get(
+                "bm25_rebuild_min_interval_sec",
+                _DEFAULT_BM25_REBUILD_MIN_INTERVAL_SEC,
+            ),
+        )
+        try:
+            bm25_rebuild_interval = float(raw_bm25_rebuild_interval)
+        except (TypeError, ValueError):
+            bm25_rebuild_interval = _DEFAULT_BM25_REBUILD_MIN_INTERVAL_SEC
+        # Zero is the explicit rollback to the old next-request trigger timing.
+        self._bm25_rebuild_min_interval_sec = max(0.0, bm25_rebuild_interval)
+        self._bm25_last_rebuild_started_at: float | None = None
+        self._bm25_rebuild_task: asyncio.Task | None = None
+        # Known writes that land while an unknown-dirty full rebuild is in
+        # flight are replayed onto that fresh generation before it is exposed.
+        self._bm25_unknown_generation = 0
+        self._bm25_known_deltas: list[tuple[int, dict | None, str, bool]] = []
+        # A complete BM25 generation also carries a resident literal-key map.
+        # Writes keep changed IDs in a tiny delta until the next generation
+        # swaps in, so exact navigation never waits for a full rebuild.
+        self._bm25_dirty_bucket_ids: set[str] = set()
+        # External edits do not identify which bucket changed. Until their
+        # replacement generation is ready, keep the exact legacy scorer rather
+        # than reading an unverifiable resident row.
+        self._bm25_unknown_dirty = True
         self._locks_dir = os.path.join(self.base_dir, ".locks")
         self._maintenance_barrier = MaintenanceBarrier(self.base_dir)
         self._clothing_review_queue = ReviewQueue(
@@ -325,7 +410,6 @@ class BucketManager:
                 config.get("audit", {}),
             )
         self._bucket_locks: dict[str, asyncio.Lock] = {}
-        self.pg_mirror_queue = PgMirrorQueue(config)
 
     def _lock_for(self, bucket_id: str) -> asyncio.Lock:
         lock = self._bucket_locks.get(bucket_id)
@@ -354,22 +438,883 @@ class BucketManager:
             snapshot["path"] = os.path.abspath(file_path)
         return snapshot
 
-    def _atomic_write_post(self, file_path: str, post) -> None:
+    def _atomic_write_post(
+        self,
+        file_path: str,
+        post,
+        *,
+        bm25_content_changed: bool = True,
+    ) -> None:
         atomic_write_post(file_path, post)
-        self.invalidate_list_all_cache()
-        # PostgreSQL is a derived vector mirror.  Queueing happens only after
-        # the authoritative Markdown replacement succeeds and never decides
-        # whether that write succeeds.
-        self.pg_mirror_queue.enqueue(
-            str(post.metadata.get("id") or ""),
-            action="dirty",
-            source="bucket_manager:after-write",
+        incremental_applied = False
+        bucket_id = str(post.get("id", ""))
+        if bm25_content_changed and bucket_id:
+            bucket = {
+                "id": bucket_id,
+                "metadata": dict(post.metadata),
+                "content": post.content,
+                "path": os.path.abspath(file_path),
+            }
+            incremental_applied = self._apply_bm25_incremental(
+                bucket=bucket,
+                visible=self._recall_path_visible(
+                    file_path,
+                    self._recall_cache_key(False),
+                ),
+            )
+            if not incremental_applied:
+                self._bm25_dirty_bucket_ids.add(bucket_id)
+        self._refresh_recall_snapshot_entry(
+            file_path,
+            bm25_content_changed=(
+                bm25_content_changed and not incremental_applied
+            ),
+        )
+        self.invalidate_list_all_cache(
+            bm25_content_changed=(
+                bm25_content_changed and not incremental_applied
+            ),
+            bm25_change_is_known=True,
         )
 
-    def invalidate_list_all_cache(self) -> None:
+    def invalidate_list_all_cache(
+        self,
+        *,
+        bm25_content_changed: bool = True,
+        bm25_change_is_known: bool = False,
+    ) -> None:
         """Drop parsed bucket snapshots after a durable in-process mutation."""
         self._list_all_cache_generation += 1
         self._list_all_cache.clear()
+        if bm25_content_changed:
+            self._mark_bm25_dirty(known_change=bm25_change_is_known)
+
+    def _recall_cache_key(
+        self,
+        include_archive: bool = False,
+        include_nsfw: bool | None = None,
+    ) -> tuple[bool, bool]:
+        if include_nsfw is None:
+            include_nsfw = getattr(self, "nsfw_active", False)
+        return (bool(include_archive), bool(include_nsfw))
+
+    def _recall_dirs(self, cache_key: tuple[bool, bool]) -> list[str]:
+        include_archive, include_nsfw = cache_key
+        dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir]
+        if include_archive:
+            dirs.append(self.archive_dir)
+        if include_nsfw:
+            dirs.append(self.nsfw_dir)
+        return dirs
+
+    @staticmethod
+    def _path_is_under(file_path: str, directory: str) -> bool:
+        try:
+            return os.path.commonpath(
+                (os.path.abspath(file_path), os.path.abspath(directory))
+            ) == os.path.abspath(directory)
+        except (OSError, ValueError):
+            return False
+
+    def _recall_path_visible(
+        self,
+        file_path: str,
+        cache_key: tuple[bool, bool],
+    ) -> bool:
+        return any(
+            self._path_is_under(file_path, directory)
+            for directory in self._recall_dirs(cache_key)
+        )
+
+    def _replace_recall_snapshot(
+        self,
+        cache_key: tuple[bool, bool],
+        buckets: tuple[dict, ...],
+        *,
+        disk_token: _BucketTreeSnapshot | None = None,
+    ) -> None:
+        self._recall_snapshot_cache[cache_key] = buckets
+        self._recall_snapshot_generation[cache_key] = (
+            self._recall_snapshot_generation.get(cache_key, 0) + 1
+        )
+        self._recall_snapshot_disk_token[cache_key] = disk_token
+
+    def _refresh_recall_snapshot_entry(
+        self,
+        file_path: str,
+        *,
+        previous_path: str = "",
+        bm25_content_changed: bool = True,
+    ) -> None:
+        """Write one durable bucket mutation through to resident recall views."""
+        if not self._recall_snapshot_cache:
+            return
+        bucket = self._load_bucket(file_path) if os.path.isfile(file_path) else None
+        bucket_id = str(bucket.get("id", "")) if bucket else ""
+        if bm25_content_changed and bucket_id:
+            self._bm25_dirty_bucket_ids.add(bucket_id)
+        normalized_path = os.path.normcase(os.path.abspath(file_path))
+        normalized_previous = (
+            os.path.normcase(os.path.abspath(previous_path))
+            if previous_path
+            else ""
+        )
+        for cache_key, current in list(self._recall_snapshot_cache.items()):
+            updated = list(current)
+            found = None
+            for index, existing in enumerate(updated):
+                existing_path = os.path.normcase(
+                    os.path.abspath(str(existing.get("path", "")))
+                )
+                if (
+                    (bucket_id and str(existing.get("id", "")) == bucket_id)
+                    or existing_path == normalized_path
+                    or (normalized_previous and existing_path == normalized_previous)
+                ):
+                    found = index
+                    break
+            visible = bool(bucket) and self._recall_path_visible(file_path, cache_key)
+            if visible and found is not None:
+                updated[found] = bucket
+            elif visible:
+                updated.append(bucket)
+            elif found is not None:
+                updated.pop(found)
+            else:
+                continue
+            self._replace_recall_snapshot(cache_key, tuple(updated))
+
+    def _remove_recall_snapshot_entry(
+        self,
+        bucket_id: str,
+        file_path: str,
+    ) -> None:
+        if not self._recall_snapshot_cache:
+            return
+        normalized_path = os.path.normcase(os.path.abspath(file_path))
+        for cache_key, current in list(self._recall_snapshot_cache.items()):
+            updated = tuple(
+                bucket
+                for bucket in current
+                if str(bucket.get("id", "")) != str(bucket_id)
+                and os.path.normcase(
+                    os.path.abspath(str(bucket.get("path", "")))
+                ) != normalized_path
+            )
+            if len(updated) != len(current):
+                self._replace_recall_snapshot(cache_key, updated)
+
+    def _scan_recall_snapshot_sync(
+        self,
+        dirs: list[str],
+    ) -> tuple[list[str], _BucketTreeSnapshot]:
+        paths: list[str] = []
+        snapshot: list[_BucketFileRevision] = []
+        for dir_path in dirs:
+            if not os.path.exists(dir_path):
+                continue
+            for root, _, files in os.walk(dir_path):
+                for filename in files:
+                    if not filename.endswith(".md"):
+                        continue
+                    file_path = os.path.join(root, filename)
+                    paths.append(file_path)
+                    try:
+                        info = os.stat(file_path)
+                        snapshot.append(
+                            (
+                                file_path,
+                                int(info.st_dev),
+                                int(info.st_ino),
+                                int(info.st_size),
+                                int(info.st_mtime_ns),
+                                int(info.st_ctime_ns),
+                            )
+                        )
+                    except OSError:
+                        snapshot.append(
+                            (file_path, None, None, None, None, None)
+                        )
+        return paths, tuple(snapshot)
+
+    def _load_recall_snapshot_sync(self, paths: list[str]) -> tuple[dict, ...]:
+        return tuple(
+            bucket
+            for file_path in paths
+            if (bucket := self._load_bucket(file_path)) is not None
+        )
+
+    async def _refresh_recall_snapshot_background(
+        self,
+        cache_key: tuple[bool, bool],
+    ) -> None:
+        """Reconcile external edits off the request thread and swap atomically."""
+        try:
+            generation = self._recall_snapshot_generation.get(cache_key, 0)
+            dirs = self._recall_dirs(cache_key)
+            paths, disk_token = await asyncio.to_thread(
+                self._scan_recall_snapshot_sync,
+                dirs,
+            )
+            if self._recall_snapshot_disk_token.get(cache_key) == disk_token:
+                return
+            buckets = await asyncio.to_thread(
+                self._load_recall_snapshot_sync,
+                paths,
+            )
+            after_paths, after_token = await asyncio.to_thread(
+                self._scan_recall_snapshot_sync,
+                dirs,
+            )
+            if after_paths != paths or after_token != disk_token:
+                return
+            async with self._recall_snapshot_lock:
+                if generation != self._recall_snapshot_generation.get(cache_key, 0):
+                    return
+                self._replace_recall_snapshot(
+                    cache_key,
+                    buckets,
+                    disk_token=disk_token,
+                )
+                self._mark_bm25_dirty()
+        except Exception as exc:
+            logger.warning(
+                "Recall snapshot background refresh failed: %s",
+                type(exc).__name__,
+            )
+
+    def _schedule_recall_snapshot_refresh(
+        self,
+        cache_key: tuple[bool, bool],
+    ) -> None:
+        now = time.monotonic()
+        current = self._recall_snapshot_refresh_tasks.get(cache_key)
+        if current is not None and not current.done():
+            return
+        if now < self._recall_snapshot_refresh_due.get(cache_key, 0.0):
+            return
+        self._recall_snapshot_refresh_due[cache_key] = (
+            now + self._recall_snapshot_refresh_sec
+        )
+        task = asyncio.create_task(
+            self._refresh_recall_snapshot_background(cache_key)
+        )
+        self._recall_snapshot_refresh_tasks[cache_key] = task
+
+        def _clear(done: asyncio.Task) -> None:
+            if self._recall_snapshot_refresh_tasks.get(cache_key) is done:
+                self._recall_snapshot_refresh_tasks.pop(cache_key, None)
+
+        task.add_done_callback(_clear)
+
+    async def prewarm_recall_snapshot(
+        self,
+        include_archive: bool = False,
+        include_nsfw: bool | None = None,
+    ) -> bool:
+        cache_key = self._recall_cache_key(include_archive, include_nsfw)
+        if cache_key in self._recall_snapshot_cache:
+            return True
+        async with self._recall_snapshot_lock:
+            if cache_key in self._recall_snapshot_cache:
+                return True
+            while True:
+                generation = self._list_all_cache_generation
+                buckets = await self.list_all(
+                    include_archive=cache_key[0],
+                    include_nsfw=cache_key[1],
+                )
+                if generation == self._list_all_cache_generation:
+                    break
+                await asyncio.sleep(0)
+            cached = self._list_all_cache.get(cache_key)
+            disk_token = cached[0] if cached is not None else None
+            self._replace_recall_snapshot(
+                cache_key,
+                tuple(buckets),
+                disk_token=disk_token,
+            )
+            self._recall_snapshot_refresh_due[cache_key] = (
+                time.monotonic() + self._recall_snapshot_refresh_sec
+            )
+        return True
+
+    async def borrow_recall_snapshot(
+        self,
+        include_archive: bool = False,
+        include_nsfw: bool | None = None,
+    ) -> tuple[dict, ...]:
+        """Return the resident immutable recall tuple without scanning/copying."""
+        cache_key = self._recall_cache_key(include_archive, include_nsfw)
+        if cache_key not in self._recall_snapshot_cache:
+            await self.prewarm_recall_snapshot(
+                include_archive=cache_key[0],
+                include_nsfw=cache_key[1],
+            )
+        snapshot = self._recall_snapshot_cache.get(cache_key, ())
+        self._schedule_recall_snapshot_refresh(cache_key)
+        return snapshot
+
+    async def recall_snapshot_token(
+        self,
+        include_archive: bool = False,
+        include_nsfw: bool | None = None,
+    ) -> tuple | None:
+        """O(1) token for views derived from the resident recall snapshot."""
+        cache_key = self._recall_cache_key(include_archive, include_nsfw)
+        if cache_key not in self._recall_snapshot_cache:
+            return None
+        return (cache_key, self._recall_snapshot_generation.get(cache_key, 0))
+
+    def _bm25_with_delta(
+        self,
+        current,
+        *,
+        bucket: dict | None = None,
+        bucket_id: str = "",
+        visible: bool,
+    ):
+        """Return one complete COW generation with resident sidecars."""
+        target_id = str(bucket_id or (bucket or {}).get("id", ""))
+        if not target_id:
+            raise ValueError("incremental BM25 delta requires bucket id")
+        fresh = (
+            current.with_upsert(bucket)
+            if visible and bucket is not None
+            else current.with_delete(target_id)
+        )
+        keyword_rows = dict(
+            getattr(current, "_keyword_score_rows", {})
+        )
+        literal_rows = list(
+            getattr(current, "_literal_retrieval_rows", ())
+        )
+        replacement = None
+        if visible and bucket is not None:
+            row = self._build_keyword_score_row(bucket)
+            keyword_rows[target_id] = row
+            if row["retrieval_keys"]:
+                replacement = (target_id, row["retrieval_keys"])
+        else:
+            keyword_rows.pop(target_id, None)
+
+        found = False
+        updated_literal_rows = []
+        for row in literal_rows:
+            if row[0] != target_id:
+                updated_literal_rows.append(row)
+                continue
+            found = True
+            if replacement is not None:
+                updated_literal_rows.append(replacement)
+        if not found and replacement is not None:
+            updated_literal_rows.append(replacement)
+
+        fresh._keyword_score_rows = keyword_rows
+        fresh._literal_retrieval_rows = tuple(updated_literal_rows)
+        return fresh
+
+    def _apply_bm25_incremental(
+        self,
+        *,
+        bucket: dict | None = None,
+        bucket_id: str = "",
+        visible: bool,
+    ) -> bool:
+        """Atomically install one copy-on-write BM25 generation."""
+        current = self._bm25
+        if (
+            self._bm25_mode == "off"
+            or current is None
+            or getattr(current, "_index", None) is None
+        ):
+            return False
+        target_id = str(bucket_id or (bucket or {}).get("id", ""))
+        if not target_id:
+            return False
+
+        started_at = time.perf_counter()
+        try:
+            delta_bucket = None
+            if visible and bucket is not None:
+                delta_bucket = {
+                    "id": target_id,
+                    "metadata": dict(bucket.get("metadata", {}) or {}),
+                    "content": str(bucket.get("content", "")),
+                    "path": str(bucket.get("path", "")),
+                }
+            fresh = self._bm25_with_delta(
+                current,
+                bucket=delta_bucket,
+                bucket_id=target_id,
+                visible=visible,
+            )
+            self._bm25_generation += 1
+            self._bm25 = fresh
+            if self._bm25_rebuilding:
+                self._bm25_known_deltas.append(
+                    (
+                        self._bm25_generation,
+                        delta_bucket,
+                        target_id,
+                        visible,
+                    )
+                )
+            self._bm25_dirty_bucket_ids.discard(target_id)
+            if not self._bm25_unknown_dirty and not self._bm25_dirty_bucket_ids:
+                self._bm25_dirty = False
+            logger.info(
+                "bm25_incremental=%s",
+                json.dumps(
+                    {
+                        "bucket_id": target_id,
+                        "elapsed_ms": round(
+                            (time.perf_counter() - started_at) * 1000.0,
+                            3,
+                        ),
+                        "generation": self._bm25_generation,
+                        "operation": "upsert" if visible else "delete",
+                        "rows": len(getattr(fresh, "_ids", ())),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[bm25] incremental update failed; keeping complete old index: %s",
+                type(exc).__name__,
+            )
+            return False
+
+    def _sync_bm25_path_transition(
+        self,
+        bucket_id: str,
+        previous_path: str,
+        current_path: str,
+    ) -> bool:
+        cache_key = self._recall_cache_key(False)
+        was_visible = self._recall_path_visible(previous_path, cache_key)
+        is_visible = self._recall_path_visible(current_path, cache_key)
+        if was_visible == is_visible:
+            return True
+        bucket = self._load_bucket(current_path) if is_visible else None
+        applied = self._apply_bm25_incremental(
+            bucket=bucket,
+            bucket_id=bucket_id,
+            visible=is_visible,
+        )
+        if not applied:
+            self._bm25_dirty_bucket_ids.add(str(bucket_id))
+            self._mark_bm25_dirty(known_change=True)
+        return applied
+
+    def _mark_bm25_dirty(self, *, known_change: bool = False) -> None:
+        self._bm25_generation += 1
+        self._bm25_dirty = True
+        if not known_change:
+            self._bm25_unknown_dirty = True
+            self._bm25_unknown_generation += 1
+        # In-process writes happen on the service loop. Schedule one delayed
+        # refresh immediately; sync maintenance callers safely fall back to the
+        # same scheduler on their next search.
+        self._schedule_bm25_rebuild()
+
+    def _bm25_rebuild_delay(self) -> float:
+        if self._bm25_last_rebuild_started_at is None:
+            return 0.0
+        return max(
+            0.0,
+            self._bm25_last_rebuild_started_at
+            + self._bm25_rebuild_min_interval_sec
+            - time.monotonic(),
+        )
+
+    def _schedule_bm25_rebuild(self) -> bool:
+        """Coalesce dirty generations into one delayed background rebuild."""
+        if (
+            self._bm25_mode == "off"
+            or not self._bm25_dirty
+            or self._bm25_rebuilding
+        ):
+            return False
+        current = self._bm25_rebuild_task
+        if current is not None and not current.done():
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+
+        delay = self._bm25_rebuild_delay()
+        task = loop.create_task(self._rebuild_bm25_when_due())
+        self._bm25_rebuild_task = task
+        logger.info(
+            "bm25_rebuild_scheduled=%s",
+            json.dumps(
+                {
+                    "delay_ms": round(delay * 1000.0, 3),
+                    "generation": self._bm25_generation,
+                    "min_interval_sec": self._bm25_rebuild_min_interval_sec,
+                    "mode": self._bm25_mode,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+        )
+
+        def _clear(done: asyncio.Task) -> None:
+            if self._bm25_rebuild_task is done:
+                self._bm25_rebuild_task = None
+                if not done.cancelled() and self._bm25_dirty:
+                    self._schedule_bm25_rebuild()
+
+        task.add_done_callback(_clear)
+        return True
+
+    async def _rebuild_bm25_when_due(self) -> bool:
+        try:
+            delay = self._bm25_rebuild_delay()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if not self._bm25_dirty or self._bm25_rebuilding:
+                return False
+            # A resident-snapshot preparation failure must be rate-limited too;
+            # otherwise the done callback would immediately reschedule forever.
+            self._bm25_last_rebuild_started_at = time.monotonic()
+            snapshot_fn = getattr(self, "borrow_recall_snapshot", None)
+            buckets = (
+                await snapshot_fn(include_archive=False)
+                if callable(snapshot_fn)
+                else await self.list_all(include_archive=False)
+            )
+            self._bm25_rebuilding = True
+            generation = self._bm25_generation
+            return await self._rebuild_bm25_async(
+                list(buckets),
+                generation,
+                reason="request_dirty",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._bm25_rebuilding = False
+            logger.warning(
+                "[bm25] coalesced rebuild preparation failed; keeping old index: %s",
+                type(exc).__name__,
+            )
+            return False
+
+    @staticmethod
+    def _build_keyword_score_row(bucket: dict) -> dict:
+        """Freeze the exact inputs used by the legacy topic scorer."""
+        metadata = bucket.get("metadata", {}) or {}
+        name = metadata.get("name", "")
+        tags = metadata.get("tags", [])
+        if isinstance(tags, str):
+            tags = [tags]
+        domain = metadata.get("domain", [])
+        if isinstance(domain, str):
+            domain = [domain]
+        full_content = str(bucket.get("content", ""))
+        return {
+            "retrieval_keys": tuple(
+                key.casefold()
+                for key in literal_retrieval_keys(
+                    full_content,
+                    metadata.get("retrieval_keys", []),
+                )
+            ),
+            "name": str(name),
+            "name_present": bool(name),
+            "name_lower": str(name).lower(),
+            "tags": tuple(str(tag) for tag in tags),
+            "tags_lower": tuple(str(tag).lower() for tag in tags),
+            "domain": tuple(str(value) for value in domain),
+            "content": full_content[:1000],
+        }
+
+    @staticmethod
+    def _build_bm25_index(buckets: list[dict]) -> BM25Index:
+        index = BM25Index()
+        index.build(buckets)
+        # Validate literal navigation keys beside the same complete BM25
+        # generation. Requests then scan a small resident key table instead of
+        # reparsing every full bucket body.
+        literal_rows: list[tuple[str, tuple[str, ...]]] = []
+        keyword_score_rows: dict[str, dict] = {}
+        for bucket in buckets:
+            bucket_id = str(bucket.get("id", ""))
+            if not bucket_id:
+                continue
+            row = BucketManager._build_keyword_score_row(bucket)
+            keyword_score_rows[bucket_id] = row
+            keys = row["retrieval_keys"]
+            if keys:
+                literal_rows.append((bucket_id, keys))
+        index._literal_retrieval_rows = tuple(literal_rows)
+        index._keyword_score_rows = keyword_score_rows
+        return index
+
+    def _keyword_score_row_for_bucket(self, bucket: dict) -> dict:
+        bucket_id = str(bucket.get("id", ""))
+        if bucket_id and bucket_id not in self._bm25_dirty_bucket_ids:
+            row = getattr(self._bm25, "_keyword_score_rows", {}).get(bucket_id)
+            if row is not None:
+                return row
+        return self._build_keyword_score_row(bucket)
+
+    def _cheap_topic_score_from_row(
+        self,
+        query: str,
+        query_lower: str,
+        query_parts: tuple[str, ...],
+        row: dict,
+    ) -> float:
+        """Return the legacy topic score without the fuzzy body component."""
+        if any(key in query_lower for key in row["retrieval_keys"]):
+            return 1.0
+
+        name_lower = row["name_lower"]
+        tags_lower = row["tags_lower"]
+        if query_lower in name_lower or any(
+            query_lower in tag for tag in tags_lower
+        ):
+            return 1.0
+
+        hit_count = 0
+        for part in query_parts:
+            if name_lower and part in name_lower:
+                hit_count += 1
+                continue
+            if any(tag and part in tag for tag in tags_lower):
+                hit_count += 1
+        partial_hit_score = hit_count / len(query_parts) if query_parts else 0.0
+        name_score = (
+            fuzz.ratio(query, row["name"]) / 100.0
+            if row["name_present"]
+            else 0.0
+        )
+        domain_score = (
+            max([fuzz.ratio(query, value) for value in row["domain"]] + [0])
+            / 100.0
+            if row["domain"]
+            else 0.0
+        )
+        tag_score = (
+            max([fuzz.ratio(query, tag) for tag in row["tags"]] + [0])
+            / 100.0
+            if row["tags"]
+            else 0.0
+        )
+        return max(
+            partial_hit_score,
+            name_score,
+            tag_score,
+            domain_score * 0.9,
+        )
+
+    def _bounded_topic_scores(
+        self,
+        query: str,
+        candidates: list[dict],
+        *,
+        limit: int,
+    ) -> dict[str, float]:
+        """Compute the exact candidate superset needed by relevance top-k.
+
+        The kth best non-body score is a proven lower bound for the kth final
+        topic score. The existing relevance tie band extends that bound. Only
+        rows whose non-body score or possible body score reaches the extended
+        bound can enter the returned top-k, so this skips work without a new
+        relevance threshold or a ranking change.
+        """
+        query_lower = str(query or "").lower()
+        query_parts = self._query_parts_for_search(query_lower)
+        rows: list[tuple[str, dict]] = []
+        cheap_scores: list[float] = []
+        for bucket in candidates:
+            bucket_id = str(bucket.get("id", ""))
+            if not bucket_id:
+                continue
+            row = self._keyword_score_row_for_bucket(bucket)
+            rows.append((bucket_id, row))
+            cheap_scores.append(
+                self._cheap_topic_score_from_row(
+                    query,
+                    query_lower,
+                    query_parts,
+                    row,
+                )
+            )
+
+        if not rows:
+            return {}
+        kth_index = min(max(1, int(limit)), len(rows)) - 1
+        kth_lower_bound = sorted(cheap_scores, reverse=True)[kth_index]
+        tie_margin = self.keyword_relevance_tie_band / 100.0
+        # One extra 1e-4 absorbs the later percentage rounding at a boundary.
+        candidate_floor = max(0.0, kth_lower_bound - tie_margin - 0.0001)
+        body_cutoff = min(100.0, candidate_floor / 0.8 * 100.0)
+        body_matches = process.extract(
+            query,
+            [row["content"] for _bucket_id, row in rows],
+            scorer=fuzz.partial_ratio,
+            score_cutoff=body_cutoff,
+            limit=None,
+        )
+        body_scores = {
+            int(index): float(score) / 100.0 * 0.8
+            for _choice, score, index in body_matches
+        }
+
+        exact_scores: dict[str, float] = {}
+        for index, ((bucket_id, _row), cheap_score) in enumerate(
+            zip(rows, cheap_scores)
+        ):
+            body_score = body_scores.get(index, 0.0)
+            if cheap_score >= candidate_floor or index in body_scores:
+                exact_scores[bucket_id] = max(cheap_score, body_score)
+        return exact_scores
+
+    async def _rebuild_bm25_async(
+        self,
+        buckets: list[dict],
+        generation: int,
+        *,
+        reason: str = "request_dirty",
+        offload: bool = True,
+    ) -> bool:
+        started_at = time.perf_counter()
+        self._bm25_last_rebuild_started_at = time.monotonic()
+        applied = False
+        replayed_deltas = 0
+        unknown_generation = self._bm25_unknown_generation
+        try:
+            # Startup runs before requests exist, so an inline build avoids
+            # jieba's extremely slow first-use path in a fresh worker thread.
+            # Dirty live rebuilds retain the upstream worker-thread behavior.
+            fresh = (
+                await asyncio.to_thread(self._build_bm25_index, buckets)
+                if offload
+                else self._build_bm25_index(buckets)
+            )
+            # A write may invalidate the snapshot while jieba is building it.
+            # Never let that stale build clear the newer dirty generation.
+            deltas = [
+                delta
+                for delta in self._bm25_known_deltas
+                if delta[0] > generation
+            ]
+            replay_generations = [delta[0] for delta in deltas]
+            expected_generations = list(
+                range(generation + 1, self._bm25_generation + 1)
+            )
+            if (
+                unknown_generation == self._bm25_unknown_generation
+                and replay_generations == expected_generations
+            ):
+                for _delta_generation, bucket, bucket_id, visible in deltas:
+                    fresh = self._bm25_with_delta(
+                        fresh,
+                        bucket=bucket,
+                        bucket_id=bucket_id,
+                        visible=visible,
+                    )
+                    replayed_deltas += 1
+                self._bm25 = fresh
+                self._bm25_dirty = False
+                self._bm25_dirty_bucket_ids.clear()
+                self._bm25_unknown_dirty = False
+                applied = True
+        except Exception as exc:
+            logger.warning("[bm25] background rebuild failed; keeping old index: %s", exc)
+        finally:
+            self._bm25_rebuilding = False
+            self._bm25_known_deltas.clear()
+            logger.info(
+                "bm25_rebuild=%s",
+                json.dumps(
+                    {
+                        "applied": applied,
+                        "elapsed_ms": round(
+                            (time.perf_counter() - started_at) * 1000.0,
+                            3,
+                        ),
+                        "generation": generation,
+                        "execution": "worker_thread" if offload else "startup_inline",
+                        "mode": self._bm25_mode,
+                        "reason": reason,
+                        "replayed_deltas": replayed_deltas,
+                        "rows": len(buckets),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+        return applied
+
+    async def prewarm_bm25(self) -> bool:
+        """Build the optional BM25 index once before requests are accepted."""
+        if self._bm25_mode == "off":
+            return False
+        if not self._bm25_dirty and getattr(self._bm25, "_index", None) is not None:
+            return True
+        if self._bm25_rebuilding:
+            return False
+
+        started_at = time.perf_counter()
+        try:
+            snapshot_fn = getattr(self, "borrow_recall_snapshot", None)
+            buckets = (
+                await snapshot_fn(include_archive=False)
+                if callable(snapshot_fn)
+                and hasattr(self, "_recall_snapshot_cache")
+                else await self.list_all(include_archive=False)
+            )
+            loaded_at = time.perf_counter()
+            self._bm25_rebuilding = True
+            generation = self._bm25_generation
+            applied = await self._rebuild_bm25_async(
+                list(buckets),
+                generation,
+                reason="startup_prewarm",
+                offload=False,
+            )
+            logger.info(
+                "bm25_prewarm=%s",
+                json.dumps(
+                    {
+                        "applied": applied,
+                        "build_ms": round(
+                            (time.perf_counter() - loaded_at) * 1000.0,
+                            3,
+                        ),
+                        "generation": generation,
+                        "load_ms": round(
+                            (loaded_at - started_at) * 1000.0,
+                            3,
+                        ),
+                        "mode": self._bm25_mode,
+                        "rows": len(buckets),
+                        "total_ms": round(
+                            (time.perf_counter() - started_at) * 1000.0,
+                            3,
+                        ),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+            )
+            return applied
+        except Exception as exc:
+            self._bm25_rebuilding = False
+            logger.warning(
+                "[bm25] startup prewarm failed; keeping existing index: %s",
+                type(exc).__name__,
+            )
+            return False
 
     # ---------------------------------------------------------
     # Create a new bucket
@@ -761,7 +1706,11 @@ class BucketManager:
                         ],
                     },
                 )
-                self._atomic_write_post(file_path, post)
+                self._atomic_write_post(
+                    file_path,
+                    post,
+                    bm25_content_changed=False,
+                )
                 self.audit_log.commit(event_id)
                 return True
             except Exception as exc:
@@ -816,7 +1765,11 @@ class BucketManager:
                     after=self._post_snapshot(post, file_path),
                     details={"changed_fields": ["thread"]},
                 )
-                self._atomic_write_post(file_path, post)
+                self._atomic_write_post(
+                    file_path,
+                    post,
+                    bm25_content_changed=False,
+                )
                 self.audit_log.commit(event_id)
                 return True
             except Exception as exc:
@@ -836,6 +1789,19 @@ class BucketManager:
         new_path = safe_path(target_dir, filename)
         if os.path.normpath(file_path) != os.path.normpath(new_path):
             os.replace(file_path, new_path)
+            self._refresh_recall_snapshot_entry(
+                str(new_path),
+                previous_path=file_path,
+                bm25_content_changed=False,
+            )
+            moved_bucket = self._load_bucket(str(new_path))
+            bucket_id = str((moved_bucket or {}).get("id", ""))
+            if bucket_id:
+                self._sync_bm25_path_transition(
+                    bucket_id,
+                    file_path,
+                    str(new_path),
+                )
             logger.info(f"Moved bucket / 移动记忆桶: {filename} → {target_dir}/")
         return new_path
 
@@ -1009,7 +1975,14 @@ class BucketManager:
                     },
                 )
 
-                self._atomic_write_post(file_path, post)
+                self._atomic_write_post(
+                    file_path,
+                    post,
+                    bm25_content_changed=bool(
+                        BM25_CORPUS_FIELDS.intersection(changed_fields)
+                        or "retrieval_keys" in changed_fields
+                    ),
+                )
 
                 if need_move and target_type_dir:
                     new_path = self._move_bucket(file_path, target_type_dir, new_domain)
@@ -1078,7 +2051,11 @@ class BucketManager:
                     after=self._post_snapshot(post, file_path),
                     details={"edge": edge},
                 )
-                self._atomic_write_post(file_path, post)
+                self._atomic_write_post(
+                    file_path,
+                    post,
+                    bm25_content_changed=False,
+                )
                 self.audit_log.commit(event_id)
                 logger.info(f"Added relation / 加边: {source_id} -[{rel_type}]-> {target_id}")
                 return True
@@ -1130,7 +2107,11 @@ class BucketManager:
                     after=self._post_snapshot(post, file_path),
                     details={"removed_edges": removed_edges},
                 )
-                self._atomic_write_post(file_path, post)
+                self._atomic_write_post(
+                    file_path,
+                    post,
+                    bm25_content_changed=False,
+                )
                 self.audit_log.commit(event_id)
                 removed = len(removed_edges)
                 logger.info(f"Removed {removed} relation(s) / 删边: {source_id}->{target_id}")
@@ -1166,11 +2147,16 @@ class BucketManager:
                 )
                 os.remove(file_path)
                 self._bucket_path_cache.pop(bucket_id, None)
-                self.invalidate_list_all_cache()
-                self.pg_mirror_queue.enqueue(
-                    bucket_id,
-                    action="delete",
-                    source=actor,
+                self._remove_recall_snapshot_entry(bucket_id, file_path)
+                incremental_applied = self._apply_bm25_incremental(
+                    bucket_id=bucket_id,
+                    visible=False,
+                )
+                if not incremental_applied:
+                    self._bm25_dirty_bucket_ids.add(bucket_id)
+                self.invalidate_list_all_cache(
+                    bm25_content_changed=not incremental_applied,
+                    bm25_change_is_known=True,
                 )
                 self.audit_log.commit(event_id)
             except Exception as e:
@@ -1218,7 +2204,11 @@ class BucketManager:
                         after=self._post_snapshot(post, file_path),
                         details={"activation_increment": 1},
                     )
-                    self._atomic_write_post(file_path, post)
+                    self._atomic_write_post(
+                        file_path,
+                        post,
+                        bm25_content_changed=False,
+                    )
                     self.audit_log.commit(event_id)
                     current_time = datetime.fromisoformat(
                         str(
@@ -1283,7 +2273,11 @@ class BucketManager:
                             after=self._post_snapshot(post, file_path),
                             details={"source_id": source_id, "activation_increment": 0.3},
                         )
-                        self._atomic_write_post(file_path, post)
+                        self._atomic_write_post(
+                            file_path,
+                            post,
+                            bm25_content_changed=False,
+                        )
                         self.audit_log.commit(event_id)
                         rippled += 1
                     except Exception as e:
@@ -1360,14 +2354,97 @@ class BucketManager:
                 if _bucket_in_time_range(b, created_after, created_before)
             ]
 
+        # Exact upstream behavior: never await a full-vault rebuild in the
+        # request.  The current query uses the last complete index while a
+        # fresh index is built and swapped atomically in a background thread.
+        bm25_scores: dict[str, float] = {}
+        bm25_shadow_ready = False
+        if self._bm25_mode != "off" and self._bm25 is not None:
+            if self._bm25_dirty and not self._bm25_rebuilding:
+                # Never build 13k rows on every dirty request. One timer owns the
+                # next generation while this request uses the old complete one.
+                self._schedule_bm25_rebuild()
+            try:
+                # rank_bm25 scores the whole corpus. Keep that CPU loop out of
+                # the async request thread just like the upstream rebuild.
+                bm25_shadow_ready = bool(
+                    getattr(self._bm25, "_index", None) is not None
+                )
+                bm25_scores = await asyncio.to_thread(self._bm25.score, query)
+            except Exception as exc:
+                logger.warning("[bm25] score failed; skipping this dimension: %s", exc)
+
+        keyword_rows_ready = bool(
+            bm25_shadow_ready
+            and getattr(self._bm25, "_keyword_score_rows", None) is not None
+            and (
+                not self._bm25_unknown_dirty
+                or self._bm25_rebuild_min_interval_sec > 0
+            )
+        )
+
+        # The old path paid rapidfuzz.partial_ratio for every body on the event
+        # loop. Reuse the resident score rows and the existing output limit +
+        # relevance tie band to derive an exact candidate superset in a worker.
+        # BM25 live mode keeps the full population because BM25 then changes
+        # the live relevance score.
+        bounded_topic_scores: dict[str, float] | None = None
+        if (
+            relevance_first
+            and keyword_rows_ready
+            and self._bm25_mode != "live"
+        ):
+            try:
+                bounded_topic_scores = await asyncio.to_thread(
+                    self._bounded_topic_scores,
+                    query,
+                    list(candidates),
+                    limit=limit,
+                )
+                candidates = [
+                    bucket
+                    for bucket in candidates
+                    if str(bucket.get("id", "")) in bounded_topic_scores
+                ]
+            except Exception as exc:
+                bounded_topic_scores = None
+                logger.warning(
+                    "[keyword] bounded topic scoring failed; using legacy scan: %s",
+                    exc,
+                )
+
         scored = []
+        query_casefold = query.casefold()
+        z_historical = self._z_historical_ids()
         for candidate_index, bucket in enumerate(candidates, start=1):
             if candidate_index % _RECALL_CANCEL_CHECK_EVERY == 0:
                 await asyncio.sleep(0)
             meta = bucket.get("metadata", {})
 
             try:
-                topic_score = self._calc_topic_score(query, bucket)
+                bucket_id = str(bucket.get("id", ""))
+                row_keys: tuple = ()
+                if bounded_topic_scores is not None:
+                    topic_score = bounded_topic_scores[bucket_id]
+                elif keyword_rows_ready:
+                    _score_row = self._keyword_score_row_for_bucket(bucket)
+                    row_keys = _score_row.get("retrieval_keys", ()) or ()
+                    topic_score = self._calc_topic_score_from_row(
+                        query,
+                        _score_row,
+                    )
+                else:
+                    topic_score = self._calc_topic_score(query, bucket)
+                    row_keys = tuple(
+                        key.casefold()
+                        for key in literal_retrieval_keys(
+                            str(bucket.get("content", "")),
+                            (bucket.get("metadata", {}) or {}).get(
+                                "retrieval_keys", []
+                            ),
+                        )
+                    )
+                bm25_score = bm25_scores.get(bucket_id, 0.0)
                 emotion_score = self._calc_emotion_score(query_valence, query_arousal, meta)
                 time_score = self._calc_time_score(meta)
                 importance_score = max(1, min(10, int(meta.get("importance", 5)))) / 10.0
@@ -1375,7 +2452,24 @@ class BucketManager:
                 if relevance_first:
                     # Retrieval must be relevance-led.  Emotion, recency and
                     # importance are retained only as a close-score tie-break.
-                    normalized = topic_score * 100.0
+                    if self._bm25_mode == "live" and bm25_scores:
+                        # Max-win 融合(2026-08-28):加权平均会让 fuzz 的口语碎词
+                        # 高分稀释 BM25 的 IDF 强信号——账本 30 题实测:
+                        # 加权 hit@1=3/hit@10=9 → max-win hit@1=6/hit@10=11。
+                        # BM25 强分直接做主,fuzz 路整体降权 0.6 只作兜底。
+                        normalized = max(
+                            bm25_score,
+                            topic_score * 0.6,
+                        ) * 100.0
+                        # 钥匙逐字命中=确定性导航,不吃 fuzz 的 0.6 连坐
+                        # (2026-08-29 t2658 案:长 query 情绪词稀释下钥匙桶
+                        # 被 max-win 挤出 top40,补键白补)。
+                        if row_keys and any(
+                            key in query_casefold for key in row_keys
+                        ):
+                            normalized = 100.0
+                    else:
+                        normalized = topic_score * 100.0
                     secondary_weight = self.w_emotion + self.w_time + self.w_importance
                     secondary_total = (
                         emotion_score * self.w_emotion
@@ -1396,6 +2490,9 @@ class BucketManager:
                     weight_sum = (
                         self.w_topic + self.w_emotion + self.w_time + self.w_importance
                     )
+                    if self._bm25_mode == "live" and bm25_scores:
+                        total += bm25_score * self.w_bm25
+                        weight_sum += self.w_bm25
                     normalized = (total / weight_sum) * 100 if weight_sum > 0 else 0
                     tie_break_score = normalized
 
@@ -1414,11 +2511,15 @@ class BucketManager:
                     if relevance_first else self.fuzzy_threshold
                 )
                 if normalized >= candidate_floor:
-                    # Resolved buckets get ranking penalty (but still reachable by keyword)
-                    # 已解决的桶仅在排序时降权
-                    if meta.get("resolved", False) and not relevance_first:
+                    # Stale buckets get ranking penalty but stay reachable:
+                    # candidate_floor above still uses their pre-penalty score.
+                    # Both resolved todos and Z-axis historical facts lose on
+                    # the main score so a current fact can actually outrank them.
+                    is_stale = meta.get("resolved", False) or (
+                        str(meta.get("id", "")).strip() in z_historical
+                    )
+                    if is_stale:
                         normalized *= 0.3
-                    elif meta.get("resolved", False):
                         tie_break_score *= 0.3
                     scored_bucket = dict(bucket)
                     scored_bucket["score"] = round(normalized, 2)
@@ -1427,6 +2528,33 @@ class BucketManager:
                             tie_break_score,
                             4,
                         )
+                        scored_bucket["_bm25_relevance_score"] = round(
+                            bm25_score * 100.0
+                            if self._bm25_mode == "live" else 0.0,
+                            4,
+                        )
+                        if self._bm25_mode == "shadow":
+                            scored_bucket["_bm25_shadow_ready"] = bm25_shadow_ready
+                            scored_bucket["_bm25_shadow_generation"] = (
+                                self._bm25_generation
+                            )
+                            if bm25_shadow_ready and bm25_scores:
+                                scored_bucket["_bm25_shadow_score"] = round(
+                                    bm25_score * 100.0,
+                                    4,
+                                )
+                                shadow_relevance_weight = self.w_topic + self.w_bm25
+                                scored_bucket["_bm25_shadow_relevance_score"] = round(
+                                    (
+                                        topic_score * self.w_topic
+                                        + bm25_score * self.w_bm25
+                                    )
+                                    / shadow_relevance_weight
+                                    * 100.0
+                                    if shadow_relevance_weight > 0
+                                    else 0.0,
+                                    4,
+                                )
                     scored.append(scored_bucket)
             except Exception as e:
                 logger.warning(
@@ -1458,74 +2586,29 @@ class BucketManager:
         Calculate text dimension relevance score (0~1).
         计算文本维度的相关性得分（强化版安全机制 + Jieba 切词）。
         """
-        meta = bucket.get("metadata", {})
+        return self._calc_topic_score_from_row(
+            query,
+            self._build_keyword_score_row(bucket),
+        )
+
+    def _calc_topic_score_from_row(self, query: str, row: dict) -> float:
+        """Run the unchanged topic formula against an immutable resident row."""
         query_lower = query.lower()
-
-        name = meta.get("name", "")
-        tags = meta.get("tags", [])
-        if isinstance(tags, str):
-            tags = [tags]
-        domain = meta.get("domain", [])
-        if isinstance(domain, str):
-            domain = [domain]
-            
-        full_content = str(bucket.get("content", ""))
-        content = full_content[:1000]
-
-        # Curated retrieval keys are literal, bounded phrases from this exact
-        # bucket body.  They must participate before the initial keyword pool
-        # is cut; a later force-keep cannot recover a bucket that never became
-        # a candidate.  Revalidate on read so malformed/manual metadata cannot
-        # manufacture a shortcut.
-        retrieval_keys = literal_retrieval_keys(
-            full_content,
-            meta.get("retrieval_keys", []),
-        )
-        if any(key.casefold() in query_lower for key in retrieval_keys):
-            return 1.0
-
-        name_lower = str(name).lower()
-        tags_lower = [str(t).lower() for t in tags]
-
-        # query 整体嵌在 name/tag 里才算绝对命中；反向（tag/name 嵌在 query 里）走比例打分，
-        # 否则长 query 下任一短 tag 都会硬撞 1.0 把不相干桶推上满分。
-        if query_lower in name_lower:
-            return 1.0
-        for t in tags_lower:
-            if query_lower in t:
-                return 1.0
-
-        # --- 1. 核心词短路机制（Jieba 分词检测） ---
         query_parts = self._query_parts_for_search(query_lower)
-
-        # 单 part 命中按比例打分，避免任一词命中就硬返 1.0 导致桶被合并吸入黑洞
-        hit_count = 0
-        for part in query_parts:
-            if name_lower and part in name_lower:
-                hit_count += 1
-                continue
-            if any(t and part in t for t in tags_lower):
-                hit_count += 1
-
-        partial_hit_score = hit_count / len(query_parts) if query_parts else 0.0
-
-        # name/tag/domain 用对称 ratio：短 tag 在长 query 里 partial_ratio 会硬给 100，
-        # 是黑洞的另一面。只有 content 本来就长才适合 partial_ratio。
-        name_score = fuzz.ratio(query, str(name)) / 100.0 if name else 0.0
-        domain_score = max([fuzz.ratio(query, str(d)) for d in domain] + [0]) / 100.0 if domain else 0.0
-        tag_score = max([fuzz.ratio(query, str(t)) for t in tags] + [0]) / 100.0 if tags else 0.0
-        content_score = fuzz.partial_ratio(query, content) / 100.0 if content else 0.0
-
-        # --- 3. 最高亮机制（Max-Win）替代加权平均 ---
-        final_score = max(
-            partial_hit_score,
-            name_score,
-            tag_score,
-            domain_score * 0.9,     # 域的匹配权重略微打折
-            content_score * 0.8     # 正文冗长，单纯匹配的权重垫底
+        cheap_score = self._cheap_topic_score_from_row(
+            query,
+            query_lower,
+            query_parts,
+            row,
         )
-
-        return final_score
+        if cheap_score >= 1.0:
+            return 1.0
+        content_score = (
+            fuzz.partial_ratio(query, row["content"]) / 100.0
+            if row["content"]
+            else 0.0
+        )
+        return max(cheap_score, content_score * 0.8)
 
     def _query_parts_for_search(self, query_lower: str) -> tuple[str, ...]:
         cached = self._query_parts_cache.get(query_lower)
@@ -1576,6 +2659,41 @@ class BucketManager:
         return math.exp(-0.1 * days)
 
     # ---------------------------------------------------------
+    # Z-axis currentness overlay (superseded-fact ranking penalty)
+    # ---------------------------------------------------------
+    def _z_historical_ids(self) -> frozenset:
+        """Return active historical IDs from the fail-open Z overlay."""
+        try:
+            mtime = os.path.getmtime(self._z_overrides_path)
+        except OSError:
+            return frozenset()
+        if mtime == self._z_overrides_mtime:
+            return self._z_historical_cache
+        ids = set()
+        try:
+            with open(self._z_overrides_path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except (ValueError, TypeError):
+                        continue
+                    if str(row.get("status", "")).strip() != "active":
+                        continue
+                    historical_id = str(
+                        row.get("historical_bucket_id", "")
+                    ).strip()
+                    if historical_id:
+                        ids.add(historical_id)
+        except OSError:
+            return frozenset()
+        self._z_historical_cache = frozenset(ids)
+        self._z_overrides_mtime = mtime
+        return self._z_historical_cache
+
+    # ---------------------------------------------------------
     # List all buckets
     # ---------------------------------------------------------
     async def list_all_snapshot_token(
@@ -1615,6 +2733,8 @@ class BucketManager:
         cached = self._list_all_cache.get(cache_key)
         if cached is not None and cached[0] == snapshot:
             return copy.deepcopy(cached[1])
+        if cached is not None:
+            self._mark_bm25_dirty()
 
         async with self._list_all_cache_lock:
             # Another request may have populated the same snapshot while this
@@ -1750,8 +2870,22 @@ class BucketManager:
                         "destination_path": os.path.abspath(str(dest)),
                     },
                 )
-                self._atomic_write_post(file_path, post)
+                self._atomic_write_post(
+                    file_path,
+                    post,
+                    bm25_content_changed=False,
+                )
                 os.replace(file_path, str(dest))
+                self._refresh_recall_snapshot_entry(
+                    str(dest),
+                    previous_path=file_path,
+                    bm25_content_changed=False,
+                )
+                self._sync_bm25_path_transition(
+                    bucket_id,
+                    file_path,
+                    str(dest),
+                )
                 self._bucket_path_cache[bucket_id] = str(dest)
                 self.audit_log.commit(event_id)
             except Exception as e:
@@ -1825,8 +2959,21 @@ class BucketManager:
                     },
                 )
                 os.replace(file_path, str(destination))
+                self._refresh_recall_snapshot_entry(
+                    str(destination),
+                    previous_path=file_path,
+                    bm25_content_changed=False,
+                )
+                incremental_applied = self._sync_bm25_path_transition(
+                    bucket_id,
+                    file_path,
+                    str(destination),
+                )
                 self._bucket_path_cache[bucket_id] = str(destination)
-                self.invalidate_list_all_cache()
+                self.invalidate_list_all_cache(
+                    bm25_content_changed=not incremental_applied,
+                    bm25_change_is_known=True,
+                )
                 self.audit_log.commit(event_id)
                 return True
             except Exception as e:

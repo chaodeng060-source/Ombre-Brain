@@ -370,6 +370,85 @@ async def test_breath_conversation_gate_can_stay_silent_while_search_remains_wid
 
 
 @pytest.mark.asyncio
+async def test_breath_search_allows_semantic_gate_to_return_empty(
+    tmp_path,
+    monkeypatch,
+):
+    bucket = _bucket("a", "alpha")
+    fake_mgr = FakeBucketMgr([bucket])
+    observed = []
+
+    async def gate(query, candidates, **kwargs):
+        observed.append(kwargs)
+        return []
+
+    monkeypatch.setitem(server.config, "buckets_dir", str(tmp_path))
+    monkeypatch.setitem(server.config, "random_surfacing", {})
+    monkeypatch.setattr(server, "bucket_mgr", fake_mgr)
+    monkeypatch.setattr(server, "decay_engine", FakeDecay())
+    monkeypatch.setattr(server, "dehydrator", FakeDehydrator())
+    monkeypatch.setattr(server, "embedding_engine", FakeEmbedding())
+    monkeypatch.setattr(server, "_ds_filter_candidates", gate)
+    monkeypatch.setattr(server, "_backfill_started", True)
+
+    result = await server.breath(
+        query="还有…",
+        policy="search",
+        max_results=1,
+        relation_depth=0,
+        include_images=False,
+    )
+
+    assert result == "未找到相关记忆。"
+    assert observed[-1]["allow_empty"] is True
+
+
+@pytest.mark.asyncio
+async def test_original_vector_strong_candidate_is_escorted_after_retention_loss(
+    tmp_path,
+    monkeypatch,
+):
+    bucket = _bucket("strong-vector", "强语义证据")
+    fake_mgr = FakeBucketMgr([bucket])
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "0")
+    monkeypatch.setattr(
+        server,
+        "config",
+        {
+            **server.config,
+            "buckets_dir": str(tmp_path),
+            "entities": {"enabled": False},
+            "query_expansion": {"enabled": False},
+            "random_surfacing": {},
+        },
+    )
+    monkeypatch.setattr(server, "bucket_mgr", fake_mgr)
+    monkeypatch.setattr(server, "decay_engine", FakeDecay())
+    monkeypatch.setattr(server, "dehydrator", FakeDehydrator())
+    monkeypatch.setattr(
+        server,
+        "embedding_engine",
+        FakeEmbedding([("strong-vector", 0.61)]),
+    )
+    monkeypatch.setattr(
+        server,
+        "retain_original_query_supported_candidates",
+        lambda _candidates, **_kwargs: [],
+    )
+    monkeypatch.setattr(server, "_backfill_started", True)
+
+    result = await server.breath(
+        query="睡美人语义题",
+        policy="search",
+        max_results=1,
+        relation_depth=0,
+        include_images=False,
+    )
+
+    assert "[bucket_id:strong-vector]" in result
+
+
+@pytest.mark.asyncio
 async def test_api_breath_forwards_anchor_policy(monkeypatch):
     observed = {}
 

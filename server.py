@@ -38,6 +38,7 @@ import hmac
 import random
 import logging
 import asyncio
+import copy
 import contextvars
 import threading
 import base64
@@ -117,6 +118,7 @@ from status_validity import (
 )
 from query_expand import expand_query
 from lmc5_recall_adapter import fuse_ranked_channels as lmc5_fuse_ranked_channels
+from curated_lexical_recall import pg_lexical_mode, search_curated_lexical
 from vendor.anchor_memory.recall_v2 import POLICIES as ANCHOR_RECALL_POLICIES
 from recall_support import (
     expand_relation_graph,
@@ -125,6 +127,11 @@ from recall_support import (
 )
 from timeline_axis import timeline_neighbors
 from recall_receipt import RecallReceiptConflict, RecallReceiptStore, normalize_bucket_ids
+from memory_signal import (
+    MemorySignalCursorError,
+    MemorySignalStore,
+    build_signal_entry,
+)
 from e_axis_shadow import (
     EAxisShadowStore,
     build_failure_record,
@@ -158,7 +165,6 @@ from e_axis_recall import (
 )
 from r2_storage import r2_storage
 from sensory_engine import SensoryEngine, format_body_state_block, senses_from_sensory
-from pg_mirror_queue import PgMirrorWorker
 from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
     world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
@@ -200,6 +206,9 @@ from recall_timing import (
     begin_recall_timing,
     finish_recall_timing,
     get_recall_partial_result,
+    get_recall_request_id,
+    mark_recall_partial,
+    recall_is_partial,
     finish_recall_stage,
     recall_stage,
     record_recall_dehydration,
@@ -238,7 +247,6 @@ bucket_mgr = BucketManager(config)                  # Bucket manager / 记忆桶
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 embedding_engine = EmbeddingEngine(config)            # Embedding engine / 向量化引擎
-pg_mirror_worker = PgMirrorWorker(bucket_mgr.pg_mirror_queue)
 consolidation_engine = ConsolidationEngine(config, bucket_mgr, embedding_engine)  # Consolidation engine / 整理引擎（夜班）
 # Narrative layer (kernel 3): Event -> Episode -> Saga. Episode owns the loop,
 # runs saga consolidation after building episodes each cycle.
@@ -287,10 +295,41 @@ _ds_filter_decision_capture = contextvars.ContextVar(
     "ombre_ds_filter_decision_capture",
     default=None,
 )
+_breath_session_seen_writes_enabled = contextvars.ContextVar(
+    "ombre_breath_session_seen_writes_enabled",
+    default=True,
+)
+_memory_signal_store = MemorySignalStore()
 
 
 class RecallOperationalError(RuntimeError):
     """A required recall channel failed instead of returning valid evidence."""
+
+
+def _capture_breath_candidate(
+    bucket: dict,
+    summary: str,
+    *,
+    reason: str,
+    limit: int,
+) -> None:
+    """Capture only candidates that survived the established breath pipeline."""
+    capture = _breath_candidate_capture.get()
+    if not isinstance(capture, list) or len(capture) >= max(1, int(limit)):
+        return
+    bucket_id = str(bucket.get("id") or "").strip()
+    if not bucket_id or any(
+        item.get("id") == bucket_id
+        for item in capture
+        if isinstance(item, dict)
+    ):
+        return
+    capture.append({
+        "id": bucket_id,
+        "bucket": copy.deepcopy(bucket),
+        "summary": str(summary or ""),
+        "reason": str(reason or "ranked"),
+    })
 
 
 def _get_recall_receipt_store() -> RecallReceiptStore:
@@ -1362,14 +1401,13 @@ def _recall_prefix(
 # stdio mode ignores host (no network)
 @asynccontextmanager
 async def _server_lifespan(_server):
-    """Own process-wide background tasks without delaying server readiness."""
-    await pg_mirror_worker.start()
+    """Warm recall state, then own process-wide background tasks."""
+    await _prewarm_recall_state()
     await _start_briefing_cache_refresh()
     try:
         yield {}
     finally:
         await _stop_briefing_cache_refresh()
-        await pg_mirror_worker.stop()
 
 
 mcp = FastMCP(
@@ -1558,6 +1596,8 @@ def _load_session_seen_ids(session_id: str) -> set[str]:
 
 
 def _remember_session_seen_ids(session_id: str, bucket_ids: list[str]) -> None:
+    if not _breath_session_seen_writes_enabled.get():
+        return
     if not session_id or not session_id.strip() or not bucket_ids:
         return
     try:
@@ -1768,35 +1808,54 @@ def _filter_anchor_policy_candidates(
     return kept
 
 
-def _parse_ds_keep_indices(raw: str, n: int) -> list[int] | None:
-    """解析 DeepSeek 返回的 ``keep``。
-
-    ``[]`` 是模型明确给出的合法判空；``None`` 才表示协议/解析失败。
-    这一区分复用 Anchor ``allow_empty`` 合同：对话召回可以安静，模型
-    故障仍必须回退既有候选，不能把故障冒充成“没有记忆”。
-    """
-    cleaned = (raw or "").strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
-    try:
-        data = json.loads(cleaned)
-    except (json.JSONDecodeError, ValueError, IndexError):
-        return None
-    arr = data.get("keep") if isinstance(data, dict) else data
-    if not isinstance(arr, list):
-        return None
-    out: list[int] = []
-    for x in arr:
+def _ds_json_payloads(raw: str) -> list[object]:
+    """Decode top-level JSON values embedded in fences or short prose."""
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    decoder = json.JSONDecoder()
+    payloads: list[object] = []
+    cursor = 0
+    while cursor < len(text):
+        starts = [position for position in (text.find("{", cursor), text.find("[", cursor)) if position >= 0]
+        if not starts:
+            break
+        start = min(starts)
         try:
-            i = int(x)
-        except (TypeError, ValueError):
+            payload, consumed = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            cursor = start + 1
             continue
-        if 0 <= i < n:
-            out.append(i)
-    if arr and not out:
-        # 只有字面上的空数组才是“合法判空”；非空但全越界/非法属于坏协议。
-        return None
-    return out
+        payloads.append(payload)
+        # Skip the complete decoded value so a nested array cannot masquerade
+        # as the top-level keep contract of an unrelated object.
+        cursor = start + max(consumed, 1)
+    return payloads
+
+
+def _parse_ds_keep_indices(raw: str, count: int) -> list[int] | None:
+    """Parse the last valid keep payload without scraping prose numbers."""
+    selected: list[int] | None = None
+    for payload in _ds_json_payloads(raw):
+        values = payload.get("keep") if isinstance(payload, dict) else payload
+        if not isinstance(values, list):
+            continue
+        result: list[int] = []
+        seen: set[int] = set()
+        for value in values:
+            if isinstance(value, bool):
+                continue
+            try:
+                index = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < count and index not in seen:
+                seen.add(index)
+                result.append(index)
+        if values and not result:
+            continue
+        selected = result
+    return selected
 
 
 def _exact_retrieval_key_ids(query: str, buckets: list[dict]) -> set[str]:
@@ -1857,6 +1916,65 @@ def _cap_candidates_preserving_forced(
 # 从不进模型。TTL 只为限内存，不为新鲜度。并发同 key 同时 miss 时各打
 # 各的（等于现状），不加锁。
 _DS_SELECT_CACHE: dict[str, tuple[float, list[int]]] = {}
+# Dedicated filter clients are process-resident.  The identity stores only a
+# digest of the credential, never the credential itself, and lets a controlled
+# restart/provider rollback create exactly one compatible client.
+_DS_FILTER_PROVIDER_CLIENTS: dict[tuple[str, str, str], object] = {}
+
+
+def _ds_filter_provider() -> tuple[str, str, object, dict]:
+    """Resolve only the ds_filter provider; dehydration remains untouched."""
+    provider = os.getenv("OMBRE_DS_FILTER_PROVIDER", "shared").strip().lower()
+    if provider in {"", "shared", "legacy", "deepseek"}:
+        client = getattr(dehydrator, "client", None)
+        if client is None:
+            raise RuntimeError("no shared ds_filter client configured")
+        model = str(getattr(dehydrator, "model", "deepseek-chat") or "deepseek-chat")
+        return "shared", model, client, {}
+
+    if provider not in {"apiroute", "gemini", "apiroute-gemini"}:
+        raise RuntimeError("unsupported ds_filter provider")
+    api_key = (
+        os.getenv("OMBRE_DS_FILTER_API_KEY", "").strip()
+        or os.getenv("OMBRE_API_KEY", "").strip()
+    )
+    base_url = (
+        os.getenv("OMBRE_DS_FILTER_BASE_URL", "").strip()
+        or os.getenv("OMBRE_BASE_URL", "").strip()
+    ).rstrip("/")
+    model = os.getenv("OMBRE_DS_FILTER_MODEL", "gemini-3.7-flash").strip()
+    if not api_key or not base_url or not model:
+        raise RuntimeError("ApiRoute Gemini ds_filter credentials are incomplete")
+    if base_url != "https://apiroute.top/v1" or model != "gemini-3.7-flash":
+        raise RuntimeError("ApiRoute Gemini ds_filter route does not match the approved channel")
+
+    identity = (
+        base_url,
+        model,
+        hashlib.sha256(api_key.encode("utf-8")).hexdigest(),
+    )
+    client = _DS_FILTER_PROVIDER_CLIENTS.get(identity)
+    if client is None:
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        _DS_FILTER_PROVIDER_CLIENTS[identity] = client
+    # 2026-08-28 关思考二轮实测（.work/probe_ds_nothink*.py，真打 apiroute）：
+    # 8/20 试死的是 DeepSeek 形状 {"thinking":{"type":"disabled"}}，gemini 不认；
+    # OpenAI 原生 reasoning_effort="none" 这条路当时没试——实测 12 采样全部
+    # 解析成功、keep 判断与基线一致（质量无损），延迟 3.6-4.9s → 1.5-2.4s。
+    # ctok 仍 180-410（中转没把思考真正压到零，天花板在 apiroute），但砍半是实的。
+    # 只挂 apiroute 分支；shared/DeepSeek 回滚路不带此参数。env 设 "off" 可一键撤。
+    effort = os.getenv("OMBRE_DS_FILTER_REASONING_EFFORT", "none").strip().lower()
+    provider_kwargs: dict = {}
+    if effort and effort != "off":
+        provider_kwargs["reasoning_effort"] = effort
+    return (
+        "apiroute-gemini",
+        model,
+        client,
+        provider_kwargs,
+    )
 
 
 def _ds_select_cache_config() -> tuple[float, int]:
@@ -1878,10 +1996,8 @@ async def _ds_semantic_select(
     keep: set[str],
     max_results: int,
 ) -> list[dict]:
-    """用 DeepSeek 判断每条候选是否与 query 语义相关；纯减法（只剔噪、不重排不外拉），forced 恒留。"""
-    client = getattr(dehydrator, "client", None)
-    if client is None:
-        raise RuntimeError("no DeepSeek client configured")
+    """用选定小模型判断语义相关性；纯减法，不重排、不外拉。"""
+    provider, model, client, provider_kwargs = _ds_filter_provider()
     lines = []
     for i, b in enumerate(buckets):
         name = redact_embedding_input((b.get("metadata", {}) or {}).get("name") or b.get("id", ""))
@@ -1893,10 +2009,26 @@ async def _ds_semantic_select(
         '只返回 JSON：{"keep": [相关条目的序号整数数组]}，不要解释。'
         "宁可多留也别漏掉明显相关的；只剔除与查询确实无关的。"
     )
+    if provider == "apiroute-gemini":
+        sys_prompt += (
+            "正确候选优先保留。只有明确与查询毫无关系时才删除；"
+            "不确定、部分相关、同一事件后续、同一人物或同一项目上下文都保留。"
+            "宁可放过噪音，不可错杀正确候选。"
+            # 2026-08-29 判空授权:只防误杀不授权判空,碎句会被按章全保。
+            "\n例外——查询本身没有实质检索意图时(纯语气词、寒暄、应答,"
+            "或没头没尾的指代碎句,如「嗯嗯」「哈哈哈」「还有…」「好了」),"
+            '返回 {"keep": []}:此时不注入任何旧记忆才是正确行为。'
+            "只要查询含具体的人名、事件、物品、地点、时间或明确话题,"
+            "哪怕口语化,仍按上述规则保留。"
+        )
     user_prompt = f"查询：{redact_embedding_input(query)}\n\n候选：\n" + "\n".join(lines)
-    cache_key = hashlib.sha256(
-        (sys_prompt + "\x00" + user_prompt).encode("utf-8")
-    ).hexdigest()
+    cache_material = sys_prompt + "\x00" + user_prompt
+    if provider != "shared":
+        # The shared/rollback path keeps its historical cache bytes exactly.
+        # Dedicated providers are namespaced so a live rollback can never
+        # reuse a decision from another route for the same query/candidates.
+        cache_material = provider + "\x00" + model + "\x00" + cache_material
+    cache_key = hashlib.sha256(cache_material.encode("utf-8")).hexdigest()
     ttl, max_entries = _ds_select_cache_config()
     idxs: list[int] | None = None
     cached = _DS_SELECT_CACHE.get(cache_key)
@@ -1910,22 +2042,24 @@ async def _ds_semantic_select(
         )
     if idxs is None:
         resp = await client.chat.completions.create(
-            model=getattr(dehydrator, "model", "deepseek-chat"),
+            model=model,
             messages=[
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             max_tokens=DS_FILTER_MAX_TOKENS,
             temperature=0.0,
+            **provider_kwargs,
         )
         raw = resp.choices[0].message.content if resp.choices else ""
         idxs = _parse_ds_keep_indices(raw, len(buckets))
         if idxs is None:
             logger.error(
                 "DS filter received invalid DeepSeek response raw_chars=%d "
-                "raw_sha256=%s response=%s",
+                "raw_sha256=%s raw_head=%r response=%s",
                 len(raw),
                 hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                raw[:500],
                 _safe_chat_completion_diagnostics(resp),
             )
             raise ValueError("invalid DeepSeek recall selection payload")
@@ -1951,10 +2085,10 @@ async def _ds_filter_candidates(
     allow_empty: bool = False,
 ) -> list[dict]:
     """
-    召回候选的注入裁剪 + 可选 DeepSeek 语义门控。
+    召回候选的注入裁剪 + 可选小模型语义门控。
 
     默认行为（门控关，PR-1 语义）：保序 + 保留 forced IDs + 限到 max_results，不调 LLM。
-    门控开（OMBRE_DS_FILTER_ENABLED 且 mode 命中且 query 非空）：在已裁剪集合上跑 DeepSeek
+    门控开（OMBRE_DS_FILTER_ENABLED 且 mode 命中且 query 非空）：在已裁剪集合上跑所选 provider
     相关性过滤，纯减法剔噪。超时/出错/解析失败一律回退裁剪集合；只有调用方
     明确采用 Anchor 对话策略并传入 ``allow_empty=True`` 时，合法 ``keep: []``
     才会安静返回空。
@@ -2148,6 +2282,31 @@ _E_AXIS_ROWS_CACHE: dict[str, object] = {"token": None, "cfg": None, "rows": {}}
 _E_AXIS_ROWS_REBUILD_LOCK = asyncio.Lock()
 
 
+async def _borrow_recall_buckets():
+    """Borrow the resident read-only corpus used by breath request paths."""
+    snapshot_fn = getattr(bucket_mgr, "borrow_recall_snapshot", None)
+    if callable(snapshot_fn):
+        return await snapshot_fn(include_archive=False)
+    return await bucket_mgr.list_all(include_archive=False)
+
+
+def _emit_upstream_fusion_shadow(payload: dict) -> bool:
+    """Write only correlation-safe shadow rows; direct MCP probes stay silent."""
+    request_id = get_recall_request_id()
+    if not request_id:
+        return False
+    logger.info(
+        "upstream_fusion_shadow=%s",
+        json.dumps(
+            {"request_id": request_id, **payload},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
+    return True
+
+
 async def _e_axis_rows_cached(e_recall_cfg) -> dict:
     """Serve E-axis grouping from a snapshot-keyed cache of its tiny result.
 
@@ -2164,10 +2323,15 @@ async def _e_axis_rows_cached(e_recall_cfg) -> dict:
     the winner's rows.  Key semantics unchanged: snapshot token + cfg, any
     bucket write still invalidates naturally.
     """
-    token_fn = getattr(bucket_mgr, "list_all_snapshot_token", None)
+    token_fn = getattr(bucket_mgr, "recall_snapshot_token", None)
+    if not callable(token_fn):
+        token_fn = getattr(bucket_mgr, "list_all_snapshot_token", None)
 
     async def _current_token() -> object:
         return await token_fn(include_archive=False) if callable(token_fn) else None
+
+    async def _current_buckets():
+        return await _borrow_recall_buckets()
 
     cfg_key = (e_recall_cfg.enabled, e_recall_cfg.min_confidence)
     cache = _E_AXIS_ROWS_CACHE
@@ -2181,14 +2345,98 @@ async def _e_axis_rows_cached(e_recall_cfg) -> dict:
         if token is not None and cache["token"] == token and cache["cfg"] == cfg_key:
             return cache["rows"]
         rows = group_primary_authored_buckets(
-            await bucket_mgr.list_all(include_archive=False),
+            await _current_buckets(),
             e_recall_cfg,
         )
+        if token is None:
+            token = await _current_token()
         if token is not None:
             cache["token"] = token
             cache["cfg"] = cfg_key
             cache["rows"] = rows
     return rows
+
+
+async def _prewarm_recall_state() -> None:
+    """Pay optional recall cold-start costs before accepting requests."""
+    started_at = time.perf_counter()
+    snapshot_ready = False
+    snapshot_rows = 0
+    snapshot_prewarm = getattr(bucket_mgr, "prewarm_recall_snapshot", None)
+    if callable(snapshot_prewarm):
+        try:
+            snapshot_ready = bool(
+                await snapshot_prewarm(include_archive=False)
+            )
+            if snapshot_ready:
+                snapshot_borrow = getattr(
+                    bucket_mgr,
+                    "borrow_recall_snapshot",
+                    None,
+                )
+                if callable(snapshot_borrow):
+                    snapshot_rows = len(
+                        await snapshot_borrow(include_archive=False)
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Recall snapshot startup prewarm unavailable: %s",
+                type(exc).__name__,
+            )
+    bm25_ready = await bucket_mgr.prewarm_bm25()
+    e_axis_ready = False
+    e_axis_rows = 0
+    try:
+        e_recall_cfg = load_e_axis_recall_config(config)
+        if e_recall_cfg.enabled:
+            rows = await _e_axis_rows_cached(e_recall_cfg)
+            e_axis_rows = sum(len(group) for group in rows.values())
+            e_axis_ready = True
+    except Exception as exc:
+        # E remains an optional behavioural projection.  Startup uses the
+        # same fail-open rule as breath(), but records the cold-start failure
+        # before the first caller can inherit it inside query_prep.
+        logger.warning(
+            "E-axis startup prewarm unavailable; first recall remains fail-open: %s",
+            type(exc).__name__,
+        )
+    embedding_prewarm = {
+        "embedding_ready": False,
+        "embedding_status": "error",
+        "vector_rows": 0,
+    }
+    try:
+        embedding_prewarm = await embedding_engine.prewarm_recall()
+    except Exception as exc:
+        logger.warning(
+            "Embedding startup prewarm unavailable; vector recall remains fail-soft: %s",
+            type(exc).__name__,
+        )
+    logger.info(
+        "recall_prewarm=%s",
+        json.dumps(
+            {
+                "bm25_ready": bm25_ready,
+                "e_axis_ready": e_axis_ready,
+                "e_axis_rows": e_axis_rows,
+                "embedding_ready": bool(
+                    embedding_prewarm.get("embedding_ready", False)
+                ),
+                "embedding_status": str(
+                    embedding_prewarm.get("embedding_status", "error")
+                ),
+                "vector_rows": int(embedding_prewarm.get("vector_rows", 0)),
+                "snapshot_ready": snapshot_ready,
+                "snapshot_rows": snapshot_rows,
+                "elapsed_ms": round(
+                    (time.perf_counter() - started_at) * 1000.0,
+                    3,
+                ),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    )
 
 
 def _recall_dehydrate_async_enabled() -> bool:
@@ -2201,6 +2449,22 @@ def _recall_dehydrate_async_enabled() -> bool:
 
 _DEHYDRATE_BACKFILL_PENDING: set[str] = set()
 _DEHYDRATE_BACKFILL_SEM = asyncio.Semaphore(2)
+
+
+def _ds_offpeak_now(now: datetime | None = None) -> bool:
+    """朝灯 2026-08-28 定的错峰约束：非实时的 DS 调用避开她的工作时段。
+
+    周一~周六 9-12、14-18 禁调（她单休，周六按工作日算）；周日全天放开。
+    时区固定 Asia/Shanghai（8/11 教训：系统时区不可信，裸 now() 会归错班）。
+    实时链路（grow digest、连边摘要、召回主路）不走这个闸。
+    """
+    from zoneinfo import ZoneInfo
+
+    current = now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    if current.weekday() == 6:  # 周日全天放开
+        return True
+    hour = current.hour
+    return not (9 <= hour < 12 or 14 <= hour < 18)
 
 
 async def _extend_e_axis_cache_after_summary_write(token_pre) -> None:
@@ -2221,7 +2485,9 @@ async def _extend_e_axis_cache_after_summary_write(token_pre) -> None:
     cache = _E_AXIS_ROWS_CACHE
     if token_pre is None or cache["token"] != token_pre:
         return
-    token_fn = getattr(bucket_mgr, "list_all_snapshot_token", None)
+    token_fn = getattr(bucket_mgr, "recall_snapshot_token", None)
+    if not callable(token_fn):
+        token_fn = getattr(bucket_mgr, "list_all_snapshot_token", None)
     if not callable(token_fn):
         return
     try:
@@ -2238,6 +2504,10 @@ def _schedule_recall_dehydration_backfill(bucket_id: str, content: str, body_has
     """Compute the LLM summary off the recall path and persist it for next beat."""
     if not bucket_id or bucket_id in _DEHYDRATE_BACKFILL_PENDING:
         return
+    if not _ds_offpeak_now():
+        # 工作时段不补摘要（朝灯 8/28 错峰令）；不进 pending，
+        # 下次召回撞到同桶会重新调度，晚间自然放行。
+        return
     _DEHYDRATE_BACKFILL_PENDING.add(bucket_id)
 
     async def _run() -> None:
@@ -2251,7 +2521,13 @@ def _schedule_recall_dehydration_backfill(bucket_id: str, content: str, body_has
                     return
                 writer = getattr(bucket_mgr, "cache_recall_dehydration", None)
                 if callable(writer):
-                    token_fn = getattr(bucket_mgr, "list_all_snapshot_token", None)
+                    token_fn = getattr(bucket_mgr, "recall_snapshot_token", None)
+                    if not callable(token_fn):
+                        token_fn = getattr(
+                            bucket_mgr,
+                            "list_all_snapshot_token",
+                            None,
+                        )
                     token_pre = (
                         await token_fn(include_archive=False)
                         if callable(token_fn)
@@ -2367,7 +2643,13 @@ async def _dehydrate_for_recall(
         persisted = False
         if callable(writer):
             try:
-                token_fn = getattr(bucket_mgr, "list_all_snapshot_token", None)
+                token_fn = getattr(bucket_mgr, "recall_snapshot_token", None)
+                if not callable(token_fn):
+                    token_fn = getattr(
+                        bucket_mgr,
+                        "list_all_snapshot_token",
+                        None,
+                    )
                 token_pre = (
                     await token_fn(include_archive=False)
                     if callable(token_fn)
@@ -4032,7 +4314,6 @@ async def _record_e_chord_shadow(
     return receipt
 
 
-@mcp.tool()
 async def breath(
     query: str = "",
     max_tokens: int = BREATH_DEFAULT_MAX_TOKENS,
@@ -4070,7 +4351,15 @@ async def breath(
     recall_policy = _normalize_anchor_recall_policy(requested_policy)
     if recall_policy != requested_policy:
         logger.warning("Unknown recall policy %r; using search", requested_policy)
-    allow_empty_recall = recall_policy in {"conversation", "reflex"}
+    # Search also accepts a legitimate keep:[] from the semantic gate.  After
+    # BM25, the lexical layer nearly always has candidates; an empty model
+    # decision is how a fragment or greeting correctly injects no old memory.
+    # Timeout and provider failures still use the existing candidate fallback.
+    allow_empty_recall = recall_policy in {
+        "conversation",
+        "reflex",
+        "search",
+    }
 
     # --- Resolve world filter once (used by all modes) ---
     # --- 解析 world filter：显式参数 > current_world ---
@@ -4086,7 +4375,7 @@ async def breath(
     # --- 无参数或空query：浮现模式（权重池主动推送）---
     if not query or not query.strip():
         try:
-            all_buckets = await bucket_mgr.list_all(include_archive=False)
+            all_buckets = await _borrow_recall_buckets()
         except Exception as e:
             logger.error(f"Failed to list buckets for surfacing / 浮现列桶失败: {e}")
             return "记忆系统暂时无法访问。"
@@ -4246,7 +4535,7 @@ async def breath(
     # --- Feel 检索：domain="feel" 是独立入口 ---
     if domain.strip().lower() == "feel":
         try:
-            all_buckets = await bucket_mgr.list_all(include_archive=False)
+            all_buckets = await _borrow_recall_buckets()
             feels = [
                 b
                 for b in all_buckets
@@ -4274,6 +4563,12 @@ async def breath(
                 entry = f"[{created}] [bucket_id:{f['id']}]\n{strip_wikilinks(f['content'])}"
                 results.append(entry)
                 shown_feels.append(f)
+                _capture_breath_candidate(
+                    f,
+                    strip_wikilinks(f["content"]),
+                    reason="feel",
+                    limit=max_results,
+                )
                 if count_tokens_approx("\n---\n".join(results)) > max_tokens:
                     break
             text = "=== 你留下的 feel ===\n" + "\n---\n".join(results)
@@ -4357,12 +4652,19 @@ async def breath(
 
     # Keyword channel (already filtered by world/domain/threshold inside)
     keyword_by_id: dict[str, dict] = {}
+    original_bm25_scores: dict[str, float] = {}
+    original_bm25_shadow_scores: dict[str, float] = {}
     try:
         with recall_stage("keyword_bucket_load"):
-            keyword_candidates = await bucket_mgr.list_all(include_archive=False)
+            keyword_candidates = await _borrow_recall_buckets()
+        keyword_candidate_by_id = {
+            str(bucket["id"]): bucket
+            for bucket in keyword_candidates
+            if bucket.get("id")
+        }
         record_recall_metric("keyword_bucket_count", len(keyword_candidates))
         with recall_stage("keyword_search"):
-            for angle in query_angles:
+            for angle_index, angle in enumerate(query_angles):
                 for bucket in await bucket_mgr.search(
                     angle,
                     limit=intent_policy["keyword_top_k"],
@@ -4379,6 +4681,13 @@ async def breath(
                     relevance_candidate_floor=0.0,
                     preloaded_buckets=keyword_candidates,
                 ):
+                    if angle_index == 0:
+                        original_bm25_scores[str(bucket["id"])] = float(
+                            bucket.get("_bm25_relevance_score", 0.0) or 0.0
+                        )
+                        original_bm25_shadow_scores[str(bucket["id"])] = float(
+                            bucket.get("_bm25_shadow_score", 0.0) or 0.0
+                        )
                     existing = keyword_by_id.get(bucket["id"])
                     if existing is None or bucket.get("score", 0) > existing.get("score", 0):
                         keyword_by_id[bucket["id"]] = bucket
@@ -4411,10 +4720,39 @@ async def breath(
     original_vector_scores: dict[str, float] = {}
     try:
         for angle_index, angle in enumerate(query_angles):
-            for bid, sim in await embedding_engine.search_similar(
-                angle,
-                top_k=intent_policy["vector_top_k"],
-            ):
+            status_search = getattr(
+                embedding_engine,
+                "search_similar_with_status",
+                None,
+            )
+            if callable(status_search):
+                vector_hits, vector_status = await status_search(
+                    angle,
+                    top_k=intent_policy["vector_top_k"],
+                )
+            else:
+                # Keep the long-standing lightweight embedding adapter
+                # contract.  Production EmbeddingEngine exposes status_search;
+                # existing integrations that only expose search_similar keep
+                # their previous behavior.
+                vector_hits = await embedding_engine.search_similar(
+                    angle,
+                    top_k=intent_policy["vector_top_k"],
+                )
+                vector_status = "ok"
+            if vector_status != "ok":
+                if _strict_recall_errors.get():
+                    raise RecallOperationalError("vector_search_failed")
+                # Vector retrieval is optional.  A bounded remote failure keeps
+                # the already-computed lexical candidates and is surfaced as a
+                # completed partial result rather than a whole-request deadline.
+                mark_recall_partial()
+                logger.warning(
+                    "Vector search degraded to lexical-only: %s",
+                    vector_status,
+                )
+                continue
+            for bid, sim in vector_hits:
                 if sim <= 0.5:
                     continue
                 if sim > vector_scores.get(bid, 0.0):
@@ -4427,6 +4765,154 @@ async def breath(
         if _strict_recall_errors.get():
             raise RecallOperationalError("vector_search_failed") from e
         vector_ranked = []
+
+    # Original-query vector top-5 entries above the audited 0.60 floor get a
+    # candidate escort.  This repairs strong semantic evidence lost only to
+    # RRF position/retention truncation; every authority filter and the later
+    # semantic gate still applies.
+    vector_strong_ids = {
+        str(bucket_id)
+        for bucket_id, similarity in sorted(
+            original_vector_scores.items(),
+            key=lambda item: -item[1],
+        )[:5]
+        if float(similarity) >= 0.60
+    }
+
+    lexical_mode = pg_lexical_mode()
+
+    # Validate original-query vector evidence before it is allowed to suppress
+    # the LMC-5 curated FTS fallback. A 0.46-0.50 score has already failed this
+    # fork's 0.5 gate; an orphan/wrong-world bucket also is not evidence.
+    original_vector_bucket_cache: dict[str, dict] = {}
+    for bid in (original_vector_scores if lexical_mode != "off" else ()):
+        try:
+            bucket = keyword_by_id.get(bid) or keyword_candidate_by_id.get(bid)
+            if not bucket or not _passes_nonkeyword_recall_filters(
+                bucket,
+                world_filter_set=wf_set,
+                domain_filter=domain_filter,
+                created_after=created_after,
+                created_before=created_before,
+            ):
+                continue
+            if not _filter_z_fact_candidates(
+                [bucket],
+                query=recall_query,
+                intent=intent_policy["intent"],
+            ):
+                continue
+            original_vector_bucket_cache[bid] = bucket
+        except Exception as exc:
+            logger.warning(
+                "Original vector candidate skipped after validation: %s",
+                type(exc).__name__,
+            )
+
+    literal_candidate_floor = max(
+        0.0,
+        float(
+            getattr(
+                bucket_mgr,
+                "literal_candidate_floor",
+                (config.get("matching", {}) or {}).get(
+                    "literal_candidate_floor",
+                    40.0,
+                ),
+            )
+        ),
+    )
+    topic_score_calculator = getattr(bucket_mgr, "_calc_topic_score", None)
+
+    # LMC-5 upstream cascade: short literal search is independent of vector
+    # confidence; curated FTS runs only when no locally eligible original-query
+    # vector candidate remains. This is local PG I/O and never calls a model.
+    lexical_bucket_cache: dict[str, dict] = {}
+    lexical_ranked: list[tuple[str, float]] = []
+    lexical_original_support: dict[str, float] = {}
+    try:
+        lexical_search = search_curated_lexical(
+            recall_query,
+            top_k=intent_policy["keyword_top_k"],
+            include_fts=not original_vector_bucket_cache,
+        )
+        lexical_hits = (
+            await asyncio.wait_for(lexical_search, timeout=0.4)
+            if lexical_mode == "shadow"
+            else await lexical_search
+        )
+        for hit in lexical_hits:
+            bid = str(hit.bucket_id)
+            bucket = (
+                keyword_by_id.get(bid)
+                or original_vector_bucket_cache.get(bid)
+                or keyword_candidate_by_id.get(bid)
+            )
+            if not bucket or not _passes_nonkeyword_recall_filters(
+                bucket,
+                world_filter_set=wf_set,
+                domain_filter=domain_filter,
+                created_after=created_after,
+                created_before=created_before,
+            ):
+                continue
+            if not _filter_z_fact_candidates(
+                [bucket],
+                query=recall_query,
+                intent=intent_policy["intent"],
+            ):
+                continue
+            # Curated FTS is a candidate generator, not independent evidence.
+            # Reject unsupported FTS rows before they can change the keyword
+            # channel's ranks. Exact literal navigation is the only lexical
+            # result allowed to carry absolute original-query support.
+            original_topic_score = (
+                round(topic_score_calculator(recall_query, bucket) * 100.0, 4)
+                if callable(topic_score_calculator)
+                else 0.0
+            )
+            if (
+                str(hit.channel) != "literal"
+                and original_topic_score < literal_candidate_floor
+            ):
+                continue
+            # keyword_candidate_by_id may point into the resident read-only
+            # snapshot.  Curated annotations are request-local evidence.
+            bucket = dict(bucket)
+            bucket["_curated_lexical_score"] = round(float(hit.score) * 100.0, 4)
+            bucket["_curated_lexical_channel"] = str(hit.channel)
+            bucket["_curated_original_topic_score"] = original_topic_score
+            lexical_bucket_cache[bid] = bucket
+            lexical_ranked.append((bid, float(hit.score)))
+            lexical_original_support[bid] = max(
+                lexical_original_support.get(bid, 0.0),
+                float(hit.original_support),
+            )
+            if lexical_mode == "live":
+                state_seed_by_id[bid] = bucket
+    except Exception as exc:
+        if lexical_mode == "shadow" and isinstance(exc, TimeoutError):
+            record_recall_metric("curated_lexical_shadow_timeouts", 1)
+        logger.warning(
+            "Curated lexical cascade failed; keeping existing channels: %s",
+            type(exc).__name__,
+        )
+        lexical_bucket_cache = {}
+        lexical_ranked = []
+        lexical_original_support = {}
+
+    lexical_shadow_bucket_cache = dict(lexical_bucket_cache)
+    lexical_shadow_ranked = list(lexical_ranked)
+    lexical_shadow_original_support = dict(lexical_original_support)
+    if lexical_mode == "shadow" and lexical_ranked:
+        logger.info(
+            "Curated lexical shadow ids=%s",
+            [bid for bid, _score in lexical_ranked],
+        )
+    if lexical_mode != "live":
+        lexical_bucket_cache = {}
+        lexical_ranked = []
+        lexical_original_support = {}
 
     candidate_started_at = time.perf_counter()
 
@@ -4473,41 +4959,165 @@ async def breath(
         for b in keyword_matches
     }
     keyword_ranked = list(keyword_scores.items())
+    # A bucket already present in the keyword channel must not receive a
+    # second RRF vote merely because the PG lexical index found the same text.
+    lexical_ranked = [
+        (bid, score)
+        for bid, score in lexical_ranked
+        if bid not in keyword_scores
+    ]
+    # Curated lexical is the fallback portion of the same lexical channel, not
+    # an extra RRF vote. Exact literal navigation may lead the channel; FTS is
+    # appended after the existing keyword results so a fallback cannot reorder
+    # already-supported candidates merely by entering the candidate pool.
+    literal_ranked = [
+        (bid, score)
+        for bid, score in lexical_ranked
+        if lexical_bucket_cache.get(bid, {}).get("_curated_lexical_channel")
+        == "literal"
+    ]
+    fts_ranked = [
+        (bid, score)
+        for bid, score in lexical_ranked
+        if lexical_bucket_cache.get(bid, {}).get("_curated_lexical_channel")
+        != "literal"
+    ]
+    merged_keyword_ranked = literal_ranked + keyword_ranked + fts_ranked
     channels = [
-        (keyword_ranked, intent_policy["keyword_weight"]),
+        (merged_keyword_ranked, intent_policy["keyword_weight"]),
         (vector_ranked, intent_policy["vector_weight"]),
     ]
     if entity_ranked and entity_weight > 0:
         channels.append((entity_ranked, entity_weight))
+
+    # Compute the exact production baseline once. Shadow receipts below reuse
+    # this same list; materialization continues to consume it unchanged.
     fused_pairs = lmc5_fuse_ranked_channels(
         channels,
         k=rrf_cfg.get("k", 60),
     )
 
+    # Passive upstream comparison. It reuses the candidate IDs and scores
+    # already produced for this natural recall turn; it does not retrieve,
+    # expand, embed, rerank, or inject anything. Production continues to use
+    # the exact RRF list computed above. The receipt contains no query
+    # text or bucket bodies.
+    fusion_shadow_enabled = str(
+        os.environ.get("OMBRE_UPSTREAM_FUSION_SHADOW", "0") or "0"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if fusion_shadow_enabled:
+        fusion_shadow_started_at = time.perf_counter()
+        shadow_keyword_scores = {
+            str(bucket["id"]): float(
+                bucket.get("_bm25_shadow_relevance_score", bucket.get("score", 0))
+                or 0.0
+            )
+            for bucket in keyword_matches
+        }
+        shadow_keyword_ranked = sorted(
+            shadow_keyword_scores.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        shadow_lexical_ranked = [
+            (bid, score)
+            for bid, score in lexical_shadow_ranked
+            if bid not in shadow_keyword_scores
+        ]
+        shadow_literal_ranked = [
+            (bid, score)
+            for bid, score in shadow_lexical_ranked
+            if lexical_shadow_bucket_cache.get(bid, {}).get(
+                "_curated_lexical_channel"
+            )
+            == "literal"
+        ]
+        shadow_fts_ranked = [
+            (bid, score)
+            for bid, score in shadow_lexical_ranked
+            if lexical_shadow_bucket_cache.get(bid, {}).get(
+                "_curated_lexical_channel"
+            )
+            != "literal"
+        ]
+        shadow_channels = [
+            (
+                shadow_literal_ranked
+                + shadow_keyword_ranked
+                + shadow_fts_ranked,
+                intent_policy["keyword_weight"],
+            ),
+            (vector_ranked, intent_policy["vector_weight"]),
+        ]
+        if entity_ranked and entity_weight > 0:
+            shadow_channels.append((entity_ranked, entity_weight))
+        shadow_results = {
+            mode: [
+                [str(bucket_id), round(float(score), 8)]
+                for bucket_id, score in lmc5_fuse_ranked_channels(
+                    shadow_channels,
+                    k=rrf_cfg.get("k", 60),
+                    fusion=mode,
+                )[:recall_limit]
+            ]
+            for mode in ("raw", "minmax", "rrf")
+        }
+        _emit_upstream_fusion_shadow(
+            {
+                    "query_sha": hashlib.sha256(
+                        recall_query.encode("utf-8")
+                    ).hexdigest()[:12],
+                    "stage": "candidate_fusion_pre_materialization",
+                    "baseline_rrf_pre_materialization": [
+                        [str(bucket_id), round(float(score), 8)]
+                        for bucket_id, score in fused_pairs[:recall_limit]
+                    ],
+                    "keyword": [
+                        [str(bucket_id), round(float(score), 8)]
+                        for bucket_id, score in shadow_channels[0][0]
+                    ],
+                    "vector": [
+                        [str(bucket_id), round(float(score), 8)]
+                        for bucket_id, score in vector_ranked
+                    ],
+                    "entity": [
+                        [str(bucket_id), round(float(score), 8)]
+                        for bucket_id, score in entity_ranked
+                    ],
+                    "original_bm25": original_bm25_shadow_scores,
+                    "bm25_ready": any(
+                        bool(bucket.get("_bm25_shadow_ready"))
+                        for bucket in keyword_matches
+                    ),
+                    "bm25_generations": sorted(
+                        {
+                            int(bucket["_bm25_shadow_generation"])
+                            for bucket in keyword_matches
+                            if "_bm25_shadow_generation" in bucket
+                        }
+                    ),
+                    "lexical_support": lexical_shadow_original_support,
+                    "modes": shadow_results,
+                    "elapsed_ms": round(
+                        (time.perf_counter() - fusion_shadow_started_at) * 1000.0,
+                        3,
+                    ),
+            }
+        )
     # Materialize fused list: reuse channel buckets, fetch vector-only ones.
     bucket_cache = {b["id"]: b for b in keyword_matches}
     bucket_cache.update(entity_bucket_cache)
-    literal_candidate_floor = max(
-        0.0,
-        float(
-            getattr(
-                bucket_mgr,
-                "literal_candidate_floor",
-                (config.get("matching", {}) or {}).get(
-                    "literal_candidate_floor",
-                    40.0,
-                ),
-            )
-        ),
-    )
-    topic_score_calculator = getattr(bucket_mgr, "_calc_topic_score", None)
+    bucket_cache.update(lexical_bucket_cache)
     matches = []
     for bid, fused_score in fused_pairs:
         if bid in bucket_cache:
             b = bucket_cache[bid]
         else:
-            # Vector-only bucket — fetch and re-apply filters that bucket_mgr.search applied
-            b = await bucket_mgr.get(bid)
+            # Vector-only IDs normally already exist in the resident corpus.
+            # Reuse that object as a request-local shallow copy instead of
+            # making _find_bucket_file walk the full tree once per ID.
+            resident = keyword_candidate_by_id.get(str(bid))
+            b = dict(resident) if resident is not None else await bucket_mgr.get(bid)
             if not b or not _passes_nonkeyword_recall_filters(
                 b,
                 world_filter_set=wf_set,
@@ -4535,7 +5145,12 @@ async def breath(
         # the original text; an explicit alias seed may safely replace only the
         # matched entity name.
         b["_literal_relevance_score"] = (
-            round(topic_score_calculator(recall_query, b) * 100.0, 4)
+            max(
+                round(topic_score_calculator(recall_query, b) * 100.0, 4),
+                float(original_bm25_scores.get(str(bid), 0.0) or 0.0),
+                float(lexical_original_support.get(str(bid), 0.0) or 0.0)
+                * 100.0,
+            )
             if callable(topic_score_calculator)
             else literal_candidate_floor
         )
@@ -4563,6 +5178,56 @@ async def breath(
         ),
         literal_floor=literal_candidate_floor,
     )[:recall_limit]
+
+    # Restore a strong original-query vector candidate if it was lost only to
+    # fusion position, original-support retention, or the recall cutoff.
+    if vector_strong_ids:
+        present_ids = {str(match.get("id")) for match in matches}
+        for bucket_id in vector_strong_ids:
+            if bucket_id in present_ids:
+                continue
+            bucket = bucket_cache.get(bucket_id) or await bucket_mgr.get(
+                bucket_id
+            )
+            if not bucket or not _is_main_recall_bucket(bucket):
+                continue
+            if not _passes_nonkeyword_recall_filters(
+                bucket,
+                world_filter_set=wf_set,
+                domain_filter=domain_filter,
+                created_after=created_after,
+                created_before=created_before,
+            ):
+                continue
+            if not _filter_z_fact_candidates(
+                [bucket],
+                query=recall_query,
+                intent=intent_policy["intent"],
+            ):
+                continue
+            bucket = dict(bucket)
+            bucket["vector_match"] = True
+            similarity = float(
+                original_vector_scores.get(bucket_id, 0.0)
+            )
+            bucket["_vector_relevance_score"] = round(similarity, 6)
+            bucket["_original_vector_relevance_score"] = round(
+                similarity,
+                6,
+            )
+            bucket["_fused_relevance_score"] = round(
+                similarity * 10.0,
+                6,
+            )
+            bucket["score"] = round(similarity * 10.0, 2)
+            bucket["_literal_relevance_score"] = 0.0
+            state_seed_by_id[bucket_id] = bucket
+            matches.append(bucket)
+            logger.info(
+                "Vector strong escort added bucket=%s sim=%.3f",
+                bucket_id,
+                similarity,
+            )
 
     # Relevance is the first ordering key.  Forgetting curve, sense and intent
     # remain useful, but may only adjust candidates inside one narrow fused
@@ -4872,9 +5537,17 @@ async def breath(
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
                 break
-            capture = _breath_candidate_capture.get()
-            if isinstance(capture, list) and len(capture) < max_results:
-                capture.append({"id": bucket["id"], "summary": summary})
+            reason = (
+                "entity" if bucket.get("entity_match")
+                else "semantic" if bucket.get("vector_match")
+                else "lexical"
+            )
+            _capture_breath_candidate(
+                bucket,
+                summary,
+                reason=reason,
+                limit=max_results,
+            )
             # Recall is read-only with respect to memory buckets.  Rendering a
             # search hit must not refresh last_active / activation_count or
             # trigger touch()'s bounded time ripple into neighboring buckets.
@@ -5020,12 +5693,12 @@ async def breath(
                 result_ids.append(timeline_neighbor.bucket_id)
                 if fingerprint:
                     selected_content_fingerprints.add(fingerprint)
-                capture = _breath_candidate_capture.get()
-                if isinstance(capture, list) and len(capture) < max_results:
-                    capture.append({
-                        "id": timeline_neighbor.bucket_id,
-                        "summary": summary,
-                    })
+                _capture_breath_candidate(
+                    neighbor,
+                    summary,
+                    reason="timeline",
+                    limit=max_results,
+                )
             except Exception as exc:
                 logger.warning(
                     "Failed to dehydrate timeline neighbor: %s",
@@ -5100,9 +5773,17 @@ async def breath(
                         bucket["_e_axis_annotation"],
                         float(bucket.get("_e_axis_resonance", 0.0) or 0.0),
                     ))
-                capture = _breath_candidate_capture.get()
-                if isinstance(capture, list) and len(capture) < max_results:
-                    capture.append({"id": bucket_id, "summary": summary})
+                reason = (
+                    "entity" if bucket.get("entity_match")
+                    else "semantic" if bucket.get("vector_match")
+                    else "lexical"
+                )
+                _capture_breath_candidate(
+                    bucket,
+                    summary,
+                    reason=reason,
+                    limit=max_results,
+                )
             except Exception as exc:
                 logger.warning(
                     "Failed to restore primary after timeline miss: %s",
@@ -5190,9 +5871,12 @@ async def breath(
             result_ids.append(state_bucket_id)
             if fingerprint:
                 selected_content_fingerprints.add(fingerprint)
-            capture = _breath_candidate_capture.get()
-            if isinstance(capture, list) and len(capture) < max_results:
-                capture.append({"id": state_bucket_id, "summary": summary})
+            _capture_breath_candidate(
+                state_bucket,
+                summary,
+                reason="state",
+                limit=max_results,
+            )
         except Exception as exc:
             logger.warning(
                 "Failed to render Z state-link evidence: %s",
@@ -5220,7 +5904,7 @@ async def breath(
     ):
         neighbor_msgs = []
         try:
-            graph_buckets = await bucket_mgr.list_all(include_archive=False)
+            graph_buckets = keyword_candidates
             graph_buckets = [
                 bucket
                 for bucket in graph_buckets
@@ -5297,6 +5981,12 @@ async def breath(
                 token_used += summary_tokens
                 result_buckets.append(neighbor)
                 result_ids.append(relation_neighbor.bucket_id)
+                _capture_breath_candidate(
+                    neighbor,
+                    summary,
+                    reason="relation",
+                    limit=max_results,
+                )
                 if fingerprint:
                     selected_content_fingerprints.add(fingerprint)
             except Exception as exc:
@@ -5397,6 +6087,12 @@ async def breath(
                 token_used += summary_tokens
                 result_buckets.append(e_bucket)
                 result_ids.append(e_bucket_id)
+                _capture_breath_candidate(
+                    e_bucket,
+                    summary,
+                    reason="emotion",
+                    limit=max_results,
+                )
                 if fingerprint:
                     selected_content_fingerprints.add(fingerprint)
                 excluded_e_ids.add(e_bucket_id)
@@ -5428,7 +6124,7 @@ async def breath(
         and random.random() < random_chance
     ):
         try:
-            all_buckets = await bucket_mgr.list_all(include_archive=False)
+            all_buckets = keyword_candidates
             all_buckets = [
                 bucket
                 for bucket in all_buckets
@@ -5468,6 +6164,12 @@ async def breath(
                     drift_results.append(f"[surface_type: random] {prefix}\n{summary}")
                     result_buckets.append(b)
                     result_ids.append(b["id"])
+                    _capture_breath_candidate(
+                        b,
+                        summary,
+                        reason="random",
+                        limit=max_results,
+                    )
                 if drift_results:
                     results.append("--- 忽然想起来 ---\n" + "\n---\n".join(drift_results))
         except Exception as e:
@@ -5505,6 +6207,170 @@ async def breath(
     _remember_session_seen_ids(session_id, result_ids)
     finish_recall_stage("assembly")
     return await _tool_result_with_optional_images(text, result_buckets, include_images)
+
+
+@mcp.tool(name="breath")
+async def _breath_tool(
+    query: str = "",
+    max_tokens: int = BREATH_DEFAULT_MAX_TOKENS,
+    domain: str = "",
+    valence: float = -1,
+    arousal: float = -1,
+    max_results: int = BREATH_DEFAULT_MAX_RESULTS,
+    world: str = "",
+    relation_depth: int = 1,
+    since: str = "",
+    until: str = "",
+    session_id: str = "",
+    policy: str = "search",
+    include_images: bool = True,
+    include_body_state: bool = True,
+    reset_body_state: bool = False,
+    output_mode: str = "full",
+    cursor: str = "",
+    page_size: int = 5,
+) -> str | list[TextContent | ImageContent]:
+    """检索记忆；默认 full 保持原返回，signal 返回可按 cursor 续读的瘦索引。
+
+    signal 第一屏只含桶 ID、来源、时间状态、命中原因和逐字片段；需要
+    完整正文时再用 ``inspect(bucket_id, signal_snapshot_id)`` 展开。
+    """
+    mode = str(output_mode or "full").strip().lower()
+    if mode == "full":
+        return await breath(
+            query=query,
+            max_tokens=max_tokens,
+            domain=domain,
+            valence=valence,
+            arousal=arousal,
+            max_results=max_results,
+            world=world,
+            relation_depth=relation_depth,
+            since=since,
+            until=until,
+            session_id=session_id,
+            policy=policy,
+            include_images=include_images,
+            include_body_state=include_body_state,
+            reset_body_state=reset_body_state,
+        )
+
+    if mode != "signal":
+        return json.dumps({
+            "mode": "signal",
+            "entries": [],
+            "partial": False,
+            "has_more": False,
+            "next_cursor": "",
+            "error": "unsupported_output_mode",
+        }, ensure_ascii=False, separators=(",", ":"))
+
+    if cursor:
+        try:
+            page = _memory_signal_store.page(cursor)
+        except MemorySignalCursorError as exc:
+            page = {
+                "mode": "signal",
+                "entries": [],
+                "partial": False,
+                "has_more": False,
+                "next_cursor": "",
+                "error": str(exc),
+            }
+        return json.dumps(page, ensure_ascii=False, separators=(",", ":"))
+
+    if not query or not query.strip():
+        return json.dumps({
+            "mode": "signal",
+            "entries": [],
+            "partial": False,
+            "has_more": False,
+            "next_cursor": "",
+            "error": "query_required",
+        }, ensure_ascii=False, separators=(",", ":"))
+
+    capture: list[dict] = []
+    capture_token = _breath_candidate_capture.set(capture)
+    seen_writes_token = _breath_session_seen_writes_enabled.set(False)
+    core_result = None
+    try:
+        core_result = await breath(
+            query=query,
+            max_tokens=max_tokens,
+            domain=domain,
+            valence=valence,
+            arousal=arousal,
+            max_results=max_results,
+            world=world,
+            relation_depth=relation_depth,
+            since=since,
+            until=until,
+            session_id=session_id,
+            policy=policy,
+            include_images=False,
+            include_body_state=False,
+            reset_body_state=False,
+        )
+    except Exception as exc:
+        logger.warning("Memory Signal recall failed: %s", type(exc).__name__)
+        return json.dumps({
+            "mode": "signal",
+            "entries": [],
+            "partial": False,
+            "has_more": False,
+            "next_cursor": "",
+            "error": "recall_failed",
+        }, ensure_ascii=False, separators=(",", ":"))
+    finally:
+        _breath_session_seen_writes_enabled.reset(seen_writes_token)
+        _breath_candidate_capture.reset(capture_token)
+
+    if isinstance(core_result, str) and core_result.strip() in {
+        "检索过程出错，请稍后重试。",
+        "读取 feel 失败。",
+    }:
+        return json.dumps({
+            "mode": "signal",
+            "entries": [],
+            "partial": False,
+            "has_more": False,
+            "next_cursor": "",
+            "error": "recall_failed",
+        }, ensure_ascii=False, separators=(",", ":"))
+
+    signal_entries = []
+    skipped_count = 0
+    for item in capture:
+        bucket_id = str(item.get("id") or "").strip()
+        if not bucket_id:
+            skipped_count += 1
+            continue
+        try:
+            bucket = item.get("bucket")
+            if not isinstance(bucket, dict):
+                raise ValueError("captured_bucket_missing")
+            signal_entries.append(build_signal_entry(
+                bucket,
+                reason=str(item.get("reason") or "ranked"),
+                query=query,
+                match_text=str(item.get("summary") or ""),
+            ))
+        except Exception as exc:
+            skipped_count += 1
+            logger.warning(
+                "Memory Signal skipped candidate %s: %s",
+                bucket_id,
+                type(exc).__name__,
+            )
+    page = _memory_signal_store.create(
+        signal_entries,
+        page_size=page_size,
+        session_id=session_id,
+        partial=skipped_count > 0,
+        error="signal_entry_build_failed" if skipped_count else "",
+        skipped_count=skipped_count,
+    )
+    return json.dumps(page, ensure_ascii=False, separators=(",", ":"))
 
 
 # =============================================================
@@ -6146,8 +7012,8 @@ async def trace(
 # 绕过浮现/检索；用于已知 ID、需要看原文的工程操作（整合、编辑、审查）。
 # =============================================================
 @mcp.tool()
-async def inspect(bucket_id: str) -> str:
-    """按 ID 查看记忆桶完整内容（不脱水）。用于整合/编辑/审查时需看原文的工程操作。"""
+async def inspect(bucket_id: str, signal_snapshot_id: str = "") -> str:
+    """按 ID 查看完整原文；signal_snapshot_id 仅记录这一次实际展开。"""
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
 
@@ -6198,7 +7064,21 @@ async def inspect(bucket_id: str) -> str:
                 rel_lines.append(f"  - {r.get('type', '?')} → {r.get('target', '?')}{note_str}")
     rel_block = ("\n\n关系边:\n" + "\n".join(rel_lines)) if rel_lines else ""
 
-    return f"{header}\n\n--- 正文 ---\n{content}{rel_block}"
+    result = f"{header}\n\n--- 正文 ---\n{content}{rel_block}"
+    if signal_snapshot_id:
+        tracked, signal_session_id = _memory_signal_store.mark_expanded_with_session(
+            signal_snapshot_id,
+            bucket["id"],
+        )
+        if tracked and signal_session_id:
+            _remember_session_seen_ids(signal_session_id, [bucket["id"]])
+        result += (
+            "\n\n---\n"
+            "[memory_signal_read "
+            f"tracked:{str(tracked).lower()} "
+            f"bucket_id:{bucket['id']} partial:false]"
+        )
+    return result
 
 
 # =============================================================
@@ -9248,6 +10128,7 @@ async def api_breath(request):
     )
     breath_task = None
     partial = False
+    deadline = False
     try:
         try:
             breath_task = asyncio.create_task(breath(
@@ -9278,7 +10159,9 @@ async def api_breath(request):
             )
             if done:
                 result = breath_task.result()
+                partial = recall_is_partial()
             else:
+                deadline = True
                 partial = True
                 result = get_recall_partial_result().strip() or "未找到相关记忆。"
                 breath_task.cancel()
@@ -9306,7 +10189,7 @@ async def api_breath(request):
             )
 
         timing = finish_recall_timing(
-            status="deadline" if partial else "ok",
+            status="deadline" if deadline else "ok",
             partial=partial,
         )
         logger.info("breath_timing=%s", json.dumps(timing, sort_keys=True))
@@ -9799,13 +10682,12 @@ if __name__ == "__main__":
         @asynccontextmanager
         async def _uvicorn_lifespan(app):
             async with _transport_lifespan(app):
-                await pg_mirror_worker.start()
+                await _prewarm_recall_state()
                 await _start_briefing_cache_refresh()
                 try:
                     yield
                 finally:
                     await _stop_briefing_cache_refresh()
-                    await pg_mirror_worker.stop()
 
         _app.router.lifespan_context = _uvicorn_lifespan
 

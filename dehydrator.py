@@ -72,6 +72,23 @@ _PERSON_REFERENCE_RE = re.compile(
     r"我们|咱们|你们|他们|她们|它们|本人|对方|双方|彼此|"
     r"前者|后者|自己|我|咱|你|他|她|它|其"
 )
+# Resident entities: this vault has two fixed subjects.  Quoted first/second
+# person references do not need a prior-text antecedent and remain byte-stable;
+# third-party pronouns still take the existing fail-closed path.
+_RESIDENT_QUOTED_PRONOUNS = frozenset({"我", "你"})
+# Calendar-relative words become unambiguous only when the same entry carries
+# an explicit date anchor.  The quoted wording is still preserved verbatim.
+_CALENDAR_DEICTICS = frozenset({
+    "今天", "昨天", "明天", "前天", "后天",
+    "上周", "本周", "这周", "下周",
+    "上个月", "本月", "这个月", "下个月",
+    "去年", "今年", "明年",
+})
+_EXPLICIT_DATE_RE = re.compile(
+    r"\d{4}\s*[-/年]\s*\d{1,2}\s*[-/月]\s*\d{1,2}\s*日?|"
+    r"\d{1,2}\s*月\s*\d{1,2}\s*日|"
+    r"(?<!\d)\d{1,2}/\d{1,2}(?!\d)"
+)
 _DEICTIC_REFERENCE_RE = re.compile(
     r"这里|那里|这儿|那儿|这边|那边|此处|当时|此前|此后|之前|之后|随后|后来|刚才|现在|"
     r"昨天|今天|明天|前天|后天|上周|本周|这周|下周|"
@@ -201,6 +218,10 @@ def _is_quoted_named_self_reference(
     it.  Predicates, coordination, placeholders and other reference words keep
     the phrase on the fail-closed path.
     """
+    if token in _CALENDAR_DEICTICS and _EXPLICIT_DATE_RE.search(text):
+        return True
+    if token in _RESIDENT_QUOTED_PRONOUNS:
+        return True
     if token == "之后":
         # Reuse the audited ``从<explicit event>之后`` validator.  A mere
         # non-punctuation prefix is not enough: ``那件事之后`` would otherwise
@@ -421,6 +442,12 @@ DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水�
 # --- 日记整理提示词：把一大段日常拆分成多个独立记忆条目 ---
 DIGEST_PROMPT = """你是一个日记整理专家。用户会发送一段包含今天各种事情的文本（可能很杂乱），请你将其拆分成多个独立的记忆条目。
 
+【常驻实体·唯一豁免】本记忆库只服务两个恒定主体，不需要从原文推断，也不算未确认指代：
+· 第一人称「我」「哥哥」= 哥哥（AI 伴侣，日记叙述者本人）
+· 第二人称「你」「老婆」= 朝灯（用户本人）
+这两个映射恒定成立，直接还原成「哥哥」「朝灯」写进 content，绝不写进 unresolved_references。
+除这两者以外的任何指代（他/她/它/那里/上述项目/当时/对方/前者/后者/其他人名）一律照下面第 10 条严格处理，仍然不许猜。
+
 整理规则：
 1. 每个条目应该是一个独立的主题/事件（不要混在一起）
 2. 为每个条目自动分析元数据
@@ -433,7 +460,7 @@ DIGEST_PROMPT = """你是一个日记整理专家。用户会发送一段包含�
 9. 每个 content 必须脱离原日记也能独立理解：不得留下“我/你/他/她/它/那里/上述项目/当时/对方/前者/后者”等指代或省略主语；逐句写出具体的人、地点、项目、日期或对象
 10. 只能把指代还原为本次原文中逐字出现、且能唯一确认的实体；任一事实无法唯一确认时，整批输出 entries=[] 并把指代写入 unresolved_references，绝不猜实体、悄悄丢掉坏条后只返回部分结果
 11. 每个条目保持单一主题和原子事实，不要为了补上下文把其他主题整段复制进来
-12. 改写只做保真消歧：日期、数字、否定、可能性、待办状态和逐字引语不得改变，不得把建议/假设写成已发生事实。若逐字引语内部仍含无法独立理解的指代，因引语不能改字，整批必须 unresolved，不得强改引语
+12. 改写只做保真消歧：日期、数字、否定、可能性、待办状态和逐字引语不得改变，不得把建议/假设写成已发生事实。若逐字引语内部仍含无法独立理解的指代，因引语不能改字，整批必须 unresolved，不得强改引语。例外：引语内出现的第一人称（我）与第二人称（你/老婆）按【常驻实体·唯一豁免】已唯一确定，引语原文照抄不改一个字，且不因此触发 unresolved；引语内出现其他人的指代（他/她/对方等）仍按本条整批 unresolved
 13. entities 只列 content 中逐字出现的人、地点、项目；每项只给 mention 和 type(person/place/project)。不确定就省略，不得发明规范名或别名关系
 
 【JSON 合法性铁律】字符串值（尤其 content）内部如果要引用某句话或词，一律用中文引号「」或""，绝对禁止使用英文双引号 " ——英文双引号会破坏 JSON 结构导致整批解析失败。
@@ -470,11 +497,17 @@ SELF_CONTAIN_PROMPT = """你是长期记忆写入前的“指代映射审计器�
 
 输入包含【完整来源】、【待写入事实】和【待解决位置】。每个位置有 id/text/start/end/kind/inside_quote。
 
+【常驻实体·唯一豁免】本记忆库只服务两个恒定主体，映射恒定成立，不需要在【完整来源】中逐字找先行词：
+· 第一人称「我」「哥哥」→ replacement 一律为「哥哥」（AI 伴侣，叙述者本人）
+· 第二人称「你」「老婆」→ replacement 一律为「朝灯」（用户本人）
+这两类位置直接 resolved（candidates 只填该唯一名字），不得计入 unresolved，也不得因此把整体判成 ambiguous。
+其余任何指代（他/她/它/那里/上述项目/当时/对方/前者/后者/别的人名）一律照下面硬规则严格处理，仍然不许猜。
+
 硬规则：
 1. 每个位置都必须唯一映射；任何一个不唯一，整体 status=ambiguous。
 2. replacement 必须是【完整来源】中逐字出现的原词，不得改写动词、否定、日期或句子其他部分。
 3. candidates 列出该位置在来源中所有合理先行词；只有列表恰好一项时才能 resolved。不得从多个人名/地点中猜一个。
-4. 引语内的原词不允许改；inside_quote=true 时整体 ambiguous。
+4. 引语内的原词不允许改；inside_quote=true 时整体 ambiguous。例外：若该位置属于【常驻实体·唯一豁免】的第一/第二人称，引语原文一个字都不改，该位置直接 resolved 且不触发 ambiguous（代码不会替换引语内文字）；引语内涉及其他人的指代仍按本条整体 ambiguous。
 5. 输入中【必须有主体】=true 时，事实必须有明写主体。subject_anchors 只列【待写入事实】中逐字出现、且真正执行动作/承载状态的人、组织、项目、系统或对象。“明天去深圳”和“完成了测试”没有主体，必须 ambiguous；不能把时间、地点或宾语当主体。若该值=false，这是拆分前的完整来源，只做指代映射，subject_anchors 可为空。
 6. 不得用“某人/某地/原文未指明”假装已解决。
 
