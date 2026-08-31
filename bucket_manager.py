@@ -38,7 +38,7 @@ from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 import frontmatter
 import jieba
@@ -57,6 +57,11 @@ from x_provenance import normalize_x_provenance, validate_x_provenance_update
 from review_queue import ReviewQueue, make_clothing_entry
 from timeline_axis import normalize_thread
 from bm25_index import BM25Index
+from relation_graph import (
+    normalize_generation_method,
+    normalize_relation_evidence,
+    plan_relations_for_created_bucket,
+)
 
 logger = logging.getLogger("ombre_brain.bucket")
 
@@ -1633,6 +1638,18 @@ class BucketManager:
                     bucket_id,
                     type(exc).__name__,
                 )
+        if bucket_type != "archived":
+            try:
+                await self.auto_link_created_bucket(bucket_id)
+            except Exception as exc:
+                # The bucket body is already durable.  Y maintenance must remain
+                # fail-open for that primary write, while leaving a visible error
+                # for the full backfill to repair.
+                logger.error(
+                    "Y auto-link failed after durable create %s: %s",
+                    bucket_id,
+                    exc,
+                )
         return bucket_id
 
     # ---------------------------------------------------------
@@ -2003,11 +2020,332 @@ class BucketManager:
     # ---------------------------------------------------------
     # Relation edges (6 类关系边：只在 source 桶记出边，反向遍历得入边)
     # ---------------------------------------------------------
+    async def auto_link_created_bucket(self, bucket_id: str) -> dict[str, int]:
+        """Attach deterministic Y edges after every formal create path.
+
+        This reads only frontmatter provenance and reviewed timeline threads.
+        It never calls a model or embedding service, and it never changes
+        ``last_active`` on an older memory merely because graph maintenance
+        touched that file.
+        """
+        created = await self.get(bucket_id)
+        if created is None:
+            return {"planned": 0, "created": 0, "enriched": 0, "failed": 1}
+        cache_key = self._recall_cache_key(True, True)
+        if cache_key not in self._recall_snapshot_cache:
+            await self.prewarm_recall_snapshot(
+                include_archive=True,
+                include_nsfw=True,
+            )
+        # Unlike recall, post-create maintenance does not schedule a periodic
+        # refresh task.  The just-completed atomic write already refreshed the
+        # resident tuple, and a one-shot writer must not keep its event loop
+        # alive solely for a background read refresh.
+        buckets = self._recall_snapshot_cache.get(cache_key, ())
+        plans = plan_relations_for_created_bucket(created, buckets)
+        by_source: dict[str, list[dict[str, Any]]] = {}
+        for plan in plans:
+            by_source.setdefault(plan.source_id, []).append(plan.edge_document())
+
+        result = {
+            "planned": len(plans),
+            "created": 0,
+            "enriched": 0,
+            "unchanged": 0,
+            "failed": 0,
+        }
+        for source_id, edges in sorted(by_source.items()):
+            applied = await self.upsert_relations(
+                source_id,
+                edges,
+                actor="system:y-auto-link:v1",
+            )
+            for field in ("created", "enriched", "unchanged", "failed"):
+                result[field] += int(applied.get(field, 0))
+        if plans:
+            logger.info("Y auto-link %s: %s", bucket_id, result)
+        return result
+
+    async def upsert_relations(
+        self,
+        source_id: str,
+        edges: list[Mapping[str, Any]],
+        *,
+        actor: str = "system:y-relation-upsert",
+    ) -> dict[str, Any]:
+        """Create or enrich many relation edges with one audited source write.
+
+        Existing relation semantics are immutable here: supplied metadata only
+        fills absent ``note``, ``strength``, ``evidence`` and
+        ``generation_method`` fields.  This makes repeated full backfills
+        idempotent and prevents a new planner from relabelling an old edge.
+        """
+        result: dict[str, Any] = {
+            "source_id": source_id,
+            "requested": len(edges) if isinstance(edges, list) else 0,
+            "created": 0,
+            "enriched": 0,
+            "unchanged": 0,
+            "failed": 0,
+            "errors": [],
+        }
+        if not source_id or not isinstance(source_id, str) or not isinstance(edges, list):
+            result["failed"] = max(1, result["requested"])
+            result["errors"].append("invalid_request")
+            return result
+
+        normalized: dict[tuple[str, str], dict[str, Any]] = {}
+        for raw in edges:
+            try:
+                if not isinstance(raw, Mapping):
+                    raise ValueError("edge must be an object")
+                rel_type = str(raw.get("type") or "").strip()
+                target_id = str(raw.get("target") or "").strip()
+                if rel_type not in RELATION_TYPES:
+                    raise ValueError("unknown relation type")
+                if not target_id or target_id == source_id:
+                    raise ValueError("invalid relation target")
+                method = normalize_generation_method(
+                    raw.get("generation_method")
+                )
+                evidence = normalize_relation_evidence(raw.get("evidence"))
+                note = str(raw.get("note") or "").strip()
+                if len(note) > 500:
+                    raise ValueError("relation note is too long")
+                strength = raw.get("strength")
+                if strength is not None:
+                    if isinstance(strength, bool) or not isinstance(
+                        strength, (int, float)
+                    ):
+                        raise ValueError("invalid relation strength")
+                    strength = float(strength)
+                    if not 0.0 <= strength <= 1.0:
+                        raise ValueError("invalid relation strength")
+                document = {
+                    "type": rel_type,
+                    "target": target_id,
+                    "generation_method": method,
+                    "evidence": evidence,
+                }
+                if note:
+                    document["note"] = note
+                if strength is not None:
+                    document["strength"] = strength
+                key = (rel_type, target_id)
+                previous = normalized.get(key)
+                if previous is not None and previous != document:
+                    raise ValueError("conflicting duplicate relation")
+                normalized[key] = document
+            except ValueError as exc:
+                result["failed"] += 1
+                result["errors"].append(str(exc))
+
+        if not normalized:
+            return result
+
+        target_exists: dict[str, bool] = {}
+        reverse_kin_exists: set[str] = set()
+        for _rel_type, target_id in normalized:
+            target = await self.get(target_id)
+            target_exists[target_id] = target is not None
+            if target is None or _rel_type != "kin":
+                continue
+            for relation in target.get("metadata", {}).get("relations") or []:
+                if (
+                    isinstance(relation, dict)
+                    and relation.get("type") == "kin"
+                    and relation.get("target") == source_id
+                ):
+                    reverse_kin_exists.add(target_id)
+                    break
+
+        async with self._write_guard(source_id):
+            file_path = self._find_bucket_file(source_id)
+            if not file_path:
+                result["failed"] += len(normalized)
+                result["errors"].append("source_not_found")
+                return result
+            event_id = None
+            try:
+                post = self._safe_load_post(file_path)
+                relations = list(post.get("relations") or [])
+                existing: dict[tuple[str, str], dict[str, Any]] = {}
+                for relation in relations:
+                    if not isinstance(relation, dict):
+                        continue
+                    key = (
+                        str(relation.get("type") or "").strip(),
+                        str(relation.get("target") or "").strip(),
+                    )
+                    if all(key):
+                        existing.setdefault(key, relation)
+
+                before = self._post_snapshot(post, file_path)
+                changed = False
+                changed_keys: list[str] = []
+                for key, desired in normalized.items():
+                    current = existing.get(key)
+                    if current is None:
+                        if key[0] == "kin" and key[1] in reverse_kin_exists:
+                            result["unchanged"] += 1
+                            continue
+                        if not target_exists.get(key[1], False):
+                            result["failed"] += 1
+                            result["errors"].append(
+                                f"target_not_found:{key[1]}"
+                            )
+                            continue
+                        relations.append(copy.deepcopy(desired))
+                        existing[key] = relations[-1]
+                        result["created"] += 1
+                        changed = True
+                        changed_keys.append(f"{key[0]}:{key[1]}")
+                        continue
+
+                    enriched = False
+                    for field in (
+                        "note",
+                        "strength",
+                        "evidence",
+                        "generation_method",
+                    ):
+                        if field not in current and field in desired:
+                            current[field] = copy.deepcopy(desired[field])
+                            enriched = True
+                    if enriched:
+                        result["enriched"] += 1
+                        changed = True
+                        changed_keys.append(f"{key[0]}:{key[1]}")
+                    else:
+                        result["unchanged"] += 1
+
+                if not changed:
+                    return result
+                post["relations"] = relations
+                event_id = self.audit_log.begin(
+                    actor=actor,
+                    action="upsert_relations",
+                    bucket_id=source_id,
+                    before=before,
+                    after=self._post_snapshot(post, file_path),
+                    details={
+                        "created": result["created"],
+                        "enriched": result["enriched"],
+                        "edge_keys": changed_keys,
+                    },
+                )
+                self._atomic_write_post(
+                    file_path,
+                    post,
+                    bm25_content_changed=False,
+                )
+                self.audit_log.commit(event_id)
+                return result
+            except Exception as exc:
+                self.audit_log.fail(event_id, exc)
+                result["created"] = 0
+                result["enriched"] = 0
+                result["failed"] += len(normalized)
+                result["errors"].append(type(exc).__name__)
+                logger.error(
+                    "Failed to upsert Y relations / Y 关系批写失败 %s: %s",
+                    source_id,
+                    exc,
+                )
+                return result
+
+    async def prune_relations(
+        self,
+        source_id: str,
+        edge_keys: list[tuple[str, str]],
+        *,
+        actor: str = "system:y-relation-prune",
+    ) -> dict[str, Any]:
+        """Remove exact audited edge records without changing memory activity."""
+        requested = {
+            (str(rel_type or "").strip(), str(target_id or "").strip())
+            for rel_type, target_id in edge_keys
+            if str(rel_type or "").strip() in RELATION_TYPES
+            and str(target_id or "").strip()
+        }
+        result: dict[str, Any] = {
+            "source_id": source_id,
+            "requested": len(requested),
+            "removed": 0,
+            "missing": 0,
+            "failed": 0,
+            "errors": [],
+        }
+        if not source_id or not requested:
+            return result
+        async with self._write_guard(source_id):
+            file_path = self._find_bucket_file(source_id)
+            if not file_path:
+                result["failed"] = len(requested)
+                result["errors"].append("source_not_found")
+                return result
+            event_id = None
+            try:
+                post = self._safe_load_post(file_path)
+                relations = list(post.get("relations") or [])
+                kept = []
+                removed_keys: set[tuple[str, str]] = set()
+                for relation in relations:
+                    key = None
+                    if isinstance(relation, dict):
+                        key = (
+                            str(relation.get("type") or "").strip(),
+                            str(relation.get("target") or "").strip(),
+                        )
+                    if key in requested:
+                        removed_keys.add(key)
+                    else:
+                        kept.append(relation)
+                result["removed"] = len(relations) - len(kept)
+                result["missing"] = len(requested - removed_keys)
+                if not result["removed"]:
+                    return result
+                before = self._post_snapshot(post, file_path)
+                post["relations"] = kept
+                event_id = self.audit_log.begin(
+                    actor=actor,
+                    action="prune_relations",
+                    bucket_id=source_id,
+                    before=before,
+                    after=self._post_snapshot(post, file_path),
+                    details={
+                        "edge_keys": [
+                            f"{rel_type}:{target_id}"
+                            for rel_type, target_id in sorted(removed_keys)
+                        ],
+                    },
+                )
+                self._atomic_write_post(
+                    file_path,
+                    post,
+                    bm25_content_changed=False,
+                )
+                self.audit_log.commit(event_id)
+                return result
+            except Exception as exc:
+                self.audit_log.fail(event_id, exc)
+                result["removed"] = 0
+                result["failed"] = len(requested)
+                result["errors"].append(type(exc).__name__)
+                logger.error(
+                    "Failed to prune Y relations / Y 关系清理失败 %s: %s",
+                    source_id,
+                    exc,
+                )
+                return result
+
     async def add_relation(
         self, source_id: str, target_id: str, rel_type: str, note: str = "",
         actor: str = "system",
         *,
         strength: float | None = None,
+        evidence: Mapping[str, Any] | None = None,
+        generation_method: str = "",
     ) -> bool:
         if rel_type not in RELATION_TYPES:
             logger.warning(f"Unknown relation type / 未知关系类型: {rel_type}")
@@ -2019,6 +2357,16 @@ class BucketManager:
                 return False
             strength = float(strength)
             if not 0.0 <= strength <= 1.0:
+                return False
+        normalized_evidence = None
+        normalized_method = ""
+        if evidence is not None or generation_method:
+            if evidence is None or not generation_method:
+                return False
+            try:
+                normalized_evidence = normalize_relation_evidence(evidence)
+                normalized_method = normalize_generation_method(generation_method)
+            except ValueError:
                 return False
         if not await self.get(target_id):
             logger.warning(f"Relation target not found / 关系目标桶不存在: {target_id}")
@@ -2040,6 +2388,9 @@ class BucketManager:
                     edge["note"] = note.strip()
                 if strength is not None:
                     edge["strength"] = strength
+                if normalized_evidence is not None:
+                    edge["evidence"] = normalized_evidence
+                    edge["generation_method"] = normalized_method
                 relations.append(edge)
                 post["relations"] = relations
                 post["last_active"] = now_iso()

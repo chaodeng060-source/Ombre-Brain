@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -34,6 +35,9 @@ from typing import Any
 from maintenance_barrier import MaintenanceBarrier
 from storage_safety import advisory_file_lock
 from utils import now_iso
+
+
+logger = logging.getLogger("ombre_brain.curated_writer")
 
 
 VECTOR_POLICIES = frozenset({"required", "fts_only"})
@@ -302,6 +306,30 @@ class CuratedWriteCoordinator:
             )
             conn.commit()
         return result
+
+    async def _auto_link_promoted_bucket(self, bucket_id: str | None) -> None:
+        """Run idempotent Y maintenance only after a staged body is visible."""
+        auto_link = getattr(self.bucket_manager, "auto_link_created_bucket", None)
+        if not bucket_id or not callable(auto_link):
+            return
+        try:
+            await auto_link(bucket_id)
+        except Exception as exc:
+            # The body, vector and promotion are already durable.  Keep the
+            # primary write fail-open; a replay or full backfill can repair Y.
+            logger.error(
+                "Y auto-link failed after curated promotion %s: %s",
+                bucket_id,
+                exc,
+            )
+
+    async def _finish_with_auto_link(
+        self,
+        idempotency_key: str,
+        result: CuratedWriteResult,
+    ) -> CuratedWriteResult:
+        await self._auto_link_promoted_bucket(result.bucket_id)
+        return self._finish(idempotency_key, result)
 
     def _record_retryable(
         self,
@@ -577,6 +605,7 @@ class CuratedWriteCoordinator:
                     payload_sha256=payload_sha256,
                     content=content,
                 )
+                await self._auto_link_promoted_bucket(result.bucket_id)
                 return result
             if row["status"] not in _INCOMPLETE_STATUSES:
                 raise CuratedWriteIntegrityError(
@@ -598,7 +627,10 @@ class CuratedWriteCoordinator:
                     vector_policy=vector_policy,
                 )
                 if recovered is not None:
-                    return self._finish(idempotency_key, recovered)
+                    return await self._finish_with_auto_link(
+                        idempotency_key,
+                        recovered,
+                    )
                 if str(
                     (staged_bucket.get("metadata", {}) or {}).get("type") or ""
                 ) != "archived":
@@ -620,7 +652,10 @@ class CuratedWriteCoordinator:
                     )
                     self._set_bucket(idempotency_key, bucket_id)
                     if recovered is not None:
-                        return self._finish(idempotency_key, recovered)
+                        return await self._finish_with_auto_link(
+                            idempotency_key,
+                            recovered,
+                        )
                     if str(
                         (staged_bucket.get("metadata", {}) or {}).get("type") or ""
                     ) != "archived":
@@ -775,4 +810,4 @@ class CuratedWriteCoordinator:
                 vector_policy=vector_policy,
                 recall_state=ready_state,
             )
-            return self._finish(idempotency_key, result)
+            return await self._finish_with_auto_link(idempotency_key, result)
