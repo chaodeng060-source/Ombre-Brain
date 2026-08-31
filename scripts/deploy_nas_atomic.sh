@@ -192,7 +192,10 @@ mounted_buckets="$($DOCKER_BIN inspect --format '{{range .Mounts}}{{if eq .Desti
   echo "container buckets volume does not match the production manifest" >&2
   exit 1
 }
-mapfile -t networks < <($DOCKER_BIN inspect --format '{{range $name, $network := .NetworkSettings.Networks}}{{$name}}{{println}}{{end}}' "$OMBRE_CONTAINER_NAME")
+mapfile -t networks < <(
+  $DOCKER_BIN inspect --format '{{range $name, $network := .NetworkSettings.Networks}}{{$name}}{{println}}{{end}}' "$OMBRE_CONTAINER_NAME" |
+    awk 'NF'
+)
 [[ "${#networks[@]}" == 1 && "${networks[0]}" == "${OMBRE_NETWORK_MODE:?missing OMBRE_NETWORK_MODE}" ]] || {
   echo "container network does not match the production manifest" >&2
   exit 1
