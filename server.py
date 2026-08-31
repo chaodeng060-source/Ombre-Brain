@@ -1727,6 +1727,25 @@ def _anchor_quality_gate_enabled(policy: str) -> bool:
     return policy in enabled_policies
 
 
+def _anchor_literal_only_cap() -> float:
+    """字面单路（vector 没命中）时的相似度上限；>=1.0 等于关闭这道压制。
+
+    每次现读 env，可在不重建镜像的前提下一键回滚：
+    ``OMBRE_ANCHOR_LITERAL_ONLY_CAP=1`` 即完全退回 2026-08-31 之前的行为。
+    """
+    raw = os.getenv("OMBRE_ANCHOR_LITERAL_ONLY_CAP", "0.55").strip()
+    if raw.lower() in ("off", "none", ""):
+        return 1.0
+    try:
+        cap = float(raw)
+    except ValueError:
+        logger.warning(
+            "OMBRE_ANCHOR_LITERAL_ONLY_CAP=%r 不是数字，回落到 0.55", raw
+        )
+        return 0.55
+    return max(0.0, min(1.0, cap))
+
+
 def _anchor_adapted_relevance_score(bucket: dict) -> float | None:
     """Map Ombre's absolute query evidence onto Anchor's score scale.
 
@@ -1741,12 +1760,30 @@ def _anchor_adapted_relevance_score(bucket: dict) -> float | None:
     """
     similarities: list[float] = []
 
+    vector = bucket.get("_original_vector_relevance_score")
+    vector_hit = isinstance(vector, (int, float)) and float(vector) > 0.0
+
     literal = bucket.get("_literal_relevance_score")
     if isinstance(literal, (int, float)):
-        similarities.append(max(0.0, min(1.0, float(literal) / 100.0)))
+        normalised = max(0.0, min(1.0, float(literal) / 100.0))
+        # 2026-08-31 朝灯令「没有相关内容就不该召回」。
+        # 实测 330 条真实候选（17 轮重放当天真实问句）：44.8% 是 vector 检索
+        # 根本没捞到、纯靠字面撞词进来的，其中 27 条字面吃满 100 → 直接拿 0.45
+        # 满分，和真正相关的并列坐在最高分档。原设计 max() 让任何一路高就整体高，
+        # 于是「语义完全不沾边但撞了几个词」永远过线，闸形同虚设（14 轮里 11 轮
+        # kept==input）。
+        #
+        # 这里只压「向量没捞到时的字面单路」：上限 0.55，使 0.45*0.55=0.2475
+        # 恰落在 conversation 线 0.25 之下。向量有命中的候选完全不受影响。
+        #
+        # 为什么不改阈值：同一批数据里把线提到 0.32 同样砍到 51%，但 27 条撞词
+        # 一条都拦不住、还多出 2 轮整轮返空。压字面单路则 27/27 全拦、零返空。
+        # 阈值是 vendor 契约，不动。
+        if not vector_hit:
+            normalised = min(normalised, _anchor_literal_only_cap())
+        similarities.append(normalised)
 
-    vector = bucket.get("_original_vector_relevance_score")
-    if isinstance(vector, (int, float)):
+    if vector_hit:
         similarities.append(max(0.0, min(1.0, float(vector))))
 
     # A current, validated entity link means the query explicitly named the
