@@ -8,6 +8,9 @@
 
 FROM python:3.12-slim
 
+ARG OMBRE_SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.revision="${OMBRE_SOURCE_REVISION}"
+
 WORKDIR /app
 
 # Install dependencies first (leverage Docker cache)

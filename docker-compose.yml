@@ -11,8 +11,13 @@
 
 services:
   ombre-brain:
-    build: .
-    container_name: ombre-brain
+    build:
+      context: .
+      args:
+        OMBRE_SOURCE_REVISION: ${OMBRE_DEPLOY_COMMIT:-unknown}
+    image: ${OMBRE_IMAGE_REPOSITORY:-ombre-brain}:${OMBRE_IMAGE_TAG:-local}
+    container_name: ${OMBRE_CONTAINER_NAME:-ombre-brain}
+    network_mode: ${OMBRE_NETWORK_MODE:-bridge}
     restart: unless-stopped
     ports:
       # Publish on host loopback only. Host cloudflared reaches 127.0.0.1;
@@ -33,9 +38,12 @@ services:
       # 挂载你的 Obsidian 仓库（或任意宿主机目录）做持久化存储
       # Example / 示例:
       #   - /path/to/your/Obsidian Vault/Ombre Brain:/data
-      - /vol1/ombre-data:/data
-      - /vol1/ombre-night-snapshots:/snapshots
-      - ./config.yaml:/app/config.yaml
+      - ${OMBRE_DATA_DIR:-/vol1/ombre-data}:/data
+      - ${OMBRE_SNAPSHOT_DIR:-/vol1/ombre-night-snapshots}:/snapshots
+      - ${OMBRE_CONFIG_FILE:-./config.yaml}:/app/config.yaml
+      - type: volume
+        source: ombre-buckets
+        target: /app/buckets
 
   # Cloudflare Tunnel — 在朝灯 NAS 上已由 host 上的 cloudflared systemd/手起进程承担
   #（zhaodeng 用户跑 `cloudflared tunnel --config ~/.cloudflared/config.yml run ombre`）
@@ -56,3 +64,8 @@ services:
   #     - /home/zhaodeng/.cloudflared:/etc/cloudflared
   #   depends_on:
   #     - ombre-brain
+
+volumes:
+  ombre-buckets:
+    name: ${OMBRE_BUCKETS_VOLUME:-ombre-buckets}
+    external: ${OMBRE_BUCKETS_VOLUME_EXTERNAL:-false}

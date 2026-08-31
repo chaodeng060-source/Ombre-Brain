@@ -33,18 +33,17 @@ POST /api/maintenance/lmc5-night
 ```
 
 宿主机不保存或传递 Token。定时器用 `/usr/bin/flock` 防止任务重叠，
-再进入容器；触发器从容器环境读取 `OMBRE_API_TOKEN`：
+再进入容器；触发器从容器环境读取 `OMBRE_API_TOKEN`。生产任务不得直接运行
+旧 `/vol1/ombre-deploy` wrapper，也不得依赖脚本的隐式容器名。统一入口由
+`scripts/install_nas_jobs.sh` 安装，并从受保护的
+`/vol1/ombre-migrate/nas-production.env` 显式加载
+`OMBRE_CONTAINER_NAME=ombre-vps-mirror`。
 
-```sh
-/vol1/ombre-deploy/cron/run-lmc5-night.sh
-```
-
-朝灯 NAS 已有 04:00 数据备份任务，因此 LMC-5 安排在 04:30，避免两份
-I/O 密集任务争抢同一数据目录：
-
-```cron
-30 4 * * * /vol1/ombre-deploy/cron/run-lmc5-night.sh >>/home/zhaodeng/ombre-lmc5-night.log 2>&1
-```
+04:00 冷备必须覆盖同一 8001 实例的 `/vol1/ombre-migrate/data` 与权威源码，
+且通过 SQLite 解包回查；旧的 `/home/zhaodeng/ombre_daily_backup.sh` 只备份
+8000 数据，不能作为这条夜班的前置备份。LMC-5 在 04:30 运行，E-axis 在
+05:30 运行。完整安装、迁移闸和回滚步骤见
+[`NAS_8001_PRODUCTION.md`](NAS_8001_PRODUCTION.md)。
 
 夜班的“同一天”按 `Asia/Shanghai` 的 04:30 边界计算，不按午夜计算：
 从本日 04:30 到次日 04:30 前都属于同一个逻辑日。本轮 cutoff 永远固定
@@ -84,4 +83,5 @@ I/O 密集任务争抢同一数据目录：
 - 旧记忆正文与元数据未因 M 改写。
 - 只有同一逻辑日已经 `complete` 时，第二次触发才返回
   `already_complete=true`；若上一轮 `deferred`，则必须创建新的 `-rN` 续跑。
-- cron 只有一条 LMC-5 任务，并与 04:00 备份错峰。
+- cron 只有一条 LMC-5 任务，显式写入 8001，并与同一 8001 数据的 04:00
+  冷备错峰；不得残留旧 8000 writer/backup 行。

@@ -1,0 +1,10 @@
+# relative_path<TAB>audited_live_sha256<TAB>reviewed_source_sha256
+#
+# The first migration remains blocked until every top-level /app/*.py versus
+# Git difference is listed and each UNRECONCILED value is replaced by the
+# reviewed Git SHA-256. ABSENT is the explicit side marker for an added or
+# removed file. Do not make hashes equal by hot-patching production first.
+server.py	33da0cc63c3b2f47ba3b6e3af4956eb27707a9c3e729ce05fe27b49b30ff6aab	UNRECONCILED
+bucket_manager.py	c6afd7f5a9e485189793151269a3c14140ad71fb1e1a44db673e4232b51dbec8	UNRECONCILED
+bm25_index.py	ebd4277c8b6a1a8a372d229541da4986ee91248142200d33a405d91de61a4724	UNRECONCILED
+memory_signal.py	59cae28abd36ab045b3bb8ee277941ae9ac7bba69e3be3fce1548e1dd4eb7808	UNRECONCILED

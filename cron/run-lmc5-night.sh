@@ -2,7 +2,12 @@
 set -eu
 
 DOCKER_BIN="${DOCKER_BIN:-/usr/bin/docker}"
-CONTAINER="${OMBRE_CONTAINER_NAME:-ombre-brain}"
+: "${OMBRE_CONTAINER_NAME:?set OMBRE_CONTAINER_NAME to the intended Ombre writer}"
+CONTAINER="$OMBRE_CONTAINER_NAME"
+if [ "$CONTAINER" != "ombre-vps-mirror" ]; then
+    echo "refusing non-production container: $CONTAINER" >&2
+    exit 2
+fi
 LOCK_FILE="${OMBRE_LMC5_LOCK_FILE:-/tmp/ombre-lmc5-night.lock}"
 PATROL_STATE_DIR="${OMBRE_PATROL_STATE_DIR:-/data/.lmc5/patrol}"
 

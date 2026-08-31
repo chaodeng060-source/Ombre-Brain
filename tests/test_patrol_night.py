@@ -107,6 +107,7 @@ def _run_cron(tmp_path: Path, *, fail_night: int = 0, fail_patrol: int = 0):
         "CALL_LOG": str(calls),
         "FAIL_NIGHT": str(fail_night),
         "FAIL_PATROL": str(fail_patrol),
+        "OMBRE_CONTAINER_NAME": "ombre-vps-mirror",
         "OMBRE_LMC5_LOCK_FILE": str(tmp_path / "night.lock"),
     }
     result = subprocess.run(["sh", str(script)], env=env, check=False)
@@ -118,8 +119,34 @@ def test_cron_runs_night_then_patrol_only(tmp_path):
 
     assert result.returncode == 0
     assert len(calls) == 2
+    assert calls[0].startswith("exec ombre-vps-mirror ")
+    assert calls[1].startswith("exec ombre-vps-mirror ")
     assert "night_run_trigger.py" in calls[0]
     assert "patrol_night.py" in calls[1]
+
+
+def test_cron_refuses_to_guess_the_writer_container(tmp_path):
+    fake, calls = _fake_docker(tmp_path)
+    script = Path(__file__).resolve().parents[1] / "cron" / "run-lmc5-night.sh"
+    env = {
+        **os.environ,
+        "DOCKER_BIN": str(fake),
+        "CALL_LOG": str(calls),
+        "OMBRE_LMC5_LOCK_FILE": str(tmp_path / "night.lock"),
+    }
+    env.pop("OMBRE_CONTAINER_NAME", None)
+
+    result = subprocess.run(
+        ["sh", str(script)],
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "OMBRE_CONTAINER_NAME" in result.stderr
+    assert not calls.exists()
 
 
 def test_cron_propagates_patrol_failure(tmp_path):
@@ -167,6 +194,7 @@ def test_cron_double_failure_preserves_m_failure_evidence(tmp_path):
         "PATROL_SCRIPT": str(patrol_script),
         "PATROL_CONFIG": str(config),
         "PATROL_STATE": str(state),
+        "OMBRE_CONTAINER_NAME": "ombre-vps-mirror",
         "OMBRE_LMC5_LOCK_FILE": str(tmp_path / "night.lock"),
     }
 
