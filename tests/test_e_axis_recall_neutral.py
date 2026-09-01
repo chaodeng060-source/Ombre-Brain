@@ -17,7 +17,9 @@ from e_axis_recall import (
     group_candidate_rows,
     group_primary_authored_buckets,
     infer_query_emotion,
+    initial_priority_score,
     load_e_axis_recall_config,
+    rank_annotation_bucket_ids,
     resonance_score,
     select_current_annotation,
 )
@@ -216,6 +218,50 @@ def test_primary_authored_bucket_is_live_without_shadow_authority():
     missing_author = {**bucket, "metadata": dict(bucket["metadata"])}
     missing_author["metadata"].pop("e_authored_by")
     assert group_primary_authored_buckets([missing_author], cfg) == {}
+
+
+def test_primary_agent_initial_priority_sets_e_side_channel_baseline():
+    query = infer_query_emotion("我真的很难过")
+    high_priority_low_weight = {
+        "e_initial_priority": 90,
+        "weight": 1.0,
+        "score": {
+            "valence": 0.9,
+            "arousal": 1.0,
+            "tension": 0.1,
+            "confidence": 1.0,
+        },
+    }
+    low_priority_high_weight = {
+        "e_initial_priority": 20,
+        "weight": 9.0,
+        "score": {
+            "valence": -0.8,
+            "arousal": 0.3,
+            "tension": 0.6,
+            "confidence": 1.0,
+        },
+    }
+
+    ranked = rank_annotation_bucket_ids(
+        {
+            "high-priority": (high_priority_low_weight,),
+            "low-priority": (low_priority_high_weight,),
+        },
+        query,
+        limit=2,
+    )
+
+    assert initial_priority_score(high_priority_low_weight) == 1.8
+    assert initial_priority_score(low_priority_high_weight) == 0.4
+    assert ranked == ["high-priority", "low-priority"]
+
+
+def test_numeric_emotion_does_not_invent_e_initial_rank():
+    calm = {"e_initial_priority": 50, "weight": 1.0, "arousal": 0.1}
+    intense = {"e_initial_priority": 50, "weight": 1.0, "arousal": 1.0}
+
+    assert initial_priority_score(calm) == initial_priority_score(intense)
 
 
 def test_e_reranks_only_inside_existing_relevance_band():

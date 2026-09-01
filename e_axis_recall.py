@@ -496,6 +496,18 @@ def resonance_score(
     return round((0.8 * russell + 0.2 * tension_similarity) * confidence, 6)
 
 
+def initial_priority_score(annotation: Mapping[str, object]) -> float:
+    """Return the primary agent's explicit E ordering contribution."""
+
+    e_initial_priority = annotation.get("e_initial_priority")
+    if e_initial_priority is None:
+        return 0.0
+    try:
+        return max(1, min(100, int(e_initial_priority))) / 50.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def apply_resonance_tie_break(
     base_score: float,
     resonance: float,
@@ -611,23 +623,24 @@ def rank_annotation_bucket_ids(
     *,
     limit: int,
 ) -> list[str]:
-    """Cheap pre-rank before current-source hydration and digest validation."""
+    """Pre-rank from the primary agent's order before source hydration."""
 
-    scored: list[tuple[str, float, int, float]] = []
+    # Numeric emotion remains an admissibility signal after hydration; it
+    # cannot invent E's initial order.  Keep ``query`` in the call shape so
+    # the downstream resonance gate still receives the same prepared query.
+    _ = query
+    scored: list[tuple[str, float, float]] = []
     for bucket_id, rows in grouped.items():
         if not rows:
             continue
         row = rows[0]
-        priority = row.get("e_initial_priority")
-        safe_priority = priority if type(priority) is int else 0
         scored.append((
             bucket_id,
-            resonance_score(query, row),
-            safe_priority,
+            initial_priority_score(row),
             _row_timestamp(row),
         ))
-    scored.sort(key=lambda item: (-item[1], -item[2], -item[3], item[0]))
-    return [bucket_id for bucket_id, _, _, _ in scored[:max(0, limit)]]
+    scored.sort(key=lambda item: (-item[1], -item[2], item[0]))
+    return [bucket_id for bucket_id, _, _ in scored[:max(0, limit)]]
 
 
 __all__ = [
@@ -641,6 +654,7 @@ __all__ = [
     "group_candidate_rows",
     "group_primary_authored_buckets",
     "infer_query_emotion",
+    "initial_priority_score",
     "load_e_axis_recall_config",
     "rank_annotation_bucket_ids",
     "resonance_score",
