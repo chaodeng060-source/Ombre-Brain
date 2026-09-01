@@ -288,6 +288,10 @@ class ActiveEAnnotation:
     scored_at: str
     authored_by: str = ""
     initial_priority: int = 0
+    # 事后回填的结果：这条 E 定的姿态真拿去接人之后管不管用。
+    # 只透出、不参与排序——排名归主 agent 亲定的 initial_priority，
+    # 让「上次砸了」自动降权就是在用统计发明排名，正是上游禁的那件事。
+    outcome: str = ""
 
 
 def _row_timestamp(row: Mapping[str, object]) -> float:
@@ -402,6 +406,7 @@ def group_primary_authored_buckets(
             "scored_at": str(metadata.get("e_authored_at") or ""),
             "e_authored_by": author,
             "e_initial_priority": priority,
+            "e_outcome": str(metadata.get("e_outcome") or ""),
         }
         grouped.setdefault(binding.bucket_id, []).append(row)
     return {
@@ -457,6 +462,7 @@ def select_current_annotation(
             scored_at=str(row.get("scored_at") or ""),
             authored_by=str(row.get("e_authored_by") or ""),
             initial_priority=int(row.get("e_initial_priority") or 0),
+            outcome=str(row.get("e_outcome") or ""),
         )
     return None
 
@@ -535,6 +541,9 @@ class ResponsePosture:
     tension: float
     confidence: float
     evidence_count: int
+    # 参与本次投票的 E 里，有几条事后回填成 backfired。
+    # 不改投票结果，只把「这个姿态上次砸过」摆到台面上让主 agent 自己看。
+    backfired_count: int = 0
 
 
 def derive_response_posture(
@@ -573,6 +582,14 @@ def derive_response_posture(
             3,
         )
 
+    # 只数投给胜出姿态的那些——「comfort 上次砸过」才是可用的提醒，
+    # 混进投 withdraw 的 backfired 会把警示稀释成噪音。
+    backfired = sum(
+        1
+        for annotation, _ in weighted
+        if annotation.response_tendency == tendency and annotation.outcome == "backfired"
+    )
+
     return ResponsePosture(
         tendency=tendency,
         growth_delta=growth,
@@ -581,6 +598,7 @@ def derive_response_posture(
         tension=average("tension"),
         confidence=average("confidence"),
         evidence_count=len(weighted),
+        backfired_count=backfired,
     )
 
 
@@ -604,16 +622,25 @@ def format_response_posture(
 ) -> str:
     """Render a compact prompt block whose evidence role is explicit."""
 
+    warning = ""
+    if posture.backfired_count:
+        warning = (
+            f"\n⚠ 这个姿态过去有 {posture.backfired_count} 次事后判定为砸了"
+            "（e_outcome=backfired）——照搬之前先想一下上次是怎么砸的。"
+        )
+
     return (
         "=== E轴回应姿态（experience only，不可改写事实） ===\n"
         f"[e_activation:{activation_id}] "
         f"[tendency:{posture.tendency}] "
         f"[growth:{posture.growth_delta}] "
         f"[confidence:{posture.confidence:.3f}] "
-        f"[evidence:{posture.evidence_count}]\n"
+        f"[evidence:{posture.evidence_count}] "
+        f"[backfired:{posture.backfired_count}]\n"
         f"{_POSTURE_TEXT[posture.tendency]} "
         f"{_GROWTH_TEXT[posture.growth_delta]} "
         "此块只约束回应姿态；人物、时间、事实与安全边界仍以主召回和 Z 轴为准。"
+        f"{warning}"
     )
 
 

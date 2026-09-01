@@ -122,6 +122,16 @@ class ResolvedGuardError(Exception):
     pass
 
 
+class EOutcomeGuardError(Exception):
+    """拒绝了一次 e_outcome 回填（值域不合法 / 已封存 / 不是 E 桶）。
+
+    跟 ResolvedGuardError 同样往外抛而不是被 update() 吞成 False：
+    回填被拒的原因必须让调用方看见，否则就是无声失败——
+    「返回 False、原因只进日志」正是 E 轴 capture_error 那个病。
+    """
+    pass
+
+
 def load_config(config_path: str = None) -> dict:
     """
     Load configuration file.

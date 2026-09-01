@@ -47,6 +47,7 @@ from rapidfuzz import fuzz, process
 from utils import (
     generate_bucket_id, sanitize_name, safe_path, now_iso, world_matches,
     RELATION_TYPES, PROTECTED_RESOLVE_DOMAINS, ResolvedGuardError,
+    EOutcomeGuardError,
     DATE_PRECISIONS, event_at_from_metadata, normalize_event_at,
 )
 from recall_support import rank_within_relevance_bands
@@ -97,6 +98,10 @@ BM25_CORPUS_FIELDS = frozenset({
 })
 E_RESPONSE_TENDENCIES = frozenset({"comfort", "engage", "withdraw", "alert"})
 E_GROWTH_DELTAS = frozenset({"growth", "stable", "setback"})
+# 事后回填：这条 E 定的姿态，真拿去接人之后管不管用。
+# 不在 E_IMMUTABLE_FIELDS 里，因为写 E 的当下还不知道结果；但一旦落定
+# 就只能落定一次，见 update() 里的 seal 检查——否则「回填」会变成事后改分。
+E_OUTCOMES = frozenset({"worked", "backfired", "unknown"})
 E_IMMUTABLE_FIELDS = frozenset({
     "e_authored_by",
     "e_initial_priority",
@@ -1851,6 +1856,22 @@ class BucketManager:
                         raise ValueError(
                             "primary-authored E content is immutable; write a successor"
                         )
+                    if "e_outcome" in kwargs:
+                        outcome = str(kwargs["e_outcome"] or "").strip()
+                        if outcome not in E_OUTCOMES:
+                            raise EOutcomeGuardError("invalid e_outcome")
+                        sealed = str(post.get("e_outcome") or "").strip()
+                        if sealed and sealed != outcome:
+                            raise EOutcomeGuardError(
+                                "e_outcome is sealed once written; "
+                                "write a successor E record instead"
+                            )
+                        kwargs["e_outcome"] = outcome
+                elif "e_outcome" in kwargs:
+                    # 只有主 agent 亲写的 E 才谈得上「这个姿态管不管用」。
+                    raise EOutcomeGuardError(
+                        "e_outcome only applies to primary-authored E"
+                    )
                 if expected_revision_hash:
                     actual_revision_hash = bucket_revision_hash(
                         post.content,
@@ -2007,7 +2028,7 @@ class BucketManager:
 
                 self.audit_log.commit(event_id)
 
-            except ResolvedGuardError:
+            except (ResolvedGuardError, EOutcomeGuardError):
                 raise
             except Exception as e:
                 self.audit_log.fail(event_id, e)

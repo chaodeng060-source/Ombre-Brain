@@ -74,7 +74,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
 
-from bucket_manager import BucketManager, bucket_revision_hash, literal_retrieval_keys
+from bucket_manager import (
+    BucketManager,
+    E_OUTCOMES,
+    bucket_revision_hash,
+    literal_retrieval_keys,
+)
 from dehydrator import (
     Dehydrator,
     SelfContainmentError,
@@ -168,6 +173,7 @@ from sensory_engine import SensoryEngine, format_body_state_block, senses_from_s
 from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
     world_matches, save_current_world, UNIVERSAL_WORLD, ResolvedGuardError,
+    EOutcomeGuardError,
     rrf_fuse, rrf_fuse_channels, parse_relative_time, PROTECTED_RESOLVE_DOMAINS,
     RELATION_TYPES, SAFE_RELATION_TYPES, REVIEW_RELATION_TYPES,
     PROPAGATION_RELATION_TYPES,
@@ -6783,6 +6789,47 @@ async def experience(
         f"[initial_priority:{e_initial_priority}] "
         f"[vector:{'ready' if vector_ready else 'missing'}]"
     )
+
+
+# =============================================================
+# Tool: e_outcome — 事后回填「这个姿态管不管用」
+# =============================================================
+@mcp.tool()
+async def e_outcome(
+    bucket_id: str,
+    outcome: str,
+    note: str = "",
+) -> str:
+    """给已写的 E 回填结果:这条 E 定的姿态真拿去接人之后管不管用。
+
+    outcome ∈ worked / backfired / unknown。只能落定一次——写过就锁,
+    改判要另写一条后继 E,不许事后改分。note 是判据(一句话),不判分。
+    """
+    bucket_id = (bucket_id or "").strip()
+    outcome = (outcome or "").strip()
+    if not bucket_id:
+        return "请提供有效的 bucket_id。"
+    if outcome not in E_OUTCOMES:
+        return f"outcome 只能是 {sorted(E_OUTCOMES)} 之一,收到 {outcome!r}。"
+
+    updates: dict = {
+        "e_outcome": outcome,
+        "e_outcome_at": datetime.now(_BJ_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    note = (note or "").strip()
+    if note:
+        updates["e_outcome_note"] = note[:500]
+
+    try:
+        ok = await _apply_bucket_update(bucket_id, updates, actor="primary")
+    except EOutcomeGuardError as exc:
+        # 值域错、已封存、非 E 桶——都是调用方要看见的硬拒绝,不吞成「写入未生效」。
+        return f"回填被拒:{exc}"
+    if not ok:
+        return f"没找到桶 {bucket_id},或写入未生效。"
+
+    _mark_briefing_cache_dirty("e_outcome_backfill")
+    return f"E⊙{bucket_id} [outcome:{outcome}]" + (f" [note:{note[:40]}]" if note else "")
 
 
 # =============================================================
