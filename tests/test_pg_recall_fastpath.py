@@ -162,5 +162,126 @@ async def test_distance_is_converted_to_similarity(monkeypatch):
                    ("bucket_far", pytest.approx(0.1))]
 
 
+@pytest.mark.asyncio
+async def test_selected_bucket_scores_share_pg_query_embedding_and_keep_top_k(
+    monkeypatch,
+):
+    """E 锚分数来自同一 PG 镜像，且不能改变正常召回的 top-k。"""
+    monkeypatch.setenv("OMBRE_PG_RECALL_ENABLED", "1")
+    normal_rows = [("normal_near", 0.1), ("normal_far", 0.4)]
+    selected_rows = [("e_comfort", 0.2), ("e_boundary", 0.7)]
+    executed = []
+
+    class _Cur:
+        def __init__(self):
+            self._selected_query_seen = False
+
+        async def execute(self, sql, params=None):
+            executed.append((sql, params))
+            if "WHERE bucket_id = ANY" in sql:
+                self._selected_query_seen = True
+
+        async def fetchall(self):
+            return selected_rows if self._selected_query_seen else normal_rows
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    monkeypatch.setitem(
+        sys.modules,
+        "psycopg",
+        types.SimpleNamespace(
+            AsyncConnection=types.SimpleNamespace(
+                connect=lambda *_a, **_kw: _make(_Conn())
+            )
+        ),
+    )
+
+    top_k, selected = await _engine()._search_similar_pg_with_selected_scores(
+        [0.1] * 1024,
+        2,
+        frozenset({"e_boundary", "e_comfort"}),
+    )
+
+    assert top_k == [
+        ("normal_near", pytest.approx(0.9)),
+        ("normal_far", pytest.approx(0.6)),
+    ]
+    assert selected == {
+        "e_comfort": pytest.approx(0.8),
+        "e_boundary": pytest.approx(0.3),
+    }
+    selected_calls = [
+        (sql, params)
+        for sql, params in executed
+        if "WHERE bucket_id = ANY" in sql
+    ]
+    assert len(selected_calls) == 1
+    assert selected_calls[0][1][1] == ["e_boundary", "e_comfort"]
+
+
+@pytest.mark.asyncio
+async def test_selected_bucket_query_failure_preserves_normal_pg_recall(monkeypatch):
+    """E 侧读证失败只回落 Russell，不能炸掉已经拿到的正常召回。"""
+    monkeypatch.setenv("OMBRE_PG_RECALL_ENABLED", "1")
+    normal_rows = [("normal_near", 0.1)]
+
+    class _Cur:
+        async def execute(self, sql, _params=None):
+            if "WHERE bucket_id = ANY" in sql:
+                raise RuntimeError("selected read failed")
+
+        async def fetchall(self):
+            return normal_rows
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    monkeypatch.setitem(
+        sys.modules,
+        "psycopg",
+        types.SimpleNamespace(
+            AsyncConnection=types.SimpleNamespace(
+                connect=lambda *_a, **_kw: _make(_Conn())
+            )
+        ),
+    )
+
+    top_k, selected = await _engine()._search_similar_pg_with_selected_scores(
+        [0.1] * 1024,
+        1,
+        frozenset({"e_comfort"}),
+    )
+
+    assert top_k == [("normal_near", pytest.approx(0.9))]
+    assert selected == {}
+
+
 async def _make(value):
     return value

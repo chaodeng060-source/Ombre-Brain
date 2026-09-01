@@ -203,6 +203,39 @@ async def test_vector_search_cooperative_yield_preserves_results(
 
 
 @pytest.mark.asyncio
+async def test_selected_vector_scores_reuse_one_query_embedding(
+    tmp_path,
+    monkeypatch,
+):
+    engine = _embedding_engine_with_rows(
+        tmp_path,
+        [
+            ("bucket-a", json.dumps([1.0, 0.0])),
+            ("bucket-b", json.dumps([0.0, 1.0])),
+            ("bucket-c", json.dumps([-1.0, 0.0])),
+        ],
+    )
+    calls = 0
+
+    async def fake_embedding(_query):
+        nonlocal calls
+        calls += 1
+        return [1.0, 0.0], "ok"
+
+    monkeypatch.setattr(engine, "_generate_embedding_with_status", fake_embedding)
+    ranked, status, selected = await engine.search_similar_with_selected_scores(
+        "query",
+        top_k=1,
+        score_bucket_ids={"bucket-a", "bucket-b"},
+    )
+
+    assert calls == 1
+    assert status == "ok"
+    assert ranked == [("bucket-a", 1.0)]
+    assert selected == {"bucket-a": 1.0, "bucket-b": 0.0}
+
+
+@pytest.mark.asyncio
 async def test_vector_cache_reuses_parse_and_refreshes_after_external_commit(
     tmp_path,
     monkeypatch,

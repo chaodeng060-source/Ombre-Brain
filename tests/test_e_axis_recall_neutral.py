@@ -20,7 +20,9 @@ from e_axis_recall import (
     initial_priority_score,
     load_e_axis_recall_config,
     rank_annotation_bucket_ids,
+    resolve_resonance_score,
     resonance_score,
+    semantic_resonance_score,
     select_current_annotation,
 )
 from e_axis_shadow import build_shadow_annotation, rank_multiplier
@@ -135,6 +137,10 @@ def test_live_projection_requires_named_active_config_and_stays_bounded():
         })
     with pytest.raises(ValueError, match="tie_break_weight"):
         _live_config(tie_break_weight=0.251)
+    assert _live_config().semantic_resonance_enabled is False
+    assert _live_config(
+        semantic_resonance_enabled=True
+    ).semantic_resonance_enabled is True
 
 
 def test_current_digest_and_confidence_gate_live_annotation():
@@ -318,6 +324,149 @@ def test_scan_limit_keeps_high_resonance_candidate_before_priority_ranking():
     assert ranked[-1] == "high-resonance-low-priority"
 
 
+def test_semantic_resonance_changes_posture_without_query_lexicon():
+    comforting = _bucket("comforting", "先接住受伤后的关系。")
+    celebrating = _bucket("celebrating", "一起庆祝关系里的好消息。")
+    cfg = _live_config(semantic_resonance_enabled=True)
+    grouped = group_candidate_rows([
+        _row(
+            comforting,
+            valence=-0.8,
+            arousal=0.4,
+            tension=0.7,
+            tendency="comfort",
+            growth="setback",
+        ),
+        _row(
+            celebrating,
+            valence=0.9,
+            arousal=0.8,
+            tension=0.1,
+            tendency="engage",
+            growth="growth",
+        ),
+    ], cfg)
+    comfort = select_current_annotation(
+        grouped["comforting"], comforting, cfg
+    )
+    celebrate = select_current_annotation(
+        grouped["celebrating"], celebrating, cfg
+    )
+    assert comfort is not None and celebrate is not None
+
+    hurt_posture = derive_response_posture([
+        (comfort, semantic_resonance_score(comfort, 0.94)),
+        (celebrate, semantic_resonance_score(celebrate, 0.51)),
+    ])
+    happy_posture = derive_response_posture([
+        (comfort, semantic_resonance_score(comfort, 0.51)),
+        (celebrate, semantic_resonance_score(celebrate, 0.94)),
+    ])
+
+    assert hurt_posture is not None and happy_posture is not None
+    assert hurt_posture.tendency == "comfort"
+    assert happy_posture.tendency == "engage"
+    assert (hurt_posture.valence, hurt_posture.tension) != (
+        happy_posture.valence,
+        happy_posture.tension,
+    )
+
+
+def test_neutral_prior_without_semantic_hit_casts_no_candidate_vote():
+    query = infer_query_emotion("重启一下")
+    comfort = {
+        "score": {
+            "valence": -0.7,
+            "arousal": 0.35,
+            "tension": 0.55,
+            "confidence": 0.8,
+        },
+    }
+    celebrate = {
+        "score": {
+            "valence": 0.9,
+            "arousal": 0.9,
+            "tension": 0.1,
+            "confidence": 1.0,
+        },
+    }
+    legacy_comfort = resonance_score(query, comfort)
+    legacy_celebrate = resonance_score(query, celebrate)
+    assert legacy_comfort != legacy_celebrate
+
+    # Feature off is the byte-for-byte legacy path.
+    assert resolve_resonance_score(
+        query,
+        comfort,
+        semantic_similarity=0.99,
+        semantic_enabled=False,
+    ) == legacy_comfort
+
+    # No usable semantic signal means no E candidate gets a static vote.
+    assert resolve_resonance_score(
+        query,
+        comfort,
+        semantic_similarity=object(),
+        semantic_enabled=True,
+    ) == 0.5
+    assert resolve_resonance_score(
+        query,
+        celebrate,
+        semantic_similarity=0.5,
+        semantic_enabled=True,
+    ) == 0.5
+    assert semantic_resonance_score(comfort, 0.5) is None
+
+    # Explicit coordinates remain a real Russell signal when semantics fail.
+    explicit = infer_query_emotion(
+        "重启一下",
+        valence_01=0.2,
+        arousal=0.9,
+    )
+    assert resolve_resonance_score(
+        explicit,
+        comfort,
+        semantic_similarity=object(),
+        semantic_enabled=True,
+    ) == resonance_score(explicit, comfort)
+
+
+def test_semantic_scan_pool_prefers_existing_query_vector_scores():
+    query = infer_query_emotion("没有词表命中的普通句子")
+    high_priority = {
+        "e_initial_priority": 95,
+        "score": {
+            "valence": 0.0,
+            "arousal": 0.35,
+            "tension": 0.2,
+            "confidence": 1.0,
+        },
+    }
+    semantic_match = {
+        "e_initial_priority": 1,
+        "score": {
+            "valence": 1.0,
+            "arousal": 1.0,
+            "tension": 0.0,
+            "confidence": 1.0,
+        },
+    }
+    grouped = {
+        "priority-a": (high_priority,),
+        "priority-b": (high_priority,),
+        "semantic-match": (semantic_match,),
+    }
+
+    ranked = rank_annotation_bucket_ids(
+        grouped,
+        query,
+        limit=2,
+        semantic_scores={"semantic-match": 0.93},
+    )
+
+    assert "semantic-match" in ranked
+
+
 def test_e_reranks_only_inside_existing_relevance_band():
     query = infer_query_emotion("我真的很难过")
     comforting = _bucket("comforting", "难过时先抱住朝灯。")
@@ -440,6 +589,31 @@ class _Dehydrator:
 class _Embedding:
     async def search_similar(self, query, top_k=20):
         return []
+
+
+class _SemanticEmbedding:
+    async def search_similar(self, query, top_k=20):
+        return []
+
+    async def search_similar_with_selected_scores(
+        self,
+        query,
+        top_k=20,
+        *,
+        score_bucket_ids,
+    ):
+        assert set(score_bucket_ids) == {"comforting", "celebrating"}
+        if query.startswith("first-neutral"):
+            return (
+                [],
+                "ok",
+                {"comforting": 0.94, "celebrating": 0.50},
+            )
+        return (
+            [],
+            "ok",
+            {"celebrating": 0.94, "comforting": 0.50},
+        )
 
 
 class _Manager:
@@ -569,6 +743,111 @@ async def test_real_breath_changes_close_order_and_injects_posture(
     assert "E轴回应姿态" in result
     assert "tendency:comfort" in result
     assert "不可改写事实" in result
+
+
+@pytest.mark.asyncio
+async def test_breath_reuses_query_vector_scores_for_neutral_posture(
+    tmp_path,
+    monkeypatch,
+):
+    async def run(query: str, *, semantic_enabled: bool) -> str:
+        comforting = _bucket("comforting", "关系受伤后先稳稳接住。")
+        celebrating = _bucket("celebrating", "关系有好消息时一起庆祝。")
+        for item in (comforting, celebrating):
+            item["metadata"].update({
+                "created": "2026-08-04T00:00:00+00:00",
+                "valence": 0.5,
+                "arousal": 0.3,
+                "e_authored_by": "claude",
+                "e_initial_priority": 80,
+                "e_confidence": 1.0,
+                "e_growth_delta": "stable",
+                "e_authored_at": "2026-08-11T10:00:00+00:00",
+            })
+        comforting["metadata"].update({
+            "e_valence": -0.8,
+            "e_arousal": 0.4,
+            "e_tension": 0.7,
+            "e_response_tendency": "comfort",
+        })
+        celebrating["metadata"].update({
+            "e_valence": 0.9,
+            "e_arousal": 0.8,
+            "e_tension": 0.1,
+            "e_response_tendency": "engage",
+        })
+        vault = tmp_path / query
+        vault.mkdir()
+        cfg = {
+            **server.config,
+            "buckets_dir": str(vault),
+            "current_world": "daily",
+            "entities": {"enabled": False},
+            "query_expansion": {"enabled": False},
+            "random_surfacing": {},
+            "matching": {
+                "literal_candidate_floor": 0.0,
+                "fused_relevance_tie_band": 0.35,
+            },
+            "e_axis_recall": {
+                "enabled": True,
+                "mode": "active",
+                "activation_id": "test-e1",
+                "allowed_rubric_versions": [RUBRIC],
+                "min_confidence": 0.5,
+                "tie_break_weight": 0.2,
+                "side_channel_limit": 1,
+                "side_channel_scan_limit": 16,
+                "side_channel_min_resonance": 0.55,
+                "semantic_resonance_enabled": semantic_enabled,
+            },
+        }
+        monkeypatch.setattr(server, "config", cfg)
+        monkeypatch.setattr(
+            server,
+            "bucket_mgr",
+            _Manager([comforting, celebrating], tmp_path / "archive"),
+        )
+        monkeypatch.setattr(server, "embedding_engine", _SemanticEmbedding())
+        monkeypatch.setattr(server, "dehydrator", _Dehydrator())
+        monkeypatch.setattr(server, "decay_engine", _Decay())
+        monkeypatch.setattr(server, "consolidation_engine", _NoopLoop())
+        monkeypatch.setattr(server, "episode_engine", _NoopLoop())
+        monkeypatch.setattr(server, "_backfill_started", True)
+        monkeypatch.setattr(server, "_entity_store", None)
+
+        async def passthrough(
+            _query,
+            values,
+            *,
+            mode,
+            max_results,
+            force_keep_ids=None,
+            allow_empty=False,
+        ):
+            return values[:max_results]
+
+        monkeypatch.setattr(server, "_ds_filter_candidates", passthrough)
+        result = await server.breath(
+            query=query,
+            max_results=2,
+            relation_depth=0,
+            world="daily",
+            include_images=False,
+            include_body_state=False,
+        )
+        assert isinstance(result, str)
+        return result
+
+    first = await run("first-neutral-query", semantic_enabled=True)
+    second = await run("second-neutral-query", semantic_enabled=True)
+    legacy_first = await run("first-neutral-legacy", semantic_enabled=False)
+    legacy_second = await run("second-neutral-legacy", semantic_enabled=False)
+
+    assert "tendency:comfort" in first
+    assert "tendency:engage" in second
+    assert "tendency:comfort" in legacy_first
+    assert "tendency:comfort" in legacy_second
 
 
 def test_negated_cues_do_not_flip_polarity():

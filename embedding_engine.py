@@ -354,28 +354,89 @@ class EmbeddingEngine:
         *,
         cooperative_yield_every: int = 16,
     ) -> tuple[list[tuple[str, float]], str]:
+        results, status, _selected_scores = (
+            await self._search_similar_with_status_and_scores(
+                query,
+                top_k=top_k,
+                cooperative_yield_every=cooperative_yield_every,
+                score_bucket_ids=frozenset(),
+            )
+        )
+        return results, status
+
+    async def search_similar_with_selected_scores(
+        self,
+        query: str,
+        top_k: int = 10,
+        *,
+        score_bucket_ids,
+        cooperative_yield_every: int = 16,
+    ) -> tuple[list[tuple[str, float]], str, dict[str, float]]:
+        """Return normal top-k plus exact scores for selected stored buckets.
+
+        Both outputs reuse the same query embedding.  The selected scores are
+        read-only side evidence and never widen or reorder the normal vector
+        result returned to recall fusion.
+        """
+
+        selected_ids = frozenset(
+            str(bucket_id)
+            for bucket_id in score_bucket_ids
+            if str(bucket_id)
+        )
+        return await self._search_similar_with_status_and_scores(
+            query,
+            top_k=top_k,
+            cooperative_yield_every=cooperative_yield_every,
+            score_bucket_ids=selected_ids,
+        )
+
+    async def _search_similar_with_status_and_scores(
+        self,
+        query: str,
+        top_k: int,
+        *,
+        cooperative_yield_every: int,
+        score_bucket_ids: frozenset[str],
+    ) -> tuple[list[tuple[str, float]], str, dict[str, float]]:
         if (
             type(cooperative_yield_every) is not int
             or cooperative_yield_every < 1
         ):
             raise ValueError("cooperative_yield_every must be a positive integer")
         if not self.enabled:
-            return [], "error"
+            return [], "error", {}
 
         try:
             with recall_stage("embedding"):
                 query_embedding, status = await self._generate_embedding_with_status(query)
                 if not query_embedding:
-                    return [], status
+                    return [], status, {}
         except Exception as e:
             logger.warning(f"Query embedding failed: {e}")
-            return [], "error"
+            return [], "error", {}
 
         # PG 快路径：ivfflat 索引一次查询，替代下面对全库逐桶的 O(n) 余弦扫描。
         # 实测 11903 桶 / 12610 段：扫表中位 3530ms → PG 154ms（快 23 倍）。
         # 任何异常都回落到扫表，绝不让召回因为镜像库出问题而失败。
         if self._pg_recall_enabled():
-            pg_results = await self._search_similar_pg(query_embedding, top_k)
+            if score_bucket_ids:
+                pg_results, selected_scores = (
+                    await self._search_similar_pg_with_selected_scores(
+                        query_embedding,
+                        top_k,
+                        score_bucket_ids,
+                    )
+                )
+            else:
+                # Preserve the long-standing override seam used by rollout
+                # probes and lightweight integrations when no side scores are
+                # requested.
+                pg_results = await self._search_similar_pg(
+                    query_embedding,
+                    top_k,
+                )
+                selected_scores = {}
             if pg_results is not None:
                 self._schedule_pg_vector_shadow(
                     query,
@@ -383,21 +444,22 @@ class EmbeddingEngine:
                     pg_results,
                     top_k,
                 )
-                return pg_results, "ok"
+                return pg_results, "ok", selected_scores
 
         with recall_stage("vector_cache_load"):
             entries = await self._get_cached_vectors()
         if not entries:
-            return [], "ok"
+            return [], "ok", {}
 
         with recall_stage("vector_query_prepare"):
             try:
                 prepared_query = self._prepare_embedding_record(query_embedding)
             except Exception:
-                return [], "ok"
+                return [], "ok", {}
         record_recall_metric("vector_dimension", len(prepared_query[0][0]))
 
         results = []
+        selected_scores: dict[str, float] = {}
         entries_scanned = 0
         stored_segments_scanned = 0
         segment_comparisons = 0
@@ -413,6 +475,8 @@ class EmbeddingEngine:
                         segment_comparisons += len(prepared_query) * len(stored)
                         sim = self._max_prepared_similarity(prepared_query, stored)
                         results.append((bucket_id, sim))
+                        if bucket_id in score_bucket_ids:
+                            selected_scores[str(bucket_id)] = float(sim)
                     except Exception:
                         invalid_rows += 1
                         continue
@@ -425,7 +489,7 @@ class EmbeddingEngine:
             record_recall_metric("vector_invalid_rows", invalid_rows)
         with recall_stage("vector_sort"):
             results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k], "ok"
+        return results[:top_k], "ok", selected_scores
 
     def _pg_recall_enabled(self) -> bool:
         """PG 召回快路径的总开关，默认关。
@@ -615,16 +679,35 @@ class EmbeddingEngine:
     async def _search_similar_pg(
         self, query_embedding, top_k: int
     ) -> list[tuple[str, float]] | None:
+        results, _selected_scores = (
+            await self._search_similar_pg_with_selected_scores(
+                query_embedding,
+                top_k,
+                frozenset(),
+            )
+        )
+        return results
+
+    async def _search_similar_pg_with_selected_scores(
+        self,
+        query_embedding,
+        top_k: int,
+        score_bucket_ids: frozenset[str],
+    ) -> tuple[list[tuple[str, float]] | None, dict[str, float]]:
         """Use an indexable segment ANN query, with exact PG as rollback.
 
         Buckets can hold up to ``_MAX_CHUNKS`` segments.  The HNSW query first
         fetches ``top_k * _MAX_CHUNKS`` nearest segments, then restores the
         long-standing bucket contract by taking each bucket's minimum distance.
         ``OMBRE_PG_RECALL_MODE=exact`` keeps the previous grouped full scan.
+
+        Selected bucket scores are read from the same PG mirror with the same
+        already-generated query embedding.  They are side evidence for E-axis
+        posture only: they never widen or reorder the normal top-k result.
         """
         requested = int(top_k)
         if requested <= 0:
-            return []
+            return [], {}
         mode = self._pg_recall_mode()
         dsn = os.environ.get("OMBRE_PG_RECALL_DSN", "postgresql:///ombre_mirror")
         try:
@@ -635,9 +718,12 @@ class EmbeddingEngine:
             import psycopg
         except Exception:
             logger.warning("PG recall enabled but psycopg is unavailable; 回落扫表")
-            return None
+            return None, {}
 
         literal = "[" + ",".join(f"{float(x):.6f}" for x in query_embedding) + "]"
+        rows = None
+        selected_rows = []
+        selected_query_failed = False
         try:
             with recall_stage("vector_pg_query"):
                 async with await psycopg.AsyncConnection.connect(
@@ -667,23 +753,68 @@ class EmbeddingEngine:
                                 (literal, requested),
                             )
                         rows = await cur.fetchall()
+                        if score_bucket_ids:
+                            try:
+                                await cur.execute("SAVEPOINT e_semantic_scores")
+                                await cur.execute(
+                                    "SELECT bucket_id, "
+                                    "MIN((embedding::vector(1024)) "
+                                    "<=> %s::vector(1024)) AS d "
+                                    "FROM ombre_vectors "
+                                    "WHERE bucket_id = ANY(%s::text[]) "
+                                    "GROUP BY bucket_id ORDER BY bucket_id",
+                                    (literal, sorted(score_bucket_ids)),
+                                )
+                                selected_rows = await cur.fetchall()
+                                await cur.execute(
+                                    "RELEASE SAVEPOINT e_semantic_scores"
+                                )
+                            except Exception as exc:              # noqa: BLE001
+                                selected_query_failed = True
+                                selected_rows = []
+                                logger.warning(
+                                    "PG selected-vector scoring failed without "
+                                    "changing live result: %s",
+                                    type(exc).__name__,
+                                )
+                                try:
+                                    await cur.execute(
+                                        "ROLLBACK TO SAVEPOINT e_semantic_scores"
+                                    )
+                                except Exception:                 # noqa: BLE001
+                                    pass
         except Exception as exc:                                    # noqa: BLE001
-            logger.warning(f"PG recall failed ({type(exc).__name__}: {exc}); 回落扫表")
-            return None
+            if rows and selected_query_failed:
+                logger.warning(
+                    "PG selected-vector cleanup failed without changing live "
+                    "result: %s",
+                    type(exc).__name__,
+                )
+            else:
+                logger.warning(
+                    f"PG recall failed ({type(exc).__name__}: {exc}); 回落扫表"
+                )
+                return None, {}
 
         if not rows:
             # 空结果可能是镜像没灌好，而不是「真的没有相关记忆」。
             # 回落扫表，宁可慢也不能凭空让她的记忆消失。
             logger.warning("PG recall returned no rows; 回落扫表")
-            return None
+            return None, {}
 
         results = (
             self._rank_pg_segment_rows(rows, requested)
             if mode == "hnsw"
             else [(str(bid), 1.0 - float(dist)) for bid, dist in rows]
         )
+        selected_scores: dict[str, float] = {}
+        for bucket_id, distance in selected_rows:
+            try:
+                selected_scores[str(bucket_id)] = 1.0 - float(distance)
+            except (TypeError, ValueError):
+                continue
         record_recall_metric("vector_pg_rows", len(results))
-        return results
+        return results, selected_scores
 
     def _ensure_vector_cache_state(self) -> None:
         """Initialize cache fields for legacy tests that bypass __init__."""

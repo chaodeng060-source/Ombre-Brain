@@ -30,6 +30,9 @@ from e_axis_shadow import validate_shadow_score
 
 
 _ACTIVATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
+# The production vector channel already defines ``sim > 0.5`` as a semantic
+# hit.  E reuses that established boundary instead of inventing a second one.
+_SEMANTIC_HIT_FLOOR = 0.5
 _NEGATIVE_HIGH = (
     "气死", "生气", "愤怒", "崩溃", "焦虑", "害怕", "恐慌", "受不了",
     "烦死", "委屈", "心痛", "绝望", "betrayed", "furious", "panic",
@@ -136,6 +139,7 @@ class EAxisRecallConfig:
     side_channel_limit: int = 1
     side_channel_scan_limit: int = 128
     side_channel_min_resonance: float = 0.55
+    semantic_resonance_enabled: bool = False
     allowed_rubric_versions: tuple[str, ...] = ()
 
 
@@ -204,6 +208,9 @@ def load_e_axis_recall_config(root: Mapping[str, object]) -> EAxisRecallConfig:
             name="side_channel_min_resonance",
             low=0.0,
             high=1.0,
+        ),
+        semantic_resonance_enabled=(
+            raw.get("semantic_resonance_enabled", False) is True
         ),
         allowed_rubric_versions=tuple(normalized_rubrics),
     )
@@ -502,6 +509,53 @@ def resonance_score(
     return round((0.8 * russell + 0.2 * tension_similarity) * confidence, 6)
 
 
+def semantic_resonance_score(
+    annotation: ActiveEAnnotation | Mapping[str, object],
+    semantic_similarity: object,
+) -> float | None:
+    """Return existing query-to-anchor similarity on the E confidence scale."""
+
+    similarity = _plain_finite(semantic_similarity)
+    if similarity is None or similarity <= _SEMANTIC_HIT_FLOOR:
+        return None
+    try:
+        if isinstance(annotation, ActiveEAnnotation):
+            confidence_value: object = annotation.confidence
+        else:
+            nested = annotation.get("score")
+            score = nested if isinstance(nested, Mapping) else annotation
+            confidence_value = score.get("confidence")
+    except Exception:
+        return None
+    confidence = _plain_finite(confidence_value)
+    if confidence is None:
+        return None
+    similarity = max(0.0, min(1.0, similarity))
+    confidence = max(0.0, min(1.0, confidence))
+    return round(similarity * confidence, 6)
+
+
+def resolve_resonance_score(
+    query: QueryEmotion,
+    annotation: ActiveEAnnotation | Mapping[str, object],
+    *,
+    semantic_similarity: object = None,
+    semantic_enabled: bool = False,
+) -> float:
+    """Prefer reused semantics; a signal-free neutral query casts no E vote."""
+
+    if semantic_enabled:
+        semantic = semantic_resonance_score(annotation, semantic_similarity)
+        if semantic is not None:
+            return semantic
+        if not query.explicit and query.source == "neutral_prior":
+            # Upstream's no-query-emotion contract is a constant 0.5: without
+            # a real semantic hit, the fabricated neutral prior casts no vote
+            # for one E candidate over another.
+            return 0.5
+    return resonance_score(query, annotation)
+
+
 def initial_priority_score(annotation: Mapping[str, object]) -> float:
     """Return the primary agent's explicit E ordering contribution."""
 
@@ -649,13 +703,15 @@ def rank_annotation_bucket_ids(
     query: QueryEmotion,
     *,
     limit: int,
+    semantic_scores: Mapping[str, object] | None = None,
 ) -> list[str]:
     """Select the bounded resonance scan pool, then apply the agent's order.
 
-    ``limit`` caps source hydration, so resonance retains its former role in
-    deciding which rows reach the existing admissibility checks at that
-    boundary.  Inside that bounded pool, only ``e_initial_priority`` creates
-    the initial E order; numeric emotion never does.
+    ``limit`` caps source hydration.  When the caller supplies the original
+    query's already-computed vector scores, those scores select the semantic
+    scan pool; missing IDs stay behind real semantic hits.  Otherwise Russell
+    resonance retains its former admission role.  Inside either bounded pool,
+    only ``e_initial_priority`` creates the initial E order.
     """
 
     scored: list[tuple[str, float, float, float]] = []
@@ -663,10 +719,17 @@ def rank_annotation_bucket_ids(
         if not rows:
             continue
         row = rows[0]
+        admission_score = resonance_score(query, row)
+        if semantic_scores is not None:
+            semantic = semantic_resonance_score(
+                row,
+                semantic_scores.get(bucket_id),
+            )
+            admission_score = semantic if semantic is not None else -1.0
         scored.append((
             bucket_id,
             initial_priority_score(row),
-            resonance_score(query, row),
+            admission_score,
             _row_timestamp(row),
         ))
     scan_pool = sorted(
@@ -691,6 +754,8 @@ __all__ = [
     "initial_priority_score",
     "load_e_axis_recall_config",
     "rank_annotation_bucket_ids",
+    "resolve_resonance_score",
     "resonance_score",
+    "semantic_resonance_score",
     "select_current_annotation",
 ]

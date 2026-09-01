@@ -165,7 +165,9 @@ from e_axis_recall import (
     infer_query_emotion,
     load_e_axis_recall_config,
     rank_annotation_bucket_ids,
+    resolve_resonance_score,
     resonance_score as e_axis_resonance_score,
+    semantic_resonance_score,
     select_current_annotation,
 )
 from r2_storage import r2_storage
@@ -4815,6 +4817,7 @@ async def breath(
     # Vector channel — sim>0.5 floor blocks high-cosine noise
     vector_scores: dict[str, float] = {}
     original_vector_scores: dict[str, float] = {}
+    e_semantic_scores: dict[str, float] = {}
     try:
         for angle_index, angle in enumerate(query_angles):
             status_search = getattr(
@@ -4822,7 +4825,42 @@ async def breath(
                 "search_similar_with_status",
                 None,
             )
-            if callable(status_search):
+            selected_score_search = getattr(
+                embedding_engine,
+                "search_similar_with_selected_scores",
+                None,
+            )
+            if (
+                angle_index == 0
+                and e_recall_cfg is not None
+                and e_recall_cfg.semantic_resonance_enabled
+                and callable(selected_score_search)
+            ):
+                (
+                    vector_hits,
+                    vector_status,
+                    selected_scores,
+                ) = await selected_score_search(
+                    angle,
+                    top_k=intent_policy["vector_top_k"],
+                    score_bucket_ids=e_rows_by_bucket,
+                )
+                for bucket_id, similarity in selected_scores.items():
+                    normalized_id = str(bucket_id)
+                    rows = e_rows_by_bucket.get(normalized_id)
+                    if not rows:
+                        continue
+                    try:
+                        normalized_similarity = float(similarity)
+                    except (TypeError, ValueError):
+                        continue
+                    if semantic_resonance_score(
+                        rows[0],
+                        normalized_similarity,
+                    ) is None:
+                        continue
+                    e_semantic_scores[normalized_id] = normalized_similarity
+            elif callable(status_search):
                 vector_hits, vector_status = await status_search(
                     angle,
                     top_k=intent_policy["vector_top_k"],
@@ -4862,6 +4900,52 @@ async def breath(
         if _strict_recall_errors.get():
             raise RecallOperationalError("vector_search_failed") from e
         vector_ranked = []
+        e_semantic_scores = {}
+
+    # Production's one-pass vector API scores every requested E anchor against
+    # the original query while making the normal top-k.  Lightweight adapters
+    # without that API still reuse any E anchors present in their top-k.
+    # Neither route embeds again, consumes expansion-angle scores, or widens
+    # the factual vector candidate pool.
+    if (
+        e_recall_cfg is not None
+        and e_recall_cfg.semantic_resonance_enabled
+        and vector_ranked
+    ):
+        try:
+            for bucket_id, similarity in original_vector_scores.items():
+                normalized_id = str(bucket_id)
+                rows = e_rows_by_bucket.get(normalized_id)
+                if not rows:
+                    continue
+                normalized_similarity = float(similarity)
+                if semantic_resonance_score(
+                    rows[0],
+                    normalized_similarity,
+                ) is None:
+                    continue
+                e_semantic_scores.setdefault(
+                    normalized_id,
+                    normalized_similarity,
+                )
+        except Exception as exc:
+            logger.warning(
+                "E semantic resonance unavailable; using Russell: %s",
+                type(exc).__name__,
+            )
+    if (
+        e_recall_cfg is not None
+        and e_recall_cfg.semantic_resonance_enabled
+    ):
+        logger.info(
+            "E resonance source=%s scored_anchors=%d requested_anchors=%d",
+            (
+                "original_query_vector_one_pass"
+                if e_semantic_scores else "russell_fallback"
+            ),
+            len(e_semantic_scores),
+            len(e_rows_by_bucket),
+        )
 
     # Original-query vector top-5 entries above the audited 0.60 floor get a
     # candidate escort.  This repairs strong semantic evidence lost only to
@@ -5367,9 +5451,13 @@ async def breath(
                 )
                 e_annotation = None
             if e_annotation is not None:
-                e_resonance = e_axis_resonance_score(
+                e_resonance = resolve_resonance_score(
                     e_query_emotion,
                     e_annotation,
+                    semantic_similarity=e_semantic_scores.get(
+                        str(b.get("id") or "")
+                    ),
+                    semantic_enabled=e_recall_cfg.semantic_resonance_enabled,
                 )
                 tie_break_score = apply_resonance_tie_break(
                     tie_break_score,
@@ -6099,13 +6187,15 @@ async def breath(
             )
 
     # --- E-axis independent resonance channel (bounded supporting evidence) ---
-    # Only explicit emotional wording/coordinates unlock E-only memories.  A
-    # neutral query can still use E to break close topical ties above, but it
-    # cannot pull an unrelated emotional memory into the prompt.
+    # Explicit coordinates/wording retain the old Russell side channel.  With
+    # semantic resonance enabled, a neutral query may unlock only curated E
+    # anchors with a real original-query semantic hit.  Exact side scores do
+    # not widen the factual vector result, and every ordinary authority/filter
+    # gate below still runs before an E-only memory can enter the prompt.
     if (
         e_recall_cfg is not None
         and e_query_emotion is not None
-        and e_query_emotion.explicit
+        and (e_query_emotion.explicit or bool(e_semantic_scores))
         and e_recall_cfg.side_channel_limit > 0
         and token_used < max_tokens
     ):
@@ -6115,6 +6205,7 @@ async def breath(
             e_rows_by_bucket,
             e_query_emotion,
             limit=e_recall_cfg.side_channel_scan_limit,
+            semantic_scores=(e_semantic_scores or None),
         )
         for e_bucket_id in prelim_ids:
             if timeline_rendered and len(result_ids) >= max_results:
@@ -6151,10 +6242,19 @@ async def breath(
                 )
                 if e_annotation is None:
                     continue
-                e_resonance = e_axis_resonance_score(
-                    e_query_emotion,
-                    e_annotation,
-                )
+                if e_semantic_scores:
+                    semantic_resonance = semantic_resonance_score(
+                        e_annotation,
+                        e_semantic_scores.get(e_bucket_id),
+                    )
+                    if semantic_resonance is None:
+                        continue
+                    e_resonance = semantic_resonance
+                else:
+                    e_resonance = e_axis_resonance_score(
+                        e_query_emotion,
+                        e_annotation,
+                    )
                 if e_resonance < e_recall_cfg.side_channel_min_resonance:
                     continue
                 clean_meta = {

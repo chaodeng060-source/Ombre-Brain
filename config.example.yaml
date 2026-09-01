@@ -140,8 +140,9 @@ e_axis_recall:
   min_confidence: 0.5
   tie_break_weight: 0.2              # 0..0.25, 且仅在 relevance band 内生效
   side_channel_limit: 1              # 显式情绪查询的额外旁证，0..2
-  side_channel_scan_limit: 128       # 先按 E 分数预排，再逐桶验 digest/Z/world/domain
+  side_channel_scan_limit: 128       # 先按共鸣候选池预排，再逐桶验 digest/Z/world/domain
   side_channel_min_resonance: 0.55
+  semantic_resonance_enabled: false  # 复用原问句已有向量分；false 完全退回 Russell 路径
 
 # --- Desire chord x E recall / 欲望和弦 × E 召回影子 ---
 # 默认关闭且只允许 mode=shadow。它读取 Twin 同一 breath 请求携带的无文本 top-2
