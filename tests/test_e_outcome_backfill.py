@@ -130,6 +130,15 @@ def test_unknown_outcome_never_counts_as_backfired(bad: str):
 # ---------------------------------------------------------------
 
 
+async def _read_meta(bucket_mgr, bucket_id: str) -> dict:
+    """从落盘的 markdown 读回 frontmatter——只信真写下去的东西。"""
+    import frontmatter
+
+    path = bucket_mgr._find_bucket_file(bucket_id)
+    assert path, f"找不到桶文件 {bucket_id}"
+    return frontmatter.load(path).metadata
+
+
 async def _make_e_bucket(bucket_mgr) -> str:
     return await bucket_mgr.create(
         content="测试用 E：她说累的时候先接住人。",
@@ -167,6 +176,27 @@ async def test_rewriting_the_same_outcome_is_idempotent(bucket_mgr):
     bucket_id = await _make_e_bucket(bucket_mgr)
     await bucket_mgr.update(bucket_id, e_outcome="worked")
     assert await bucket_mgr.update(bucket_id, e_outcome="worked") is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_time_is_stamped_by_the_store_not_the_caller(bucket_mgr):
+    """时间戳归存储层补——放调用方意味着换个入口进来就没有，
+    「什么时候判的」缺了，这条回填事后没法核对。"""
+    bucket_id = await _make_e_bucket(bucket_mgr)
+    await bucket_mgr.update(bucket_id, e_outcome="worked")
+    meta = await _read_meta(bucket_mgr, bucket_id)
+    assert meta.get("e_outcome") == "worked"
+    assert meta.get("e_outcome_at"), "回填没留下时间戳"
+
+
+@pytest.mark.asyncio
+async def test_idempotent_rewrite_keeps_the_original_timestamp(bucket_mgr):
+    """重放同一个判定不该把「什么时候判的」改成今天。"""
+    bucket_id = await _make_e_bucket(bucket_mgr)
+    await bucket_mgr.update(bucket_id, e_outcome="worked")
+    first = (await _read_meta(bucket_mgr, bucket_id)).get("e_outcome_at")
+    await bucket_mgr.update(bucket_id, e_outcome="worked")
+    assert (await _read_meta(bucket_mgr, bucket_id)).get("e_outcome_at") == first
 
 
 @pytest.mark.asyncio

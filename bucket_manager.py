@@ -1867,6 +1867,11 @@ class BucketManager:
                                 "write a successor E record instead"
                             )
                         kwargs["e_outcome"] = outcome
+                        # 回填时间在这一层补，不放调用方。放上层意味着换个入口
+                        # 进来就没有时间戳——「什么时候判的」缺了，这条回填
+                        # 事后没法核对，跟没记一样。已封存的不覆盖原时间。
+                        if not sealed and not kwargs.get("e_outcome_at"):
+                            kwargs["e_outcome_at"] = now_iso()
                 elif "e_outcome" in kwargs:
                     # 只有主 agent 亲写的 E 才谈得上「这个姿态管不管用」。
                     raise EOutcomeGuardError(
