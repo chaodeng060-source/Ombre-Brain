@@ -258,10 +258,64 @@ def test_primary_agent_initial_priority_sets_e_side_channel_baseline():
 
 
 def test_numeric_emotion_does_not_invent_e_initial_rank():
-    calm = {"e_initial_priority": 50, "weight": 1.0, "arousal": 0.1}
-    intense = {"e_initial_priority": 50, "weight": 1.0, "arousal": 1.0}
+    query = infer_query_emotion("难过", valence_01=0.5, arousal=0.1)
 
-    assert initial_priority_score(calm) == initial_priority_score(intense)
+    def annotation(arousal: float) -> dict:
+        return {
+            "e_initial_priority": 50,
+            "weight": 1.0,
+            "score": {
+                "valence": 0.0,
+                "arousal": arousal,
+                "tension": 0.2,
+                "confidence": 1.0,
+            },
+        }
+
+    calm_first = rank_annotation_bucket_ids(
+        {"a-memory": (annotation(0.1),), "z-memory": (annotation(1.0),)},
+        query,
+        limit=2,
+    )
+    intense_first = rank_annotation_bucket_ids(
+        {"a-memory": (annotation(1.0),), "z-memory": (annotation(0.1),)},
+        query,
+        limit=2,
+    )
+
+    assert calm_first == intense_first == ["a-memory", "z-memory"]
+
+
+def test_scan_limit_keeps_high_resonance_candidate_before_priority_ranking():
+    query = infer_query_emotion("我真的很难过")
+    low_resonance_high_priority = {
+        "e_initial_priority": 90,
+        "score": {
+            "valence": 1.0,
+            "arousal": 1.0,
+            "tension": 0.0,
+            "confidence": 1.0,
+        },
+    }
+    high_resonance_low_priority = {
+        "e_initial_priority": 1,
+        "score": {
+            "valence": -0.7,
+            "arousal": 0.35,
+            "tension": 0.55,
+            "confidence": 1.0,
+        },
+    }
+    grouped = {
+        f"filler-{index:03d}": (low_resonance_high_priority,)
+        for index in range(128)
+    }
+    grouped["high-resonance-low-priority"] = (high_resonance_low_priority,)
+
+    ranked = rank_annotation_bucket_ids(grouped, query, limit=128)
+
+    assert len(ranked) == 128
+    assert ranked[-1] == "high-resonance-low-priority"
 
 
 def test_e_reranks_only_inside_existing_relevance_band():

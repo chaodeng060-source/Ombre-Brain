@@ -623,13 +623,15 @@ def rank_annotation_bucket_ids(
     *,
     limit: int,
 ) -> list[str]:
-    """Pre-rank from the primary agent's order before source hydration."""
+    """Select the bounded resonance scan pool, then apply the agent's order.
 
-    # Numeric emotion remains an admissibility signal after hydration; it
-    # cannot invent E's initial order.  Keep ``query`` in the call shape so
-    # the downstream resonance gate still receives the same prepared query.
-    _ = query
-    scored: list[tuple[str, float, float]] = []
+    ``limit`` caps source hydration, so resonance retains its former role in
+    deciding which rows reach the existing admissibility checks at that
+    boundary.  Inside that bounded pool, only ``e_initial_priority`` creates
+    the initial E order; numeric emotion never does.
+    """
+
+    scored: list[tuple[str, float, float, float]] = []
     for bucket_id, rows in grouped.items():
         if not rows:
             continue
@@ -637,10 +639,15 @@ def rank_annotation_bucket_ids(
         scored.append((
             bucket_id,
             initial_priority_score(row),
+            resonance_score(query, row),
             _row_timestamp(row),
         ))
-    scored.sort(key=lambda item: (-item[1], -item[2], item[0]))
-    return [bucket_id for bucket_id, _, _ in scored[:max(0, limit)]]
+    scan_pool = sorted(
+        scored,
+        key=lambda item: (-item[2], -item[1], -item[3], item[0]),
+    )[:max(0, limit)]
+    scan_pool.sort(key=lambda item: (-item[1], -item[3], item[0]))
+    return [bucket_id for bucket_id, _, _, _ in scan_pool]
 
 
 __all__ = [
