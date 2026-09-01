@@ -109,6 +109,7 @@ def _configure(
     *,
     extra_config: dict | None = None,
 ) -> _Manager:
+    monkeypatch.delenv("OMBRE_RELATION_SLOT_RESERVATION", raising=False)
     manager = _Manager(buckets, search_ids)
     cfg = {
         **server.config,
@@ -478,6 +479,236 @@ async def test_query_without_named_thread_is_byte_stable(
 
     assert enabled == disabled
     assert _bucket_ids(enabled) == ["a", "b", "c", "d", "e"]
+
+
+@pytest.mark.asyncio
+async def test_relation_slot_reservation_off_is_byte_stable(
+    tmp_path,
+    monkeypatch,
+):
+    seed = _bucket(
+        "a",
+        "主证据",
+        relations=(
+            {"type": "explains", "target": "c", "strength": 1.0},
+        ),
+    )
+    buckets = [seed, _bucket("b", "第二主结果"), _bucket("c", "关系旁证")]
+    _configure(monkeypatch, tmp_path, buckets, ["a", "b"])
+
+    unset = await server.breath(
+        query="工程证据",
+        max_results=2,
+        relation_depth=1,
+        include_images=False,
+    )
+    monkeypatch.setenv("OMBRE_RELATION_SLOT_RESERVATION", "0")
+    explicit_off = await server.breath(
+        query="工程证据",
+        max_results=2,
+        relation_depth=1,
+        include_images=False,
+    )
+
+    assert unset == explicit_off
+    assert _bucket_ids(unset) == ["a", "b"]
+    assert "[layer:y_relation]" not in unset
+
+
+@pytest.mark.asyncio
+async def test_relation_slot_is_reserved_only_after_a_real_candidate_probe(
+    tmp_path,
+    monkeypatch,
+):
+    seed = _bucket(
+        "a",
+        "主证据",
+        relations=(
+            {"type": "explains", "target": "c", "strength": 1.0},
+        ),
+    )
+    buckets = [seed, _bucket("b", "第二主结果"), _bucket("c", "关系旁证")]
+    _configure(monkeypatch, tmp_path, buckets, ["a", "b"])
+    monkeypatch.setenv("OMBRE_RELATION_SLOT_RESERVATION", "1")
+
+    dehydration_ids = []
+    original = server._dehydrate_for_recall
+
+    async def counted(content, metadata, *, bucket=None, **kwargs):
+        dehydration_ids.append(str((bucket or {}).get("id") or ""))
+        return await original(content, metadata, bucket=bucket, **kwargs)
+
+    monkeypatch.setattr(server, "_dehydrate_for_recall", counted)
+    raw = await server.breath(
+        query="工程证据",
+        max_results=2,
+        relation_depth=1,
+        include_images=False,
+    )
+
+    assert _bucket_ids(raw) == ["a", "c"]
+    assert "[layer:y_relation]" in raw
+    assert "[relation:explains:out:d1←a]" in raw
+    assert dehydration_ids == ["a", "c"]
+
+
+@pytest.mark.asyncio
+async def test_relation_slot_is_not_reserved_for_storage_only_edges(
+    tmp_path,
+    monkeypatch,
+):
+    seed = _bucket(
+        "a",
+        "主证据",
+        relations=(
+            {"type": "kin", "target": "c", "strength": 1.0},
+        ),
+    )
+    buckets = [seed, _bucket("b", "第二主结果"), _bucket("c", "关系旁证")]
+    _configure(monkeypatch, tmp_path, buckets, ["a", "b"])
+
+    off = await server.breath(
+        query="工程证据",
+        max_results=2,
+        relation_depth=1,
+        include_images=False,
+    )
+    monkeypatch.setenv("OMBRE_RELATION_SLOT_RESERVATION", "1")
+    enabled = await server.breath(
+        query="工程证据",
+        max_results=2,
+        relation_depth=1,
+        include_images=False,
+    )
+
+    assert enabled == off
+    assert _bucket_ids(enabled) == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_relation_tail_seed_cannot_create_a_false_reserved_slot(
+    tmp_path,
+    monkeypatch,
+):
+    buckets = [
+        _bucket("a", "第一主结果"),
+        _bucket(
+            "b",
+            "第二主结果",
+            relations=(
+                {"type": "explains", "target": "c", "strength": 1.0},
+            ),
+        ),
+        _bucket("c", "只和将被预留的尾项相连"),
+    ]
+    _configure(monkeypatch, tmp_path, buckets, ["a", "b"])
+
+    off = await server.breath(
+        query="工程证据",
+        max_results=2,
+        relation_depth=1,
+        include_images=False,
+    )
+    monkeypatch.setenv("OMBRE_RELATION_SLOT_RESERVATION", "1")
+    enabled = await server.breath(
+        query="工程证据",
+        max_results=2,
+        relation_depth=1,
+        include_images=False,
+    )
+
+    assert enabled == off
+    assert _bucket_ids(enabled) == ["a", "b"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["duplicate", "dehydrate"])
+async def test_unrenderable_relation_restores_primary_tail_in_place(
+    tmp_path,
+    monkeypatch,
+    failure,
+):
+    seed = _bucket(
+        "a",
+        "主证据内容足够长用于重复检测",
+        relations=(
+            {"type": "explains", "target": "c", "strength": 1.0},
+        ),
+    )
+    relation_content = (
+        "主证据内容足够长用于重复检测"
+        if failure == "duplicate"
+        else "关系旁证"
+    )
+    buckets = [seed, _bucket("b", "第二主结果"), _bucket("c", relation_content)]
+    _configure(monkeypatch, tmp_path, buckets, ["a", "b"])
+
+    off = await server.breath(
+        query="工程证据",
+        max_results=2,
+        relation_depth=1,
+        include_images=False,
+    )
+    original = server._dehydrate_for_recall
+
+    async def fail_relation(content, metadata, *, bucket=None, **kwargs):
+        if bucket and bucket.get("id") == "c":
+            raise RuntimeError("relation dehydration failed")
+        return await original(content, metadata, bucket=bucket, **kwargs)
+
+    if failure == "dehydrate":
+        monkeypatch.setattr(server, "_dehydrate_for_recall", fail_relation)
+    monkeypatch.setenv("OMBRE_RELATION_SLOT_RESERVATION", "1")
+    enabled = await server.breath(
+        query="工程证据",
+        max_results=2,
+        relation_depth=1,
+        include_images=False,
+    )
+
+    assert enabled == off
+    assert _bucket_ids(enabled) == ["a", "b"]
+    assert "[layer:y_relation]" not in enabled
+
+
+@pytest.mark.asyncio
+async def test_x_and_reserved_y_keep_primary_order_and_shared_budget(
+    tmp_path,
+    monkeypatch,
+):
+    seed = _bucket(
+        "seed",
+        "主证据",
+        thread="基础设施演进",
+        event_at="2026-07-01T00:00:00+08:00",
+        relations=(
+            {"type": "explains", "target": "y-only", "strength": 1.0},
+        ),
+    )
+    buckets = [
+        seed,
+        _bucket("tail", "第二主结果"),
+        _bucket(
+            "next",
+            "线内后续",
+            thread="基础设施演进",
+            event_at="2026-08-01T00:00:00+08:00",
+        ),
+        _bucket("y-only", "关系旁证"),
+    ]
+    _configure(monkeypatch, tmp_path, buckets, ["seed", "tail"])
+    monkeypatch.setenv("OMBRE_RELATION_SLOT_RESERVATION", "1")
+
+    raw = await server.breath(
+        query="工程证据",
+        max_results=3,
+        relation_depth=1,
+        include_images=False,
+    )
+
+    assert _bucket_ids(raw) == ["seed", "next", "y-only"]
+    assert "[layer:x_timeline]" in raw
+    assert "[layer:y_relation]" in raw
 
 
 @pytest.mark.asyncio

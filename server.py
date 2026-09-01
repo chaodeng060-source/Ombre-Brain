@@ -1247,6 +1247,14 @@ def _relation_recall_neighbors(
     )
 
 
+def _relation_slot_reservation_enabled() -> bool:
+    """Whether Y may reserve one existing injection slot after a real probe."""
+    return os.environ.get(
+        "OMBRE_RELATION_SLOT_RESERVATION",
+        "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _timeline_recall_neighbors(
     buckets,
     seed_ids,
@@ -5631,6 +5639,7 @@ async def breath(
     # C still never escapes this pool; the actual displayed primary cutoff is
     # known only after X preflight and token/dehydration rendering below.
     chord_shadow_b_candidates = list(matches)
+    original_primary_matches = list(matches)
 
     # Reserve one existing result slot only when a retained primary seed has
     # a real same-thread neighbor. Queries without such a neighbor keep their
@@ -5638,6 +5647,7 @@ async def breath(
     timeline_slot_reserved = False
     timeline_buckets = []
     timeline_fallback_matches = []
+    timeline_probe = []
     if max_results > 1 and matches:
         try:
             # Reuse the full per-request snapshot already loaded for keyword
@@ -5683,6 +5693,97 @@ async def breath(
                 "Timeline preflight failed / 时间线预检失败: %s",
                 type(exc).__name__,
             )
+
+    # Y is downstream of the primary/X/Z budgets.  With the rollout enabled,
+    # reserve one primary slot only after the exact production relation gate
+    # proves that the retained seeds have a genuinely eligible propagating
+    # neighbor.  The probe is local over keyword_candidates: no provider,
+    # embedding or dehydration call is introduced.
+    relation_slot_reserved = False
+    relation_fallback_matches = []
+    relation_reserved_primary_ids: set[str] = set()
+    expected_occupied_slots = (
+        len(matches)
+        + len(state_link_candidates)
+        + (1 if timeline_slot_reserved else 0)
+    )
+    if (
+        _relation_slot_reservation_enabled()
+        and intent_policy["relation_depth"] >= 1
+        and max_results > 1
+        and len(matches) > 1
+        and expected_occupied_slots >= max_results
+    ):
+        try:
+            retained_primary = matches[:-1]
+            retained_primary_ids = [
+                str(bucket.get("id") or "")
+                for bucket in retained_primary
+                if bucket.get("id")
+            ]
+            state_candidate_ids = {
+                str(bucket.get("id") or "")
+                for bucket in state_link_candidates
+                if bucket.get("id")
+            }
+            relation_probe_seed_ids = list(retained_primary_ids)
+            if not timeline_slot_reserved:
+                # This mirrors the existing Y contract: without rendered X,
+                # Z evidence may also be in result_ids when Y runs.
+                relation_probe_seed_ids.extend(sorted(state_candidate_ids))
+            relation_graph_buckets = [
+                bucket
+                for bucket in keyword_candidates
+                if _is_main_recall_bucket(bucket)
+            ]
+            relation_reserved_primary_ids = {
+                str(bucket.get("id") or "")
+                for bucket in original_primary_matches
+                if bucket.get("id")
+            }
+            timeline_probe_ids = {
+                str(neighbor.bucket_id)
+                for neighbor in timeline_probe
+                if getattr(neighbor, "bucket_id", None)
+            }
+            relation_probe = _relation_recall_neighbors(
+                relation_graph_buckets,
+                relation_probe_seed_ids,
+                query=recall_query,
+                intent=intent_policy["intent"],
+                world_filter=world_filter,
+                domain_filter=domain_filter,
+                created_after=created_after,
+                created_before=created_before,
+                max_depth=intent_policy["relation_depth"],
+                max_results=1,
+                excluded_ids=(
+                    relation_reserved_primary_ids
+                    | state_candidate_ids
+                    | timeline_probe_ids
+                    | _session_seen_bucket_ids(
+                        relation_graph_buckets,
+                        session_id,
+                    )
+                    | _load_session_seen_ids(session_id)
+                ),
+            )
+            if relation_probe:
+                relation_slot_reserved = True
+                relation_fallback_matches = matches[-1:]
+                matches = retained_primary
+        except Exception as exc:
+            logger.warning(
+                "Relation slot preflight failed; legacy budget kept: %s",
+                type(exc).__name__,
+            )
+            relation_slot_reserved = False
+            relation_fallback_matches = []
+            relation_reserved_primary_ids = set()
+    record_recall_metric(
+        "relation_slot_reserved",
+        int(relation_slot_reserved),
+    )
     with recall_stage("assembly"):
         set_recall_partial_result(_local_partial_recall_text(
             matches,
@@ -5785,6 +5886,7 @@ async def breath(
     # X and Y may expand only the primary RRF results. State or side evidence
     # must not recursively become a timeline seed.
     main_result_ids = tuple(result_ids)
+    primary_result_section_size = len(results)
 
     # --- X-axis thread navigation: bounded previous/next supporting context ---
     # X consumes exactly the slot proven by preflight before Z/Y can claim it.
@@ -5905,7 +6007,21 @@ async def breath(
     if timeline_slot_reserved and not timeline_rendered:
         restored_main_messages = []
         restored_main_ids = []
-        for bucket in timeline_fallback_matches:
+        timeline_restore_pool = list(timeline_fallback_matches)
+        if relation_slot_reserved:
+            timeline_restore_pool = [
+                *relation_fallback_matches,
+                *timeline_restore_pool,
+            ]
+        desired_primary_count = max(
+            1,
+            max_results
+            - len(state_link_candidates)
+            - (1 if relation_slot_reserved else 0),
+        )
+        for bucket in timeline_restore_pool:
+            if len(main_result_ids) + len(restored_main_ids) >= desired_primary_count:
+                break
             if token_used >= max_tokens or len(result_ids) >= max_results:
                 break
             bucket_id = str(bucket.get("id") or "")
@@ -5978,6 +6094,7 @@ async def breath(
         if restored_main_messages:
             results.extend(restored_main_messages)
             main_result_ids = tuple((*main_result_ids, *restored_main_ids))
+            primary_result_section_size += len(restored_main_messages)
             set_recall_partial_result("\n---\n".join(results))
 
     # Shadow-only arm C: all semantic/state/session/anchor/DS gates have run,
@@ -6081,6 +6198,7 @@ async def breath(
         int(intent_policy.get("relation_neighbor_limit", 5)),
         remaining_relation_slots,
     )
+    relation_rendered = False
     if (
         intent_policy["relation_depth"] >= 1
         and (main_result_ids if timeline_rendered else result_ids)
@@ -6117,6 +6235,7 @@ async def breath(
                         if timeline_rendered
                         else set()
                     )
+                    | relation_reserved_primary_ids
                     | _session_seen_bucket_ids(graph_buckets, session_id)
                     | _load_session_seen_ids(session_id)
                 ),
@@ -6181,10 +6300,122 @@ async def breath(
                 )
                 continue
         if neighbor_msgs:
+            relation_rendered = True
             results.append(
                 "--- 关系网关联旁证（supporting only，不可替代主证据） ---\n"
                 + "\n---\n".join(neighbor_msgs)
             )
+
+    # Structural preflight is intentionally provider-free.  If the proven
+    # neighbor later cannot render (duplicate body, token pressure or local
+    # dehydration failure), put the withheld primary back in its original
+    # primary section.  This prevents a failed Y overlay from deleting useful
+    # recall while leaving the rollout-off path untouched byte for byte.
+    relation_primary_restored = False
+    if relation_slot_reserved and not relation_rendered:
+        desired_primary_count = min(
+            len(original_primary_matches),
+            max(
+                1,
+                max_results
+                - len(state_link_candidates)
+                - (1 if timeline_rendered else 0),
+            ),
+        )
+        restored_main_messages = []
+        restored_main_ids = []
+        restored_main_buckets = []
+        existing_main_ids = set(main_result_ids)
+        for bucket in original_primary_matches:
+            if len(main_result_ids) + len(restored_main_ids) >= desired_primary_count:
+                break
+            bucket_id = str(bucket.get("id") or "")
+            if (
+                not bucket_id
+                or bucket_id in existing_main_ids
+                or bucket_id in restored_main_ids
+            ):
+                continue
+            if token_used >= max_tokens or len(result_ids) >= max_results:
+                break
+            try:
+                clean_meta = {
+                    key: value
+                    for key, value in bucket["metadata"].items()
+                    if key != "tags"
+                }
+                if q_valence is not None and "valence" in clean_meta:
+                    original_v = float(clean_meta.get("valence", 0.5))
+                    shift = (q_valence - 0.5) * 0.2
+                    clean_meta["valence"] = max(
+                        0.0,
+                        min(1.0, original_v + shift),
+                    )
+                summary = await _dehydrate_for_recall(
+                    strip_wikilinks(bucket["content"]),
+                    clean_meta,
+                    bucket=bucket,
+                )
+                summary_tokens = count_tokens_approx(summary)
+                if token_used + summary_tokens > max_tokens:
+                    break
+                marker = "[实体关联]" if bucket.get("entity_match") else (
+                    "[语义关联]" if bucket.get("vector_match") else ""
+                )
+                prefix = _recall_prefix(
+                    bucket_id,
+                    "main",
+                    "curated_rrf",
+                    marker=marker,
+                    bucket=bucket,
+                    state_profile=state_profile,
+                )
+                restored_main_messages.append(f"{prefix} {summary}")
+                restored_main_ids.append(bucket_id)
+                restored_main_buckets.append(bucket)
+                token_used += summary_tokens
+                fingerprint = default_content_fingerprint(
+                    str(bucket.get("content") or "")
+                )
+                if fingerprint:
+                    selected_content_fingerprints.add(fingerprint)
+                if bucket.get("_e_axis_annotation") is not None:
+                    selected_e_evidence.append((
+                        bucket["_e_axis_annotation"],
+                        float(bucket.get("_e_axis_resonance", 0.0) or 0.0),
+                    ))
+                reason = (
+                    "entity" if bucket.get("entity_match")
+                    else "semantic" if bucket.get("vector_match")
+                    else "lexical"
+                )
+                _capture_breath_candidate(
+                    bucket,
+                    summary,
+                    reason=reason,
+                    limit=max_results,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to restore primary after relation miss: %s",
+                    type(exc).__name__,
+                )
+                continue
+        if restored_main_messages:
+            main_insert_at = len(main_result_ids)
+            results[
+                primary_result_section_size:primary_result_section_size
+            ] = restored_main_messages
+            result_ids[main_insert_at:main_insert_at] = restored_main_ids
+            result_buckets[main_insert_at:main_insert_at] = restored_main_buckets
+            main_result_ids = tuple((*main_result_ids, *restored_main_ids))
+            primary_result_section_size += len(restored_main_messages)
+            relation_primary_restored = True
+            set_recall_partial_result("\n---\n".join(results))
+    record_recall_metric(
+        "relation_primary_restored",
+        int(relation_primary_restored),
+    )
 
     # --- E-axis independent resonance channel (bounded supporting evidence) ---
     # Explicit coordinates/wording retain the old Russell side channel.  With

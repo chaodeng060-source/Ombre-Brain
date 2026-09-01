@@ -41,6 +41,8 @@ def test_timing_receipt_accumulates_calls_without_content():
         record_recall_metric("vector_cache_hits", 2)
         record_recall_metric("vector_dimension", 3072)
         record_recall_metric("vector_dimension", 768)
+        record_recall_metric("relation_slot_reserved", 1)
+        record_recall_metric("relation_primary_restored", 0)
         receipt = finish_recall_timing(status="ok", partial=False)
     finally:
         reset_recall_timing(token)
@@ -59,6 +61,8 @@ def test_timing_receipt_accumulates_calls_without_content():
     assert receipt["metrics"] == {
         "vector_cache_hits": 3,
         "vector_dimension": 3072,
+        "relation_slot_reserved": 1,
+        "relation_primary_restored": 0,
     }
     assert "query" not in json.dumps(receipt)
 

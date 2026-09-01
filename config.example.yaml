@@ -370,6 +370,9 @@ state_aware_recall:
 # --- Typed relation recall / 类型化关系召回 ---
 # propagation_only=false 仅用于紧急回滚到旧行为；默认只允许 explains
 # 传播。kin/updates 只记录关系，causes/contributes/improves 留待 review。
+# OMBRE_RELATION_SLOT_RESERVATION=1：只有本地预检确认 retained seed 存在
+# 合格传播边时，才从既有注入预算给 Y 轴预留 1 位。默认 0；设回 0 后
+# IDs、顺序和正文走原选择路径，不新增任何模型或 embedding 调用。
 relation_recall:
   propagation_only: true
   allowed_types: [kin, explains]  # rollback/legacy mode only

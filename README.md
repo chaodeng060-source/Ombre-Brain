@@ -472,6 +472,7 @@ Sensitive config via env vars:
 - `OMBRE_TRANSPORT` — 覆盖传输方式
 - `OMBRE_BUCKETS_DIR` — 覆盖存储路径
 - `OMBRE_HOOK_TOKEN` — LMC-5 生命周期 hook 的共享密钥（启用时必填）
+- `OMBRE_RELATION_SLOT_RESERVATION` — 查询已有关系图后按需给 Y 轴预留 1 个既有注入位；默认关闭，`0` 为逐字回滚路径，不新增模型/API 调用
 
 ## 衰减公式 / Decay Formula
 

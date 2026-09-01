@@ -406,6 +406,40 @@ def main() -> int:
             }
             for candidate in relation_candidates
         ]
+        state_result_ids = [
+            entry["bucket_id"]
+            for entry in rendered_entries
+            if entry["layer"] == "z_lifecycle"
+        ]
+        reservation_probe_rows: list[dict[str, Any]] = []
+        if cap == 0 and len(main_result_ids) > 1:
+            retained_primary_ids = list(main_result_ids[:-1])
+            reservation_seed_ids = list(retained_primary_ids)
+            if not timeline_rendered:
+                reservation_seed_ids.extend(state_result_ids)
+            reservation_allowed_ids = set(allowed_node_ids)
+            reservation_allowed_ids.difference_update(before_relation_ids)
+            reservation_probe = recall_support.expand_relation_graph(
+                graph_buckets,
+                reservation_seed_ids,
+                allowed_types=allowed_relation_types,
+                max_depth=int(resolved["relation_depth"]),
+                max_results=max(1, policy_limit),
+                allowed_node_ids=reservation_allowed_ids,
+                hop_min_strength=hop_min_strength,
+            )
+            reservation_probe_rows = [
+                {
+                    "relation_type": candidate.relation_type,
+                    "direction": candidate.direction,
+                    "depth": candidate.depth,
+                    "source_bucket_id": candidate.via_id,
+                    "target_bucket_id": candidate.bucket_id,
+                    "strength": candidate.strength,
+                    "score": candidate.score,
+                }
+                for candidate in reservation_probe
+            ]
         y_call_gate_open = bool(
             int(resolved["relation_depth"]) >= 1
             and relation_seed_ids
@@ -455,6 +489,10 @@ def main() -> int:
             "operational_status_view": operational_view,
             "eligible_relation_candidates_current_graph": candidate_rows,
             "eligible_relation_candidate_count_current_graph": len(candidate_rows),
+            "reservation_probe_candidates_current_graph": reservation_probe_rows,
+            "reservation_probe_candidate_count_current_graph": len(
+                reservation_probe_rows
+            ),
             "y_call_gate_open": y_call_gate_open,
             "successive_gate_outcome": successive_gate_outcome,
             "seed_modified_after_capture": bool(
@@ -489,6 +527,9 @@ def main() -> int:
                 "operational_status_view": row["operational_status_view"],
                 "eligible_relation_candidate_count_current_graph": row[
                     "eligible_relation_candidate_count_current_graph"
+                ],
+                "reservation_probe_candidate_count_current_graph": row[
+                    "reservation_probe_candidate_count_current_graph"
                 ],
                 "y_call_gate_open": row["y_call_gate_open"],
                 "successive_gate_outcome": row["successive_gate_outcome"],
@@ -586,6 +627,14 @@ def main() -> int:
                 for row in public_cases
                 if row["successive_gate_outcome"]
                 == "cap_zero_with_eligible_candidate"
+            ),
+            "reservation_probe_cases_current_graph": sum(
+                row["reservation_probe_candidate_count_current_graph"] > 0
+                for row in public_cases
+            ),
+            "reservation_probe_candidates_current_graph": sum(
+                row["reservation_probe_candidate_count_current_graph"]
+                for row in public_cases
             ),
             "non_neutral_operational_status_cases": sum(
                 row["operational_status_view"] != status_validity.VIEW_NEUTRAL

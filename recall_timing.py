@@ -52,6 +52,8 @@ _RECALL_METRIC_MODES = {
     "vector_pg_shadow_busy_skips": "sum",
     "vector_dimension": "max",
     "curated_lexical_shadow_timeouts": "sum",
+    "relation_slot_reserved": "sum",
+    "relation_primary_restored": "sum",
 }
 
 
