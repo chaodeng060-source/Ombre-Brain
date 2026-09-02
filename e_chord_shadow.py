@@ -16,7 +16,7 @@ import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +26,10 @@ from e_axis_storage import open_secure_e_axis_jsonl, secure_e_axis_lock
 LIVE_SCHEMA = "live_chord.v1"
 LEGACY_RECEIPT_SCHEMA = "e_chord_shadow_receipt.v1"
 RECEIPT_SCHEMA = "e_chord_shadow_receipt.v2"
+BYPASS_RECEIPT_SCHEMA = "e_chord_shadow_receipt.v3"
 LEGACY_FINAL_SELECTION_SCHEMA = "e_chord_final_selection.v1"
 FINAL_SELECTION_SCHEMA = "e_chord_final_selection.v2"
+BYPASS_FINAL_SELECTION_SCHEMA = "e_chord_final_selection.v3"
 MAX_FACETS = 2
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 _HEX16_RE = re.compile(r"^[0-9a-f]{16}$")
@@ -188,6 +190,8 @@ class EChordShadowConfig:
     near_tie_epsilon: float = 0.03
     max_age_ms: int = 30_000
     derived_lock_enabled: bool = False
+    bypass_enabled: bool = False
+    bypass_limit: int = 4
 
 
 def load_e_chord_shadow_config(root: Mapping[str, object]) -> EChordShadowConfig:
@@ -204,6 +208,13 @@ def load_e_chord_shadow_config(root: Mapping[str, object]) -> EChordShadowConfig
     max_age_ms = raw.get("max_age_ms", 30_000)
     if type(max_age_ms) is not int or not 1_000 <= max_age_ms <= 120_000:
         raise ValueError("e_chord_shadow.max_age_ms must be in [1000, 120000]")
+    bypass_limit = raw.get("bypass_limit", 4)
+    if (
+        type(bypass_limit) is not int
+        or isinstance(bypass_limit, bool)
+        or not 1 <= bypass_limit <= 8
+    ):
+        raise ValueError("e_chord_shadow.bypass_limit must be in [1, 8]")
     return EChordShadowConfig(
         enabled=True,
         near_tie_epsilon=epsilon,
@@ -211,6 +222,10 @@ def load_e_chord_shadow_config(root: Mapping[str, object]) -> EChordShadowConfig
         derived_lock_enabled=os.environ.get(
             "OMBRE_E_CHORD_DERIVED_LOCK", "0"
         ).strip().lower() in {"1", "true", "yes", "on"},
+        bypass_enabled=os.environ.get(
+            "OMBRE_E_CHORD_BYPASS", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"},
+        bypass_limit=bypass_limit,
     )
 
 
@@ -697,6 +712,62 @@ def _candidate_e_guard(candidate: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def _recorded_at_epoch(candidate: Mapping[str, object]) -> float:
+    value = _metadata(candidate).get("recorded_at")
+    if not isinstance(value, str) or not value.strip():
+        return float("-inf")
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return float("-inf")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def select_bypass_candidates(
+    e_candidates: Sequence[Mapping[str, object]],
+    natural_b_candidates: Sequence[Mapping[str, object]],
+    *,
+    source_buckets_by_id: Mapping[str, Mapping[str, object]] | None = None,
+    limit: int = 4,
+) -> list[Mapping[str, object]]:
+    """Select an in-memory, shadow-only suffix of source-bound E buckets."""
+
+    if type(limit) is not int or isinstance(limit, bool) or not 1 <= limit <= 8:
+        raise ValueError("bypass limit must be in [1, 8]")
+    natural_ids = {
+        bucket_id
+        for candidate in natural_b_candidates
+        if (bucket_id := _candidate_id(candidate))
+    }
+    known_source_ids = natural_ids | set(source_buckets_by_id or {})
+    eligible: list[tuple[int, float, str, Mapping[str, object]]] = []
+    for candidate in e_candidates:
+        bucket_id = _candidate_id(candidate)
+        source_bucket_id = _candidate_source_bucket_id(candidate)
+        priority = _annotation_value(candidate, "initial_priority")
+        if (
+            not bucket_id
+            or bucket_id in natural_ids
+            or not source_bucket_id
+            or source_bucket_id not in known_source_ids
+            or type(priority) is not int
+            or isinstance(priority, bool)
+            or not 1 <= priority <= 100
+            or _candidate_e_guard(candidate)["e_admissibility"] != "admissible"
+        ):
+            continue
+        eligible.append((
+            priority,
+            _recorded_at_epoch(candidate),
+            bucket_id,
+            candidate,
+        ))
+    eligible.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return [item[3] for item in eligible[:limit]]
+
+
 def frozen_relevance_band_ids(
     candidates: Sequence[Mapping[str, object]],
     band_width: float,
@@ -777,6 +848,7 @@ def propose_chord_reorder(
     chord: LiveChord,
     *,
     near_tie_epsilon: float = 0.03,
+    bypass_ids: Sequence[str] = (),
     derived_lock_enabled: bool = False,
     source_buckets_by_id: Mapping[str, Mapping[str, object]] | None = None,
     allowed_relation_types: Sequence[str] = ("explains",),
@@ -798,11 +870,20 @@ def propose_chord_reorder(
     source_lookup = source_buckets_by_id or {}
     original = list(candidates)
     b_ids = tuple(_candidate_id(candidate) for candidate in original)
+    bypass_tuple = tuple(bypass_ids)
+    bypass_set = set(bypass_tuple)
     violations: list[str] = []
     if any(not bucket_id for bucket_id in b_ids):
         violations.append("invalid_candidate_id")
     if len(set(b_ids)) != len(b_ids):
         violations.append("duplicate_candidate_id")
+    if (
+        any(_safe_id(bucket_id) is None for bucket_id in bypass_tuple)
+        or len(bypass_set) != len(bypass_tuple)
+        or len(bypass_tuple) > len(b_ids)
+        or (bypass_tuple and tuple(b_ids[-len(bypass_tuple):]) != bypass_tuple)
+    ):
+        violations.append("bypass_boundary")
     if violations or len(original) < 2 or not chord.facets:
         return ShadowProposal(
             b_ids=b_ids,
@@ -823,6 +904,10 @@ def propose_chord_reorder(
         right = proposed[index + 1]
         left_id = _candidate_id(left)
         right_id = _candidate_id(right)
+        if (left_id in bypass_set) != (right_id in bypass_set):
+            _append_reason(skipped, "bypass_boundary")
+            index += 1
+            continue
         selected_lock = _select_event_lock(
             left,
             right,
@@ -923,6 +1008,11 @@ def propose_chord_reorder(
     if displacement > 1:
         violations.append("max_displacement")
     for swap in swaps:
+        if (
+            (swap.promoted_id in bypass_set)
+            != (swap.demoted_id in bypass_set)
+        ):
+            violations.append("bypass_boundary")
         before_left = original[swap.to_index]
         before_right = original[swap.from_index]
         validated_lock = _select_event_lock(
@@ -1022,6 +1112,9 @@ def build_shadow_receipt(
     first_screen_limit: int,
     request_path_delta_ms: float,
     recorded_at_ms: int,
+    bypass_enabled: bool = False,
+    bypass_ids: Sequence[str] = (),
+    bypass_limit: int = 4,
 ) -> dict[str, Any]:
     """Build a content-free A/B/C receipt over one frozen retained pool."""
 
@@ -1038,21 +1131,49 @@ def build_shadow_receipt(
         raise ValueError("payload_status is invalid")
     if ds_decision_source not in _DS_DECISION_SOURCES:
         raise ValueError("ds_decision_source is invalid")
+    if type(bypass_enabled) is not bool:
+        raise ValueError("bypass_enabled must be a boolean")
+    bypass_tuple = tuple(bypass_ids)
+    if bypass_enabled:
+        if (
+            type(bypass_limit) is not int
+            or isinstance(bypass_limit, bool)
+            or not 1 <= bypass_limit <= 8
+            or len(bypass_tuple) > bypass_limit
+        ):
+            raise ValueError("bypass_limit must be in [1, 8]")
+    elif bypass_tuple:
+        raise ValueError("bypass_ids require bypass_enabled")
 
     declared_a_ids = _ids(a_candidates)
     b_ids = _ids(b_candidates)
+    bypass_set = set(bypass_tuple)
+    bypass_boundary = int(
+        len(bypass_set) != len(bypass_tuple)
+        or any(_safe_id(bucket_id) is None for bucket_id in bypass_tuple)
+        or len(bypass_tuple) > len(b_ids)
+        or (
+            bool(bypass_tuple)
+            and tuple(b_ids[-len(bypass_tuple):]) != bypass_tuple
+        )
+    )
+    if "bypass_boundary" in proposal.violations:
+        bypass_boundary = 1
+    natural_b_ids = (
+        b_ids[:-len(bypass_tuple)] if bypass_tuple else b_ids
+    )
     pre_e_ids = tuple(pre_e_cohort_ids)
     post_e_ids = tuple(post_e_cohort_ids)
     cohort_status = _a_cohort_status(
         pre_e_ids,
         post_e_ids,
-        b_ids,
+        natural_b_ids if bypass_enabled else b_ids,
         ds_decision_source,
     )
     if cohort_status == "pure_semantic":
         if declared_a_ids != pre_e_ids:
             raise ValueError("pure semantic A does not match frozen pre-E cohort")
-        a_ids = pre_e_ids
+        a_ids = pre_e_ids + (bypass_tuple if bypass_enabled else ())
     else:
         # Never serialize a post-hoc ablation as a semantic baseline.  The
         # evaluator excludes this turn; B is a neutral placeholder for A.
@@ -1068,11 +1189,27 @@ def build_shadow_receipt(
                 _annotation_value(candidate, "authored_by") == chord.e_authored_by
                 if chord is not None else False
             ),
+            **(
+                {"origin": "bypass" if _candidate_id(candidate) in bypass_set else "natural"}
+                if bypass_enabled else {}
+            ),
             **_candidate_e_guard(candidate),
         }
         for candidate in b_candidates
     ]
     c_ids = proposal.c_ids
+    effective_swaps = proposal.swaps
+    if bypass_enabled:
+        for swap in effective_swaps:
+            if (
+                (swap.promoted_id in bypass_set)
+                != (swap.demoted_id in bypass_set)
+            ):
+                bypass_boundary = 1
+                break
+        if bypass_boundary:
+            c_ids = b_ids
+            effective_swaps = ()
     pool_set = set(b_ids)
     same_pool = (
         len(a_ids) == len(b_ids) == len(c_ids)
@@ -1085,6 +1222,8 @@ def build_shadow_receipt(
         default=0,
     )
     hard_violations = set(proposal.violations)
+    if bypass_boundary:
+        hard_violations.add("bypass_boundary")
     if not same_pool:
         hard_violations.add("candidate_set_drift")
     if max_displacement > 1:
@@ -1092,7 +1231,7 @@ def build_shadow_receipt(
     if not b_ids and c_ids:
         hard_violations.add("zero_to_nonzero")
     guard_by_id = {guard["id"]: guard for guard in candidate_guards}
-    for swap in proposal.swaps:
+    for swap in effective_swaps:
         promoted_guard = guard_by_id.get(swap.promoted_id, {})
         demoted_guard = guard_by_id.get(swap.demoted_id, {})
         shared_locks = set(promoted_guard.get("event_lock_digests", ())) & set(
@@ -1138,8 +1277,8 @@ def build_shadow_receipt(
         ):
             hard_violations.add("e_admissibility_move")
 
-    return {
-        "schema": RECEIPT_SCHEMA,
+    receipt = {
+        "schema": BYPASS_RECEIPT_SCHEMA if bypass_enabled else RECEIPT_SCHEMA,
         "shadow_only": True,
         "affects_ranking": False,
         "payload_status": payload_status,
@@ -1184,7 +1323,7 @@ def build_shadow_receipt(
                 "recorded_day": swap.recorded_day,
                 "domain_digest": swap.domain_digest,
             }
-            for swap in proposal.swaps
+            for swap in effective_swaps
         ],
         "skipped_reasons": list(proposal.skipped_reasons),
         "diagnostics": {
@@ -1201,11 +1340,23 @@ def build_shadow_receipt(
                 "e_admissibility_move" in hard_violations
             ),
             "zero_to_nonzero": int("zero_to_nonzero" in hard_violations),
+            **({"bypass_boundary": bypass_boundary} if bypass_enabled else {}),
             "external_api_delta": 0,
             "hard_violation_count": len(hard_violations),
         },
         "request_path_delta_ms": round(elapsed, 6),
     }
+    if bypass_enabled:
+        guard_by_id = {guard["id"]: guard for guard in candidate_guards}
+        receipt.update({
+            "bypass_ids": list(bypass_tuple),
+            "bypass_source_ids": [
+                str(guard_by_id[bucket_id]["e_source_bucket_id"])
+                for bucket_id in bypass_tuple
+            ],
+            "bypass_limit": bypass_limit,
+        })
+    return receipt
 
 
 _RECEIPT_KEYS = frozenset({
@@ -1235,6 +1386,11 @@ _RECEIPT_KEYS = frozenset({
     "diagnostics",
     "request_path_delta_ms",
 })
+_BYPASS_RECEIPT_KEYS = _RECEIPT_KEYS | frozenset({
+    "bypass_ids",
+    "bypass_source_ids",
+    "bypass_limit",
+})
 _DIAGNOSTIC_KEYS = frozenset({
     "same_candidate_pool",
     "candidate_set_drift",
@@ -1247,6 +1403,9 @@ _DIAGNOSTIC_KEYS = frozenset({
     "zero_to_nonzero",
     "external_api_delta",
     "hard_violation_count",
+})
+_BYPASS_DIAGNOSTIC_KEYS = _DIAGNOSTIC_KEYS | frozenset({
+    "bypass_boundary",
 })
 _LEGACY_SWAP_KEYS = frozenset({
     "promoted_id",
@@ -1280,6 +1439,9 @@ _LEGACY_CANDIDATE_GUARD_KEYS = frozenset({
 _CANDIDATE_GUARD_KEYS = _LEGACY_CANDIDATE_GUARD_KEYS | frozenset({
     "e_source_bucket_id",
 })
+_BYPASS_CANDIDATE_GUARD_KEYS = _CANDIDATE_GUARD_KEYS | frozenset({
+    "origin",
+})
 _MACHINE_REASON_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,79}$")
 
 
@@ -1294,12 +1456,19 @@ def _validated_id_list(value: object, *, maximum: int = 50) -> list[str]:
 
 
 def validate_shadow_receipt(row: object) -> dict[str, Any]:
-    if type(row) is not dict or set(row) != _RECEIPT_KEYS:
+    if type(row) is not dict:
         raise ValueError("invalid E chord receipt contract")
     schema = row.get("schema")
-    if schema not in {LEGACY_RECEIPT_SCHEMA, RECEIPT_SCHEMA}:
+    if schema not in {
+        LEGACY_RECEIPT_SCHEMA,
+        RECEIPT_SCHEMA,
+        BYPASS_RECEIPT_SCHEMA,
+    }:
         raise ValueError("invalid E chord receipt contract")
-    is_v2 = schema == RECEIPT_SCHEMA
+    is_v3 = schema == BYPASS_RECEIPT_SCHEMA
+    if set(row) != (_BYPASS_RECEIPT_KEYS if is_v3 else _RECEIPT_KEYS):
+        raise ValueError("invalid E chord receipt contract")
+    is_v2 = schema in {RECEIPT_SCHEMA, BYPASS_RECEIPT_SCHEMA}
     if (
         row.get("shadow_only") is not True
         or row.get("affects_ranking") is not False
@@ -1344,11 +1513,41 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
     ds_decision_source = row.get("ds_decision_source")
     if ds_decision_source not in _DS_DECISION_SOURCES:
         raise ValueError("invalid E chord receipt contract")
-    pool_ids = _validated_id_list(row.get("pool_ids"))
+    pool_ids = _validated_id_list(
+        row.get("pool_ids"),
+        maximum=58 if is_v3 else 50,
+    )
+    bypass_ids: list[str] = []
+    bypass_source_ids: list[str] = []
+    bypass_limit = 0
+    if is_v3:
+        bypass_ids = _validated_id_list(row.get("bypass_ids"), maximum=8)
+        raw_source_ids = row.get("bypass_source_ids")
+        bypass_limit = row.get("bypass_limit")
+        if (
+            type(raw_source_ids) is not list
+            or len(raw_source_ids) != len(bypass_ids)
+            or any(_safe_id(item) is None for item in raw_source_ids)
+            or type(bypass_limit) is not int
+            or isinstance(bypass_limit, bool)
+            or not 1 <= bypass_limit <= 8
+            or len(bypass_ids) > bypass_limit
+            or (
+                bool(bypass_ids)
+                and pool_ids[-len(bypass_ids):] != bypass_ids
+            )
+            or any(bucket_id in pre_e_cohort_ids for bucket_id in bypass_ids)
+            or any(bucket_id in post_e_cohort_ids for bucket_id in bypass_ids)
+        ):
+            raise ValueError("invalid E chord receipt contract")
+        bypass_source_ids = list(raw_source_ids)
+    natural_pool_ids = (
+        pool_ids[:-len(bypass_ids)] if bypass_ids else pool_ids
+    )
     expected_cohort_status = _a_cohort_status(
         pre_e_cohort_ids,
         post_e_cohort_ids,
-        pool_ids,
+        natural_pool_ids if is_v3 else pool_ids,
         ds_decision_source,
     )
     if row.get("a_cohort_status") != expected_cohort_status:
@@ -1366,7 +1565,11 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
         raise ValueError("invalid E chord receipt contract")
     guard_by_id: dict[str, dict[str, Any]] = {}
     expected_guard_keys = (
-        _CANDIDATE_GUARD_KEYS if is_v2 else _LEGACY_CANDIDATE_GUARD_KEYS
+        _BYPASS_CANDIDATE_GUARD_KEYS
+        if is_v3
+        else _CANDIDATE_GUARD_KEYS
+        if is_v2
+        else _LEGACY_CANDIDATE_GUARD_KEYS
     )
     for index, guard in enumerate(candidate_guards):
         if type(guard) is not dict or set(guard) != expected_guard_keys:
@@ -1374,6 +1577,7 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
         bucket_id = guard.get("id")
         lock_digests = guard.get("event_lock_digests")
         source_bucket_id = guard.get("e_source_bucket_id", "")
+        expected_origin = "bypass" if bucket_id in set(bypass_ids) else "natural"
         if (
             bucket_id != pool_ids[index]
             or type(lock_digests) is not list
@@ -1387,6 +1591,10 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
                 is_v2
                 and source_bucket_id != ""
                 and _safe_id(source_bucket_id) is None
+            )
+            or (
+                is_v3
+                and guard.get("origin") != expected_origin
             )
             or type(guard.get("is_factual")) is not bool
             or type(guard.get("author_match")) is not bool
@@ -1411,6 +1619,18 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
         ):
             raise ValueError("invalid E chord receipt contract")
         guard_by_id[bucket_id] = guard
+    if is_v3:
+        for bucket_id, source_bucket_id in zip(
+            bypass_ids,
+            bypass_source_ids,
+            strict=True,
+        ):
+            guard = guard_by_id[bucket_id]
+            if (
+                guard.get("e_source_bucket_id") != source_bucket_id
+                or guard.get("e_admissibility") != "admissible"
+            ):
+                raise ValueError("invalid E chord receipt contract")
     if candidate_guards and (
         len({guard["input_polarity"] for guard in candidate_guards}) != 1
         or len({guard["e_resonance_floor_milli"] for guard in candidate_guards}) != 1
@@ -1441,6 +1661,11 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
             or type(swap.get("event_lock_digest")) is not str
             or _HEX16_RE.fullmatch(swap["event_lock_digest"]) is None
             or band_by_id[swap["promoted_id"]] != band_by_id[swap["demoted_id"]]
+            or (
+                is_v3
+                and guard_by_id[swap["promoted_id"]]["origin"]
+                != guard_by_id[swap["demoted_id"]]["origin"]
+            )
         ):
             raise ValueError("invalid E chord receipt contract")
         promoted_guard = guard_by_id[swap["promoted_id"]]
@@ -1530,13 +1755,17 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
         if type(value) is not dict or set(value) != {"a", "b", "c"}:
             raise ValueError("invalid E chord receipt contract")
         for arm in ("a", "b", "c"):
-            _validated_id_list(value[arm])
+            _validated_id_list(
+                value[arm],
+                maximum=(58 if is_v3 and name == "arms" else 50),
+            )
     if row["arms"]["b"] != pool_ids:
         raise ValueError("invalid E chord receipt contract")
     if row["arms"]["c"] != reconstructed_c:
         raise ValueError("invalid E chord receipt contract")
     if row["a_cohort_status"] == "pure_semantic":
-        if row["arms"]["a"] != pre_e_cohort_ids:
+        expected_a = pre_e_cohort_ids + (bypass_ids if is_v3 else [])
+        if row["arms"]["a"] != expected_a:
             raise ValueError("invalid E chord receipt contract")
     elif row["arms"]["a"] != row["arms"]["b"]:
         # An unscorable turn gets a neutral B placeholder, never a fabricated
@@ -1553,7 +1782,11 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
         if row["first_screen"][arm] != row["arms"][arm][:row["first_screen_limit"]]:
             raise ValueError("invalid E chord receipt contract")
     diagnostics = row.get("diagnostics")
-    if type(diagnostics) is not dict or set(diagnostics) != _DIAGNOSTIC_KEYS:
+    if (
+        type(diagnostics) is not dict
+        or set(diagnostics)
+        != (_BYPASS_DIAGNOSTIC_KEYS if is_v3 else _DIAGNOSTIC_KEYS)
+    ):
         raise ValueError("invalid E chord receipt contract")
     if type(diagnostics.get("same_candidate_pool")) is not bool:
         raise ValueError("invalid E chord receipt contract")
@@ -1567,6 +1800,8 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
         "zero_to_nonzero",
         "external_api_delta",
     }
+    if is_v3:
+        binary_diagnostics.add("bypass_boundary")
     for name in binary_diagnostics:
         if type(diagnostics.get(name)) is not int or diagnostics[name] < 0:
             raise ValueError("invalid E chord receipt contract")
@@ -1589,6 +1824,12 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
         != recomputed_e_admissibility_moves
     ):
         raise ValueError("invalid E chord receipt contract")
+    if (
+        is_v3
+        and diagnostics["bypass_boundary"]
+        and (row["swaps"] or row["arms"]["c"] != row["arms"]["b"])
+    ):
+        raise ValueError("invalid E chord receipt contract")
     recomputed_displacement = max(
         (
             abs(row["arms"]["c"].index(bucket_id) - index)
@@ -1607,6 +1848,7 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
         + diagnostics["cross_author_moves"]
         + diagnostics["e_admissibility_moves"]
         + diagnostics["zero_to_nonzero"]
+        + (diagnostics["bypass_boundary"] if is_v3 else 0)
     )
     if diagnostics["hard_violation_count"] != expected_hard_count:
         raise ValueError("invalid E chord receipt contract")
@@ -1688,17 +1930,31 @@ _FINAL_SELECTION_KEYS = frozenset({
     "applied_swaps",
     "request_path_delta_ms",
 })
+_BYPASS_FINAL_SELECTION_KEYS = _FINAL_SELECTION_KEYS | frozenset({
+    "bypass_ids",
+    "bypass_source_ids",
+    "bypass_limit",
+})
 
 
 def validate_final_selection(value: object) -> dict[str, Any]:
     """Validate Twin's text-free post-filter A/B/C final selection receipt."""
 
-    if type(value) is not dict or set(value) != _FINAL_SELECTION_KEYS:
+    if type(value) is not dict:
         raise ValueError("invalid E chord final selection contract")
     schema = value.get("schema")
-    if schema not in {LEGACY_FINAL_SELECTION_SCHEMA, FINAL_SELECTION_SCHEMA}:
+    if schema not in {
+        LEGACY_FINAL_SELECTION_SCHEMA,
+        FINAL_SELECTION_SCHEMA,
+        BYPASS_FINAL_SELECTION_SCHEMA,
+    }:
         raise ValueError("invalid E chord final selection contract")
-    is_v2 = schema == FINAL_SELECTION_SCHEMA
+    is_v3 = schema == BYPASS_FINAL_SELECTION_SCHEMA
+    if set(value) != (
+        _BYPASS_FINAL_SELECTION_KEYS if is_v3 else _FINAL_SELECTION_KEYS
+    ):
+        raise ValueError("invalid E chord final selection contract")
+    is_v2 = schema in {FINAL_SELECTION_SCHEMA, BYPASS_FINAL_SELECTION_SCHEMA}
     if type(value.get("recorded_at_ms")) is not int or value["recorded_at_ms"] < 0:
         raise ValueError("invalid E chord final selection contract")
     if _safe_id(value.get("agent_id")) is None:
@@ -1712,17 +1968,49 @@ def validate_final_selection(value: object) -> dict[str, Any]:
         or not 0 <= value["attempt_index"] <= 3
     ):
         raise ValueError("invalid E chord final selection contract")
-    pool_ids = _validated_id_list(value.get("pool_ids"))
+    pool_ids = _validated_id_list(
+        value.get("pool_ids"),
+        maximum=58 if is_v3 else 50,
+    )
+    bypass_ids: list[str] = []
+    bypass_source_ids: list[str] = []
+    if is_v3:
+        bypass_ids = _validated_id_list(value.get("bypass_ids"), maximum=8)
+        raw_source_ids = value.get("bypass_source_ids")
+        bypass_limit = value.get("bypass_limit")
+        if (
+            type(raw_source_ids) is not list
+            or len(raw_source_ids) != len(bypass_ids)
+            or any(_safe_id(item) is None for item in raw_source_ids)
+            or type(bypass_limit) is not int
+            or isinstance(bypass_limit, bool)
+            or not 1 <= bypass_limit <= 8
+            or len(bypass_ids) > bypass_limit
+            or (
+                bool(bypass_ids)
+                and pool_ids[-len(bypass_ids):] != bypass_ids
+            )
+        ):
+            raise ValueError("invalid E chord final selection contract")
+        bypass_source_ids = list(raw_source_ids)
+    natural_pool_ids = (
+        pool_ids[:-len(bypass_ids)] if bypass_ids else pool_ids
+    )
     final_input_ids = _validated_id_list(value.get("final_input_cohort_ids"))
-    if len(final_input_ids) > 50 or not set(final_input_ids) <= set(pool_ids):
+    if (
+        len(final_input_ids) > 50
+        or not set(final_input_ids) <= set(natural_pool_ids)
+    ):
         raise ValueError("invalid E chord final selection contract")
     if final_input_ids != [
-        bucket_id for bucket_id in pool_ids if bucket_id in set(final_input_ids)
+        bucket_id
+        for bucket_id in natural_pool_ids
+        if bucket_id in set(final_input_ids)
     ]:
         raise ValueError("invalid E chord final selection contract")
     expected_final_cohort_status = (
         "pure_same_cohort"
-        if final_input_ids == pool_ids
+        if final_input_ids == natural_pool_ids
         else "unscorable_final_cohort_drift"
     )
     if value.get("final_input_cohort_status") != expected_final_cohort_status:
@@ -1732,6 +2020,8 @@ def validate_final_selection(value: object) -> dict[str, Any]:
     if len(final_ids) > 32 or len(outside_ids) > 32:
         raise ValueError("invalid E chord final selection contract")
     pool = set(pool_ids)
+    if is_v3 and set(final_ids) & set(bypass_ids):
+        raise ValueError("invalid E chord final selection contract")
     if [bucket_id for bucket_id in final_ids if bucket_id not in pool] != outside_ids:
         raise ValueError("invalid E chord final selection contract")
     arms = value.get("arms")
@@ -1739,7 +2029,7 @@ def validate_final_selection(value: object) -> dict[str, Any]:
         raise ValueError("invalid E chord final selection contract")
     for arm in ("a", "b", "c"):
         arm_ids = _validated_id_list(arms[arm])
-        if len(arm_ids) > 32 or not set(arm_ids) <= pool:
+        if len(arm_ids) > 32 or not set(arm_ids) <= set(natural_pool_ids):
             raise ValueError("invalid E chord final selection contract")
     if arms["b"] != [bucket_id for bucket_id in final_ids if bucket_id in pool]:
         raise ValueError("invalid E chord final selection contract")
@@ -1891,6 +2181,8 @@ __all__ = [
     "EChordShadowConfig",
     "EChordShadowLedger",
     "EChordFinalSelectionLedger",
+    "BYPASS_FINAL_SELECTION_SCHEMA",
+    "BYPASS_RECEIPT_SCHEMA",
     "FINAL_SELECTION_SCHEMA",
     "LiveChord",
     "LiveChordFacet",
@@ -1902,6 +2194,7 @@ __all__ = [
     "parse_live_chord",
     "propose_chord_reorder",
     "rank_within_frozen_relevance_bands",
+    "select_bypass_candidates",
     "validate_shadow_receipt",
     "validate_final_selection",
 ]

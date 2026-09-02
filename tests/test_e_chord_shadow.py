@@ -8,6 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from e_chord_shadow import (
+    BYPASS_FINAL_SELECTION_SCHEMA,
+    BYPASS_RECEIPT_SCHEMA,
     EChordFinalSelectionLedger,
     EChordShadowLedger,
     FINAL_SELECTION_SCHEMA,
@@ -17,6 +19,7 @@ from e_chord_shadow import (
     load_e_chord_shadow_config,
     parse_live_chord,
     propose_chord_reorder,
+    select_bypass_candidates,
     session_scope_digest,
     validate_final_selection,
     validate_shadow_receipt,
@@ -85,8 +88,17 @@ def _candidate(
     query_valence=0.0,
     experience_valence=0.0,
     e_resonance=0.8,
+    source="",
+    priority=50,
+    recorded_at="2026-09-02T12:00:00+08:00",
 ):
-    metadata = {"event_id": event, "type": "experience"}
+    metadata = {
+        "event_id": event,
+        "type": "experience",
+        "recorded_at": recorded_at,
+    }
+    if source:
+        metadata["e_source_bucket_id"] = source
     if fact:
         metadata.update({"fact_key": "preference.example", "fact_status": "current"})
     return {
@@ -101,6 +113,7 @@ def _candidate(
             "confidence": 0.9,
             "authored_by": author,
             "valence": experience_valence,
+            "initial_priority": priority,
         },
         "_e_axis_query_valence": query_valence,
         "_e_axis_resonance": e_resonance,
@@ -182,6 +195,7 @@ def test_parser_fails_closed_on_scope_privacy_freshness_and_mapping(mutate, reas
 
 def test_config_is_default_off_and_active_contract_is_bounded(monkeypatch):
     monkeypatch.delenv("OMBRE_E_CHORD_DERIVED_LOCK", raising=False)
+    monkeypatch.delenv("OMBRE_E_CHORD_BYPASS", raising=False)
     assert load_e_chord_shadow_config({}).enabled is False
     assert load_e_chord_shadow_config({"e_chord_shadow": {"enabled": True}}).enabled is False
     active = load_e_chord_shadow_config({
@@ -195,10 +209,22 @@ def test_config_is_default_off_and_active_contract_is_bounded(monkeypatch):
     assert active.enabled is True
     assert active.near_tie_epsilon == 0.03
     assert active.derived_lock_enabled is False
+    assert active.bypass_enabled is False
+    assert active.bypass_limit == 4
     monkeypatch.setenv("OMBRE_E_CHORD_DERIVED_LOCK", "1")
     assert load_e_chord_shadow_config({
         "e_chord_shadow": {"enabled": True, "mode": "shadow"}
     }).derived_lock_enabled is True
+    monkeypatch.setenv("OMBRE_E_CHORD_BYPASS", "1")
+    bypass = load_e_chord_shadow_config({
+        "e_chord_shadow": {
+            "enabled": True,
+            "mode": "shadow",
+            "bypass_limit": 8,
+        }
+    })
+    assert bypass.bypass_enabled is True
+    assert bypass.bypass_limit == 8
     with pytest.raises(ValueError, match="near_tie_epsilon"):
         load_e_chord_shadow_config({
             "e_chord_shadow": {
@@ -207,6 +233,101 @@ def test_config_is_default_off_and_active_contract_is_bounded(monkeypatch):
                 "near_tie_epsilon": math.nan,
             }
         })
+
+
+def test_bypass_selection_requires_source_admissibility_and_respects_cap():
+    natural = [_candidate("natural")]
+    sources = {
+        "source-a": {"id": "source-a", "metadata": {}},
+        "source-b": {"id": "source-b", "metadata": {}},
+        "source-c": {"id": "source-c", "metadata": {}},
+    }
+    candidates = [
+        _candidate(
+            "older-high",
+            source="source-a",
+            priority=90,
+            recorded_at="2026-09-01T12:00:00+08:00",
+        ),
+        _candidate(
+            "newer-high",
+            source="source-b",
+            priority=90,
+            recorded_at="2026-09-02T12:00:00+08:00",
+        ),
+        _candidate("lower", source="source-c", priority=80),
+        _candidate("missing-source", priority=100),
+        _candidate("unknown-source", source="not-loaded", priority=100),
+        _candidate(
+            "opposite",
+            source="source-c",
+            priority=100,
+            query_valence=-0.9,
+            experience_valence=0.9,
+        ),
+        _candidate("natural", source="source-a", priority=100),
+    ]
+
+    selected = select_bypass_candidates(
+        candidates,
+        natural,
+        source_buckets_by_id=sources,
+        limit=2,
+    )
+
+    assert [candidate["id"] for candidate in selected] == [
+        "newer-high",
+        "older-high",
+    ]
+
+
+def test_bypass_segment_swaps_internally_but_never_across_boundary():
+    rows = [
+        _candidate("natural", tendency="engage", e_score=0.52, relevance_band=1),
+        _candidate(
+            "bypass-left",
+            tendency="engage",
+            e_score=0.52,
+            relevance_band=1,
+            source="source-left",
+        ),
+        _candidate(
+            "bypass-right",
+            tendency="comfort",
+            e_score=0.50,
+            relevance_band=1,
+            source="source-right",
+        ),
+    ]
+
+    proposal = propose_chord_reorder(
+        rows,
+        _parse(),
+        bypass_ids=("bypass-left", "bypass-right"),
+    )
+
+    assert proposal.c_ids == ("natural", "bypass-right", "bypass-left")
+    assert [swap.promoted_id for swap in proposal.swaps] == ["bypass-right"]
+    assert "bypass_boundary" in proposal.skipped_reasons
+    assert proposal.violations == ()
+
+
+def test_bypass_boundary_violation_clears_the_whole_proposal():
+    rows = [
+        _candidate("natural", tendency="engage", e_score=0.52),
+        _candidate("bypass-left", tendency="engage", e_score=0.52),
+        _candidate("bypass-right", tendency="comfort", e_score=0.50),
+    ]
+
+    proposal = propose_chord_reorder(
+        rows,
+        _parse(),
+        bypass_ids=("bypass-left",),
+    )
+
+    assert proposal.c_ids == proposal.b_ids
+    assert proposal.swaps == ()
+    assert proposal.violations == ("bypass_boundary",)
 
 
 def test_same_event_near_tie_can_propose_one_adjacent_swap_without_mutation():
@@ -614,6 +735,165 @@ def test_receipt_has_same_frozen_pool_and_no_private_text_or_session_identifiers
         assert forbidden not in raw
 
 
+def test_bypass_receipt_v3_binds_suffix_sources_origins_and_stays_text_free():
+    natural = _candidate("natural", tendency="engage", e_score=0.52)
+    bypass_left = _candidate(
+        "bypass-left",
+        tendency="engage",
+        e_score=0.52,
+        relevance_band=1,
+        source="source-left",
+        priority=90,
+    )
+    bypass_right = _candidate(
+        "bypass-right",
+        tendency="comfort",
+        e_score=0.50,
+        relevance_band=1,
+        source="source-right",
+        priority=80,
+    )
+    rows = [natural, bypass_left, bypass_right]
+    chord = _parse()
+    proposal = propose_chord_reorder(
+        rows,
+        chord,
+        bypass_ids=("bypass-left", "bypass-right"),
+    )
+    receipt = build_shadow_receipt(
+        chord=chord,
+        payload_status="accepted",
+        pre_e_cohort_ids=["natural"],
+        post_e_cohort_ids=["natural"],
+        ds_decision_source="disabled",
+        a_candidates=[natural],
+        b_candidates=rows,
+        proposal=proposal,
+        attempt_index=0,
+        first_screen_limit=1,
+        request_path_delta_ms=0.2,
+        recorded_at_ms=NOW_MS,
+        bypass_enabled=True,
+        bypass_ids=("bypass-left", "bypass-right"),
+        bypass_limit=4,
+    )
+
+    assert receipt["schema"] == BYPASS_RECEIPT_SCHEMA
+    assert receipt["bypass_ids"] == ["bypass-left", "bypass-right"]
+    assert receipt["bypass_source_ids"] == ["source-left", "source-right"]
+    assert receipt["bypass_limit"] == 4
+    assert [guard["origin"] for guard in receipt["candidate_guards"]] == [
+        "natural",
+        "bypass",
+        "bypass",
+    ]
+    assert receipt["arms"]["a"] == ["natural", "bypass-left", "bypass-right"]
+    assert receipt["arms"]["c"] == ["natural", "bypass-right", "bypass-left"]
+    assert receipt["diagnostics"]["bypass_boundary"] == 0
+    assert receipt["diagnostics"]["external_api_delta"] == 0
+    assert validate_shadow_receipt(receipt) is receipt
+    encoded = json.dumps(receipt, ensure_ascii=False, allow_nan=False)
+    assert "content" not in encoded
+    assert "query" not in encoded
+
+
+def test_bypass_disabled_is_byte_for_byte_v2_equivalent():
+    rows = [
+        _candidate("plain", tendency="engage", e_score=0.52),
+        _candidate("comfort", tendency="comfort", e_score=0.50),
+    ]
+    chord = _parse()
+    proposal = propose_chord_reorder(rows, chord)
+    common = {
+        "chord": chord,
+        "payload_status": "accepted",
+        "pre_e_cohort_ids": ["plain", "comfort"],
+        "post_e_cohort_ids": ["plain", "comfort"],
+        "ds_decision_source": "disabled",
+        "a_candidates": rows,
+        "b_candidates": rows,
+        "proposal": proposal,
+        "attempt_index": 0,
+        "first_screen_limit": 2,
+        "request_path_delta_ms": 0.2,
+        "recorded_at_ms": NOW_MS,
+    }
+
+    before = build_shadow_receipt(**common)
+    disabled = build_shadow_receipt(
+        **common,
+        bypass_enabled=False,
+        bypass_ids=(),
+        bypass_limit=4,
+    )
+
+    assert before["schema"] == "e_chord_shadow_receipt.v2"
+    assert json.dumps(before, sort_keys=True, separators=(",", ":")) == json.dumps(
+        disabled,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def test_bypass_v3_validator_rejects_cross_boundary_swap():
+    natural = _candidate("natural", tendency="engage", e_score=0.52)
+    bypass = _candidate(
+        "bypass",
+        tendency="comfort",
+        e_score=0.50,
+        source="source-bypass",
+    )
+    rows = [natural, bypass]
+    chord = _parse()
+    safe_proposal = propose_chord_reorder(
+        rows,
+        chord,
+        bypass_ids=("bypass",),
+    )
+    receipt = build_shadow_receipt(
+        chord=chord,
+        payload_status="accepted",
+        pre_e_cohort_ids=["natural"],
+        post_e_cohort_ids=["natural"],
+        ds_decision_source="disabled",
+        a_candidates=[natural],
+        b_candidates=rows,
+        proposal=safe_proposal,
+        attempt_index=0,
+        first_screen_limit=1,
+        request_path_delta_ms=0.1,
+        recorded_at_ms=NOW_MS,
+        bypass_enabled=True,
+        bypass_ids=("bypass",),
+        bypass_limit=4,
+    )
+    forged = copy.deepcopy(receipt)
+    forged["swaps"] = [{
+        "promoted_id": "bypass",
+        "demoted_id": "natural",
+        "from_index": 1,
+        "to_index": 0,
+        "event_lock_digest": next(iter(
+            set(forged["candidate_guards"][0]["event_lock_digests"])
+            & set(forged["candidate_guards"][1]["event_lock_digests"])
+        )),
+        "lock_kind": "strong",
+        "source_bucket_ids": [],
+        "derived_lock_basis": "",
+        "relation_type": "",
+        "relation_from_id": "",
+        "relation_to_id": "",
+        "recorded_day": "",
+        "domain_digest": "",
+    }]
+    forged["arms"]["c"] = ["bypass", "natural"]
+    forged["first_screen"]["c"] = ["bypass"]
+    forged["diagnostics"]["max_displacement"] = 1
+
+    with pytest.raises(ValueError, match="receipt contract"):
+        validate_shadow_receipt(forged)
+
+
 def test_derived_receipt_binds_candidate_sources_and_legacy_v1_still_loads():
     left, right = _derived_candidates()
     sources = {
@@ -942,6 +1222,32 @@ def test_final_selection_validator_binds_actual_injection_and_pool_boundary():
     assert validate_final_selection(outside)["outside_pool_ids"] == ["other"]
 
 
+def test_bypass_final_selection_v3_never_accepts_bypass_as_injected():
+    selection = _final_selection(
+        schema=BYPASS_FINAL_SELECTION_SCHEMA,
+        pool_ids=["natural", "bypass-a", "bypass-b"],
+        final_input_cohort_ids=["natural"],
+        final_input_cohort_status="pure_same_cohort",
+        final_injected_ids=["natural"],
+        arms={"a": ["natural"], "b": ["natural"], "c": ["natural"]},
+        bypass_ids=["bypass-a", "bypass-b"],
+        bypass_source_ids=["source-a", "source-b"],
+        bypass_limit=4,
+    )
+
+    assert validate_final_selection(selection) is selection
+
+    leaked = copy.deepcopy(selection)
+    leaked["final_injected_ids"] = ["natural", "bypass-a"]
+    leaked["arms"] = {
+        "a": ["natural", "bypass-a"],
+        "b": ["natural", "bypass-a"],
+        "c": ["natural", "bypass-a"],
+    }
+    with pytest.raises(ValueError, match="final selection contract"):
+        validate_final_selection(leaked)
+
+
 def test_final_selection_validator_reconstructs_only_declared_boundary_swaps():
     swap = {
         "promoted_id": "b",
@@ -1126,6 +1432,82 @@ def test_server_shadow_hook_uses_derived_source_proof_without_external_call(
         "source-left", "source-right",
     ]
     assert receipt["diagnostics"]["external_api_delta"] == 0
+    assert written == [receipt]
+
+
+def test_server_shadow_hook_appends_bypass_only_to_v3_shadow_pool(monkeypatch):
+    import server
+
+    written = []
+
+    class _Ledger:
+        def append(self, row):
+            written.append(copy.deepcopy(row))
+
+    async def _inline_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    natural = [_candidate("natural", relevance_band=0)]
+    bypass = [
+        _candidate(
+            "bypass-left",
+            tendency="engage",
+            e_score=0.52,
+            relevance_band=1,
+            source="source-left",
+        ),
+        _candidate(
+            "bypass-right",
+            tendency="comfort",
+            e_score=0.50,
+            relevance_band=1,
+            source="source-right",
+        ),
+    ]
+    natural_before = copy.deepcopy(natural)
+    monkeypatch.setenv("OMBRE_E_CHORD_BYPASS", "1")
+    monkeypatch.setitem(server.config, "e_chord_shadow", {
+        "enabled": True,
+        "mode": "shadow",
+        "near_tie_epsilon": 0.03,
+        "max_age_ms": 30_000,
+        "bypass_limit": 4,
+    })
+    monkeypatch.setattr(server, "_get_e_chord_shadow_ledger", lambda: _Ledger())
+    monkeypatch.setattr(server.asyncio, "to_thread", _inline_to_thread)
+
+    async def _run():
+        receipt = await server._record_e_chord_shadow(
+            raw_chord=_payload(captured_at_ms=int(server.time.time() * 1000)),
+            expected_turn_id="turn-abc123",
+            expected_agent_id="claude",
+            expected_session_id=TEST_SESSION_ID,
+            a_candidates=natural,
+            post_e_candidates=natural,
+            b_candidates=natural,
+            bypass_candidates=bypass,
+            ds_decision_source="disabled",
+            chord_config=load_e_chord_shadow_config(server.config),
+            prelude_elapsed_ms=0.0,
+            attempt_index=0,
+            first_screen_limit=1,
+        )
+        if server._e_chord_shadow_write_tasks:
+            await asyncio.gather(*tuple(server._e_chord_shadow_write_tasks))
+        return receipt
+
+    receipt = asyncio.run(_run())
+
+    assert natural == natural_before
+    assert receipt is not None
+    assert receipt["schema"] == BYPASS_RECEIPT_SCHEMA
+    assert receipt["arms"]["b"] == [
+        "natural", "bypass-left", "bypass-right",
+    ]
+    assert receipt["arms"]["c"] == [
+        "natural", "bypass-right", "bypass-left",
+    ]
+    assert receipt["bypass_ids"] == ["bypass-left", "bypass-right"]
     assert written == [receipt]
 
 

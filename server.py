@@ -47,7 +47,7 @@ import re
 import time
 import httpx
 import jieba
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -155,6 +155,7 @@ from e_chord_shadow import (
     parse_live_chord,
     propose_chord_reorder,
     rank_within_frozen_relevance_bands,
+    select_bypass_candidates,
     validate_shadow_receipt,
     validate_final_selection,
 )
@@ -164,6 +165,7 @@ from e_axis_recall import (
     format_response_posture,
     group_primary_authored_buckets,
     infer_query_emotion,
+    initial_priority_score,
     load_e_axis_recall_config,
     rank_annotation_bucket_ids,
     resolve_resonance_score,
@@ -4346,6 +4348,82 @@ async def _auto_infer_edges(
 # With args: search by keyword + emotion coordinates
 # 有参数：按关键词+情感坐标检索记忆
 # =============================================================
+def _e_chord_bypass_candidates(
+    *,
+    natural_b_candidates: list[dict],
+    source_buckets_by_id: Mapping[str, Mapping[str, object]],
+    e_rows_by_bucket: Mapping[str, Sequence[Mapping[str, object]]],
+    e_recall_config: object,
+    e_query_emotion: object,
+    e_semantic_scores: Mapping[str, float],
+    admissibility_floor: float,
+    limit: int,
+) -> list[dict]:
+    """Decorate and select source-bound E rows for the shadow pool only."""
+
+    natural_ids = {
+        str(candidate.get("id") or "") for candidate in natural_b_candidates
+    }
+    natural_band_ids = [
+        candidate.get("_e_chord_relevance_band_id")
+        for candidate in natural_b_candidates
+        if type(candidate.get("_e_chord_relevance_band_id")) is int
+    ]
+    bypass_band_id = max(natural_band_ids, default=-1) + 1
+    decorated: list[dict] = []
+    for bucket_id, rows in e_rows_by_bucket.items():
+        normalized_id = str(bucket_id or "")
+        if not normalized_id or normalized_id in natural_ids or not rows:
+            continue
+        resident = source_buckets_by_id.get(normalized_id)
+        if not isinstance(resident, Mapping):
+            continue
+        try:
+            annotation = select_current_annotation(
+                rows,
+                resident,
+                e_recall_config,
+            )
+            if annotation is None:
+                continue
+            resonance = resolve_resonance_score(
+                e_query_emotion,
+                annotation,
+                semantic_similarity=e_semantic_scores.get(normalized_id),
+                semantic_enabled=bool(
+                    getattr(e_recall_config, "semantic_resonance_enabled", False)
+                ),
+            )
+            priority_score = initial_priority_score(rows[0])
+        except Exception as exc:
+            logger.warning(
+                "E chord bypass candidate rejected %s: %s",
+                normalized_id,
+                type(exc).__name__,
+            )
+            continue
+        candidate = dict(resident)
+        candidate.update({
+            "_e_axis_annotation": annotation,
+            "_e_axis_resonance": resonance,
+            "_e_axis_query_valence": getattr(e_query_emotion, "valence", None),
+            "_e_axis_admissibility_floor": admissibility_floor,
+            "_pre_e_tie_break_score": priority_score,
+            "_non_relevance_tie_break_score": priority_score,
+            "_e_chord_relevance_band_id": bypass_band_id,
+        })
+        decorated.append(candidate)
+    return [
+        dict(candidate)
+        for candidate in select_bypass_candidates(
+            decorated,
+            natural_b_candidates,
+            source_buckets_by_id=source_buckets_by_id,
+            limit=limit,
+        )
+    ]
+
+
 async def _record_e_chord_shadow(
     *,
     raw_chord: object,
@@ -4355,6 +4433,7 @@ async def _record_e_chord_shadow(
     a_candidates: list[dict],
     post_e_candidates: list[dict],
     b_candidates: list[dict],
+    bypass_candidates: Sequence[Mapping[str, object]] = (),
     ds_decision_source: str,
     chord_config: EChordShadowConfig,
     prelude_elapsed_ms: float,
@@ -4381,10 +4460,16 @@ async def _record_e_chord_shadow(
         return None
 
     allowed_relation_types, hop_min_strength = _relation_recall_edge_policy()
+    active_bypass = (
+        list(bypass_candidates) if chord_config.bypass_enabled else []
+    )
+    shadow_b_candidates = [*b_candidates, *active_bypass]
+    bypass_ids = [str(candidate.get("id") or "") for candidate in active_bypass]
     proposal = propose_chord_reorder(
-        b_candidates,
+        shadow_b_candidates,
         chord,
         near_tie_epsilon=chord_config.near_tie_epsilon,
+        bypass_ids=bypass_ids,
         derived_lock_enabled=chord_config.derived_lock_enabled,
         source_buckets_by_id=source_buckets_by_id or {},
         allowed_relation_types=allowed_relation_types,
@@ -4401,12 +4486,15 @@ async def _record_e_chord_shadow(
         ],
         ds_decision_source=ds_decision_source,
         a_candidates=a_candidates,
-        b_candidates=b_candidates,
+        b_candidates=shadow_b_candidates,
         proposal=proposal,
         attempt_index=attempt_index,
         first_screen_limit=max(0, min(first_screen_limit, 50)),
         request_path_delta_ms=0.0,
         recorded_at_ms=recorded_at_ms,
+        bypass_enabled=chord_config.bypass_enabled,
+        bypass_ids=bypass_ids,
+        bypass_limit=chord_config.bypass_limit,
     )
     # Validate before enqueue.  The append/fsync itself is deliberately
     # off-path, so this measured delta covers every synchronous shadow step
@@ -5495,6 +5583,7 @@ async def breath(
     chord_shadow_a_candidates: list[dict] = []
     chord_shadow_post_e_candidates: list[dict] = []
     chord_shadow_ds_decision_source = "unobserved"
+    chord_shadow_admissibility_floor = 0.55
     if live_chord is not None:
         try:
             candidate_config = load_e_chord_shadow_config(config)
@@ -5507,6 +5596,7 @@ async def breath(
                         if e_recall_cfg is not None else 0.55
                     ),
                 )
+                chord_shadow_admissibility_floor = admissibility_floor
                 band_by_id = frozen_relevance_band_ids(matches, fused_band)
                 for bucket in matches:
                     bucket["_e_axis_query_valence"] = (
@@ -6113,6 +6203,23 @@ async def breath(
                 raise ValueError("invalid first_screen_limit")
             if not 0 <= attempt <= 3:
                 raise ValueError("invalid e_chord_attempt")
+            bypass_candidates: list[dict] = []
+            if (
+                chord_shadow_config.bypass_enabled
+                and e_recall_cfg is not None
+                and e_query_emotion is not None
+                and e_rows_by_bucket
+            ):
+                bypass_candidates = _e_chord_bypass_candidates(
+                    natural_b_candidates=chord_shadow_b_candidates,
+                    source_buckets_by_id=keyword_candidate_by_id,
+                    e_rows_by_bucket=e_rows_by_bucket,
+                    e_recall_config=e_recall_cfg,
+                    e_query_emotion=e_query_emotion,
+                    e_semantic_scores=e_semantic_scores,
+                    admissibility_floor=chord_shadow_admissibility_floor,
+                    limit=chord_shadow_config.bypass_limit,
+                )
             await _record_e_chord_shadow(
                 raw_chord=live_chord,
                 expected_turn_id=str(turn_id or ""),
@@ -6121,6 +6228,7 @@ async def breath(
                 a_candidates=chord_shadow_a_candidates,
                 post_e_candidates=chord_shadow_post_e_candidates,
                 b_candidates=chord_shadow_b_candidates,
+                bypass_candidates=bypass_candidates,
                 source_buckets_by_id=keyword_candidate_by_id,
                 ds_decision_source=chord_shadow_ds_decision_source,
                 chord_config=chord_shadow_config,
