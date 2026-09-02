@@ -11,12 +11,15 @@ from e_chord_shadow import (
     EChordFinalSelectionLedger,
     EChordShadowLedger,
     FINAL_SELECTION_SCHEMA,
+    LEGACY_FINAL_SELECTION_SCHEMA,
+    LEGACY_RECEIPT_SCHEMA,
     build_shadow_receipt,
     load_e_chord_shadow_config,
     parse_live_chord,
     propose_chord_reorder,
     session_scope_digest,
     validate_final_selection,
+    validate_shadow_receipt,
 )
 
 
@@ -177,7 +180,8 @@ def test_parser_fails_closed_on_scope_privacy_freshness_and_mapping(mutate, reas
     assert observed == reason
 
 
-def test_config_is_default_off_and_active_contract_is_bounded():
+def test_config_is_default_off_and_active_contract_is_bounded(monkeypatch):
+    monkeypatch.delenv("OMBRE_E_CHORD_DERIVED_LOCK", raising=False)
     assert load_e_chord_shadow_config({}).enabled is False
     assert load_e_chord_shadow_config({"e_chord_shadow": {"enabled": True}}).enabled is False
     active = load_e_chord_shadow_config({
@@ -190,6 +194,11 @@ def test_config_is_default_off_and_active_contract_is_bounded():
     })
     assert active.enabled is True
     assert active.near_tie_epsilon == 0.03
+    assert active.derived_lock_enabled is False
+    monkeypatch.setenv("OMBRE_E_CHORD_DERIVED_LOCK", "1")
+    assert load_e_chord_shadow_config({
+        "e_chord_shadow": {"enabled": True, "mode": "shadow"}
+    }).derived_lock_enabled is True
     with pytest.raises(ValueError, match="near_tie_epsilon"):
         load_e_chord_shadow_config({
             "e_chord_shadow": {
@@ -242,6 +251,173 @@ def test_event_and_e_source_bucket_lock_namespaces_do_not_cross_match():
 
     proposal = propose_chord_reorder([left, right], _parse(), near_tie_epsilon=0.03)
 
+    assert proposal.c_ids == proposal.b_ids
+    assert "event_lock" in proposal.skipped_reasons
+
+
+def _derived_candidates():
+    left = _candidate("left-e", event="left-strong", e_score=0.52)
+    right = _candidate(
+        "right-e",
+        event="right-strong",
+        tendency="comfort",
+        e_score=0.50,
+    )
+    left["metadata"]["e_source_bucket_id"] = "source-left"
+    right["metadata"]["e_source_bucket_id"] = "source-right"
+    return left, right
+
+
+def test_derived_relation_lock_is_opt_in_deterministic_and_auditable():
+    left, right = _derived_candidates()
+    sources = {
+        "source-left": {
+            "id": "source-left",
+            "metadata": {
+                "recorded_at": "2026-09-01T10:00:00+08:00",
+                "domain": ["left-only"],
+                "relations": [{
+                    "type": "explains",
+                    "target": "source-right",
+                    "strength": 0.8,
+                    "generation_method": "deterministic:explicit-reference:v1",
+                }],
+            },
+        },
+        "source-right": {
+            "id": "source-right",
+            "metadata": {
+                "recorded_at": "2026-09-02T10:00:00+08:00",
+                "domain": ["right-only"],
+            },
+        },
+    }
+
+    disabled = propose_chord_reorder(
+        [left, right],
+        _parse(),
+        source_buckets_by_id=sources,
+    )
+    enabled = propose_chord_reorder(
+        [left, right],
+        _parse(),
+        derived_lock_enabled=True,
+        source_buckets_by_id=sources,
+        allowed_relation_types=("explains",),
+        relation_min_strength=0.4,
+    )
+
+    assert disabled.c_ids == disabled.b_ids
+    assert enabled.c_ids == ("right-e", "left-e")
+    swap = enabled.swaps[0]
+    assert swap.lock_kind == "derived"
+    assert swap.derived_lock_basis == "relation"
+    assert swap.source_bucket_ids == ("source-left", "source-right")
+    assert swap.relation_type == "explains"
+    assert (swap.relation_from_id, swap.relation_to_id) == (
+        "source-left", "source-right",
+    )
+    assert len(swap.event_lock_digest) == 16
+
+
+def test_derived_lock_disabled_is_full_proposal_equivalent():
+    left, right = _derived_candidates()
+    sources = {
+        "source-left": {
+            "id": "source-left",
+            "metadata": {
+                "relations": [{
+                    "type": "explains",
+                    "target": "source-right",
+                    "strength": 0.9,
+                    "generation_method": "deterministic:explicit-reference:v1",
+                }],
+            },
+        },
+        "source-right": {"id": "source-right", "metadata": {}},
+    }
+
+    legacy = propose_chord_reorder([left, right], _parse())
+    disabled = propose_chord_reorder(
+        [left, right],
+        _parse(),
+        derived_lock_enabled=False,
+        source_buckets_by_id=sources,
+        allowed_relation_types=("explains",),
+        relation_min_strength=0.4,
+    )
+
+    assert disabled == legacy
+
+
+def test_derived_same_day_domain_lock_and_strong_lock_precedence():
+    left, right = _derived_candidates()
+    sources = {
+        source_id: {
+            "id": source_id,
+            "metadata": {
+                "recorded_at": timestamp,
+                "domain": domains,
+            },
+        }
+        for source_id, timestamp, domains in (
+            ("source-left", "2026-09-02T01:00:00+08:00", ["relationship", "x"]),
+            ("source-right", "2026-09-02T23:00:00+08:00", ["relationship", "y"]),
+        )
+    }
+    derived = propose_chord_reorder(
+        [left, right],
+        _parse(),
+        derived_lock_enabled=True,
+        source_buckets_by_id=sources,
+    )
+    assert derived.swaps[0].lock_kind == "derived"
+    assert derived.swaps[0].derived_lock_basis == "same_day_domain"
+    assert derived.swaps[0].recorded_day == "2026-09-02"
+    assert len(derived.swaps[0].domain_digest) == 16
+
+    left["metadata"]["event_id"] = "shared-strong"
+    right["metadata"]["event_id"] = "shared-strong"
+    strong = propose_chord_reorder(
+        [left, right],
+        _parse(),
+        derived_lock_enabled=True,
+        source_buckets_by_id=sources,
+    )
+    assert strong.swaps[0].lock_kind == "strong"
+    assert strong.swaps[0].source_bucket_ids == ()
+
+
+def test_derived_lock_rejects_model_edge_and_unrelated_day_domain():
+    left, right = _derived_candidates()
+    sources = {
+        "source-left": {
+            "id": "source-left",
+            "metadata": {
+                "recorded_at": "2026-09-01T10:00:00+08:00",
+                "domain": ["left-only"],
+                "relations": [{
+                    "type": "explains",
+                    "target": "source-right",
+                    "strength": 0.9,
+                    "generation_method": "model:relation:v1",
+                }],
+            },
+        },
+        "source-right": {
+            "id": "source-right",
+            "metadata": {
+                "recorded_at": "2026-09-02T10:00:00+08:00",
+                "domain": ["right-only"],
+            },
+        },
+    }
+    proposal = propose_chord_reorder(
+        [left, right],
+        _parse(),
+        derived_lock_enabled=True,
+        source_buckets_by_id=sources,
+    )
     assert proposal.c_ids == proposal.b_ids
     assert "event_lock" in proposal.skipped_reasons
 
@@ -422,6 +598,9 @@ def test_receipt_has_same_frozen_pool_and_no_private_text_or_session_identifiers
     assert receipt["diagnostics"]["same_candidate_pool"] is True
     assert receipt["arms"]["b"] == ["plain", "comfort"]
     assert receipt["arms"]["c"] == ["comfort", "plain"]
+    assert receipt["swaps"][0]["lock_kind"] == "strong"
+    assert receipt["swaps"][0]["source_bucket_ids"] == []
+    assert all("e_source_bucket_id" in guard for guard in receipt["candidate_guards"])
     raw = json.dumps(receipt, ensure_ascii=False, allow_nan=False)
     for forbidden in (
         "turn-abc123",
@@ -433,6 +612,63 @@ def test_receipt_has_same_frozen_pool_and_no_private_text_or_session_identifiers
         "selfcheck",
     ):
         assert forbidden not in raw
+
+
+def test_derived_receipt_binds_candidate_sources_and_legacy_v1_still_loads():
+    left, right = _derived_candidates()
+    sources = {
+        source_id: {
+            "id": source_id,
+            "metadata": {
+                "recorded_at": "2026-09-02T12:00:00+08:00",
+                "domain": ["relationship"],
+            },
+        }
+        for source_id in ("source-left", "source-right")
+    }
+    chord = _parse()
+    proposal = propose_chord_reorder(
+        [left, right],
+        chord,
+        derived_lock_enabled=True,
+        source_buckets_by_id=sources,
+    )
+    receipt = build_shadow_receipt(
+        chord=chord,
+        payload_status="accepted",
+        pre_e_cohort_ids=["left-e", "right-e"],
+        post_e_cohort_ids=["left-e", "right-e"],
+        ds_decision_source="disabled",
+        a_candidates=[left, right],
+        b_candidates=[left, right],
+        proposal=proposal,
+        attempt_index=0,
+        first_screen_limit=2,
+        request_path_delta_ms=0.1,
+        recorded_at_ms=NOW_MS,
+    )
+    assert validate_shadow_receipt(receipt) is receipt
+    assert receipt["swaps"][0]["lock_kind"] == "derived"
+
+    tampered = copy.deepcopy(receipt)
+    tampered["swaps"][0]["source_bucket_ids"] = ["source-left", "source-other"]
+    with pytest.raises(ValueError, match="receipt contract"):
+        validate_shadow_receipt(tampered)
+
+    malformed = copy.deepcopy(receipt)
+    malformed["swaps"][0]["relation_from_id"] = []
+    with pytest.raises(ValueError, match="receipt contract"):
+        validate_shadow_receipt(malformed)
+
+    legacy = copy.deepcopy(receipt)
+    legacy["schema"] = LEGACY_RECEIPT_SCHEMA
+    for guard in legacy["candidate_guards"]:
+        guard.pop("e_source_bucket_id")
+    legacy["swaps"] = []
+    legacy["arms"]["c"] = list(legacy["arms"]["b"])
+    legacy["first_screen"]["c"] = list(legacy["first_screen"]["b"])
+    legacy["diagnostics"]["max_displacement"] = 0
+    assert validate_shadow_receipt(legacy) is legacy
 
 
 def test_receipt_validator_rejects_tampered_candidate_policy_guards():
@@ -713,6 +949,14 @@ def test_final_selection_validator_reconstructs_only_declared_boundary_swaps():
         "from_index": 1,
         "to_index": 0,
         "event_lock_digest": "0" * 16,
+        "lock_kind": "strong",
+        "source_bucket_ids": [],
+        "derived_lock_basis": "",
+        "relation_type": "",
+        "relation_from_id": "",
+        "relation_to_id": "",
+        "recorded_day": "",
+        "domain_digest": "",
     }
     valid = _final_selection(
         pool_ids=["a", "b", "c"],
@@ -721,6 +965,17 @@ def test_final_selection_validator_reconstructs_only_declared_boundary_swaps():
         applied_swaps=[swap],
     )
     assert validate_final_selection(valid)["arms"]["c"] == ["b", "a", "c"]
+
+    legacy = copy.deepcopy(valid)
+    legacy["schema"] = LEGACY_FINAL_SELECTION_SCHEMA
+    legacy["applied_swaps"][0] = {
+        key: legacy["applied_swaps"][0][key]
+        for key in (
+            "promoted_id", "demoted_id", "from_index", "to_index",
+            "event_lock_digest",
+        )
+    }
+    assert validate_final_selection(legacy)["arms"]["c"] == ["b", "a", "c"]
 
     forged = copy.deepcopy(valid)
     forged["arms"]["c"] = ["b", "c", "a"]
@@ -793,6 +1048,85 @@ def test_server_shadow_hook_keeps_served_b_and_writes_one_text_free_receipt(
     assert receipt["arms"]["c"] == ["comfort", "plain"]
     assert written == [receipt]
     assert written[0]["diagnostics"]["external_api_delta"] == 0
+
+
+def test_server_shadow_hook_uses_derived_source_proof_without_external_call(
+    monkeypatch,
+):
+    import server
+
+    written = []
+
+    class _Ledger:
+        def append(self, row):
+            written.append(copy.deepcopy(row))
+
+    async def _inline_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    left, right = _derived_candidates()
+    rows = [left, right]
+    sources = {
+        "source-left": {
+            "id": "source-left",
+            "metadata": {
+                "relations": [{
+                    "type": "explains",
+                    "target": "source-right",
+                    "strength": 0.8,
+                    "generation_method": "deterministic:explicit-reference:v1",
+                }],
+            },
+        },
+        "source-right": {"id": "source-right", "metadata": {}},
+    }
+    payload = _payload(captured_at_ms=int(server.time.time() * 1000))
+    monkeypatch.setenv("OMBRE_E_CHORD_DERIVED_LOCK", "1")
+    monkeypatch.setitem(server.config, "e_chord_shadow", {
+        "enabled": True,
+        "mode": "shadow",
+        "near_tie_epsilon": 0.03,
+        "max_age_ms": 30_000,
+    })
+    monkeypatch.setitem(server.config, "relation_recall", {
+        "propagation_only": True,
+        "propagation_types": ["explains"],
+        "hop1_min_strength": 0.4,
+    })
+    monkeypatch.setattr(server, "_get_e_chord_shadow_ledger", lambda: _Ledger())
+    monkeypatch.setattr(server.asyncio, "to_thread", _inline_to_thread)
+
+    async def _run():
+        receipt = await server._record_e_chord_shadow(
+            raw_chord=payload,
+            expected_turn_id="turn-abc123",
+            expected_agent_id="claude",
+            expected_session_id=TEST_SESSION_ID,
+            a_candidates=rows,
+            post_e_candidates=rows,
+            b_candidates=rows,
+            ds_decision_source="disabled",
+            chord_config=load_e_chord_shadow_config(server.config),
+            prelude_elapsed_ms=0.0,
+            attempt_index=0,
+            first_screen_limit=2,
+            source_buckets_by_id=sources,
+        )
+        if server._e_chord_shadow_write_tasks:
+            await asyncio.gather(*tuple(server._e_chord_shadow_write_tasks))
+        return receipt
+
+    receipt = asyncio.run(_run())
+
+    assert receipt is not None
+    assert receipt["schema"] == "e_chord_shadow_receipt.v2"
+    assert receipt["arms"]["c"] == ["right-e", "left-e"]
+    assert receipt["swaps"][0]["lock_kind"] == "derived"
+    assert receipt["swaps"][0]["source_bucket_ids"] == [
+        "source-left", "source-right",
+    ]
+    assert receipt["diagnostics"]["external_api_delta"] == 0
+    assert written == [receipt]
 
 
 def test_server_shadow_hook_marks_post_e_state_reorder_unscorable(monkeypatch):

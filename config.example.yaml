@@ -149,6 +149,9 @@ e_axis_recall:
 # motivation/hunger 投影，只在语义、Z、session、anchor、DS 已保留的同事件 E 近邻间
 # 生成 C 臂相邻调序提案。真实返回始终保持现有 B 臂；Twin 会在原有
 # recall-receipt 调用中回传最终筛噪后的 text-free A/B/C 选择；不新增检索/API/embedding。
+# 可选环境变量 OMBRE_E_CHORD_DERIVED_LOCK=1 会在两条 E 没有共享强锁时，核对它们的
+# e_source_bucket_id：仅 deterministic 关系边，或同一 recorded_at 日期且 domain 相同，
+# 才形成二级派生锁。默认 0；关闭后提案路径与旧版逐对象等价。
 e_chord_shadow:
   enabled: false
   mode: shadow

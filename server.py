@@ -47,6 +47,7 @@ import re
 import time
 import httpx
 import jieba
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -1140,6 +1141,45 @@ def _z_pair_validation_error(current: dict, historical: dict, fact_key: str) -> 
     return ""
 
 
+def _relation_recall_edge_policy() -> tuple[frozenset[str], dict[int, float]]:
+    """Return the exact typed edge policy used by relation recall."""
+
+    relation_cfg = config.get("relation_recall", {}) or {}
+    raw_propagation_only = relation_cfg.get("propagation_only", True)
+    if isinstance(raw_propagation_only, str):
+        propagation_only = raw_propagation_only.strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+    else:
+        propagation_only = bool(raw_propagation_only)
+
+    if propagation_only:
+        classification = PROPAGATION_RELATION_TYPES
+        raw_allowed_types = relation_cfg.get(
+            "propagation_types", PROPAGATION_RELATION_TYPES
+        )
+    else:
+        classification = SAFE_RELATION_TYPES
+        raw_allowed_types = relation_cfg.get("allowed_types", SAFE_RELATION_TYPES)
+    if isinstance(raw_allowed_types, str):
+        raw_allowed_types = [raw_allowed_types]
+    elif not isinstance(raw_allowed_types, (list, tuple, set, frozenset)):
+        raw_allowed_types = []
+    configured_types = {str(value).strip() for value in raw_allowed_types}
+
+    def threshold(name: str, default: float) -> float:
+        try:
+            value = float(relation_cfg.get(name, default))
+        except (TypeError, ValueError):
+            return default
+        return value if 0.0 <= value <= 1.0 else default
+
+    return frozenset(configured_types.intersection(classification)), {
+        1: threshold("hop1_min_strength", 0.4),
+        2: threshold("hop2_min_strength", 0.7),
+    }
+
+
 def _relation_recall_neighbors(
     buckets,
     seed_ids,
@@ -1193,45 +1233,7 @@ def _relation_recall_neighbors(
         if str(value)
     })
 
-    relation_cfg = config.get("relation_recall", {}) or {}
-    raw_propagation_only = relation_cfg.get("propagation_only", True)
-    if isinstance(raw_propagation_only, str):
-        propagation_only = raw_propagation_only.strip().lower() in {
-            "1", "true", "yes", "on",
-        }
-    else:
-        propagation_only = bool(raw_propagation_only)
-
-    if propagation_only:
-        classification = PROPAGATION_RELATION_TYPES
-        raw_allowed_types = relation_cfg.get(
-            "propagation_types", PROPAGATION_RELATION_TYPES
-        )
-    else:
-        # Exact rollback to the pre-classification behavior.  Keep this branch
-        # separate so a legacy allowed_types=[kin, explains] config cannot
-        # suppress hard-edge types after propagation mode is enabled.
-        classification = SAFE_RELATION_TYPES
-        raw_allowed_types = relation_cfg.get(
-            "allowed_types", SAFE_RELATION_TYPES
-        )
-    if isinstance(raw_allowed_types, str):
-        raw_allowed_types = [raw_allowed_types]
-    elif not isinstance(raw_allowed_types, (list, tuple, set, frozenset)):
-        raw_allowed_types = []
-    configured_types = {
-        str(value).strip()
-        for value in raw_allowed_types
-    }
-    # Unknown/storage-only edge types degrade to non-propagating semantics.
-    allowed_types = configured_types.intersection(classification)
-
-    def threshold(name: str, default: float) -> float:
-        try:
-            value = float(relation_cfg.get(name, default))
-        except (TypeError, ValueError):
-            return default
-        return value if 0.0 <= value <= 1.0 else default
+    allowed_types, hop_min_strength = _relation_recall_edge_policy()
 
     return expand_relation_graph(
         buckets,
@@ -1240,10 +1242,7 @@ def _relation_recall_neighbors(
         max_depth=max_depth,
         max_results=max_results,
         allowed_node_ids=allowed_node_ids,
-        hop_min_strength={
-            1: threshold("hop1_min_strength", 0.4),
-            2: threshold("hop2_min_strength", 0.7),
-        },
+        hop_min_strength=hop_min_strength,
     )
 
 
@@ -4361,6 +4360,7 @@ async def _record_e_chord_shadow(
     prelude_elapsed_ms: float,
     attempt_index: int,
     first_screen_limit: int,
+    source_buckets_by_id: Mapping[str, Mapping[str, object]] | None = None,
 ) -> dict | None:
     """Schedule one A/B/C receipt while leaving served B untouched."""
 
@@ -4380,10 +4380,15 @@ async def _record_e_chord_shadow(
         logger.info("E chord shadow payload rejected: %s", payload_status)
         return None
 
+    allowed_relation_types, hop_min_strength = _relation_recall_edge_policy()
     proposal = propose_chord_reorder(
         b_candidates,
         chord,
         near_tie_epsilon=chord_config.near_tie_epsilon,
+        derived_lock_enabled=chord_config.derived_lock_enabled,
+        source_buckets_by_id=source_buckets_by_id or {},
+        allowed_relation_types=allowed_relation_types,
+        relation_min_strength=hop_min_strength[1],
     )
     receipt = build_shadow_receipt(
         chord=chord,
@@ -6116,6 +6121,7 @@ async def breath(
                 a_candidates=chord_shadow_a_candidates,
                 post_e_candidates=chord_shadow_post_e_candidates,
                 b_candidates=chord_shadow_b_candidates,
+                source_buckets_by_id=keyword_candidate_by_id,
                 ds_decision_source=chord_shadow_ds_decision_source,
                 chord_config=chord_shadow_config,
                 prelude_elapsed_ms=chord_shadow_prelude_ms,

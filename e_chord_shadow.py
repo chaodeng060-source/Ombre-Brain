@@ -1,9 +1,10 @@
 """Text-free, zero-call E-chord shadow proposal and private receipt ledger.
 
 The chord is never a retrieval channel.  It may only propose an adjacent swap
-between already-retained, primary-authored E memories that share an explicit
-event lock and are already a near tie under the existing E rank.  Callers keep
-serving arm B; arm C exists solely in the append-only shadow receipt.
+between already-retained, primary-authored E memories that share either a
+strong persisted event lock or, when explicitly enabled, a source-verifiable
+derived lock, and are already a near tie under the existing E rank.  Callers
+keep serving arm B; arm C exists solely in the append-only shadow receipt.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import os
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -22,10 +24,13 @@ from e_axis_storage import open_secure_e_axis_jsonl, secure_e_axis_lock
 
 
 LIVE_SCHEMA = "live_chord.v1"
-RECEIPT_SCHEMA = "e_chord_shadow_receipt.v1"
-FINAL_SELECTION_SCHEMA = "e_chord_final_selection.v1"
+LEGACY_RECEIPT_SCHEMA = "e_chord_shadow_receipt.v1"
+RECEIPT_SCHEMA = "e_chord_shadow_receipt.v2"
+LEGACY_FINAL_SELECTION_SCHEMA = "e_chord_final_selection.v1"
+FINAL_SELECTION_SCHEMA = "e_chord_final_selection.v2"
 MAX_FACETS = 2
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
+_HEX16_RE = re.compile(r"^[0-9a-f]{16}$")
 _HEX32_RE = re.compile(r"^[0-9a-f]{32}$")
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _TOP_KEYS = frozenset({
@@ -182,6 +187,7 @@ class EChordShadowConfig:
     enabled: bool = False
     near_tie_epsilon: float = 0.03
     max_age_ms: int = 30_000
+    derived_lock_enabled: bool = False
 
 
 def load_e_chord_shadow_config(root: Mapping[str, object]) -> EChordShadowConfig:
@@ -202,6 +208,9 @@ def load_e_chord_shadow_config(root: Mapping[str, object]) -> EChordShadowConfig
         enabled=True,
         near_tie_epsilon=epsilon,
         max_age_ms=max_age_ms,
+        derived_lock_enabled=os.environ.get(
+            "OMBRE_E_CHORD_DERIVED_LOCK", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"},
     )
 
 
@@ -312,6 +321,14 @@ class ShadowSwap:
     from_index: int
     to_index: int
     event_lock_digest: str
+    lock_kind: str = "strong"
+    source_bucket_ids: tuple[str, ...] = ()
+    derived_lock_basis: str = ""
+    relation_type: str = ""
+    relation_from_id: str = ""
+    relation_to_id: str = ""
+    recorded_day: str = ""
+    domain_digest: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,6 +365,227 @@ def _event_lock_digests(candidate: Mapping[str, object]) -> tuple[str, ...]:
         hashlib.sha256(lock.encode("utf-8")).hexdigest()[:16]
         for lock in _event_locks(candidate)
     ))
+
+
+@dataclass(frozen=True, slots=True)
+class _SelectedEventLock:
+    canonical: str
+    kind: str
+    source_bucket_ids: tuple[str, ...] = ()
+    derived_lock_basis: str = ""
+    relation_type: str = ""
+    relation_from_id: str = ""
+    relation_to_id: str = ""
+    recorded_day: str = ""
+    domain_digest: str = ""
+
+
+def _candidate_source_bucket_id(candidate: Mapping[str, object]) -> str:
+    return _safe_id(_metadata(candidate).get("e_source_bucket_id")) or ""
+
+
+def _metadata_domains(bucket: Mapping[str, object]) -> frozenset[str]:
+    raw = _metadata(bucket).get("domain", ())
+    values: Sequence[object]
+    if isinstance(raw, str):
+        values = (raw,)
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        values = tuple(raw)
+    else:
+        values = ()
+    return frozenset(
+        normalized
+        for value in values
+        if (normalized := str(value or "").strip().lower())
+    )
+
+
+def _recorded_day(bucket: Mapping[str, object]) -> str:
+    value = _metadata(bucket).get("recorded_at")
+    if not isinstance(value, str) or len(value) < 10:
+        return ""
+    day = value[:10]
+    try:
+        # Keep the receipt content-free while rejecting malformed calendar days.
+        date.fromisoformat(day)
+    except ValueError:
+        return ""
+    return day
+
+
+def _direct_deterministic_relation(
+    left_source: Mapping[str, object],
+    right_source: Mapping[str, object],
+    *,
+    allowed_relation_types: frozenset[str],
+    min_strength: float,
+) -> tuple[str, str, str] | None:
+    left_id = _safe_id(left_source.get("id"))
+    right_id = _safe_id(right_source.get("id"))
+    if left_id is None or right_id is None or left_id == right_id:
+        return None
+    matches: list[tuple[str, str, str]] = []
+    for source_id, target_id, bucket in (
+        (left_id, right_id, left_source),
+        (right_id, left_id, right_source),
+    ):
+        raw_relations = _metadata(bucket).get("relations", ())
+        if not isinstance(raw_relations, Sequence) or isinstance(raw_relations, str):
+            continue
+        for edge in raw_relations:
+            if not isinstance(edge, Mapping):
+                continue
+            relation_type = str(edge.get("type") or "").strip()
+            strength = _finite(edge.get("strength"))
+            generation_method = str(edge.get("generation_method") or "").strip()
+            if (
+                _safe_id(edge.get("target")) == target_id
+                and relation_type in allowed_relation_types
+                and strength is not None
+                and strength >= min_strength
+                and generation_method.startswith("deterministic:")
+            ):
+                matches.append((relation_type, source_id, target_id))
+    return min(matches) if matches else None
+
+
+def _derived_event_lock(
+    left: Mapping[str, object],
+    right: Mapping[str, object],
+    *,
+    source_buckets_by_id: Mapping[str, Mapping[str, object]],
+    allowed_relation_types: frozenset[str],
+    relation_min_strength: float,
+) -> _SelectedEventLock | None:
+    left_source_id = _candidate_source_bucket_id(left)
+    right_source_id = _candidate_source_bucket_id(right)
+    if (
+        not left_source_id
+        or not right_source_id
+        or left_source_id == right_source_id
+    ):
+        return None
+    left_source = source_buckets_by_id.get(left_source_id)
+    right_source = source_buckets_by_id.get(right_source_id)
+    if not isinstance(left_source, Mapping) or not isinstance(right_source, Mapping):
+        return None
+    source_ids = tuple(sorted((left_source_id, right_source_id)))
+    relation = _direct_deterministic_relation(
+        left_source,
+        right_source,
+        allowed_relation_types=allowed_relation_types,
+        min_strength=relation_min_strength,
+    )
+    if relation is not None:
+        relation_type, relation_from_id, relation_to_id = relation
+        canonical = (
+            f"derived:relation:{relation_type}:{relation_from_id}:{relation_to_id}"
+        )
+        return _SelectedEventLock(
+            canonical=canonical,
+            kind="derived",
+            source_bucket_ids=source_ids,
+            derived_lock_basis="relation",
+            relation_type=relation_type,
+            relation_from_id=relation_from_id,
+            relation_to_id=relation_to_id,
+        )
+
+    left_day = _recorded_day(left_source)
+    right_day = _recorded_day(right_source)
+    shared_domains = sorted(
+        _metadata_domains(left_source) & _metadata_domains(right_source)
+    )
+    if not left_day or left_day != right_day or not shared_domains:
+        return None
+    domain_digest = hashlib.sha256(
+        shared_domains[0].encode("utf-8")
+    ).hexdigest()[:16]
+    canonical = f"derived:same-day-domain:{left_day}:{domain_digest}"
+    return _SelectedEventLock(
+        canonical=canonical,
+        kind="derived",
+        source_bucket_ids=source_ids,
+        derived_lock_basis="same_day_domain",
+        recorded_day=left_day,
+        domain_digest=domain_digest,
+    )
+
+
+def _select_event_lock(
+    left: Mapping[str, object],
+    right: Mapping[str, object],
+    *,
+    derived_lock_enabled: bool,
+    source_buckets_by_id: Mapping[str, Mapping[str, object]],
+    allowed_relation_types: frozenset[str],
+    relation_min_strength: float,
+) -> _SelectedEventLock | None:
+    shared_strong_locks = sorted(_event_locks(left) & _event_locks(right))
+    if shared_strong_locks:
+        return _SelectedEventLock(
+            canonical=shared_strong_locks[0],
+            kind="strong",
+        )
+    if not derived_lock_enabled:
+        return None
+    return _derived_event_lock(
+        left,
+        right,
+        source_buckets_by_id=source_buckets_by_id,
+        allowed_relation_types=allowed_relation_types,
+        relation_min_strength=relation_min_strength,
+    )
+
+
+def _derived_lock_canonical(
+    *,
+    source_bucket_ids: object,
+    derived_lock_basis: object,
+    relation_type: object,
+    relation_from_id: object,
+    relation_to_id: object,
+    recorded_day: object,
+    domain_digest: object,
+) -> str | None:
+    if (
+        type(source_bucket_ids) not in (list, tuple)
+        or len(source_bucket_ids) != 2
+        or any(_safe_id(value) is None for value in source_bucket_ids)
+        or list(source_bucket_ids) != sorted(set(source_bucket_ids))
+    ):
+        return None
+    source_set = set(source_bucket_ids)
+    if derived_lock_basis == "relation":
+        if (
+            _safe_id(relation_type) is None
+            or _safe_id(relation_from_id) is None
+            or _safe_id(relation_to_id) is None
+            or {relation_from_id, relation_to_id} != source_set
+            or recorded_day != ""
+            or domain_digest != ""
+        ):
+            return None
+        return (
+            f"derived:relation:{relation_type}:"
+            f"{relation_from_id}:{relation_to_id}"
+        )
+    if derived_lock_basis == "same_day_domain":
+        if (
+            relation_type != ""
+            or relation_from_id != ""
+            or relation_to_id != ""
+            or type(recorded_day) is not str
+            or type(domain_digest) is not str
+            or _HEX16_RE.fullmatch(domain_digest) is None
+        ):
+            return None
+        try:
+            date.fromisoformat(recorded_day)
+        except ValueError:
+            return None
+        return f"derived:same-day-domain:{recorded_day}:{domain_digest}"
+    return None
 
 
 def _is_factual(candidate: Mapping[str, object]) -> bool:
@@ -539,12 +777,25 @@ def propose_chord_reorder(
     chord: LiveChord,
     *,
     near_tie_epsilon: float = 0.03,
+    derived_lock_enabled: bool = False,
+    source_buckets_by_id: Mapping[str, Mapping[str, object]] | None = None,
+    allowed_relation_types: Sequence[str] = ("explains",),
+    relation_min_strength: float = 0.4,
 ) -> ShadowProposal:
     """Propose bounded C ordering without mutating B or serving the result."""
 
     epsilon = _finite(near_tie_epsilon)
     if epsilon is None or not 0.0 <= epsilon <= 0.1:
         raise ValueError("near_tie_epsilon must be in [0, 0.1]")
+    relation_floor = _finite(relation_min_strength)
+    if relation_floor is None or not 0.0 <= relation_floor <= 1.0:
+        raise ValueError("relation_min_strength must be in [0, 1]")
+    relation_types = frozenset(
+        relation_type
+        for value in allowed_relation_types
+        if (relation_type := _safe_id(value)) is not None
+    )
+    source_lookup = source_buckets_by_id or {}
     original = list(candidates)
     b_ids = tuple(_candidate_id(candidate) for candidate in original)
     violations: list[str] = []
@@ -572,12 +823,19 @@ def propose_chord_reorder(
         right = proposed[index + 1]
         left_id = _candidate_id(left)
         right_id = _candidate_id(right)
-        shared_locks = sorted(_event_locks(left) & _event_locks(right))
-        if not shared_locks:
+        selected_lock = _select_event_lock(
+            left,
+            right,
+            derived_lock_enabled=derived_lock_enabled,
+            source_buckets_by_id=source_lookup,
+            allowed_relation_types=relation_types,
+            relation_min_strength=relation_floor,
+        )
+        if selected_lock is None:
             _append_reason(skipped, "event_lock")
             index += 1
             continue
-        lock = shared_locks[0]
+        lock = selected_lock.canonical
         left_band = _frozen_band(left)
         right_band = _frozen_band(right)
         if left_band is None or right_band is None or left_band != right_band:
@@ -644,6 +902,14 @@ def propose_chord_reorder(
             from_index=index + 1,
             to_index=index,
             event_lock_digest=hashlib.sha256(lock.encode("utf-8")).hexdigest()[:16],
+            lock_kind=selected_lock.kind,
+            source_bucket_ids=selected_lock.source_bucket_ids,
+            derived_lock_basis=selected_lock.derived_lock_basis,
+            relation_type=selected_lock.relation_type,
+            relation_from_id=selected_lock.relation_from_id,
+            relation_to_id=selected_lock.relation_to_id,
+            recorded_day=selected_lock.recorded_day,
+            domain_digest=selected_lock.domain_digest,
         ))
         index += 2
 
@@ -659,7 +925,21 @@ def propose_chord_reorder(
     for swap in swaps:
         before_left = original[swap.to_index]
         before_right = original[swap.from_index]
-        if not (_event_locks(before_left) & _event_locks(before_right)):
+        validated_lock = _select_event_lock(
+            before_left,
+            before_right,
+            derived_lock_enabled=derived_lock_enabled,
+            source_buckets_by_id=source_lookup,
+            allowed_relation_types=relation_types,
+            relation_min_strength=relation_floor,
+        )
+        if (
+            validated_lock is None
+            or validated_lock.kind != swap.lock_kind
+            or hashlib.sha256(
+                validated_lock.canonical.encode("utf-8")
+            ).hexdigest()[:16] != swap.event_lock_digest
+        ):
             violations.append("cross_event_move")
         if _frozen_band(before_left) != _frozen_band(before_right):
             violations.append("cross_relevance_move")
@@ -782,6 +1062,7 @@ def build_shadow_receipt(
         {
             "id": _candidate_id(candidate),
             "event_lock_digests": list(_event_lock_digests(candidate)),
+            "e_source_bucket_id": _candidate_source_bucket_id(candidate),
             "is_factual": _is_factual(candidate),
             "author_match": (
                 _annotation_value(candidate, "authored_by") == chord.e_authored_by
@@ -817,7 +1098,32 @@ def build_shadow_receipt(
         shared_locks = set(promoted_guard.get("event_lock_digests", ())) & set(
             demoted_guard.get("event_lock_digests", ())
         )
-        if swap.event_lock_digest not in shared_locks:
+        if swap.lock_kind == "strong":
+            lock_is_bound = swap.event_lock_digest in shared_locks
+        else:
+            expected_sources = sorted({
+                str(promoted_guard.get("e_source_bucket_id") or ""),
+                str(demoted_guard.get("e_source_bucket_id") or ""),
+            })
+            canonical = _derived_lock_canonical(
+                source_bucket_ids=swap.source_bucket_ids,
+                derived_lock_basis=swap.derived_lock_basis,
+                relation_type=swap.relation_type,
+                relation_from_id=swap.relation_from_id,
+                relation_to_id=swap.relation_to_id,
+                recorded_day=swap.recorded_day,
+                domain_digest=swap.domain_digest,
+            )
+            lock_is_bound = (
+                swap.lock_kind == "derived"
+                and not shared_locks
+                and expected_sources == list(swap.source_bucket_ids)
+                and "" not in expected_sources
+                and canonical is not None
+                and hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+                == swap.event_lock_digest
+            )
+        if not lock_is_bound:
             hard_violations.add("cross_event_move")
         if promoted_guard.get("is_factual") or demoted_guard.get("is_factual"):
             hard_violations.add("fact_move")
@@ -869,6 +1175,14 @@ def build_shadow_receipt(
                 "from_index": swap.from_index,
                 "to_index": swap.to_index,
                 "event_lock_digest": swap.event_lock_digest,
+                "lock_kind": swap.lock_kind,
+                "source_bucket_ids": list(swap.source_bucket_ids),
+                "derived_lock_basis": swap.derived_lock_basis,
+                "relation_type": swap.relation_type,
+                "relation_from_id": swap.relation_from_id,
+                "relation_to_id": swap.relation_to_id,
+                "recorded_day": swap.recorded_day,
+                "domain_digest": swap.domain_digest,
             }
             for swap in proposal.swaps
         ],
@@ -934,14 +1248,24 @@ _DIAGNOSTIC_KEYS = frozenset({
     "external_api_delta",
     "hard_violation_count",
 })
-_SWAP_KEYS = frozenset({
+_LEGACY_SWAP_KEYS = frozenset({
     "promoted_id",
     "demoted_id",
     "from_index",
     "to_index",
     "event_lock_digest",
 })
-_CANDIDATE_GUARD_KEYS = frozenset({
+_SWAP_KEYS = _LEGACY_SWAP_KEYS | frozenset({
+    "lock_kind",
+    "source_bucket_ids",
+    "derived_lock_basis",
+    "relation_type",
+    "relation_from_id",
+    "relation_to_id",
+    "recorded_day",
+    "domain_digest",
+})
+_LEGACY_CANDIDATE_GUARD_KEYS = frozenset({
     "id",
     "event_lock_digests",
     "is_factual",
@@ -953,7 +1277,9 @@ _CANDIDATE_GUARD_KEYS = frozenset({
     "experience_polarity",
     "e_admissibility",
 })
-_HEX16_RE = re.compile(r"^[0-9a-f]{16}$")
+_CANDIDATE_GUARD_KEYS = _LEGACY_CANDIDATE_GUARD_KEYS | frozenset({
+    "e_source_bucket_id",
+})
 _MACHINE_REASON_RE = re.compile(r"^[a-z][a-z0-9_.:-]{0,79}$")
 
 
@@ -970,9 +1296,12 @@ def _validated_id_list(value: object, *, maximum: int = 50) -> list[str]:
 def validate_shadow_receipt(row: object) -> dict[str, Any]:
     if type(row) is not dict or set(row) != _RECEIPT_KEYS:
         raise ValueError("invalid E chord receipt contract")
+    schema = row.get("schema")
+    if schema not in {LEGACY_RECEIPT_SCHEMA, RECEIPT_SCHEMA}:
+        raise ValueError("invalid E chord receipt contract")
+    is_v2 = schema == RECEIPT_SCHEMA
     if (
-        row.get("schema") != RECEIPT_SCHEMA
-        or row.get("shadow_only") is not True
+        row.get("shadow_only") is not True
         or row.get("affects_ranking") is not False
     ):
         raise ValueError("invalid E chord receipt contract")
@@ -1036,19 +1365,28 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
     if type(candidate_guards) is not list or len(candidate_guards) != len(pool_ids):
         raise ValueError("invalid E chord receipt contract")
     guard_by_id: dict[str, dict[str, Any]] = {}
+    expected_guard_keys = (
+        _CANDIDATE_GUARD_KEYS if is_v2 else _LEGACY_CANDIDATE_GUARD_KEYS
+    )
     for index, guard in enumerate(candidate_guards):
-        if type(guard) is not dict or set(guard) != _CANDIDATE_GUARD_KEYS:
+        if type(guard) is not dict or set(guard) != expected_guard_keys:
             raise ValueError("invalid E chord receipt contract")
         bucket_id = guard.get("id")
         lock_digests = guard.get("event_lock_digests")
+        source_bucket_id = guard.get("e_source_bucket_id", "")
         if (
             bucket_id != pool_ids[index]
             or type(lock_digests) is not list
-            or len(lock_digests) > 2
+            or len(lock_digests) > (3 if is_v2 else 2)
             or lock_digests != sorted(set(lock_digests))
             or any(
                 type(value) is not str or _HEX16_RE.fullmatch(value) is None
                 for value in lock_digests
+            )
+            or (
+                is_v2
+                and source_bucket_id != ""
+                and _safe_id(source_bucket_id) is None
             )
             or type(guard.get("is_factual")) is not bool
             or type(guard.get("author_match")) is not bool
@@ -1087,8 +1425,9 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
     recomputed_fact_moves = 0
     recomputed_cross_author_moves = 0
     recomputed_e_admissibility_moves = 0
+    expected_swap_keys = _SWAP_KEYS if is_v2 else _LEGACY_SWAP_KEYS
     for swap in row["swaps"]:
-        if type(swap) is not dict or set(swap) != _SWAP_KEYS:
+        if type(swap) is not dict or set(swap) != expected_swap_keys:
             raise ValueError("invalid E chord receipt contract")
         if (
             _safe_id(swap.get("promoted_id")) is None
@@ -1109,7 +1448,44 @@ def validate_shadow_receipt(row: object) -> dict[str, Any]:
         shared_locks = set(promoted_guard["event_lock_digests"]) & set(
             demoted_guard["event_lock_digests"]
         )
-        if swap["event_lock_digest"] not in shared_locks:
+        if not is_v2:
+            lock_is_bound = swap["event_lock_digest"] in shared_locks
+        elif swap.get("lock_kind") == "strong":
+            lock_is_bound = (
+                swap["event_lock_digest"] in shared_locks
+                and swap.get("source_bucket_ids") == []
+                and swap.get("derived_lock_basis") == ""
+                and swap.get("relation_type") == ""
+                and swap.get("relation_from_id") == ""
+                and swap.get("relation_to_id") == ""
+                and swap.get("recorded_day") == ""
+                and swap.get("domain_digest") == ""
+            )
+        elif swap.get("lock_kind") == "derived":
+            expected_sources = sorted({
+                promoted_guard.get("e_source_bucket_id", ""),
+                demoted_guard.get("e_source_bucket_id", ""),
+            })
+            canonical = _derived_lock_canonical(
+                source_bucket_ids=swap.get("source_bucket_ids"),
+                derived_lock_basis=swap.get("derived_lock_basis"),
+                relation_type=swap.get("relation_type"),
+                relation_from_id=swap.get("relation_from_id"),
+                relation_to_id=swap.get("relation_to_id"),
+                recorded_day=swap.get("recorded_day"),
+                domain_digest=swap.get("domain_digest"),
+            )
+            lock_is_bound = (
+                not shared_locks
+                and "" not in expected_sources
+                and swap.get("source_bucket_ids") == expected_sources
+                and canonical is not None
+                and hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+                == swap["event_lock_digest"]
+            )
+        else:
+            lock_is_bound = False
+        if not lock_is_bound:
             recomputed_cross_event_moves = 1
         if promoted_guard["is_factual"] or demoted_guard["is_factual"]:
             recomputed_fact_moves = 1
@@ -1319,8 +1695,10 @@ def validate_final_selection(value: object) -> dict[str, Any]:
 
     if type(value) is not dict or set(value) != _FINAL_SELECTION_KEYS:
         raise ValueError("invalid E chord final selection contract")
-    if value.get("schema") != FINAL_SELECTION_SCHEMA:
+    schema = value.get("schema")
+    if schema not in {LEGACY_FINAL_SELECTION_SCHEMA, FINAL_SELECTION_SCHEMA}:
         raise ValueError("invalid E chord final selection contract")
+    is_v2 = schema == FINAL_SELECTION_SCHEMA
     if type(value.get("recorded_at_ms")) is not int or value["recorded_at_ms"] < 0:
         raise ValueError("invalid E chord final selection contract")
     if _safe_id(value.get("agent_id")) is None:
@@ -1378,14 +1756,43 @@ def validate_final_selection(value: object) -> dict[str, Any]:
     reconstructed_c = list(arms["b"])
     used_event_locks: set[str] = set()
     moved_ids: set[str] = set()
+    expected_swap_keys = _SWAP_KEYS if is_v2 else _LEGACY_SWAP_KEYS
     for swap in applied_swaps:
-        if type(swap) is not dict or set(swap) != _SWAP_KEYS:
+        if type(swap) is not dict or set(swap) != expected_swap_keys:
             raise ValueError("invalid E chord final selection contract")
         promoted_id = swap.get("promoted_id")
         demoted_id = swap.get("demoted_id")
         from_index = swap.get("from_index")
         to_index = swap.get("to_index")
         event_lock_digest = swap.get("event_lock_digest")
+        lock_contract_valid = True
+        if is_v2 and swap.get("lock_kind") == "strong":
+            lock_contract_valid = (
+                swap.get("source_bucket_ids") == []
+                and swap.get("derived_lock_basis") == ""
+                and swap.get("relation_type") == ""
+                and swap.get("relation_from_id") == ""
+                and swap.get("relation_to_id") == ""
+                and swap.get("recorded_day") == ""
+                and swap.get("domain_digest") == ""
+            )
+        elif is_v2 and swap.get("lock_kind") == "derived":
+            canonical = _derived_lock_canonical(
+                source_bucket_ids=swap.get("source_bucket_ids"),
+                derived_lock_basis=swap.get("derived_lock_basis"),
+                relation_type=swap.get("relation_type"),
+                relation_from_id=swap.get("relation_from_id"),
+                relation_to_id=swap.get("relation_to_id"),
+                recorded_day=swap.get("recorded_day"),
+                domain_digest=swap.get("domain_digest"),
+            )
+            lock_contract_valid = (
+                canonical is not None
+                and hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+                == event_lock_digest
+            )
+        elif is_v2:
+            lock_contract_valid = False
         if (
             _safe_id(promoted_id) is None
             or _safe_id(demoted_id) is None
@@ -1402,6 +1809,7 @@ def validate_final_selection(value: object) -> dict[str, Any]:
             or event_lock_digest in used_event_locks
             or promoted_id in moved_ids
             or demoted_id in moved_ids
+            or not lock_contract_valid
         ):
             raise ValueError("invalid E chord final selection contract")
         reconstructed_c[to_index], reconstructed_c[from_index] = (
