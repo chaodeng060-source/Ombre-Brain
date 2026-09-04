@@ -1768,6 +1768,27 @@ def _anchor_literal_only_cap() -> float:
     return max(0.0, min(1.0, cap))
 
 
+def _anchor_rare_literal_max_df() -> int:
+    """稀有词精确命中豁免的 df 上限；<=0 关闭豁免（回到 8/31 纯压制行为）。
+
+    2026-09-04 朝灯考「蚊子」：整库 13.9k 桶里 5 条带这个词、字面满分，但她整句
+    「我也判断不出来 比如我现在问你蚊子」的向量落在 0.5 地板之下，候选成了
+    字面单路，被 0.55 上限压成 0.2475、卡在 0.25 线下——记了却搜不到。
+    8/31 那道上限要拦的是常见词撞车；语料里只出现个位数次的词被整词命中，
+    恰恰是最强的字面证据，不该一起压。上限按 df 绝对数取，每次现读 env。
+    """
+    raw = os.getenv("OMBRE_ANCHOR_RARE_LITERAL_MAX_DF", "8").strip()
+    if raw.lower() in ("off", "none", ""):
+        return 0
+    try:
+        return max(0, int(float(raw)))
+    except ValueError:
+        logger.warning(
+            "OMBRE_ANCHOR_RARE_LITERAL_MAX_DF=%r 不是数字，回落到 8", raw
+        )
+        return 8
+
+
 def _anchor_adapted_relevance_score(bucket: dict) -> float | None:
     """Map Ombre's absolute query evidence onto Anchor's score scale.
 
@@ -1801,7 +1822,10 @@ def _anchor_adapted_relevance_score(bucket: dict) -> float | None:
         # 为什么不改阈值：同一批数据里把线提到 0.32 同样砍到 51%，但 27 条撞词
         # 一条都拦不住、还多出 2 轮整轮返空。压字面单路则 27/27 全拦、零返空。
         # 阈值是 vendor 契约，不动。
-        if not vector_hit:
+        # 2026-09-04 例外：候选带着语料稀有的查询词整词命中（_rare_literal_terms，
+        # 由召回路径按 BM25 df 标注），不压——它不是撞词。字面分本身仍要 ≥55.6
+        # 才够 0.25 线，豁免只是不再把它按死在线下。
+        if not vector_hit and not bucket.get("_rare_literal_terms"):
             normalised = min(normalised, _anchor_literal_only_cap())
         similarities.append(normalised)
 
@@ -1878,6 +1902,7 @@ def _filter_anchor_policy_candidates(
                     "lit": bucket.get("_literal_relevance_score"),
                     "vec": bucket.get("_original_vector_relevance_score"),
                     "ent": bool(bucket.get("entity_match")),
+                    "rare": list(bucket.get("_rare_literal_terms") or ()),
                 }
                 for bucket in candidates
             ],
@@ -5395,6 +5420,22 @@ async def breath(
     bucket_cache = {b["id"]: b for b in keyword_matches}
     bucket_cache.update(entity_bucket_cache)
     bucket_cache.update(lexical_bucket_cache)
+    # 稀有词精确命中标注（只查 BM25 现成 postings/df，不打分、不打模型）：
+    # 供 _anchor_adapted_relevance_score 判断字面单路要不要豁免 0.55 上限。
+    rare_literal_hits: dict[str, tuple[str, ...]] = {}
+    rare_literal_lookup = getattr(bucket_mgr, "rare_literal_hits", None)
+    if callable(rare_literal_lookup):
+        try:
+            rare_literal_hits = rare_literal_lookup(
+                recall_query,
+                max_df=_anchor_rare_literal_max_df(),
+            ) or {}
+        except Exception as exc:
+            logger.warning(
+                "Rare literal lookup skipped; literal-only cap unchanged: %s",
+                type(exc).__name__,
+            )
+            rare_literal_hits = {}
     matches = []
     for bid, fused_score in fused_pairs:
         if bid in bucket_cache:
@@ -5449,6 +5490,11 @@ async def breath(
             float(original_vector_scores.get(bid, 0.0)),
             6,
         )
+        rare_terms = rare_literal_hits.get(str(bid))
+        if rare_terms:
+            b["_rare_literal_terms"] = list(rare_terms)
+        else:
+            b.pop("_rare_literal_terms", None)
         matches.append(b)
 
     # Generated expansion angles may improve ranking, but cannot introduce a

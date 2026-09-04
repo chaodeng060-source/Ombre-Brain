@@ -344,6 +344,37 @@ class BM25Index:
         """Return a complete generation without one bucket (idempotent)."""
         return self._replace_document(str(bucket_id), [])
 
+    def rare_term_hits(
+        self,
+        query: str,
+        *,
+        max_df: int,
+        min_term_chars: int = 2,
+    ) -> dict[str, tuple[str, ...]]:
+        """bucket_id -> query terms that are rare in the corpus and occur in it.
+
+        2026-09-04 朝灯考「蚊子」：整库只有 3 条桶带这个词，字面全中，但她整句
+        的向量落在 0.5 地板之下，候选变成「字面单路」被 0.55 上限压到 0.2475、
+        卡在 conversation 线 0.25 之下——记了搜不到。8/31 那道上限要拦的是
+        常见词撞车（刚才/这样子/看看），稀有词精确命中恰恰是最强的字面证据。
+        这里只回答「哪些候选带着稀有查询词」，不打分、不排序；阈值由调用方给，
+        单字词不算（单字太容易撞），rank_bm25 缺席或索引未建时返回空 = 不豁免。
+        """
+        if max_df <= 0 or not self._postings or not self._term_doc_counts:
+            return {}
+        hits: dict[str, list[str]] = {}
+        seen: set[str] = set()
+        for term in _tokenize(query):
+            if term in seen or len(term) < max(1, min_term_chars):
+                continue
+            seen.add(term)
+            df = self._term_doc_counts.get(term, 0)
+            if df <= 0 or df > max_df:
+                continue
+            for bucket_id in self._postings.get(term, ()):
+                hits.setdefault(bucket_id, []).append(term)
+        return {bucket_id: tuple(terms) for bucket_id, terms in hits.items()}
+
     def score(self, query: str) -> dict[str, float]:
         """Return normalized BM25 scores; the rank_bm25 formula is unchanged."""
         if not _BM25_AVAILABLE or self._index is None:

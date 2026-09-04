@@ -1265,6 +1265,31 @@ class BucketManager:
             )
         return applied
 
+    def rare_literal_hits(
+        self,
+        query: str,
+        *,
+        max_df: int,
+    ) -> dict[str, tuple[str, ...]]:
+        """Which resident buckets literally contain a corpus-rare query term.
+
+        Read-only lookup over the current complete BM25 generation (postings +
+        df).  Never awaits a rebuild and never scores: BM25 off / index not
+        built / rank_bm25 missing all mean "no rare anchor" so the caller's
+        literal-only cap keeps its 2026-08-31 behaviour unchanged.
+        """
+        index = self._bm25
+        if self._bm25_mode == "off" or index is None or max_df <= 0:
+            return {}
+        lookup = getattr(index, "rare_term_hits", None)
+        if not callable(lookup):
+            return {}
+        try:
+            return lookup(query, max_df=max_df)
+        except Exception as exc:
+            logger.warning("[bm25] rare-term lookup failed; no exemption: %s", exc)
+            return {}
+
     async def prewarm_bm25(self) -> bool:
         """Build the optional BM25 index once before requests are accepted."""
         if self._bm25_mode == "off":
