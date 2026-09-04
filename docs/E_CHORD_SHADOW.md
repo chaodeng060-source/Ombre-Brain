@@ -1,11 +1,16 @@
-# Desire chord × E recall: zero-call shadow contract
+# Desire chord × E recall: shadow proposal and opt-in live delivery
 
 This feature is deliberately not a new recall channel. Twin attaches one
 `live_chord.v1` object to the existing `/api/breath` request. Ombre validates
 that object against the same request's turn and agent, freezes a pre-E cohort,
 then waits until all existing E, state, session, anchor and DS filters have
 produced the retained candidate pool and computes a private arm-C proposal. The `/api/breath` response carries
-that text-free proposal back to Twin, but the served list remains arm B.
+that text-free proposal back to Twin. By default the served list remains arm B.
+When both Twin's explicit `e_chord_live_enabled=true` request bit and Ombre's
+`OMBRE_E_CHORD_BYPASS=1` gate are open, Ombre may additionally return one
+source-bound rendered bypass block in `e_chord_bypass_delivery.v1`. Natural
+`raw` is never mutated, so Twin can discard a malformed delivery and use the
+exact old result.
 
 ## Ordering boundary
 
@@ -14,7 +19,8 @@ The receipt distinguishes an honest baseline from an unscorable placeholder:
 - A: relevance plus the non-E tie score, frozen before existing E ordering and
   before every later first-wins or subtractive gate;
 - B: the current E-aware order that production already uses;
-- C: B plus the chord proposal, recorded but never returned.
+- C: B plus the chord proposal. It remains shadow-only in receipt v1-v3;
+  validated live bypass delivery is recorded separately by final selection v4.
 
 `pre_e_cohort_ids` records that original text-free cohort, while
 `post_e_cohort_ids` freezes the order immediately after existing-E ranking and
@@ -74,6 +80,35 @@ audited even though there are no activation IDs.
 `e_chord_shadow.enabled` defaults to false and only `mode: shadow` activates
 receipt capture. Turning it off restores the exact old path without rewriting
 any bucket or E annotation.
+
+## Live bypass delivery
+
+The shadow receipt remains text-free and continues to declare
+`shadow_only=true` / `affects_ranking=false`: it is proposal evidence, not the
+served payload. The sibling delivery has an independent schema and binds
+`projection_digest`, `source_turn_digest`, `attempt_index`, candidate ID and
+`e_source_bucket_id` to that validated v3 proposal. At most the first declared
+adjacent bypass winner is delivered, preventing multiple independent swaps
+from becoming a global leap.
+
+Before building the block, Ombre reruns the established world, time, session,
+Z/fact, current-annotation, semantic-resonance and Russell-resonance gates.
+Rendering uses a valid frontmatter dehydration cache when present; otherwise it
+uses the established deterministic 300-character passthrough shape. It never
+starts a summarizer/provider, query, embedding, write or background backfill.
+Twin validates the one-ID block, then sends it through its existing scene,
+telemetry, association, mood, domain, dedupe, rerank and prompt cutoff. Only a
+block that survives into the actual model prompt is recorded as
+`e_chord_final_selection.v4` with `delivered_bypass_ids`, `served_arm=c` and
+`live_applied=true`. Twin independently replays the same local rerank after
+removing the delivered block to bind the natural OFF arm. If a full top-k
+causes replacement, v4 names the exact `displaced_natural_ids`; therefore
+`C-B` is exactly the one delivery and `B-C` is exactly zero or one declared
+natural displacement.
+
+Either live gate closed means no delivery field at all. Any proposal, delivery,
+filter, rerank or receipt error leaves natural `raw` available and does not
+block the assistant response.
 
 ## Privacy and call budget
 
@@ -157,12 +192,13 @@ of every attempt and final-selection overhead.
 A mechanically good cohort would need at least 20 fully labelled natural turns,
 C precision and both zero metrics no worse than B, strictly better completeness,
 no higher noise, no hard violation, no outside-pool injection, zero
-external-call delta and P95 within budget. This contract deliberately requires
-final B and C to have the same set, so set-based precision, noise and
-completeness are identical and the strict completeness-improvement gate is
-unreachable. The current evaluator therefore remains `inconclusive` and cannot
-authorize live use, even with a clean 20-turn cohort. `candidate_for_named_review`
-is retained only as a future schema gate; `eligible_for_live` is always false.
+external-call delta and P95 within budget. The v1-v3 shadow contract
+deliberately requires final B and C to have the same set, so set-based
+precision, noise and completeness are identical and the strict
+completeness-improvement gate is unreachable. The current shadow evaluator
+therefore remains `inconclusive` and does not score v4 membership delivery.
+Live acceptance instead requires paired OFF/ON production queries,
+receipt-backed reversal cases and the separate P95 gate.
 All statuses return non-zero, so automation cannot confuse an unscored cohort
 with live approval.
 `annotated_by` is auditable attribution, not a cryptographic human signature;
@@ -188,7 +224,8 @@ does not match. This implementation does not weaken the lock to thread, wording
 or emotion merely to manufacture movement. At least two audited E writes must
 share the same explicit source/event link before a meaningful cohort can move.
 
-Rollback is one config change: keep or set `e_chord_shadow.enabled: false`.
-Twin may also stop attaching the optional fields. Existing E ordering, factual
+Rollback is immediate from either side: set `TWIN_E_CHORD_RECALL_ENABLED=0` or
+`OMBRE_E_CHORD_BYPASS=0`; disabling `e_chord_shadow.enabled` also removes all
+proposal work. Existing E ordering, factual
 recall, embeddings, buckets and sidecar annotations require no migration or
 cleanup; the append-only shadow ledger can remain ignored for audit.

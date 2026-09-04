@@ -146,6 +146,7 @@ from e_axis_shadow import (
     strict_json_loads,
 )
 from e_chord_shadow import (
+    BYPASS_RECEIPT_SCHEMA,
     EChordFinalSelectionLedger,
     EChordShadowConfig,
     EChordShadowLedger,
@@ -4389,7 +4390,7 @@ def _e_chord_bypass_candidates(
     admissibility_floor: float,
     limit: int,
 ) -> list[dict]:
-    """Decorate and select source-bound E rows for the shadow pool only."""
+    """Decorate source-bound E rows for shadow and gated live delivery."""
 
     natural_ids = {
         str(candidate.get("id") or "") for candidate in natural_b_candidates
@@ -4544,6 +4545,104 @@ async def _record_e_chord_shadow(
     return receipt
 
 
+def _e_chord_bypass_delivery_choice(
+    receipt: object,
+) -> tuple[str, str] | None:
+    """Return one source-bound bypass winner from a validated v3 proposal.
+
+    The v3 receipt remains a text-free shadow proposal.  Live delivery is a
+    separate response field, and this helper deliberately chooses at most one
+    adjacent bypass winner so multiple disjoint swaps cannot turn into a
+    global leap in the real side channel.
+    """
+
+    if not isinstance(receipt, Mapping):
+        return None
+    if receipt.get("schema") != BYPASS_RECEIPT_SCHEMA:
+        return None
+    bypass_ids = receipt.get("bypass_ids")
+    source_ids = receipt.get("bypass_source_ids")
+    arms = receipt.get("arms")
+    swaps = receipt.get("swaps")
+    if (
+        not isinstance(bypass_ids, list)
+        or not bypass_ids
+        or len(bypass_ids) != len(set(bypass_ids))
+        or not isinstance(source_ids, list)
+        or len(source_ids) != len(bypass_ids)
+        or not isinstance(arms, Mapping)
+        or not isinstance(arms.get("b"), list)
+        or not isinstance(arms.get("c"), list)
+        or not isinstance(swaps, list)
+    ):
+        return None
+    bypass_set = set(bypass_ids)
+    source_by_id = dict(zip(bypass_ids, source_ids, strict=True))
+    arm_b = arms["b"]
+    arm_c = arms["c"]
+    if len(arm_b) != len(arm_c):
+        return None
+    for swap in swaps:
+        if not isinstance(swap, Mapping):
+            continue
+        promoted_id = swap.get("promoted_id")
+        demoted_id = swap.get("demoted_id")
+        from_index = swap.get("from_index")
+        to_index = swap.get("to_index")
+        if (
+            promoted_id not in bypass_set
+            or demoted_id not in bypass_set
+            or type(from_index) is not int
+            or type(to_index) is not int
+            or from_index != to_index + 1
+            or not 0 <= to_index < from_index < len(arm_b)
+            or arm_b[to_index] != demoted_id
+            or arm_b[from_index] != promoted_id
+            or arm_c[to_index] != promoted_id
+            or arm_c[from_index] != demoted_id
+        ):
+            continue
+        source_id = source_by_id.get(promoted_id)
+        if isinstance(source_id, str) and source_id:
+            return str(promoted_id), source_id
+    return None
+
+
+def _e_chord_delivery_summary(bucket: Mapping[str, object], metadata: dict) -> str:
+    """Render a bounded delivery summary without a provider or write call."""
+
+    raw_body = str(bucket.get("content") or "")
+    bucket_metadata = bucket.get("metadata")
+    stored_summary = (
+        bucket_metadata.get("dehydrated_summary")
+        if isinstance(bucket_metadata, Mapping)
+        else None
+    )
+    stored_hash = (
+        bucket_metadata.get("dehydrated_content_hash")
+        if isinstance(bucket_metadata, Mapping)
+        else None
+    )
+    body_hash = hashlib.sha256(raw_body.encode("utf-8")).hexdigest()
+    if (
+        _frontmatter_dehydration_cache_enabled()
+        and isinstance(stored_summary, str)
+        and len(stored_summary.strip()) >= 10
+        and stored_hash == body_hash
+    ):
+        record_recall_dehydration("frontmatter_hits")
+        summary = stored_summary.strip()
+    else:
+        # A live candidate must not add a second summarizer/provider call.
+        # This is the same bounded passthrough shape used by the established
+        # async cache-miss path, without scheduling a write or background job.
+        record_recall_dehydration("passthrough")
+        squashed = " ".join(strip_wikilinks(raw_body).split())
+        summary = squashed[:300] + ("…" if len(squashed) > 300 else "")
+    formatter = getattr(dehydrator, "format_dehydration_summary", None)
+    return formatter(summary, metadata) if callable(formatter) else summary
+
+
 async def breath(
     query: str = "",
     max_tokens: int = BREATH_DEFAULT_MAX_TOKENS,
@@ -4565,6 +4664,7 @@ async def breath(
     agent_id: str = "",
     e_chord_attempt: int = 0,
     first_screen_limit: int = 0,
+    e_chord_live_enabled: bool = False,
 ) -> str | list[TextContent | ImageContent]:
     """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认6000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制注入数量上限(默认8,最大50; 内部仍先召回20条给过滤器)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿安全关系边双向召回邻居的跳数(默认1,0=关闭,最大2)，关联证据单独列出且不改变主排序。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。session_id=同一会话内对已浮现动态桶去重。include_images=True时,白名单图桶会随文本返回 MCP image content。include_body_state=False时只关闭外部身体状态块,不改变记忆检索。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。"""
     with recall_stage("setup"):
@@ -5630,6 +5730,7 @@ async def breath(
         ),
     )
     chord_shadow_config = None
+    chord_shadow_receipt = None
     chord_shadow_prelude_ms = 0.0
     chord_shadow_a_candidates: list[dict] = []
     chord_shadow_post_e_candidates: list[dict] = []
@@ -6271,7 +6372,7 @@ async def breath(
                     admissibility_floor=chord_shadow_admissibility_floor,
                     limit=chord_shadow_config.bypass_limit,
                 )
-            await _record_e_chord_shadow(
+            chord_shadow_receipt = await _record_e_chord_shadow(
                 raw_chord=live_chord,
                 expected_turn_id=str(turn_id or ""),
                 expected_agent_id=str(agent_id or ""),
@@ -6702,6 +6803,151 @@ async def breath(
                 "不可替代事实） ---\n"
                 + "\n---\n".join(e_side_messages)
             )
+
+        # Formal bypass delivery is separate from ``raw``.  Keeping natural B
+        # untouched gives Twin an exact fail-open result if the content-bearing
+        # delivery fails its local contract or downstream filters.  Both the
+        # caller's live bit and Ombre's environment gate must be open.
+        if (
+            e_chord_live_enabled is True
+            and chord_shadow_config is not None
+            and chord_shadow_config.bypass_enabled
+            and isinstance(chord_shadow_receipt, Mapping)
+        ):
+            try:
+                delivery_choice = _e_chord_bypass_delivery_choice(
+                    chord_shadow_receipt
+                )
+                if delivery_choice is not None:
+                    delivery_id, delivery_source_id = delivery_choice
+                    if delivery_id not in excluded_e_ids:
+                        delivery_bucket = await bucket_mgr.get(delivery_id)
+                        if (
+                            delivery_bucket
+                            and str(delivery_bucket.get("id") or "")
+                            == delivery_id
+                            and isinstance(
+                                delivery_bucket.get("metadata"),
+                                Mapping,
+                            )
+                            and str(
+                                delivery_bucket["metadata"].get(
+                                    "e_source_bucket_id"
+                                )
+                                or ""
+                            )
+                            == delivery_source_id
+                            and _passes_nonkeyword_recall_filters(
+                                delivery_bucket,
+                                world_filter_set=wf_set,
+                                domain_filter=domain_filter,
+                                created_after=created_after,
+                                created_before=created_before,
+                            )
+                            and _filter_session_seen([delivery_bucket], session_id)
+                            and _filter_z_fact_candidates(
+                                [delivery_bucket],
+                                query=recall_query,
+                                intent=intent_policy["intent"],
+                            )
+                        ):
+                            delivery_fingerprint = default_content_fingerprint(
+                                str(delivery_bucket.get("content") or "")
+                            )
+                            if (
+                                not delivery_fingerprint
+                                or delivery_fingerprint
+                                not in selected_content_fingerprints
+                            ):
+                                delivery_annotation = select_current_annotation(
+                                    e_rows_by_bucket.get(delivery_id, ()),
+                                    delivery_bucket,
+                                    e_recall_cfg,
+                                )
+                                if delivery_annotation is not None:
+                                    if e_semantic_scores:
+                                        delivery_resonance = semantic_resonance_score(
+                                            delivery_annotation,
+                                            e_semantic_scores.get(delivery_id),
+                                        )
+                                    else:
+                                        delivery_resonance = e_axis_resonance_score(
+                                            e_query_emotion,
+                                            delivery_annotation,
+                                        )
+                                    if (
+                                        delivery_resonance is not None
+                                        and delivery_resonance
+                                        >= e_recall_cfg.side_channel_min_resonance
+                                    ):
+                                        delivery_meta = {
+                                            key: value
+                                            for key, value in delivery_bucket[
+                                                "metadata"
+                                            ].items()
+                                            if key != "tags"
+                                        }
+                                        delivery_summary = _e_chord_delivery_summary(
+                                            delivery_bucket,
+                                            delivery_meta,
+                                        )
+                                        delivery_summary = " ".join(
+                                            delivery_summary.split()
+                                        )
+                                        delivery_tokens = count_tokens_approx(
+                                            delivery_summary
+                                        )
+                                        if token_used + delivery_tokens <= max_tokens:
+                                            delivery_prefix = _recall_prefix(
+                                                delivery_id,
+                                                "side_channel",
+                                                "e_emotion",
+                                                marker="[情绪共鸣]",
+                                                bucket=delivery_bucket,
+                                                state_profile=state_profile,
+                                            )
+                                            response_capture = (
+                                                _e_chord_shadow_response_capture.get()
+                                            )
+                                            if isinstance(response_capture, dict):
+                                                response_capture["bypass_delivery"] = {
+                                                    "schema": (
+                                                        "e_chord_bypass_delivery.v1"
+                                                    ),
+                                                    "projection_digest": (
+                                                        chord_shadow_receipt[
+                                                            "projection_digest"
+                                                        ]
+                                                    ),
+                                                    "source_turn_digest": (
+                                                        chord_shadow_receipt[
+                                                            "source_turn_digest"
+                                                        ]
+                                                    ),
+                                                    "attempt_index": (
+                                                        chord_shadow_receipt[
+                                                            "attempt_index"
+                                                        ]
+                                                    ),
+                                                    "blocks": [{
+                                                        "id": delivery_id,
+                                                        "e_source_bucket_id": (
+                                                            delivery_source_id
+                                                        ),
+                                                        "text": (
+                                                            f"{delivery_prefix} "
+                                                            f"[resonance:"
+                                                            f"{delivery_resonance:.3f}] "
+                                                            f"{delivery_summary}"
+                                                        ),
+                                                    }],
+                                                }
+            except Exception as exc:
+                # Natural B is already complete and is never mutated above.
+                logger.warning(
+                    "E chord bypass delivery skipped; natural recall unchanged: %s",
+                    type(exc).__name__,
+                )
 
     # --- Random surfacing is opt-in after PR-1 noise reduction.
     # --- 减噪后随机漂浮改为显式配置，默认关闭，避免检索不足时硬塞旧噪音。
@@ -10848,6 +11094,7 @@ async def api_breath(request):
                 agent_id=str(body.get("agent_id") or "")[:160],
                 e_chord_attempt=_int_arg("e_chord_attempt", 0),
                 first_screen_limit=_int_arg("first_screen_limit", 0),
+                e_chord_live_enabled=body.get("e_chord_live_enabled") is True,
             ))
             done, _pending = await asyncio.wait(
                 {breath_task},
@@ -10911,6 +11158,9 @@ async def api_breath(request):
     shadow_receipt = e_chord_response_capture.get("receipt")
     if isinstance(shadow_receipt, dict):
         response_payload["e_chord_shadow"] = shadow_receipt
+    bypass_delivery = e_chord_response_capture.get("bypass_delivery")
+    if isinstance(bypass_delivery, dict):
+        response_payload["e_chord_bypass_delivery"] = bypass_delivery
     return JSONResponse(response_payload)
 
 

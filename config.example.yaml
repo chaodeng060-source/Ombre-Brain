@@ -152,8 +152,11 @@ e_axis_recall:
 # 可选环境变量 OMBRE_E_CHORD_DERIVED_LOCK=1 会在两条 E 没有共享强锁时，核对它们的
 # e_source_bucket_id：仅 deterministic 关系边，或同一 recorded_at 日期且 domain 相同，
 # 才形成二级派生锁。默认 0；关闭后提案路径与旧版逐对象等价。
-# 可选 OMBRE_E_CHORD_BYPASS=1 仅向影子 B 池尾部追加源事件已进入本次内存候选图的
-# 合格 E 桶；不会进入真实返回，也不会新增查询、模型或 embedding 调用。默认 0。
+# 可选 OMBRE_E_CHORD_BYPASS=1 向候选账本追加源事件已进入本次内存候选图的
+# 合格 E 桶；只有请求同时显式携带 e_chord_live_enabled=true，才把一条经全部安全闸
+# 验证的欲望提升候选作为独立 delivery 返回给 Twin。自然 raw 始终不变；delivery 只用
+# 缓存摘要或确定性限长正文，不新增模型、查询或 embedding 调用。默认 0，关闭即完全退回
+# 旧响应合同。
 e_chord_shadow:
   enabled: false
   mode: shadow

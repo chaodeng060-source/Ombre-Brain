@@ -1,10 +1,11 @@
-"""Text-free, zero-call E-chord shadow proposal and private receipt ledger.
+"""Text-free E-chord proposal and private shadow/final receipt ledgers.
 
 The chord is never a retrieval channel.  It may only propose an adjacent swap
 between already-retained, primary-authored E memories that share either a
 strong persisted event lock or, when explicitly enabled, a source-verifiable
 derived lock, and are already a near tie under the existing E rank.  Callers
-keep serving arm B; arm C exists solely in the append-only shadow receipt.
+keep serving arm B unless a separately gated, content-bearing delivery is
+validated downstream. This module itself remains text-free and zero-call.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ BYPASS_RECEIPT_SCHEMA = "e_chord_shadow_receipt.v3"
 LEGACY_FINAL_SELECTION_SCHEMA = "e_chord_final_selection.v1"
 FINAL_SELECTION_SCHEMA = "e_chord_final_selection.v2"
 BYPASS_FINAL_SELECTION_SCHEMA = "e_chord_final_selection.v3"
+LIVE_BYPASS_FINAL_SELECTION_SCHEMA = "e_chord_final_selection.v4"
 MAX_FACETS = 2
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 _HEX16_RE = re.compile(r"^[0-9a-f]{16}$")
@@ -732,7 +734,7 @@ def select_bypass_candidates(
     source_buckets_by_id: Mapping[str, Mapping[str, object]] | None = None,
     limit: int = 4,
 ) -> list[Mapping[str, object]]:
-    """Select an in-memory, shadow-only suffix of source-bound E buckets."""
+    """Select a bounded, source-bound E suffix for shadow and gated delivery."""
 
     if type(limit) is not int or isinstance(limit, bool) or not 1 <= limit <= 8:
         raise ValueError("bypass limit must be in [1, 8]")
@@ -1935,6 +1937,117 @@ _BYPASS_FINAL_SELECTION_KEYS = _FINAL_SELECTION_KEYS | frozenset({
     "bypass_source_ids",
     "bypass_limit",
 })
+_LIVE_BYPASS_FINAL_SELECTION_KEYS = _BYPASS_FINAL_SELECTION_KEYS | frozenset({
+    "delivered_bypass_ids",
+    "displaced_natural_ids",
+    "mode",
+    "served_arm",
+    "live_applied",
+    "fallback_reason",
+})
+
+
+def _validate_live_bypass_final_selection(value: dict[str, Any]) -> dict[str, Any]:
+    """Validate a final prompt whose membership changed via live delivery."""
+
+    if set(value) != _LIVE_BYPASS_FINAL_SELECTION_KEYS:
+        raise ValueError("invalid E chord final selection contract")
+    if type(value.get("recorded_at_ms")) is not int or value["recorded_at_ms"] < 0:
+        raise ValueError("invalid E chord final selection contract")
+    if _safe_id(value.get("agent_id")) is None:
+        raise ValueError("invalid E chord final selection contract")
+    for name in ("source_turn_digest", "projection_digest"):
+        digest = value.get(name)
+        if type(digest) is not str or _HEX64_RE.fullmatch(digest) is None:
+            raise ValueError("invalid E chord final selection contract")
+    if (
+        type(value.get("attempt_index")) is not int
+        or not 0 <= value["attempt_index"] <= 3
+    ):
+        raise ValueError("invalid E chord final selection contract")
+
+    pool_ids = _validated_id_list(value.get("pool_ids"), maximum=58)
+    bypass_ids = _validated_id_list(value.get("bypass_ids"), maximum=8)
+    bypass_source_ids = value.get("bypass_source_ids")
+    bypass_limit = value.get("bypass_limit")
+    delivered_ids = _validated_id_list(
+        value.get("delivered_bypass_ids"),
+        maximum=1,
+    )
+    displaced_ids = _validated_id_list(
+        value.get("displaced_natural_ids"),
+        maximum=1,
+    )
+    if (
+        not delivered_ids
+        or type(bypass_source_ids) is not list
+        or len(bypass_source_ids) != len(bypass_ids)
+        or any(_safe_id(item) is None for item in bypass_source_ids)
+        or type(bypass_limit) is not int
+        or isinstance(bypass_limit, bool)
+        or not 1 <= bypass_limit <= 8
+        or len(bypass_ids) > bypass_limit
+        or not set(delivered_ids) <= set(bypass_ids)
+        or set(displaced_ids) & set(bypass_ids)
+        or (bool(bypass_ids) and pool_ids[-len(bypass_ids):] != bypass_ids)
+    ):
+        raise ValueError("invalid E chord final selection contract")
+
+    final_input_ids = _validated_id_list(value.get("final_input_cohort_ids"))
+    final_ids = _validated_id_list(value.get("final_injected_ids"))
+    outside_ids = _validated_id_list(value.get("outside_pool_ids"))
+    pool_set = set(pool_ids)
+    if (
+        len(final_input_ids) > 58
+        or len(final_ids) > 32
+        or len(outside_ids) > 32
+        or not set(final_input_ids) <= pool_set
+        or final_input_ids
+        != [bucket_id for bucket_id in pool_ids if bucket_id in set(final_input_ids)]
+        or value.get("final_input_cohort_status") != "live_bypass_delivery"
+        or [bucket_id for bucket_id in final_ids if bucket_id not in pool_set]
+        != outside_ids
+        or any(bucket_id not in final_ids for bucket_id in delivered_ids)
+        or any(bucket_id not in final_input_ids for bucket_id in delivered_ids)
+        or set(final_ids) & set(bypass_ids) != set(delivered_ids)
+    ):
+        raise ValueError("invalid E chord final selection contract")
+
+    arms = value.get("arms")
+    if type(arms) is not dict or set(arms) != {"a", "b", "c"}:
+        raise ValueError("invalid E chord final selection contract")
+    normalized_arms = {
+        name: _validated_id_list(arms[name])
+        for name in ("a", "b", "c")
+    }
+    final_pool_ids = [bucket_id for bucket_id in final_ids if bucket_id in pool_set]
+    natural_pool_set = pool_set - set(bypass_ids)
+    arm_a = normalized_arms["a"]
+    arm_b = normalized_arms["b"]
+    arm_c = normalized_arms["c"]
+    if (
+        any(len(ids) > 32 or not set(ids) <= pool_set for ids in normalized_arms.values())
+        or arm_a != arm_b
+        or not set(arm_b) <= natural_pool_set
+        or arm_c != final_pool_ids
+        or set(arm_c) - set(arm_b) != set(delivered_ids)
+        or set(arm_b) - set(arm_c) != set(displaced_ids)
+        or not set(arm_b) <= set(final_input_ids)
+        or value.get("applied_swaps") != []
+        or value.get("mode") != "live"
+        or value.get("served_arm") != "c"
+        or value.get("live_applied") is not True
+        or value.get("fallback_reason") != ""
+    ):
+        raise ValueError("invalid E chord final selection contract")
+    elapsed = _finite(value.get("request_path_delta_ms"))
+    if elapsed is None or elapsed < 0:
+        raise ValueError("invalid E chord final selection contract")
+    try:
+        json.dumps(value, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid E chord final selection contract") from exc
+    return value
 
 
 def validate_final_selection(value: object) -> dict[str, Any]:
@@ -1943,6 +2056,8 @@ def validate_final_selection(value: object) -> dict[str, Any]:
     if type(value) is not dict:
         raise ValueError("invalid E chord final selection contract")
     schema = value.get("schema")
+    if schema == LIVE_BYPASS_FINAL_SELECTION_SCHEMA:
+        return _validate_live_bypass_final_selection(value)
     if schema not in {
         LEGACY_FINAL_SELECTION_SCHEMA,
         FINAL_SELECTION_SCHEMA,
@@ -2184,6 +2299,7 @@ __all__ = [
     "BYPASS_FINAL_SELECTION_SCHEMA",
     "BYPASS_RECEIPT_SCHEMA",
     "FINAL_SELECTION_SCHEMA",
+    "LIVE_BYPASS_FINAL_SELECTION_SCHEMA",
     "LiveChord",
     "LiveChordFacet",
     "ShadowProposal",

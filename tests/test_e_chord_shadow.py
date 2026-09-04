@@ -15,6 +15,7 @@ from e_chord_shadow import (
     FINAL_SELECTION_SCHEMA,
     LEGACY_FINAL_SELECTION_SCHEMA,
     LEGACY_RECEIPT_SCHEMA,
+    LIVE_BYPASS_FINAL_SELECTION_SCHEMA,
     build_shadow_receipt,
     load_e_chord_shadow_config,
     parse_live_chord,
@@ -1248,6 +1249,50 @@ def test_bypass_final_selection_v3_never_accepts_bypass_as_injected():
         validate_final_selection(leaked)
 
 
+def test_live_bypass_final_selection_v4_binds_delivered_membership():
+    selection = _final_selection(
+        schema=LIVE_BYPASS_FINAL_SELECTION_SCHEMA,
+        pool_ids=["natural", "bypass-a", "bypass-b"],
+        final_input_cohort_ids=["natural", "bypass-b"],
+        final_input_cohort_status="live_bypass_delivery",
+        final_injected_ids=["bypass-b", "natural", "helper"],
+        outside_pool_ids=["helper"],
+        arms={
+            "a": ["natural"],
+            "b": ["natural"],
+            "c": ["bypass-b", "natural"],
+        },
+        bypass_ids=["bypass-a", "bypass-b"],
+        bypass_source_ids=["source-a", "source-b"],
+        bypass_limit=4,
+        delivered_bypass_ids=["bypass-b"],
+        displaced_natural_ids=[],
+        mode="live",
+        served_arm="c",
+        live_applied=True,
+        fallback_reason="",
+    )
+
+    assert validate_final_selection(selection) is selection
+
+    undeclared = copy.deepcopy(selection)
+    undeclared["delivered_bypass_ids"] = ["bypass-a"]
+    with pytest.raises(ValueError, match="final selection contract"):
+        validate_final_selection(undeclared)
+
+    forged_off = copy.deepcopy(selection)
+    forged_off["live_applied"] = False
+    with pytest.raises(ValueError, match="final selection contract"):
+        validate_final_selection(forged_off)
+
+    hidden_displacement = copy.deepcopy(selection)
+    hidden_displacement["arms"]["b"] = ["natural", "natural-extra"]
+    hidden_displacement["pool_ids"].insert(1, "natural-extra")
+    hidden_displacement["final_input_cohort_ids"].insert(1, "natural-extra")
+    with pytest.raises(ValueError, match="final selection contract"):
+        validate_final_selection(hidden_displacement)
+
+
 def test_final_selection_validator_reconstructs_only_declared_boundary_swaps():
     swap = {
         "promoted_id": "b",
@@ -1511,6 +1556,136 @@ def test_server_shadow_hook_appends_bypass_only_to_v3_shadow_pool(monkeypatch):
     assert written == [receipt]
 
 
+def test_live_delivery_choice_uses_one_adjacent_bypass_winner():
+    import server
+
+    receipt = {
+        "schema": BYPASS_RECEIPT_SCHEMA,
+        "bypass_ids": ["bypass-left", "bypass-right"],
+        "bypass_source_ids": ["source-left", "source-right"],
+        "arms": {
+            "b": ["natural", "bypass-left", "bypass-right"],
+            "c": ["natural", "bypass-right", "bypass-left"],
+        },
+        "swaps": [{
+            "promoted_id": "bypass-right",
+            "demoted_id": "bypass-left",
+            "from_index": 2,
+            "to_index": 1,
+        }],
+    }
+
+    assert server._e_chord_bypass_delivery_choice(receipt) == (
+        "bypass-right",
+        "source-right",
+    )
+
+
+def test_live_delivery_choice_rejects_missing_or_forged_swap():
+    import server
+
+    no_swap = {
+        "schema": BYPASS_RECEIPT_SCHEMA,
+        "bypass_ids": ["bypass-left", "bypass-right"],
+        "bypass_source_ids": ["source-left", "source-right"],
+        "arms": {
+            "b": ["natural", "bypass-left", "bypass-right"],
+            "c": ["natural", "bypass-left", "bypass-right"],
+        },
+        "swaps": [],
+    }
+    malformed = {
+        **no_swap,
+        "swaps": [{
+            "promoted_id": "outside",
+            "demoted_id": "bypass-left",
+            "from_index": 2,
+            "to_index": 1,
+        }],
+    }
+
+    assert server._e_chord_bypass_delivery_choice(None) is None
+    assert server._e_chord_bypass_delivery_choice(no_swap) is None
+    assert server._e_chord_bypass_delivery_choice(malformed) is None
+
+
+def test_emotion_polarity_reversal_changes_live_delivery_winner():
+    sources = {
+        f"source-{name}": {"id": f"source-{name}", "metadata": {}}
+        for name in (
+            "neg-1-engage",
+            "neg-2-comfort",
+            "pos-1-engage",
+            "pos-2-comfort",
+        )
+    }
+
+    def winner(query_valence):
+        candidates = [
+            _candidate(
+                name,
+                tendency=tendency,
+                query_valence=query_valence,
+                experience_valence=experience_valence,
+                source=f"source-{name}",
+            )
+            for name, tendency, experience_valence in (
+                ("neg-1-engage", "engage", -0.8),
+                ("neg-2-comfort", "comfort", -0.8),
+                ("pos-1-engage", "engage", 0.8),
+                ("pos-2-comfort", "comfort", 0.8),
+            )
+        ]
+        selected = select_bypass_candidates(
+            candidates,
+            [],
+            source_buckets_by_id=sources,
+            limit=2,
+        )
+        selected_ids = tuple(candidate["id"] for candidate in selected)
+        proposal = propose_chord_reorder(
+            selected,
+            _parse(),
+            bypass_ids=selected_ids,
+        )
+        assert len(proposal.swaps) == 1
+        return proposal.swaps[0].promoted_id
+
+    assert winner(-0.9) == "neg-2-comfort"
+    assert winner(0.9) == "pos-2-comfort"
+
+
+def test_live_delivery_summary_never_calls_dehydrator(monkeypatch):
+    import server
+
+    async def forbidden(*_args, **_kwargs):
+        raise AssertionError("live delivery must not call a provider")
+
+    monkeypatch.setattr(server.dehydrator, "dehydrate_with_source", forbidden)
+    bucket = {
+        "content": "  一段   没有缓存、但可以确定性限长的 E 轴经历正文。  ",
+        "metadata": {},
+    }
+
+    rendered = server._e_chord_delivery_summary(bucket, {})
+
+    assert "一段 没有缓存" in rendered
+
+
+def test_live_delivery_prefix_matches_twin_validation_contract():
+    import server
+
+    prefix = server._recall_prefix(
+        "bypass-right",
+        "side_channel",
+        "e_emotion",
+    )
+
+    assert "[role:side_channel]" in prefix
+    assert "[layer:e_emotion]" in prefix
+    assert "[bucket_id:bypass-right]" in prefix
+
+
 def test_server_shadow_hook_marks_post_e_state_reorder_unscorable(monkeypatch):
     import server
 
@@ -1658,6 +1833,82 @@ def test_recall_receipt_records_empty_final_selection_without_activation(
     assert written == [selection]
 
 
+def test_recall_receipt_accepts_live_bypass_v4_matching_prompt(monkeypatch):
+    import server
+
+    written = []
+
+    class _Ledger:
+        def append(self, row):
+            written.append(copy.deepcopy(row))
+            return True
+
+    class _ReceiptStore:
+        def begin(self, _event_id, bucket_ids, _source):
+            return {"pending": list(bucket_ids), "duplicate": False}
+
+        def mark_applied(self, *_args, **_kwargs):
+            return None
+
+        def mark_failed(self, *_args, **_kwargs):
+            raise AssertionError("valid live receipt must not fail")
+
+        def status(self, _event_id):
+            return {"status": "complete", "applied": 2, "pending": 0}
+
+    async def _inline_to_thread(function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    selection = _final_selection(
+        schema=LIVE_BYPASS_FINAL_SELECTION_SCHEMA,
+        pool_ids=["natural", "bypass-a", "bypass-b"],
+        final_input_cohort_ids=["natural", "bypass-b"],
+        final_input_cohort_status="live_bypass_delivery",
+        final_injected_ids=["natural", "bypass-b"],
+        arms={
+            "a": ["natural"],
+            "b": ["natural"],
+            "c": ["natural", "bypass-b"],
+        },
+        bypass_ids=["bypass-a", "bypass-b"],
+        bypass_source_ids=["source-a", "source-b"],
+        bypass_limit=4,
+        delivered_bypass_ids=["bypass-b"],
+        displaced_natural_ids=[],
+        mode="live",
+        served_arm="c",
+        live_applied=True,
+        fallback_reason="",
+    )
+    monkeypatch.setattr(
+        server,
+        "_get_e_chord_final_selection_ledger",
+        lambda: _Ledger(),
+    )
+    monkeypatch.setattr(server, "_get_recall_receipt_store", lambda: _ReceiptStore())
+    monkeypatch.setattr(server.asyncio, "to_thread", _inline_to_thread)
+    monkeypatch.setattr(
+        server.bucket_mgr,
+        "get",
+        lambda _bucket_id: asyncio.sleep(0, result={"id": _bucket_id}),
+    )
+    monkeypatch.setattr(
+        server.bucket_mgr,
+        "touch",
+        lambda *_args, **_kwargs: asyncio.sleep(0),
+    )
+
+    response = asyncio.run(server.api_recall_receipt(_JsonRequest({
+        "event_id": "event-live-v4",
+        "bucket_ids": ["natural", "bypass-b"],
+        "source": "twin_prompt_injection",
+        "e_chord_selection": selection,
+    })))
+
+    assert response.status_code == 200
+    assert written == [selection]
+
+
 def test_recall_receipt_rejects_selection_not_matching_final_ids(monkeypatch):
     import server
 
@@ -1686,10 +1937,18 @@ def test_http_breath_forwards_projection_on_the_existing_call(monkeypatch):
     observed = {}
     payload = _payload(captured_at_ms=int(server.time.time() * 1000))
     shadow_receipt = {"projection_digest": "d" * 64, "attempt_index": 0}
+    delivery = {
+        "schema": "e_chord_bypass_delivery.v1",
+        "projection_digest": "d" * 64,
+        "source_turn_digest": "b" * 64,
+        "attempt_index": 0,
+        "blocks": [],
+    }
 
     async def fake_breath(**kwargs):
         observed.update(kwargs)
         server._e_chord_shadow_response_capture.get()["receipt"] = shadow_receipt
+        server._e_chord_shadow_response_capture.get()["bypass_delivery"] = delivery
         return "unchanged recall"
 
     monkeypatch.setattr(server, "breath", fake_breath)
@@ -1699,6 +1958,7 @@ def test_http_breath_forwards_projection_on_the_existing_call(monkeypatch):
         "live_chord": payload,
         "turn_id": "turn-abc123",
         "agent_id": "claude",
+        "e_chord_live_enabled": True,
     })))
 
     assert response.status_code == 200
@@ -1706,6 +1966,27 @@ def test_http_breath_forwards_projection_on_the_existing_call(monkeypatch):
     assert observed["turn_id"] == "turn-abc123"
     assert observed["agent_id"] == "claude"
     assert observed["session_id"] == TEST_SESSION_ID
+    assert observed["e_chord_live_enabled"] is True
     response_payload = json.loads(bytes(response.body))
     assert response_payload["raw"] == "unchanged recall"
     assert response_payload["e_chord_shadow"] == shadow_receipt
+    assert response_payload["e_chord_bypass_delivery"] == delivery
+
+
+def test_http_breath_live_bit_is_strict_boolean(monkeypatch):
+    import server
+
+    observed = {}
+
+    async def fake_breath(**kwargs):
+        observed.update(kwargs)
+        return "unchanged recall"
+
+    monkeypatch.setattr(server, "breath", fake_breath)
+    response = asyncio.run(server.api_breath(_JsonRequest({
+        "query": "same natural phrase",
+        "e_chord_live_enabled": "true",
+    })))
+
+    assert response.status_code == 200
+    assert observed["e_chord_live_enabled"] is False
