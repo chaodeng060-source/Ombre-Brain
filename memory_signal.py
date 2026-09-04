@@ -33,12 +33,14 @@ class SignalEntry:
     bucket_id: str
     line: str
     partial: bool
+    revision: str = ""
 
 
 @dataclass
 class _Snapshot:
     snapshot_id: str
     created_at: float
+    last_accessed_at: float
     page_size: int
     entries: tuple[SignalEntry, ...]
     session_id: str = ""
@@ -133,6 +135,7 @@ def build_signal_entry(
     reason: str,
     query: str = "",
     match_text: str = "",
+    revision: str = "",
     max_chars: int = SIGNAL_LINE_MAX_CHARS,
 ) -> SignalEntry:
     """Build one source-derived signal line without summarising or rewriting."""
@@ -161,6 +164,7 @@ def build_signal_entry(
             bucket_id=bucket_id,
             line=f"{prefix}「{sentence}」",
             partial=False,
+            revision=_one_line(revision),
         )
 
     marker = "[partial]"
@@ -169,7 +173,12 @@ def build_signal_entry(
         raise ValueError("bucket id and signal metadata exceed line budget")
     snippet = sentence[:available]
     line = f"{prefix}「{snippet}」{marker}"
-    return SignalEntry(bucket_id=bucket_id, line=line, partial=True)
+    return SignalEntry(
+        bucket_id=bucket_id,
+        line=line,
+        partial=True,
+        revision=_one_line(revision),
+    )
 
 
 class MemorySignalStore:
@@ -180,30 +189,42 @@ class MemorySignalStore:
         *,
         ttl_seconds: float = 15 * 60,
         max_snapshots: int = 128,
+        max_total_entries: int = 4096,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.ttl_seconds = max(1.0, float(ttl_seconds))
         self.max_snapshots = max(1, int(max_snapshots))
+        self.max_total_entries = max(1, int(max_total_entries))
         self._clock = clock
         self._snapshots: dict[str, _Snapshot] = {}
         self._lock = threading.RLock()
+
+    def _total_entries_locked(self) -> int:
+        return sum(len(snapshot.entries) for snapshot in self._snapshots.values())
 
     def _prune_locked(self, now: float) -> None:
         expired = [
             snapshot_id
             for snapshot_id, snapshot in self._snapshots.items()
-            if now - snapshot.created_at > self.ttl_seconds
+            if now - snapshot.last_accessed_at > self.ttl_seconds
         ]
         for snapshot_id in expired:
             self._snapshots.pop(snapshot_id, None)
-        overflow = len(self._snapshots) - self.max_snapshots
-        if overflow > 0:
-            oldest = sorted(
+        while (
+            len(self._snapshots) > self.max_snapshots
+            or self._total_entries_locked() > self.max_total_entries
+        ):
+            oldest = min(
                 self._snapshots.values(),
-                key=lambda snapshot: snapshot.created_at,
-            )[:overflow]
-            for snapshot in oldest:
-                self._snapshots.pop(snapshot.snapshot_id, None)
+                key=lambda snapshot: (
+                    snapshot.last_accessed_at,
+                    snapshot.created_at,
+                ),
+                default=None,
+            )
+            if oldest is None:
+                break
+            self._snapshots.pop(oldest.snapshot_id, None)
 
     def create(
         self,
@@ -223,11 +244,18 @@ class MemorySignalStore:
                 continue
             seen.add(entry.bucket_id)
             deduped.append(entry)
+        overflow = max(0, len(deduped) - self.max_total_entries)
+        if overflow:
+            deduped = deduped[:self.max_total_entries]
+            partial = True
+            skipped_count = max(0, int(skipped_count)) + overflow
+            error = str(error or "").strip() or "snapshot_entry_limit"
         now = self._clock()
         snapshot_id = secrets.token_urlsafe(12)
         snapshot = _Snapshot(
             snapshot_id=snapshot_id,
             created_at=now,
+            last_accessed_at=now,
             page_size=size,
             entries=tuple(deduped),
             session_id=str(session_id or "").strip(),
@@ -247,6 +275,7 @@ class MemorySignalStore:
         snapshot = self._snapshots.get(snapshot_id)
         if snapshot is None:
             raise MemorySignalCursorError("snapshot_expired_or_unknown")
+        snapshot.last_accessed_at = now
         return snapshot
 
     @staticmethod
@@ -294,17 +323,49 @@ class MemorySignalStore:
         snapshot_id: str,
         bucket_id: str,
     ) -> tuple[bool, str]:
+        tracked, session_id, _error = self.track_expansion(
+            snapshot_id,
+            bucket_id,
+        )
+        return tracked, session_id
+
+    def track_expansion(
+        self,
+        snapshot_id: str,
+        bucket_id: str,
+        *,
+        current_revision: str | None = None,
+    ) -> tuple[bool, str, str]:
+        """Validate one snapshot member and record a full-body expansion.
+
+        A revision is optional for backwards-compatible direct store users.
+        Production ``inspect`` supplies it, so a stale signal line can never
+        be silently paired with a newer authoritative body.
+        """
         with self._lock:
             try:
                 snapshot = self._snapshot_locked(str(snapshot_id or ""))
             except MemorySignalCursorError:
-                return False, ""
-            member_ids = {entry.bucket_id for entry in snapshot.entries}
+                return False, "", "snapshot_expired_or_unknown"
             normalized = str(bucket_id or "").strip()
-            if normalized not in member_ids:
-                return False, ""
+            entry = next(
+                (
+                    candidate
+                    for candidate in snapshot.entries
+                    if candidate.bucket_id == normalized
+                ),
+                None,
+            )
+            if entry is None:
+                return False, "", "bucket_not_in_snapshot"
+            if (
+                entry.revision
+                and current_revision is not None
+                and str(current_revision or "").strip() != entry.revision
+            ):
+                return False, "", "source_changed"
             snapshot.expanded.setdefault(normalized, None)
-            return True, snapshot.session_id
+            return True, snapshot.session_id, ""
 
     def mark_expanded(self, snapshot_id: str, bucket_id: str) -> bool:
         tracked, _session_id = self.mark_expanded_with_session(

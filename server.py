@@ -314,6 +314,11 @@ _breath_session_seen_writes_enabled = contextvars.ContextVar(
 _memory_signal_store = MemorySignalStore()
 
 
+def _memory_signal_body_revision(bucket: dict) -> str:
+    """Bind a signal line to its body, excluding transient recall overlays."""
+    return bucket_revision_hash(str(bucket.get("content") or ""), {})
+
+
 class RecallOperationalError(RuntimeError):
     """A required recall channel failed instead of returning valid evidence."""
 
@@ -6896,6 +6901,7 @@ async def _breath_tool(
                 reason=str(item.get("reason") or "ranked"),
                 query=query,
                 match_text=str(item.get("summary") or ""),
+                revision=_memory_signal_body_revision(bucket),
             ))
         except Exception as exc:
             skipped_count += 1
@@ -7618,6 +7624,25 @@ async def inspect(bucket_id: str, signal_snapshot_id: str = "") -> str:
 
     meta = bucket.get("metadata", {})
     content = strip_wikilinks(bucket.get("content", ""))
+    signal_session_id = ""
+    if signal_snapshot_id:
+        tracked, signal_session_id, signal_error = (
+            _memory_signal_store.track_expansion(
+                signal_snapshot_id,
+                bucket["id"],
+                current_revision=_memory_signal_body_revision(bucket),
+            )
+        )
+        if not tracked:
+            if signal_error == "source_changed":
+                detail = "该记忆在信号页生成后已更新，请重新 breath 获取新快照。"
+            else:
+                detail = "该信号页已失效或不包含这个桶，请重新 breath 获取新快照。"
+            return (
+                "[memory_signal_read "
+                f"tracked:false bucket_id:{bucket['id']} "
+                f"partial:true error:{signal_error}]\n{detail}"
+            )
 
     try:
         score = decay_engine.calculate_score(meta)
@@ -7661,19 +7686,49 @@ async def inspect(bucket_id: str, signal_snapshot_id: str = "") -> str:
 
     result = f"{header}\n\n--- 正文 ---\n{content}{rel_block}"
     if signal_snapshot_id:
-        tracked, signal_session_id = _memory_signal_store.mark_expanded_with_session(
-            signal_snapshot_id,
-            bucket["id"],
-        )
-        if tracked and signal_session_id:
+        if signal_session_id:
             _remember_session_seen_ids(signal_session_id, [bucket["id"]])
         result += (
             "\n\n---\n"
             "[memory_signal_read "
-            f"tracked:{str(tracked).lower()} "
+            "tracked:true "
             f"bucket_id:{bucket['id']} partial:false]"
         )
     return result
+
+
+@mcp.tool()
+async def inspect_batch(
+    bucket_ids: list[str],
+    signal_snapshot_id: str = "",
+) -> str:
+    """按原顺序一次展开至多 5 条记忆；signal 快照校验与单条 inspect 相同。"""
+    if not isinstance(bucket_ids, list):
+        return "请提供 bucket_ids 列表。"
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in bucket_ids:
+        bucket_id = str(value or "").strip()
+        if not bucket_id or bucket_id in seen:
+            continue
+        seen.add(bucket_id)
+        normalized.append(bucket_id)
+    if not normalized:
+        return "请至少提供一个有效的 bucket_id。"
+    if len(normalized) > 5:
+        return "一次最多展开 5 条记忆；请缩小 bucket_ids。"
+
+    chunks = []
+    total = len(normalized)
+    for index, bucket_id in enumerate(normalized, start=1):
+        body = await inspect(
+            bucket_id,
+            signal_snapshot_id=signal_snapshot_id,
+        )
+        chunks.append(
+            f"=== inspect {index}/{total} [bucket_id:{bucket_id}] ===\n{body}"
+        )
+    return "\n\n".join(chunks)
 
 
 # =============================================================

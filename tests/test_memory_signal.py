@@ -4,6 +4,7 @@ from contextlib import nullcontext
 import pytest
 
 import server
+from bucket_manager import bucket_revision_hash
 from memory_signal import (
     MemorySignalCursorError,
     MemorySignalStore,
@@ -107,6 +108,57 @@ def test_snapshot_cursor_is_fixed_and_does_not_rerank_mutated_inputs():
     assert page_two["has_more"] is False
 
 
+def test_active_cursor_refreshes_ttl_but_idle_cursor_expires():
+    now = [100.0]
+    store = MemorySignalStore(
+        ttl_seconds=10,
+        max_snapshots=4,
+        clock=lambda: now[0],
+    )
+    page = store.create(
+        [
+            build_signal_entry(_bucket("111111111111", "第一页。"), reason="lexical"),
+            build_signal_entry(_bucket("222222222222", "第二页。"), reason="semantic"),
+        ],
+        page_size=1,
+    )
+
+    now[0] = 108.0
+    store.page(page["next_cursor"])
+    now[0] = 117.0
+    assert store.page(page["next_cursor"])["snapshot_id"] == page["snapshot_id"]
+    now[0] = 128.0
+
+    with pytest.raises(MemorySignalCursorError, match="snapshot_expired_or_unknown"):
+        store.page(page["next_cursor"])
+
+
+def test_total_entry_bound_evicts_least_recently_used_snapshot():
+    now = [100.0]
+    store = MemorySignalStore(
+        ttl_seconds=60,
+        max_snapshots=4,
+        max_total_entries=2,
+        clock=lambda: now[0],
+    )
+    old = store.create(
+        [
+            build_signal_entry(_bucket("111111111111", "旧第一页。"), reason="lexical"),
+            build_signal_entry(_bucket("222222222222", "旧第二页。"), reason="semantic"),
+        ],
+        page_size=1,
+    )
+    now[0] = 101.0
+    current = store.create(
+        [build_signal_entry(_bucket("333333333333", "新页。"), reason="semantic")],
+        page_size=1,
+    )
+
+    with pytest.raises(MemorySignalCursorError, match="snapshot_expired_or_unknown"):
+        store.page(old["next_cursor"])
+    assert store.expanded_ids(current["snapshot_id"]) == ()
+
+
 def test_only_inspected_snapshot_member_enters_read_receipt():
     store = MemorySignalStore(ttl_seconds=60, max_snapshots=4)
     entries = [
@@ -182,12 +234,16 @@ async def test_breath_default_mode_is_byte_stable_passthrough(monkeypatch):
 
 def test_mcp_breath_schema_exposes_signal_without_replacing_core_function():
     tool = server.mcp._tool_manager.get_tool("breath")
+    batch_tool = server.mcp._tool_manager.get_tool("inspect_batch")
 
     assert tool.fn is server._breath_tool
     assert "output_mode" in tool.parameters["properties"]
     assert "cursor" in tool.parameters["properties"]
     assert "page_size" in tool.parameters["properties"]
     assert server.breath is not server._breath_tool
+    assert batch_tool.fn is server.inspect_batch
+    assert "bucket_ids" in batch_tool.parameters["properties"]
+    assert "signal_snapshot_id" in batch_tool.parameters["properties"]
 
 
 @pytest.mark.asyncio
@@ -432,6 +488,94 @@ async def test_inspect_expands_full_body_and_only_then_marks_read(monkeypatch):
     assert "memory_signal_read" in result
     assert "partial:false" in result
     assert store.expanded_ids(page["snapshot_id"]) == ("111111111111",)
+
+
+@pytest.mark.asyncio
+async def test_signal_snapshot_rejects_body_changed_after_search(monkeypatch):
+    store = MemorySignalStore(ttl_seconds=60, max_snapshots=4)
+    bucket = _bucket("111111111111", "搜索时的完整正文。")
+    revision = bucket_revision_hash(bucket["content"], {})
+    page = store.create(
+        [build_signal_entry(bucket, reason="semantic", revision=revision)],
+        page_size=1,
+    )
+    bucket["content"] = "搜索以后被改写的正文。"
+
+    class _Manager:
+        async def get(self, bucket_id):
+            return bucket if bucket_id == bucket["id"] else None
+
+    monkeypatch.setattr(server, "_memory_signal_store", store)
+    monkeypatch.setattr(server, "bucket_mgr", _Manager())
+
+    result = await server.inspect(
+        bucket["id"],
+        signal_snapshot_id=page["snapshot_id"],
+    )
+
+    assert "error:source_changed" in result
+    assert "重新 breath" in result
+    assert "搜索时的完整正文" not in result
+    assert "搜索以后被改写的正文" not in result
+    assert store.expanded_ids(page["snapshot_id"]) == ()
+
+
+@pytest.mark.asyncio
+async def test_inspect_batch_expands_up_to_five_snapshot_members(monkeypatch):
+    store = MemorySignalStore(ttl_seconds=60, max_snapshots=4)
+    buckets = {
+        bucket_id: _bucket(bucket_id, content)
+        for bucket_id, content in (
+            ("111111111111", "第一条完整正文。"),
+            ("222222222222", "第二条完整正文。"),
+        )
+    }
+    page = store.create(
+        [
+            build_signal_entry(
+                bucket,
+                reason="semantic",
+                revision=bucket_revision_hash(bucket["content"], {}),
+            )
+            for bucket in buckets.values()
+        ],
+        page_size=2,
+    )
+
+    class _Manager:
+        async def get(self, bucket_id):
+            return buckets.get(bucket_id)
+
+    monkeypatch.setattr(server, "_memory_signal_store", store)
+    monkeypatch.setattr(server, "bucket_mgr", _Manager())
+    monkeypatch.setattr(server.decay_engine, "calculate_score", lambda _meta: 1.25)
+
+    result = await server.inspect_batch(
+        ["111111111111", "222222222222", "111111111111"],
+        signal_snapshot_id=page["snapshot_id"],
+    )
+
+    assert "=== inspect 1/2 [bucket_id:111111111111] ===" in result
+    assert "=== inspect 2/2 [bucket_id:222222222222] ===" in result
+    assert "第一条完整正文。" in result
+    assert "第二条完整正文。" in result
+    assert store.expanded_ids(page["snapshot_id"]) == (
+        "111111111111",
+        "222222222222",
+    )
+
+
+@pytest.mark.asyncio
+async def test_inspect_batch_rejects_more_than_five_before_read(monkeypatch):
+    class _Manager:
+        async def get(self, bucket_id):
+            raise AssertionError(f"oversized batch must not read {bucket_id}")
+
+    monkeypatch.setattr(server, "bucket_mgr", _Manager())
+
+    result = await server.inspect_batch([str(index) for index in range(6)])
+
+    assert result == "一次最多展开 5 条记忆；请缩小 bucket_ids。"
 
 
 @pytest.mark.asyncio
