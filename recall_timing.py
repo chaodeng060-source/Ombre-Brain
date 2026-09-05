@@ -64,6 +64,8 @@ def begin_recall_timing() -> contextvars.Token:
         "started_at": time.perf_counter(),
         "stages": {},
         "active_stages": {},
+        "breakdowns": {},
+        "active_breakdowns": {},
         "dehydration": {},
         "metrics": {},
         "degraded": False,
@@ -119,6 +121,27 @@ def record_recall_stage(name: str, elapsed_seconds: float) -> None:
         return
     elapsed_ms = max(0.0, float(elapsed_seconds) * 1000.0)
     entry = stages.setdefault(name, {"elapsed_ms": 0.0, "calls": 0})
+    entry["elapsed_ms"] = round(float(entry["elapsed_ms"]) + elapsed_ms, 3)
+    entry["calls"] = int(entry["calls"]) + 1
+
+
+def record_recall_breakdown(
+    group: str,
+    name: str,
+    elapsed_seconds: float,
+) -> None:
+    """Record a nested diagnostic without double-counting top-level stages."""
+    state = _recall_timing.get()
+    if not isinstance(state, dict):
+        return
+    breakdowns = state.get("breakdowns")
+    if not isinstance(breakdowns, dict):
+        return
+    group_entries = breakdowns.setdefault(group, {})
+    if not isinstance(group_entries, dict):
+        return
+    elapsed_ms = max(0.0, float(elapsed_seconds) * 1000.0)
+    entry = group_entries.setdefault(name, {"elapsed_ms": 0.0, "calls": 0})
     entry["elapsed_ms"] = round(float(entry["elapsed_ms"]) + elapsed_ms, 3)
     entry["calls"] = int(entry["calls"]) + 1
 
@@ -193,6 +216,46 @@ def finish_recall_stage(name: str) -> None:
         record_recall_stage(name, time.perf_counter() - started_at)
 
 
+def start_recall_breakdown(group: str, name: str) -> None:
+    state = _recall_timing.get()
+    if not isinstance(state, dict):
+        return
+    active = state.get("active_breakdowns")
+    if not isinstance(active, dict):
+        return
+    if group in active:
+        finish_recall_breakdown(group)
+    active[group] = {
+        "name": name,
+        "started_at": time.perf_counter(),
+    }
+
+
+def finish_recall_breakdown(group: str) -> None:
+    state = _recall_timing.get()
+    if not isinstance(state, dict):
+        return
+    active = state.get("active_breakdowns")
+    if not isinstance(active, dict):
+        return
+    current = active.pop(group, None)
+    if not isinstance(current, dict):
+        return
+    name = current.get("name")
+    started_at = current.get("started_at")
+    if isinstance(name, str) and isinstance(started_at, (int, float)):
+        record_recall_breakdown(
+            group,
+            name,
+            time.perf_counter() - started_at,
+        )
+
+
+def switch_recall_breakdown(group: str, name: str) -> None:
+    finish_recall_breakdown(group)
+    start_recall_breakdown(group, name)
+
+
 @contextmanager
 def recall_stage(name: str) -> Iterator[None]:
     started_at = time.perf_counter()
@@ -200,6 +263,15 @@ def recall_stage(name: str) -> Iterator[None]:
         yield
     finally:
         record_recall_stage(name, time.perf_counter() - started_at)
+
+
+@contextmanager
+def recall_breakdown(group: str, name: str) -> Iterator[None]:
+    start_recall_breakdown(group, name)
+    try:
+        yield
+    finally:
+        finish_recall_breakdown(group)
 
 
 def finish_recall_timing(*, status: str, partial: bool) -> dict:
@@ -213,6 +285,7 @@ def finish_recall_timing(*, status: str, partial: bool) -> dict:
             "total_ms": 0.0,
             "unattributed_ms": 0.0,
             "stages": {},
+            "breakdowns": {},
             "dehydration": {},
             "metrics": {},
         }
@@ -226,14 +299,59 @@ def finish_recall_timing(*, status: str, partial: bool) -> dict:
         for name, entry in state["stages"].items()
     }
     active = state.get("active_stages")
-    if isinstance(active, dict) and active:
+    active_breakdowns = state.get("active_breakdowns")
+    if (
+        (isinstance(active, dict) and active)
+        or (isinstance(active_breakdowns, dict) and active_breakdowns)
+    ):
         now = time.perf_counter()
+    else:
+        now = None
+    if isinstance(active, dict) and active and now is not None:
         for name, started_at in active.items():
             if not isinstance(started_at, (int, float)):
                 continue
             entry = stages.setdefault(name, {"elapsed_ms": 0.0, "calls": 0})
             entry["elapsed_ms"] = round(
                 float(entry["elapsed_ms"]) + max(0.0, now - started_at) * 1000.0,
+                3,
+            )
+            entry["calls"] = int(entry["calls"]) + 1
+    breakdowns = {
+        group: {
+            name: {
+                "elapsed_ms": round(float(entry.get("elapsed_ms", 0.0)), 3),
+                "calls": int(entry.get("calls", 0)),
+            }
+            for name, entry in entries.items()
+            if isinstance(entry, dict)
+        }
+        for group, entries in state.get("breakdowns", {}).items()
+        if isinstance(entries, dict)
+    }
+    if (
+        isinstance(active_breakdowns, dict)
+        and active_breakdowns
+        and now is not None
+    ):
+        for group, current in active_breakdowns.items():
+            if not isinstance(current, dict):
+                continue
+            name = current.get("name")
+            started_at = current.get("started_at")
+            if not isinstance(name, str) or not isinstance(
+                started_at,
+                (int, float),
+            ):
+                continue
+            group_entries = breakdowns.setdefault(group, {})
+            entry = group_entries.setdefault(
+                name,
+                {"elapsed_ms": 0.0, "calls": 0},
+            )
+            entry["elapsed_ms"] = round(
+                float(entry["elapsed_ms"])
+                + max(0.0, now - started_at) * 1000.0,
                 3,
             )
             entry["calls"] = int(entry["calls"]) + 1
@@ -246,6 +364,7 @@ def finish_recall_timing(*, status: str, partial: bool) -> dict:
         "total_ms": round(total_ms, 3),
         "unattributed_ms": round(max(0.0, total_ms - attributed_ms), 3),
         "stages": stages,
+        "breakdowns": breakdowns,
         "metrics": {
             name: int(value)
             for name, value in state.get("metrics", {}).items()

@@ -221,7 +221,9 @@ from recall_timing import (
     get_recall_request_id,
     mark_recall_partial,
     recall_is_partial,
+    finish_recall_breakdown,
     finish_recall_stage,
+    recall_breakdown,
     recall_stage,
     record_recall_dehydration,
     record_recall_ds_gate,
@@ -229,7 +231,9 @@ from recall_timing import (
     record_recall_stage,
     reset_recall_timing,
     set_recall_partial_result,
+    start_recall_breakdown,
     start_recall_stage,
+    switch_recall_breakdown,
 )
 from lmc5_ledger import (
     LMC5Ledger,
@@ -5841,12 +5845,13 @@ async def breath(
             recall_policy,
         )[:state_link_budget]
     with recall_stage("assembly"):
-        set_recall_partial_result(_local_partial_recall_text(
-            matches,
-            max_results=max(0, max_results - len(state_link_candidates)),
-            max_tokens=max_tokens,
-            state_profile=state_profile,
-        ))
+        with recall_breakdown("assembly", "partial_snapshot_pre_ds"):
+            set_recall_partial_result(_local_partial_recall_text(
+                matches,
+                max_results=max(0, max_results - len(state_link_candidates)),
+                max_tokens=max_tokens,
+                state_profile=state_profile,
+            ))
     with recall_stage("ds_filter"):
         if chord_shadow_config is None:
             matches = await _ds_filter_candidates(
@@ -5896,6 +5901,7 @@ async def breath(
     timeline_fallback_matches = []
     timeline_probe = []
     if max_results > 1 and matches:
+        timeline_preflight_started_at = time.perf_counter()
         try:
             # Reuse the full per-request snapshot already loaded for keyword
             # search; X must not add another 8k-bucket filesystem scan.
@@ -5940,6 +5946,11 @@ async def breath(
                 "Timeline preflight failed / 时间线预检失败: %s",
                 type(exc).__name__,
             )
+        finally:
+            record_recall_stage(
+                "timeline_preflight",
+                time.perf_counter() - timeline_preflight_started_at,
+            )
 
     # Y is downstream of the primary/X/Z budgets.  With the rollout enabled,
     # reserve one primary slot only after the exact production relation gate
@@ -5961,6 +5972,7 @@ async def breath(
         and len(matches) > 1
         and expected_occupied_slots >= max_results
     ):
+        relation_preflight_started_at = time.perf_counter()
         try:
             retained_primary = matches[:-1]
             retained_primary_ids = [
@@ -6027,19 +6039,26 @@ async def breath(
             relation_slot_reserved = False
             relation_fallback_matches = []
             relation_reserved_primary_ids = set()
+        finally:
+            record_recall_stage(
+                "relation_preflight",
+                time.perf_counter() - relation_preflight_started_at,
+            )
     record_recall_metric(
         "relation_slot_reserved",
         int(relation_slot_reserved),
     )
     with recall_stage("assembly"):
-        set_recall_partial_result(_local_partial_recall_text(
-            matches,
-            max_results=max(0, max_results - len(state_link_candidates)),
-            max_tokens=max_tokens,
-            state_profile=state_profile,
-        ))
+        with recall_breakdown("assembly", "partial_snapshot_post_preflight"):
+            set_recall_partial_result(_local_partial_recall_text(
+                matches,
+                max_results=max(0, max_results - len(state_link_candidates)),
+                max_tokens=max_tokens,
+                state_profile=state_profile,
+            ))
 
     start_recall_stage("assembly")
+    start_recall_breakdown("assembly", "main_candidate_render")
     results = []
     token_used = 0
     result_buckets = []
@@ -6139,6 +6158,7 @@ async def breath(
     # X consumes exactly the slot proven by preflight before Z/Y can claim it.
     # If rendering fails, primary fallback is restored before Z is assembled,
     # preserving the original primary-first selection and dedup semantics.
+    switch_recall_breakdown("assembly", "timeline_lookup")
     remaining_timeline_slots = min(1, max(0, max_results - len(result_ids)))
     timeline_rendered = False
     if (
@@ -6183,6 +6203,7 @@ async def breath(
             timeline_found = []
             timeline_by_id = {}
 
+        switch_recall_breakdown("assembly", "timeline_render")
         for timeline_neighbor in timeline_found:
             if token_used >= max_tokens or len(result_ids) >= max_results:
                 break
@@ -6251,6 +6272,7 @@ async def breath(
     # rendered (duplicate body, token budget, or dehydration error), restore
     # the primary candidates held back for the tentative X slot.  A failed X
     # expansion must be observationally equivalent to the pre-X path.
+    switch_recall_breakdown("assembly", "timeline_restore")
     if timeline_slot_reserved and not timeline_rendered:
         restored_main_messages = []
         restored_main_ids = []
@@ -6347,6 +6369,7 @@ async def breath(
     # Shadow-only arm C: all semantic/state/session/anchor/DS gates have run,
     # and the visible primary cutoff now reflects X reservation plus actual
     # token/dehydration rendering.  The retained B pool is never replaced by C.
+    switch_recall_breakdown("assembly", "e_chord_receipt")
     if live_chord is not None and chord_shadow_config is not None:
         try:
             requested_screen = int(first_screen_limit)
@@ -6399,6 +6422,7 @@ async def breath(
     # --- Z lifecycle state links: explicit current/history transition evidence ---
     # This is a bounded overlay over reviewed reciprocal links.  It does not
     # enter RRF, touch generic Y edges, or alter the underlying vector index.
+    switch_recall_breakdown("assembly", "state_render")
     state_messages = []
     for state_bucket in state_link_candidates:
         if token_used >= max_tokens or len(result_ids) >= max_results:
@@ -6459,6 +6483,7 @@ async def breath(
 
     # --- Typed relation expansion: bounded, bidirectional, at most 2 hops ---
     # --- Y 轴关系召回：只从实际展示的主结果出发，关联证据不进主排序 ---
+    switch_recall_breakdown("assembly", "relation_lookup")
     remaining_relation_slots = max(0, max_results - len(result_ids))
     relation_neighbor_cap = min(
         int(intent_policy.get("relation_neighbor_limit", 5)),
@@ -6511,6 +6536,7 @@ async def breath(
             relation_neighbors = []
             bucket_by_id = {}
 
+        switch_recall_breakdown("assembly", "relation_render")
         for relation_neighbor in relation_neighbors:
             if token_used >= max_tokens:
                 break
@@ -6577,6 +6603,7 @@ async def breath(
     # dehydration failure), put the withheld primary back in its original
     # primary section.  This prevents a failed Y overlay from deleting useful
     # recall while leaving the rollout-off path untouched byte for byte.
+    switch_recall_breakdown("assembly", "relation_restore")
     relation_primary_restored = False
     if relation_slot_reserved and not relation_rendered:
         desired_primary_count = min(
@@ -6689,6 +6716,7 @@ async def breath(
     # anchors with a real original-query semantic hit.  Exact side scores do
     # not widen the factual vector result, and every ordinary authority/filter
     # gate below still runs before an E-only memory can enter the prompt.
+    switch_recall_breakdown("assembly", "emotion_render")
     if (
         e_recall_cfg is not None
         and e_query_emotion is not None
@@ -6951,6 +6979,7 @@ async def breath(
 
     # --- Random surfacing is opt-in after PR-1 noise reduction.
     # --- 减噪后随机漂浮改为显式配置，默认关闭，避免检索不足时硬塞旧噪音。
+    switch_recall_breakdown("assembly", "random_render")
     random_cfg = config.get("random_surfacing", {}) or {}
     try:
         random_chance = float(random_cfg.get("search_underflow_chance", 0.0) or 0.0)
@@ -7014,7 +7043,9 @@ async def breath(
         except Exception as e:
             logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")
 
+    switch_recall_breakdown("assembly", "finalize")
     if not results:
+        finish_recall_breakdown("assembly")
         finish_recall_stage("assembly")
         return _append_body_state_block(
             "未找到相关记忆。",
@@ -7044,6 +7075,7 @@ async def breath(
         reset_body_state,
     )
     _remember_session_seen_ids(session_id, result_ids)
+    finish_recall_breakdown("assembly")
     finish_recall_stage("assembly")
     return await _tool_result_with_optional_images(text, result_buckets, include_images)
 

@@ -11,14 +11,18 @@ from embedding_engine import EmbeddingEngine
 from maintenance_barrier import MaintenanceBarrier
 from recall_timing import (
     begin_recall_timing,
+    finish_recall_breakdown,
     finish_recall_timing,
     finish_recall_stage,
+    record_recall_breakdown,
     record_recall_stage,
     record_recall_dehydration,
     record_recall_metric,
     reset_recall_timing,
     set_recall_partial_result,
+    start_recall_breakdown,
     start_recall_stage,
+    switch_recall_breakdown,
 )
 
 
@@ -482,4 +486,63 @@ def test_finished_stage_is_not_double_counted(monkeypatch):
     assert receipt["stages"]["assembly"] == {
         "elapsed_ms": 1500.0,
         "calls": 1,
+    }
+
+
+def test_breakdown_splits_parent_without_double_counting_attribution(monkeypatch):
+    ticks = iter((10.0, 11.0, 11.0, 12.5, 12.5, 14.0, 14.0, 14.0))
+    monkeypatch.setattr("recall_timing.time.perf_counter", lambda: next(ticks))
+    token = begin_recall_timing()
+    try:
+        start_recall_stage("assembly")
+        start_recall_breakdown("assembly", "candidate_render")
+        switch_recall_breakdown("assembly", "finalize")
+        finish_recall_breakdown("assembly")
+        finish_recall_stage("assembly")
+        receipt = finish_recall_timing(status="ok", partial=False)
+    finally:
+        reset_recall_timing(token)
+
+    assert receipt["stages"]["assembly"] == {
+        "elapsed_ms": 3000.0,
+        "calls": 1,
+    }
+    assert receipt["breakdowns"]["assembly"] == {
+        "candidate_render": {"elapsed_ms": 1500.0, "calls": 1},
+        "finalize": {"elapsed_ms": 1500.0, "calls": 1},
+    }
+    assert receipt["unattributed_ms"] == 1000.0
+
+
+def test_open_breakdown_is_included_in_deadline_receipt(monkeypatch):
+    ticks = iter((10.0, 11.0, 11.0, 13.5, 13.5))
+    monkeypatch.setattr("recall_timing.time.perf_counter", lambda: next(ticks))
+    token = begin_recall_timing()
+    try:
+        start_recall_stage("assembly")
+        start_recall_breakdown("assembly", "candidate_render")
+        receipt = finish_recall_timing(status="deadline", partial=True)
+    finally:
+        reset_recall_timing(token)
+
+    assert receipt["stages"]["assembly"] == {
+        "elapsed_ms": 2500.0,
+        "calls": 1,
+    }
+    assert receipt["breakdowns"]["assembly"] == {
+        "candidate_render": {"elapsed_ms": 2500.0, "calls": 1},
+    }
+    assert receipt["unattributed_ms"] == 1000.0
+
+
+def test_direct_breakdown_record_is_content_free():
+    token = begin_recall_timing()
+    try:
+        record_recall_breakdown("assembly", "finalize", 0.004)
+        receipt = finish_recall_timing(status="ok", partial=False)
+    finally:
+        reset_recall_timing(token)
+
+    assert receipt["breakdowns"] == {
+        "assembly": {"finalize": {"elapsed_ms": 4.0, "calls": 1}},
     }
