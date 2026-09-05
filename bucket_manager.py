@@ -1290,6 +1290,30 @@ class BucketManager:
             logger.warning("[bm25] rare-term lookup failed; no exemption: %s", exc)
             return {}
 
+    def literal_term_df_hits(
+        self,
+        query: str,
+        *,
+        bucket_ids: set[str],
+    ) -> dict[str, tuple[tuple[str, int], ...]]:
+        """Exact query-term/DF evidence for an already-selected candidate set.
+
+        The collision guard is opt-in and must fail open.  If BM25 is off,
+        absent, or incompatible, returning no evidence leaves the existing
+        recall decision unchanged. Rebuilds retain the last complete index.
+        """
+        index = self._bm25
+        if self._bm25_mode == "off" or index is None or not bucket_ids:
+            return {}
+        lookup = getattr(index, "literal_term_df_hits", None)
+        if not callable(lookup):
+            return {}
+        try:
+            return lookup(query, bucket_ids=bucket_ids)
+        except Exception as exc:
+            logger.warning("[bm25] literal-DF lookup failed; guard skipped: %s", exc)
+            return {}
+
     async def prewarm_bm25(self) -> bool:
         """Build the optional BM25 index once before requests are accepted."""
         if self._bm25_mode == "off":

@@ -375,6 +375,40 @@ class BM25Index:
                 hits.setdefault(bucket_id, []).append(term)
         return {bucket_id: tuple(terms) for bucket_id, terms in hits.items()}
 
+    def literal_term_df_hits(
+        self,
+        query: str,
+        *,
+        bucket_ids: set[str],
+        min_term_chars: int = 1,
+    ) -> dict[str, tuple[tuple[str, int], ...]]:
+        """Return exact query-term hits and corpus DF for selected buckets.
+
+        This is evidence only: it does not score or rank.  Restricting the
+        lookup to the already-fused candidate IDs avoids expanding a common
+        posting list (for example ``任务``) into thousands of request-local
+        rows.  Missing/incomplete indexes return no evidence so callers can
+        fail open rather than deleting memories without a DF witness.
+        """
+        targets = {str(bucket_id) for bucket_id in bucket_ids if bucket_id}
+        if not targets or not self._postings or not self._term_doc_counts:
+            return {}
+
+        hits: dict[str, list[tuple[str, int]]] = {}
+        seen: set[str] = set()
+        for term in _tokenize(query):
+            if term in seen or len(term) < max(1, min_term_chars):
+                continue
+            seen.add(term)
+            df = int(self._term_doc_counts.get(term, 0) or 0)
+            if df <= 0:
+                continue
+            posting = self._postings.get(term, ())
+            for bucket_id in targets:
+                if bucket_id in posting:
+                    hits.setdefault(bucket_id, []).append((term, df))
+        return {bucket_id: tuple(terms) for bucket_id, terms in hits.items()}
+
     def score(self, query: str) -> dict[str, float]:
         """Return normalized BM25 scores; the rank_bm25 formula is unchanged."""
         if not _BM25_AVAILABLE or self._index is None:

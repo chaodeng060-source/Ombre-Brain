@@ -293,10 +293,12 @@ def test_anchor_quality_gate_uses_adapted_absolute_score(monkeypatch):
 
     assert [bucket["id"] for bucket in kept] == [
         "high-vector",
-        "high-literal",
         "entity",
         "unscored",
     ]
+    # The existing literal-only cap is 0.55: even 60 literal points cannot
+    # pass the 0.25 conversation gate without vector/entity/rare evidence.
+    assert high_literal["_anchor_adapted_relevance_score"] == pytest.approx(0.2475)
     assert high_vector["_anchor_adapted_relevance_score"] == 0.27
     assert low_vector["_anchor_adapted_relevance_score"] == 0.243
     # Search/manual recall keeps its wider existing contract.

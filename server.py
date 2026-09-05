@@ -1794,6 +1794,67 @@ def _anchor_rare_literal_max_df() -> int:
         return 8
 
 
+def _literal_collision_guard_enabled() -> bool:
+    """Whether common literal hits need corroborating semantic evidence.
+
+    Default-off until the frozen real-query ledger has been independently
+    reviewed.  Rollback is one environment toggle and does not alter the
+    existing Anchor threshold, ranking, budget, or vector query.
+    """
+    return os.getenv(
+        "OMBRE_LITERAL_COLLISION_GUARD_ENABLED", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _literal_collision_vector_floor() -> float:
+    """Meaningful-vector floor used only for common-literal collisions.
+
+    The provisional 0.71 floor is not a production-accepted threshold. It is
+    scoped to common-literal candidates, not the global vector or Anchor
+    threshold. Pure semantic, rare literal, and entity candidates bypass it.
+    """
+    raw = os.getenv("OMBRE_LITERAL_COLLISION_VECTOR_FLOOR", "0.71").strip()
+    try:
+        floor = float(raw)
+    except ValueError:
+        logger.warning(
+            "OMBRE_LITERAL_COLLISION_VECTOR_FLOOR=%r 不是数字，回落到 0.71",
+            raw,
+        )
+        return 0.71
+    return max(0.0, min(1.0, floor))
+
+
+def _common_literal_lacks_semantic_support(
+    bucket: dict,
+    vector_similarity: float,
+) -> bool:
+    """True only when DF proves a non-rare literal collision with weak vector support."""
+    if not _literal_collision_guard_enabled():
+        return False
+    if bucket.get("entity_match") or bucket.get("_rare_literal_terms"):
+        return False
+    if not bucket.get("_keyword_channel_match"):
+        return False
+    term_dfs = bucket.get("_literal_term_dfs")
+    if not isinstance(term_dfs, list) or not term_dfs:
+        return False
+    observed_terms = [
+        (str(item.get("term") or ""), int(item.get("df", 0) or 0))
+        for item in term_dfs if isinstance(item, dict) and item.get("df", 0) > 0
+    ]
+    if not observed_terms:
+        return False
+    rare_max_df = _anchor_rare_literal_max_df()
+    if not any(df > rare_max_df for _term, df in observed_terms):
+        return False
+    if rare_max_df > 0 and any(
+        len(term) >= 2 and df <= rare_max_df for term, df in observed_terms
+    ):
+        return False
+    return vector_similarity < _literal_collision_vector_floor()
+
+
 def _anchor_adapted_relevance_score(bucket: dict) -> float | None:
     """Map Ombre's absolute query evidence onto Anchor's score scale.
 
@@ -1810,6 +1871,20 @@ def _anchor_adapted_relevance_score(bucket: dict) -> float | None:
 
     vector = bucket.get("_original_vector_relevance_score")
     vector_hit = isinstance(vector, (int, float)) and float(vector) > 0.0
+    vector_similarity = (
+        max(0.0, min(1.0, float(vector)))
+        if vector_hit
+        else 0.0
+    )
+    collision_guarded = _common_literal_lacks_semantic_support(
+        bucket,
+        vector_similarity,
+    )
+    vector_hit = vector_hit and not collision_guarded
+    if collision_guarded:
+        bucket["_literal_collision_guard"] = "common_literal_weak_vector"
+    else:
+        bucket.pop("_literal_collision_guard", None)
 
     literal = bucket.get("_literal_relevance_score")
     if isinstance(literal, (int, float)):
@@ -1835,7 +1910,7 @@ def _anchor_adapted_relevance_score(bucket: dict) -> float | None:
         similarities.append(normalised)
 
     if vector_hit:
-        similarities.append(max(0.0, min(1.0, float(vector))))
+        similarities.append(vector_similarity)
 
     # A current, validated entity link means the query explicitly named the
     # entity.  Treat that as anchored query evidence, not a ranking bonus.
@@ -1908,6 +1983,11 @@ def _filter_anchor_policy_candidates(
                     "vec": bucket.get("_original_vector_relevance_score"),
                     "ent": bool(bucket.get("entity_match")),
                     "rare": list(bucket.get("_rare_literal_terms") or ()),
+                    **({
+                        "lit_df": list(bucket.get("_literal_term_dfs") or ()),
+                        "kw": bool(bucket.get("_keyword_channel_match")),
+                        "collision": bucket.get("_literal_collision_guard"),
+                    } if _literal_collision_guard_enabled() else {}),
                 }
                 for bucket in candidates
             ],
@@ -2129,6 +2209,15 @@ async def _ds_semantic_select(
             '返回 {"keep": []}:此时不注入任何旧记忆才是正确行为。'
             "只要查询含具体的人名、事件、物品、地点、时间或明确话题,"
             "哪怕口语化,仍按上述规则保留。"
+        )
+    if _literal_collision_guard_enabled():
+        sys_prompt += (
+            "\n以下规则优先于上面的宽松保留规则：必须与正在谈论的事件、对象或项目相关；"
+            "仅出现同一人物名字不算相关。"
+            "只共享「单子、任务、验收、慢、修、提速」等泛词，不算相关。"
+            "当查询在生活、亲密、情话或身体语境，而候选只是工程任务、修复、验收记录时，"
+            "除非查询明确点名该工程、任务编号或同一事件，否则必须拒绝该候选。"
+            "反过来也一样：只共享抽象动作或情绪词、实际对象和事件不同，必须拒绝。"
         )
     user_prompt = f"查询：{redact_embedding_input(query)}\n\n候选：\n" + "\n".join(lines)
     cache_material = sys_prompt + "\x00" + user_prompt
@@ -5540,6 +5629,21 @@ async def breath(
                 type(exc).__name__,
             )
             rare_literal_hits = {}
+    literal_term_df_hits: dict[str, tuple[tuple[str, int], ...]] = {}
+    if _literal_collision_guard_enabled():
+        literal_df_lookup = getattr(bucket_mgr, "literal_term_df_hits", None)
+        if callable(literal_df_lookup):
+            try:
+                literal_term_df_hits = literal_df_lookup(
+                    recall_query,
+                    bucket_ids={str(bucket_id) for bucket_id, _ in fused_pairs},
+                ) or {}
+            except Exception as exc:
+                logger.warning(
+                    "Literal-DF lookup skipped; collision guard fails open: %s",
+                    type(exc).__name__,
+                )
+                literal_term_df_hits = {}
     matches = []
     for bid, fused_score in fused_pairs:
         if bid in bucket_cache:
@@ -5599,6 +5703,15 @@ async def breath(
             b["_rare_literal_terms"] = list(rare_terms)
         else:
             b.pop("_rare_literal_terms", None)
+        term_dfs = literal_term_df_hits.get(str(bid))
+        if term_dfs:
+            b["_literal_term_dfs"] = [
+                {"term": term, "df": int(df)} for term, df in term_dfs
+            ]
+            b["_keyword_channel_match"] = str(bid) in keyword_scores
+        else:
+            b.pop("_literal_term_dfs", None)
+            b.pop("_keyword_channel_match", None)
         matches.append(b)
 
     # Generated expansion angles may improve ranking, but cannot introduce a
