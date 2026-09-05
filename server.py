@@ -2095,6 +2095,33 @@ def _cap_candidates_preserving_forced(
     return selected
 
 
+def _merge_mood_coords(
+    her_valence: float | None,
+    her_arousal: float | None,
+    self_valence: float,
+    self_arousal: float,
+) -> tuple[float | None, float | None]:
+    """合并「她这句话的情绪」与「主对话 AI 自己的心情」为关键词通道的情绪坐标。
+
+    两者都有 → 取平均；只有一方 → 用那一方；都没有 → (None, None)，行为同旧。
+    self_* 不在 0..1 内视为未传。
+    """
+    s_valence = self_valence if isinstance(self_valence, (int, float)) and 0 <= self_valence <= 1 else None
+    s_arousal = self_arousal if isinstance(self_arousal, (int, float)) and 0 <= self_arousal <= 1 else None
+    her_ok = her_valence is not None and her_arousal is not None
+    self_ok = s_valence is not None and s_arousal is not None
+    if her_ok and self_ok:
+        return (
+            round((float(her_valence) + float(s_valence)) / 2.0, 4),
+            round((float(her_arousal) + float(s_arousal)) / 2.0, 4),
+        )
+    if self_ok:
+        return float(s_valence), float(s_arousal)
+    if her_ok:
+        return float(her_valence), float(her_arousal)
+    return None, None
+
+
 def _ds_failure_fallback_enabled() -> bool:
     """Whether DS call failures use the conservative Anchor fallback."""
     flag = os.getenv("OMBRE_DS_FAILURE_FALLBACK_ENABLED", "0").strip().lower()
@@ -4896,6 +4923,8 @@ async def breath(
     include_body_state: bool = True,
     reset_body_state: bool = False,
     live_chord: object = None,
+    self_valence: float = -1,
+    self_arousal: float = -1,
     turn_id: str = "",
     agent_id: str = "",
     e_chord_attempt: int = 0,
@@ -5156,6 +5185,11 @@ async def breath(
     domain_filter = [d.strip() for d in domain.split(",") if d.strip()] or None
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
+    # 9/5 朝灯拍「开心的时候想起开心的事」：主对话 AI 自己的心情（self_*，Twin drive 派生）
+    # 也进关键词通道的情绪一致打分；她的坐标（valence/arousal）继续单独喂 E 轴与记忆重构。
+    mood_valence, mood_arousal = _merge_mood_coords(
+        q_valence, q_arousal, self_valence, self_arousal
+    )
     e_recall_cfg = None
     e_query_emotion = None
     e_rows_by_bucket = {}
@@ -5236,8 +5270,8 @@ async def breath(
                     limit=intent_policy["keyword_top_k"],
                     domain_filter=domain_filter,
                     world_filter=world_filter,
-                    query_valence=q_valence,
-                    query_arousal=q_arousal,
+                    query_valence=mood_valence,
+                    query_arousal=mood_arousal,
                     created_after=created_after,
                     created_before=created_before,
                     relevance_first=True,
@@ -11397,6 +11431,8 @@ async def api_breath(request):
                 include_body_state=False,
                 reset_body_state=False,
                 live_chord=body.get("live_chord"),
+                self_valence=_float_arg("self_valence"),
+                self_arousal=_float_arg("self_arousal"),
                 turn_id=str(body.get("turn_id") or "")[:160],
                 agent_id=str(body.get("agent_id") or "")[:160],
                 e_chord_attempt=_int_arg("e_chord_attempt", 0),

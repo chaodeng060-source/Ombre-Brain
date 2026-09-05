@@ -2947,8 +2947,21 @@ class BucketManager:
                     if is_stale:
                         normalized *= 0.3
                         tie_break_score *= 0.3
+                    mood_factor = 1.0
+                    if (
+                        relevance_first
+                        and query_valence is not None
+                        and query_arousal is not None
+                    ):
+                        mood_factor = self._mood_congruent_factor(
+                            emotion_score, self._mood_congruent_weight()
+                        )
+                        if mood_factor != 1.0:
+                            normalized *= mood_factor
                     scored_bucket = dict(bucket)
                     scored_bucket["score"] = round(normalized, 2)
+                    if mood_factor != 1.0:
+                        scored_bucket["_mood_congruent_factor"] = round(mood_factor, 4)
                     if relevance_first:
                         scored_bucket["_keyword_tie_break_score"] = round(
                             tie_break_score,
@@ -3057,6 +3070,34 @@ class BucketManager:
     # ---------------------------------------------------------
     # Emotion resonance sub-score
     # ---------------------------------------------------------
+    # ---------------------------------------------------------
+    # Mood-congruent recall (2026-09-05 朝灯：「开心的时候想起开心的事」)
+    # relevance_first 把情绪压成平手才用的次级分；这里给它一个真权重：
+    # 心情相近的记忆抬一点、相反的压一点，幅度 ±weight，只动排序分不动候选门槛。
+    # OMBRE_MOOD_CONGRUENT_WEIGHT=0（默认）= 旧行为逐字等价。
+    # ---------------------------------------------------------
+    @staticmethod
+    def _mood_congruent_weight() -> float:
+        import os
+        raw = os.getenv("OMBRE_MOOD_CONGRUENT_WEIGHT", "0").strip()
+        try:
+            value = float(raw) if raw else 0.0
+        except ValueError:
+            return 0.0
+        return max(0.0, min(0.5, value))
+
+    @staticmethod
+    def _mood_congruent_factor(emotion_score: float, weight: float) -> float:
+        """emotion_score 0..1（0.5=无关）→ 排序乘数 1±weight。"""
+        if weight <= 0.0:
+            return 1.0
+        try:
+            centered = (float(emotion_score) - 0.5) * 2.0
+        except (TypeError, ValueError):
+            return 1.0
+        centered = max(-1.0, min(1.0, centered))
+        return 1.0 + weight * centered
+
     def _calc_emotion_score(
         self, q_valence: float, q_arousal: float, meta: dict
     ) -> float:
