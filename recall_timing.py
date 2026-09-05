@@ -27,6 +27,7 @@ _DEHYDRATION_OUTCOMES = frozenset({
 })
 _DS_GATE_OUTCOMES = frozenset({
     "ok",
+    "invalid",
     "timeout",
     "error",
     "noop",
@@ -381,9 +382,14 @@ def finish_recall_timing(*, status: str, partial: bool) -> dict:
         isinstance(ds_gate, dict)
         and ds_gate.get("outcome") in _DS_GATE_OUTCOMES
     ):
+        ds_status = ds_gate["outcome"]
         receipt.update({
-            "ds_gate_outcome": ds_gate["outcome"],
+            # Keep the legacy vocabulary accepted by existing Twin consumers;
+            # the new field below carries the finer invalid split.
+            "ds_gate_outcome": "error" if ds_status == "invalid" else ds_status,
             "ds_gate_in": max(0, int(ds_gate.get("input_count", 0))),
             "ds_gate_out": max(0, int(ds_gate.get("output_count", 0))),
         })
+        if ds_status in {"ok", "invalid", "timeout", "error"}:
+            receipt["ds_status"] = ds_status
     return receipt

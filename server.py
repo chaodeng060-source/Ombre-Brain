@@ -2095,6 +2095,103 @@ def _cap_candidates_preserving_forced(
     return selected
 
 
+def _ds_failure_fallback_enabled() -> bool:
+    """Whether DS call failures use the conservative Anchor fallback."""
+    flag = os.getenv("OMBRE_DS_FAILURE_FALLBACK_ENABLED", "0").strip().lower()
+    return flag in ("1", "true", "yes", "on")
+
+
+def _ds_failure_anchor_floor() -> float:
+    """Return the isolated DS-failure Anchor floor.
+
+    The 2026-09-05 production distribution put entity-only collisions at the
+    Anchor adapter's 0.45 ceiling.  The default sits one precision step above
+    that ceiling, so a failed gate normally falls through to the deterministic
+    top-one safety net instead of admitting a score-tied collision batch.
+    """
+    raw = os.getenv("OMBRE_DS_FAILURE_ANCHOR_FLOOR", "0.450001").strip()
+    try:
+        return max(0.0, min(1.0, float(raw)))
+    except ValueError:
+        logger.warning(
+            "OMBRE_DS_FAILURE_ANCHOR_FLOOR=%r is not numeric; using 0.450001",
+            raw,
+        )
+        return 0.450001
+
+
+def _ds_conservative_failure_candidates(
+    candidates: list[dict],
+    *,
+    force_keep_ids: set[str],
+    max_results: int,
+) -> list[dict]:
+    """Apply one conservative, order-preserving fallback after a DS failure.
+
+    This helper is intentionally isolated from successful model decisions and
+    is byte-compatible with the old capped fallback while its env switch is
+    off.  Exact retrieval-key rows retain their established forced contract.
+    If neither a forced row nor a row at/above the Anchor floor survives, the
+    first capped row is the required one-result safety net.
+    """
+    capped = _cap_candidates_preserving_forced(
+        candidates,
+        force_keep_ids,
+        max_results,
+    )
+    if not _ds_failure_fallback_enabled() or not capped:
+        return capped
+
+    floor = _ds_failure_anchor_floor()
+    selected: list[dict] = []
+    for bucket in capped:
+        bucket_id = str(bucket.get("id") or "")
+        if bucket_id in force_keep_ids:
+            selected.append(bucket)
+            continue
+        score = bucket.get("_anchor_adapted_relevance_score")
+        if not isinstance(score, (int, float)):
+            score = _anchor_adapted_relevance_score(bucket)
+        if isinstance(score, (int, float)) and float(score) >= floor:
+            selected.append(bucket)
+    return selected or capped[:1]
+
+
+class DSFilterInvalidPayloadError(ValueError):
+    """The provider returned content that did not satisfy the keep contract."""
+
+    def __init__(self, reason: str):
+        self.reason = str(reason or "invalid_payload")
+        super().__init__(self.reason)
+
+
+def _ds_invalid_payload_reason(raw: str, count: int) -> str:
+    """Classify an invalid response without retaining or logging its content."""
+    if not raw.strip():
+        return "empty_content"
+    payloads = _ds_json_payloads(raw)
+    if not payloads:
+        return "no_complete_json"
+    saw_keep_list = False
+    for payload in payloads:
+        values = payload.get("keep") if isinstance(payload, dict) else payload
+        if not isinstance(values, list):
+            continue
+        saw_keep_list = True
+        for value in values:
+            if isinstance(value, bool):
+                continue
+            try:
+                index = int(value)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < count:
+                # Defensive consistency: callers use this only after the parser
+                # returned None, so a valid index here would be unexpected.
+                return "parser_inconsistent"
+    return "no_valid_indices" if saw_keep_list else "missing_keep_list"
+
+
 # 2026-08-21 削 ds_filter 耗时：gemini 时代单次判断 2.6-3.7s 且与候选数无关
 # （ids_in=2 与 5 实测同价）——是模型固定思考成本，压 prompt 削不动；关思考
 # 8/20 已试死（见 DS_FILTER_MAX_TOKENS 注释）。代码侧唯一确定安全的浪费是
@@ -2249,9 +2346,15 @@ async def _ds_semantic_select(
             temperature=0.0,
             **provider_kwargs,
         )
-        raw = resp.choices[0].message.content if resp.choices else ""
+        raw_value = resp.choices[0].message.content if resp.choices else ""
+        raw = raw_value if isinstance(raw_value, str) else ""
         idxs = _parse_ds_keep_indices(raw, len(buckets))
         if idxs is None:
+            parse_reason = (
+                _ds_invalid_payload_reason(raw, len(buckets))
+                if isinstance(raw_value, str)
+                else "non_string_content"
+            )
             # Preserve the provider-refusal category needed for diagnosis without
             # writing arbitrary model output into logs.
             raw_head = (
@@ -2260,14 +2363,18 @@ async def _ds_semantic_select(
                 else "<redacted>"
             )
             logger.error(
-                "DS filter received invalid DeepSeek response raw_chars=%d "
-                "raw_sha256=%s raw_head=%r response=%s",
+                "DS filter received invalid response parse_reason=%s "
+                "fenced=%s json_values=%d raw_chars=%d raw_sha256=%s "
+                "raw_head=%r response=%s",
+                parse_reason,
+                raw.lstrip().startswith("```"),
+                len(_ds_json_payloads(raw)),
                 len(raw),
                 hashlib.sha256(raw.encode("utf-8")).hexdigest(),
                 raw_head,
                 _safe_chat_completion_diagnostics(resp),
             )
-            raise ValueError("invalid DeepSeek recall selection payload")
+            raise DSFilterInvalidPayloadError(parse_reason)
         if ttl > 0:
             if len(_DS_SELECT_CACHE) >= max_entries:
                 _DS_SELECT_CACHE.pop(next(iter(_DS_SELECT_CACHE)))
@@ -2294,7 +2401,8 @@ async def _ds_filter_candidates(
 
     默认行为（门控关，PR-1 语义）：保序 + 保留 forced IDs + 限到 max_results，不调 LLM。
     门控开（OMBRE_DS_FILTER_ENABLED 且 mode 命中且 query 非空）：在已裁剪集合上跑所选 provider
-    相关性过滤，纯减法剔噪。超时/出错/解析失败一律回退裁剪集合；只有调用方
+    相关性过滤，纯减法剔噪。超时/出错/解析失败走同一个、默认关闭的保守
+    Anchor 回退；只有调用方
     明确采用 Anchor 对话策略并传入 ``allow_empty=True`` 时，合法 ``keep: []``
     才会安静返回空。
     """
@@ -2309,6 +2417,13 @@ async def _ds_filter_candidates(
         if isinstance(decision_capture, dict):
             decision_capture["source"] = source
         record_recall_ds_gate(outcome, input_count, output_count)
+        if outcome in {"ok", "invalid", "timeout", "error"}:
+            # Also cover direct MCP/Anchor calls without a breath timing scope,
+            # including cancellation before the caller can persist its record.
+            logger.info(
+                "DS gate diagnostic ds_status=%s input=%d output=%d",
+                outcome, input_count, output_count,
+            )
 
     if max_results <= 0:
         record_decision("deterministic_noop", "noop", 0, 0)
@@ -2358,25 +2473,53 @@ async def _ds_filter_candidates(
         )
         return capped
 
+    def failure_result(outcome: str) -> list[dict]:
+        result = _ds_conservative_failure_candidates(
+            capped,
+            force_keep_ids=keep,
+            max_results=max_results,
+        )
+        record_decision("fallback", outcome, len(capped), len(result))
+        return result
+
     try:
         kept = await asyncio.wait_for(
             _ds_semantic_select(query, capped, keep, max_results),
             timeout=_ds_gate_timeout(),
         )
+    except asyncio.CancelledError:
+        result = failure_result("timeout")
+        logger.warning(
+            "DS filter cancelled by outer deadline; conservative fallback "
+            "prepared input=%d output=%d",
+            len(capped),
+            len(result),
+        )
+        raise
     except asyncio.TimeoutError as e:
-        record_decision("fallback", "timeout", len(capped), len(capped))
+        result = failure_result("timeout")
         logger.warning(
-            "DS filter fell back to stub / 门控回退裁剪集合 (%s): %s",
-            type(e).__name__, e,
+            "DS filter used conservative fallback outcome=timeout "
+            "input=%d output=%d (%s): %s",
+            len(capped), len(result), type(e).__name__, e,
         )
-        return capped
+        return result
+    except DSFilterInvalidPayloadError as e:
+        result = failure_result("invalid")
+        logger.warning(
+            "DS filter used conservative fallback outcome=invalid "
+            "input=%d output=%d reason=%s",
+            len(capped), len(result), e.reason,
+        )
+        return result
     except Exception as e:
-        record_decision("fallback", "error", len(capped), len(capped))
+        result = failure_result("error")
         logger.warning(
-            "DS filter fell back to stub / 门控回退裁剪集合 (%s): %s",
-            type(e).__name__, e,
+            "DS filter used conservative fallback outcome=error "
+            "input=%d output=%d (%s): %s",
+            len(capped), len(result), type(e).__name__, e,
         )
-        return capped
+        return result
 
     result = kept if kept or allow_empty else capped
     record_decision("model", "ok", len(capped), len(result))
@@ -5957,11 +6100,27 @@ async def breath(
             state_link_candidates,
             recall_policy,
         )[:state_link_budget]
+    ds_max_results = max(0, max_results - len(state_link_candidates))
+    ds_force_keep_ids = _exact_retrieval_key_ids(recall_query, matches)
+    pre_ds_partial_matches = matches
+    if (
+        _ds_gate_enabled("search")
+        and recall_query
+        and _ds_failure_fallback_enabled()
+    ):
+        # The API deadline cancels the active DS call and returns this snapshot.
+        # Prepare it with the same failure policy as internal timeout/error so
+        # an outer cancellation cannot bypass the conservative gate.
+        pre_ds_partial_matches = _ds_conservative_failure_candidates(
+            matches,
+            force_keep_ids=ds_force_keep_ids,
+            max_results=ds_max_results,
+        )
     with recall_stage("assembly"):
         with recall_breakdown("assembly", "partial_snapshot_pre_ds"):
             set_recall_partial_result(_local_partial_recall_text(
-                matches,
-                max_results=max(0, max_results - len(state_link_candidates)),
+                pre_ds_partial_matches,
+                max_results=ds_max_results,
                 max_tokens=max_tokens,
                 state_profile=state_profile,
             ))
@@ -5971,8 +6130,8 @@ async def breath(
                 recall_query,
                 matches,
                 mode="search",
-                max_results=max(0, max_results - len(state_link_candidates)),
-                force_keep_ids=_exact_retrieval_key_ids(recall_query, matches),
+                max_results=ds_max_results,
+                force_keep_ids=ds_force_keep_ids,
                 allow_empty=allow_empty_recall,
             )
         else:
@@ -5985,14 +6144,8 @@ async def breath(
                     recall_query,
                     matches,
                     mode="search",
-                    max_results=max(
-                        0,
-                        max_results - len(state_link_candidates),
-                    ),
-                    force_keep_ids=_exact_retrieval_key_ids(
-                        recall_query,
-                        matches,
-                    ),
+                    max_results=ds_max_results,
+                    force_keep_ids=ds_force_keep_ids,
                     allow_empty=allow_empty_recall,
                 )
             finally:
@@ -10323,6 +10476,7 @@ async def _probe_anchor_status(query: str) -> dict:
             )
 
     matches: list[dict] = []
+    ds_timing: dict = {}
     if vector_status == "ok" and not keyword_error:
         keyword_ranked = [(bucket["id"], bucket.get("score", 0)) for bucket in keyword_by_id.values()]
         channels = [
@@ -10351,13 +10505,18 @@ async def _probe_anchor_status(query: str) -> dict:
                 continue
             bucket["score"] = round(fused_score * 1000, 2)
             matches.append(bucket)
-        matches = await _ds_filter_candidates(
-            recall_query,
-            matches,
-            mode="search",
-            max_results=2,
-            force_keep_ids=_exact_retrieval_key_ids(recall_query, matches),
-        )
+        ds_timing_token = begin_recall_timing()
+        try:
+            matches = await _ds_filter_candidates(
+                recall_query,
+                matches,
+                mode="search",
+                max_results=2,
+                force_keep_ids=_exact_retrieval_key_ids(recall_query, matches),
+            )
+            ds_timing = finish_recall_timing(status="ok", partial=False)
+        finally:
+            reset_recall_timing(ds_timing_token)
 
     has_evidence = bool(matches) if vector_status == "ok" and not keyword_error else False
     if keyword_error and vector_status == "ok":
@@ -10377,6 +10536,9 @@ async def _probe_anchor_status(query: str) -> dict:
         "has_evidence": has_evidence,
         "timing_ms": round((time.monotonic() - started) * 1000, 2),
     }
+    for field in ("ds_status", "ds_gate_outcome", "ds_gate_in", "ds_gate_out"):
+        if field in ds_timing:
+            record[field] = ds_timing[field]
     _append_recall_status_trace(record)
     return record
 

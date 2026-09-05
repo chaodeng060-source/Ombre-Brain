@@ -11,6 +11,7 @@ from dehydrator import DEHYDRATE_PROMPT
 from recall_timing import (
     begin_recall_timing,
     finish_recall_timing,
+    get_recall_partial_result,
     reset_recall_timing,
 )
 
@@ -409,6 +410,68 @@ async def test_breath_search_allows_semantic_gate_to_return_empty(
 
     assert result == "未找到相关记忆。"
     assert observed[-1]["allow_empty"] is True
+
+
+@pytest.mark.asyncio
+async def test_breath_pre_ds_partial_uses_conservative_failure_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    buckets = [
+        _bucket("target", "亲密语境真正相关的记忆"),
+        _bucket("noise", "纯工程任务记录"),
+    ]
+    fake_mgr = FakeBucketMgr(buckets)
+    entered = asyncio.Event()
+    ds_input_ids = []
+
+    def score_candidates(candidates, _policy):
+        for candidate in candidates:
+            candidate["_anchor_adapted_relevance_score"] = (
+                0.44 if candidate["id"] == "target" else 0.45
+            )
+        return candidates
+
+    async def hanging_gate(_query, candidates, **_kwargs):
+        ds_input_ids.extend(candidate["id"] for candidate in candidates)
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setenv("OMBRE_DS_FILTER_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FILTER_MODES", "search")
+    monkeypatch.setenv("OMBRE_DS_FAILURE_FALLBACK_ENABLED", "1")
+    monkeypatch.setenv("OMBRE_DS_FAILURE_ANCHOR_FLOOR", "0.450001")
+    monkeypatch.setitem(server.config, "buckets_dir", str(tmp_path))
+    monkeypatch.setitem(server.config, "random_surfacing", {})
+    monkeypatch.setattr(server, "bucket_mgr", fake_mgr)
+    monkeypatch.setattr(server, "decay_engine", FakeDecay())
+    monkeypatch.setattr(server, "dehydrator", FakeDehydrator())
+    monkeypatch.setattr(server, "embedding_engine", FakeEmbedding())
+    monkeypatch.setattr(server, "_backfill_started", True)
+    monkeypatch.setattr(server, "_filter_anchor_policy_candidates", score_candidates)
+    monkeypatch.setattr(server, "_ds_filter_candidates", hanging_gate)
+
+    token = begin_recall_timing()
+    try:
+        task = asyncio.create_task(server.breath(
+            query="亲密语境",
+            policy="conversation",
+            max_results=2,
+            relation_depth=0,
+            include_images=False,
+            include_body_state=False,
+        ))
+        await entered.wait()
+        partial = get_recall_partial_result()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        reset_recall_timing(token)
+
+    assert ds_input_ids == ["target", "noise"]
+    assert "bucket_id:target" in partial
+    assert "bucket_id:noise" not in partial
 
 
 @pytest.mark.asyncio
@@ -923,7 +986,7 @@ async def test_ds_gate_logs_sanitized_response_metadata_on_invalid_payload(
         )
 
     assert [b["id"] for b in selected] == ["a", "b"]
-    assert "DS filter received invalid DeepSeek response" in caplog.text
+    assert "DS filter received invalid response" in caplog.text
     assert '"finish_reason": "length"' in caplog.text
     assert "ds-response-id" in caplog.text
     assert "not-json" not in caplog.text
