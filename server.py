@@ -1806,6 +1806,162 @@ def _literal_collision_guard_enabled() -> bool:
     ).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _entity_score_guard_enabled() -> bool:
+    """Whether validated entity links become bounded DS review tickets."""
+    return os.getenv(
+        "OMBRE_ENTITY_SCORE_GUARD_ENABLED", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _entity_recall_evidence_for_candidates(
+    query: str,
+    *,
+    store,
+    candidate_ids: set[str],
+    term_df_lookup,
+) -> dict[str, list[dict]]:
+    """Build request-local entity/DF evidence from the current BM25 generation.
+
+    Entity resolution remains authoritative for which bucket links are current;
+    this helper only annotates those already-validated candidates with corpus
+    frequency.  Missing resolution or DF data fails closed to no ticket.
+    """
+    if (
+        not _entity_score_guard_enabled()
+        or store is None
+        or not candidate_ids
+        or not callable(term_df_lookup)
+    ):
+        return {}
+    try:
+        resolution = store.resolve_query(query)
+        entity_ids = tuple(getattr(resolution, "entity_ids", ()) or ())
+        terms = tuple(getattr(resolution, "terms", ()) or ())
+        term_stats = term_df_lookup(list(terms)) or {}
+        targets = {str(bucket_id) for bucket_id in candidate_ids if bucket_id}
+        evidence_by_bucket: dict[str, list[dict]] = {}
+        for entity_id, term in zip(entity_ids, terms):
+            stats = term_stats.get(str(term))
+            if (
+                not isinstance(stats, (list, tuple))
+                or len(stats) != 2
+                or not isinstance(stats[0], int)
+                or isinstance(stats[0], bool)
+                or not isinstance(stats[1], int)
+                or isinstance(stats[1], bool)
+                or stats[0] <= 0
+                or stats[1] <= 0
+                or stats[0] > stats[1]
+            ):
+                continue
+            df, corpus_count = stats
+            linked_ids = {
+                str(bucket_id)
+                for bucket_id in store.linked_bucket_ids(
+                    entity_ids=(str(entity_id),)
+                )
+            }
+            evidence = {
+                "term": str(term),
+                "df": df,
+                "corpus_bucket_count": corpus_count,
+            }
+            for bucket_id in targets & linked_ids:
+                evidence_by_bucket.setdefault(bucket_id, []).append(
+                    dict(evidence)
+                )
+        return evidence_by_bucket
+    except Exception as exc:
+        logger.warning(
+            "Entity recall DF evidence unavailable; issuing no tickets: %s",
+            type(exc).__name__,
+        )
+        return {}
+
+
+def _build_weak_entity_tickets(
+    entity_candidates: list[dict],
+    *,
+    literal_candidate_floor: float,
+    excluded_ids: set[str] | None = None,
+    max_tickets: int = 2,
+) -> list[dict]:
+    """Return at most two low-frequency entity candidates for the same DS call.
+
+    Tickets are independent request-local copies.  They never carry the legacy
+    entity score marker and therefore cannot enter Anchor, forced, or failure
+    fallback paths by accident.
+    """
+    try:
+        ticket_limit = max(0, int(max_tickets))
+        literal_floor = float(literal_candidate_floor)
+    except (TypeError, ValueError, OverflowError):
+        return []
+    if ticket_limit <= 0:
+        return []
+
+    excluded = {str(bucket_id) for bucket_id in (excluded_ids or set())}
+    tickets: list[dict] = []
+    for candidate in entity_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        bucket_id = str(candidate.get("id") or "")
+        if not bucket_id or bucket_id in excluded:
+            continue
+
+        literal = candidate.get("_literal_relevance_score")
+        vector = candidate.get("_original_vector_relevance_score")
+        if (
+            not isinstance(literal, (int, float))
+            or isinstance(literal, bool)
+            or not isinstance(vector, (int, float))
+            or isinstance(vector, bool)
+            or not float(literal) < literal_floor
+            or float(vector) != 0.0
+        ):
+            continue
+
+        evidence = candidate.get("_entity_recall_evidence")
+        low_frequency = False
+        if isinstance(evidence, list):
+            for item in evidence:
+                if not isinstance(item, dict):
+                    continue
+                df = item.get("df")
+                corpus_count = item.get("corpus_bucket_count")
+                if (
+                    not isinstance(df, int)
+                    or isinstance(df, bool)
+                    or not isinstance(corpus_count, int)
+                    or isinstance(corpus_count, bool)
+                    or df <= 0
+                    or corpus_count <= 0
+                    or df > corpus_count
+                ):
+                    continue
+                if df / corpus_count < 0.2:
+                    low_frequency = True
+                    break
+        if not low_frequency:
+            continue
+
+        ticket = dict(candidate)
+        metadata = ticket.get("metadata")
+        if isinstance(metadata, dict):
+            ticket["metadata"] = dict(metadata)
+        ticket.pop("entity_match", None)
+        ticket["weak_entity"] = True
+        ticket["score"] = 0.0
+        ticket["_anchor_adapted_relevance_score"] = 0.0
+        ticket["_fused_relevance_score"] = 0.0
+        ticket["_pre_e_tie_break_score"] = 0.0
+        ticket["_non_relevance_tie_break_score"] = 0.0
+        tickets.append(ticket)
+        if len(tickets) >= ticket_limit:
+            break
+    return tickets
+
+
 def _literal_collision_vector_floor() -> float:
     """Meaningful-vector floor used only for common-literal collisions.
 
@@ -2161,6 +2317,20 @@ def _ds_conservative_failure_candidates(
     If neither a forced row nor a row at/above the Anchor floor survives, the
     first capped row is the required one-result safety net.
     """
+    # A weak-entity row is only eligible after an explicit successful model
+    # decision.  It must never reach the forced, Anchor-floor, or top-one
+    # failure safety nets, even if a future caller accidentally mixes pools.
+    if any(bucket.get("weak_entity") for bucket in candidates):
+        candidates = [
+            bucket for bucket in candidates
+            if not bucket.get("weak_entity")
+        ]
+        candidate_ids = {bucket.get("id") for bucket in candidates}
+        force_keep_ids = {
+            bucket_id
+            for bucket_id in force_keep_ids
+            if bucket_id in candidate_ids
+        }
     capped = _cap_candidates_preserving_forced(
         candidates,
         force_keep_ids,
@@ -2422,6 +2592,7 @@ async def _ds_filter_candidates(
     max_results: int,
     force_keep_ids: set[str] = None,
     allow_empty: bool = False,
+    weak_entity_tickets: list[dict] | None = None,
 ) -> list[dict]:
     """
     召回候选的注入裁剪 + 可选小模型语义门控。
@@ -2455,10 +2626,26 @@ async def _ds_filter_candidates(
     if max_results <= 0:
         record_decision("deterministic_noop", "noop", 0, 0)
         return []
-    keep = force_keep_ids or set()
+    requested_keep = force_keep_ids or set()
+    normal_ids = {
+        str(bucket.get("id") or "")
+        for bucket in candidates
+        if isinstance(bucket, dict) and bucket.get("id")
+    }
+    # Supplying the new pool makes its authority boundary explicit: only IDs
+    # from the normal pool may remain forced.  With no ticket argument the
+    # exact legacy keep set is retained.
+    keep = (
+        {bucket_id for bucket_id in requested_keep if bucket_id in normal_ids}
+        if weak_entity_tickets is not None
+        else requested_keep
+    )
     capped = _cap_candidates_preserving_forced(candidates, keep, max_results)
     gate_enabled = _ds_gate_enabled(mode)
 
+    # A ticket may only piggyback on the one semantic call the legacy normal
+    # pool was already going to make.  It must not turn an empty/no-op request
+    # into a new provider call.
     if not gate_enabled or not query or not capped:
         if not gate_enabled or not query:
             record_decision("disabled", "disabled", len(capped), len(capped))
@@ -2483,9 +2670,11 @@ async def _ds_filter_candidates(
     # it also falls back to ``capped`` below.  Likewise, forced candidates can
     # never be removed.  Avoid paying for a model decision whose result is
     # already determined locally.
-    if (len(capped) == 1 and not allow_empty) or all(
-        bucket.get("id") in keep for bucket in capped
-    ):
+    deterministic_legacy_noop = (
+        (len(capped) == 1 and not allow_empty)
+        or all(bucket.get("id") in keep for bucket in capped)
+    )
+    if deterministic_legacy_noop:
         record_decision(
             "deterministic_noop",
             "noop",
@@ -2500,18 +2689,45 @@ async def _ds_filter_candidates(
         )
         return capped
 
+    capped_ids = {
+        str(bucket.get("id") or "")
+        for bucket in capped
+        if isinstance(bucket, dict) and bucket.get("id")
+    }
+    tickets: list[dict] = []
+    ticket_ids: set[str] = set()
+    for ticket in weak_entity_tickets or ():
+        if not isinstance(ticket, dict) or ticket.get("weak_entity") is not True:
+            continue
+        ticket_id = str(ticket.get("id") or "")
+        if (
+            not ticket_id
+            or ticket_id in normal_ids
+            or ticket_id in capped_ids
+            or ticket_id in ticket_ids
+        ):
+            continue
+        tickets.append(ticket)
+        ticket_ids.add(ticket_id)
+        if len(tickets) >= 2:
+            break
+    combined = [*capped, *tickets]
+    if tickets and isinstance(decision_capture, dict):
+        decision_capture["weak_entity_ticket_count"] = len(tickets)
+        decision_capture["weak_entity_ticket_kept"] = 0
+
     def failure_result(outcome: str) -> list[dict]:
         result = _ds_conservative_failure_candidates(
             capped,
             force_keep_ids=keep,
             max_results=max_results,
         )
-        record_decision("fallback", outcome, len(capped), len(result))
+        record_decision("fallback", outcome, len(combined), len(result))
         return result
 
     try:
         kept = await asyncio.wait_for(
-            _ds_semantic_select(query, capped, keep, max_results),
+            _ds_semantic_select(query, combined, keep, len(combined)),
             timeout=_ds_gate_timeout(),
         )
     except asyncio.CancelledError:
@@ -2519,7 +2735,7 @@ async def _ds_filter_candidates(
         logger.warning(
             "DS filter cancelled by outer deadline; conservative fallback "
             "prepared input=%d output=%d",
-            len(capped),
+            len(combined),
             len(result),
         )
         raise
@@ -2528,7 +2744,7 @@ async def _ds_filter_candidates(
         logger.warning(
             "DS filter used conservative fallback outcome=timeout "
             "input=%d output=%d (%s): %s",
-            len(capped), len(result), type(e).__name__, e,
+            len(combined), len(result), type(e).__name__, e,
         )
         return result
     except DSFilterInvalidPayloadError as e:
@@ -2536,7 +2752,7 @@ async def _ds_filter_candidates(
         logger.warning(
             "DS filter used conservative fallback outcome=invalid "
             "input=%d output=%d reason=%s",
-            len(capped), len(result), e.reason,
+            len(combined), len(result), e.reason,
         )
         return result
     except Exception as e:
@@ -2544,16 +2760,49 @@ async def _ds_filter_candidates(
         logger.warning(
             "DS filter used conservative fallback outcome=error "
             "input=%d output=%d (%s): %s",
-            len(capped), len(result), type(e).__name__, e,
+            len(combined), len(result), type(e).__name__, e,
         )
         return result
 
-    result = kept if kept or allow_empty else capped
-    record_decision("model", "ok", len(capped), len(result))
-    logger.info(
-        "DS filter mode=%s query=%r input=%d capped=%d kept=%d",
-        mode, query[:80], len(candidates), len(capped), len(result),
-    )
+    if not kept and not allow_empty:
+        result = capped
+    else:
+        kept_ids = {
+            str(bucket.get("id") or "")
+            for bucket in kept
+            if isinstance(bucket, dict) and bucket.get("id")
+        }
+        normal_survivors = [
+            bucket for bucket in capped
+            if str(bucket.get("id") or "") in kept_ids
+        ]
+        vacancies = max(0, max_results - len(normal_survivors))
+        ticket_survivors = [
+            ticket for ticket in tickets
+            if str(ticket.get("id") or "") in kept_ids
+        ][:vacancies]
+        result = [*normal_survivors, *ticket_survivors]
+    if tickets and isinstance(decision_capture, dict):
+        decision_capture["weak_entity_ticket_kept"] = sum(
+            1 for bucket in result if bucket.get("weak_entity") is True
+        )
+    record_decision("model", "ok", len(combined), len(result))
+    if tickets:
+        logger.info(
+            "DS filter mode=%s query=%r normal_input=%d normal_capped=%d "
+            "weak_entity_tickets=%d kept=%d",
+            mode,
+            query[:80],
+            len(candidates),
+            len(capped),
+            len(tickets),
+            len(result),
+        )
+    else:
+        logger.info(
+            "DS filter mode=%s query=%r input=%d capped=%d kept=%d",
+            mode, query[:80], len(candidates), len(capped), len(result),
+        )
     return result
 
 
@@ -5601,6 +5850,7 @@ async def breath(
     # Entity channel — linked ids are advisory until their content hash and the
     # same authority filters as vector-only candidates have been revalidated.
     entity_top_k, entity_weight = _entity_recall_settings()
+    entity_guard_enabled = _entity_score_guard_enabled()
     entity_store = _get_entity_store(initialize=False)
     entity_bucket_cache: dict[str, dict] = {}
     entity_ranked: list[tuple[str, float]] = []
@@ -5619,13 +5869,19 @@ async def breath(
                 bid, bucket.get("content", "")
             ):
                 continue
-            state_seed_by_id[str(bid)] = bucket
+            if not entity_guard_enabled:
+                state_seed_by_id[str(bid)] = bucket
             if not _filter_z_fact_candidates(
                 [bucket],
                 query=recall_query,
                 intent=intent_policy["intent"],
             ):
                 continue
+            if entity_guard_enabled:
+                bucket = dict(bucket)
+                metadata = bucket.get("metadata")
+                if isinstance(metadata, dict):
+                    bucket["metadata"] = dict(metadata)
             entity_bucket_cache[bid] = bucket
             entity_ranked.append((bid, score))
         except Exception as exc:
@@ -5633,6 +5889,51 @@ async def breath(
                 "Entity candidate skipped after validation: %s",
                 type(exc).__name__,
             )
+
+    entity_recall_evidence: dict[str, list[dict]] = {}
+    entity_ticket_candidates: list[dict] = []
+    if entity_guard_enabled and entity_bucket_cache:
+        entity_recall_evidence = _entity_recall_evidence_for_candidates(
+            query,
+            store=entity_store,
+            candidate_ids=set(entity_bucket_cache),
+            term_df_lookup=getattr(bucket_mgr, "entity_term_df_stats", None),
+        )
+        for bid, _score in entity_ranked:
+            bucket = entity_bucket_cache.get(bid)
+            if not bucket:
+                continue
+            candidate = dict(bucket)
+            metadata = candidate.get("metadata")
+            if isinstance(metadata, dict):
+                candidate["metadata"] = dict(metadata)
+            candidate["_literal_relevance_score"] = (
+                max(
+                    round(
+                        topic_score_calculator(recall_query, candidate) * 100.0,
+                        4,
+                    ),
+                    float(original_bm25_scores.get(str(bid), 0.0) or 0.0),
+                    float(lexical_original_support.get(str(bid), 0.0) or 0.0)
+                    * 100.0,
+                )
+                if callable(topic_score_calculator)
+                else literal_candidate_floor
+            )
+            candidate["_vector_relevance_score"] = round(
+                float(vector_scores.get(bid, 0.0)),
+                6,
+            )
+            candidate["_original_vector_relevance_score"] = round(
+                float(original_vector_scores.get(bid, 0.0)),
+                6,
+            )
+            evidence = entity_recall_evidence.get(str(bid))
+            if evidence:
+                candidate["_entity_recall_evidence"] = [
+                    dict(item) for item in evidence
+                ]
+            entity_ticket_candidates.append(candidate)
 
     # RRF fusion of keyword + vector + the optional entity channel.
     rrf_cfg = config.get("rrf", {})
@@ -5669,7 +5970,7 @@ async def breath(
         (merged_keyword_ranked, intent_policy["keyword_weight"]),
         (vector_ranked, intent_policy["vector_weight"]),
     ]
-    if entity_ranked and entity_weight > 0:
+    if not entity_guard_enabled and entity_ranked and entity_weight > 0:
         channels.append((entity_ranked, entity_weight))
 
     # Compute the exact production baseline once. Shadow receipts below reuse
@@ -5731,7 +6032,7 @@ async def breath(
             ),
             (vector_ranked, intent_policy["vector_weight"]),
         ]
-        if entity_ranked and entity_weight > 0:
+        if not entity_guard_enabled and entity_ranked and entity_weight > 0:
             shadow_channels.append((entity_ranked, entity_weight))
         shadow_results = {
             mode: [
@@ -5841,7 +6142,7 @@ async def breath(
                 continue
             b["vector_match"] = True
         b.pop("entity_match", None)
-        if bid in entity_bucket_cache:
+        if not entity_guard_enabled and bid in entity_bucket_cache:
             b["entity_match"] = True
         state_seed_by_id[str(bid)] = b
         if not _filter_z_fact_candidates(
@@ -6134,6 +6435,50 @@ async def breath(
             state_link_candidates,
             recall_policy,
         )[:state_link_budget]
+
+    weak_entity_tickets: list[dict] = []
+    if entity_guard_enabled and entity_ticket_candidates:
+        excluded_ticket_ids = (
+            {
+                str(bucket.get("id") or "")
+                for bucket in (*matches, *state_link_candidates)
+                if bucket.get("id")
+            }
+            | _session_seen_bucket_ids(
+                list(entity_bucket_cache.values()),
+                session_id,
+            )
+            | _load_session_seen_ids(session_id)
+        )
+        occupied_fingerprints = {
+            fingerprint
+            for fingerprint in (
+                default_content_fingerprint(str(bucket.get("content") or ""))
+                for bucket in (*matches, *state_link_candidates)
+            )
+            if fingerprint
+        }
+        for candidate in entity_ticket_candidates:
+            candidate_ticket = _build_weak_entity_tickets(
+                [candidate],
+                literal_candidate_floor=literal_candidate_floor,
+                excluded_ids=excluded_ticket_ids,
+                max_tickets=1,
+            )
+            if not candidate_ticket:
+                continue
+            ticket = candidate_ticket[0]
+            fingerprint = default_content_fingerprint(
+                str(ticket.get("content") or "")
+            )
+            if fingerprint and fingerprint in occupied_fingerprints:
+                continue
+            weak_entity_tickets.append(ticket)
+            if fingerprint:
+                occupied_fingerprints.add(fingerprint)
+            if len(weak_entity_tickets) >= 2:
+                break
+
     ds_max_results = max(0, max_results - len(state_link_candidates))
     ds_force_keep_ids = _exact_retrieval_key_ids(recall_query, matches)
     pre_ds_partial_matches = matches
@@ -6167,9 +6512,12 @@ async def breath(
                 max_results=ds_max_results,
                 force_keep_ids=ds_force_keep_ids,
                 allow_empty=allow_empty_recall,
+                **({
+                    "weak_entity_tickets": weak_entity_tickets,
+                } if entity_guard_enabled else {}),
             )
         else:
-            ds_decision_capture: dict[str, str] = {}
+            ds_decision_capture: dict[str, object] = {}
             ds_capture_token = _ds_filter_decision_capture.set(
                 ds_decision_capture
             )
@@ -6181,6 +6529,9 @@ async def breath(
                     max_results=ds_max_results,
                     force_keep_ids=ds_force_keep_ids,
                     allow_empty=allow_empty_recall,
+                    **({
+                        "weak_entity_tickets": weak_entity_tickets,
+                    } if entity_guard_enabled else {}),
                 )
             finally:
                 _ds_filter_decision_capture.reset(ds_capture_token)
@@ -6390,7 +6741,8 @@ async def breath(
             if token_used + summary_tokens > max_tokens:
                 break
             reason = (
-                "entity" if bucket.get("entity_match")
+                "weak_entity" if bucket.get("weak_entity")
+                else "entity" if bucket.get("entity_match")
                 else "semantic" if bucket.get("vector_match")
                 else "lexical"
             )
@@ -6403,7 +6755,17 @@ async def breath(
             # Recall is read-only with respect to memory buckets.  Rendering a
             # search hit must not refresh last_active / activation_count or
             # trigger touch()'s bounded time ripple into neighboring buckets.
-            if bucket.get("entity_match"):
+            if bucket.get("weak_entity"):
+                prefix = _recall_prefix(
+                    bucket["id"],
+                    "main",
+                    "entity_ticket",
+                    marker="[实体门卫复核]",
+                    bucket=bucket,
+                    state_profile=state_profile,
+                )
+                summary = f"{prefix} {summary}"
+            elif bucket.get("entity_match"):
                 prefix = _recall_prefix(
                     bucket["id"],
                     "main",
@@ -6617,13 +6979,20 @@ async def breath(
                 summary_tokens = count_tokens_approx(summary)
                 if token_used + summary_tokens > max_tokens:
                     break
-                marker = "[实体关联]" if bucket.get("entity_match") else (
-                    "[语义关联]" if bucket.get("vector_match") else ""
+                marker = (
+                    "[实体门卫复核]" if bucket.get("weak_entity")
+                    else "[实体关联]" if bucket.get("entity_match")
+                    else "[语义关联]" if bucket.get("vector_match")
+                    else ""
                 )
                 prefix = _recall_prefix(
                     bucket_id,
                     "main",
-                    "curated_rrf",
+                    (
+                        "entity_ticket"
+                        if bucket.get("weak_entity")
+                        else "curated_rrf"
+                    ),
                     marker=marker,
                     bucket=bucket,
                     state_profile=state_profile,
@@ -6644,7 +7013,8 @@ async def breath(
                         float(bucket.get("_e_axis_resonance", 0.0) or 0.0),
                     ))
                 reason = (
-                    "entity" if bucket.get("entity_match")
+                    "weak_entity" if bucket.get("weak_entity")
+                    else "entity" if bucket.get("entity_match")
                     else "semantic" if bucket.get("vector_match")
                     else "lexical"
                 )
@@ -6952,13 +7322,20 @@ async def breath(
                 summary_tokens = count_tokens_approx(summary)
                 if token_used + summary_tokens > max_tokens:
                     break
-                marker = "[实体关联]" if bucket.get("entity_match") else (
-                    "[语义关联]" if bucket.get("vector_match") else ""
+                marker = (
+                    "[实体门卫复核]" if bucket.get("weak_entity")
+                    else "[实体关联]" if bucket.get("entity_match")
+                    else "[语义关联]" if bucket.get("vector_match")
+                    else ""
                 )
                 prefix = _recall_prefix(
                     bucket_id,
                     "main",
-                    "curated_rrf",
+                    (
+                        "entity_ticket"
+                        if bucket.get("weak_entity")
+                        else "curated_rrf"
+                    ),
                     marker=marker,
                     bucket=bucket,
                     state_profile=state_profile,
@@ -6978,7 +7355,8 @@ async def breath(
                         float(bucket.get("_e_axis_resonance", 0.0) or 0.0),
                     ))
                 reason = (
-                    "entity" if bucket.get("entity_match")
+                    "weak_entity" if bucket.get("weak_entity")
+                    else "entity" if bucket.get("entity_match")
                     else "semantic" if bucket.get("vector_match")
                     else "lexical"
                 )
@@ -10480,6 +10858,7 @@ async def _probe_anchor_status(query: str) -> dict:
                 vector_scores[bucket_id] = similarity
 
     entity_top_k, entity_weight = _entity_recall_settings()
+    entity_guard_enabled = _entity_score_guard_enabled()
     entity_store = _get_entity_store(initialize=False)
     entity_by_id: dict[str, dict] = {}
     entity_ranked: list[tuple[str, float]] = []
@@ -10517,7 +10896,7 @@ async def _probe_anchor_status(query: str) -> dict:
             (keyword_ranked, intent_policy["keyword_weight"]),
             (list(vector_scores.items()), intent_policy["vector_weight"]),
         ]
-        if entity_ranked and entity_weight > 0:
+        if not entity_guard_enabled and entity_ranked and entity_weight > 0:
             channels.append((entity_ranked, entity_weight))
         fused_pairs = rrf_fuse_channels(
             channels,
@@ -10539,6 +10918,11 @@ async def _probe_anchor_status(query: str) -> dict:
                 continue
             bucket["score"] = round(fused_score * 1000, 2)
             matches.append(bucket)
+
+        # This lightweight probe deliberately skips query expansion, curated
+        # lexical lookup, and the full Anchor assembly used by breath.  It can
+        # therefore observe the guard's entity-score removal, but cannot issue
+        # or count tickets without inventing a different eligibility decision.
         ds_timing_token = begin_recall_timing()
         try:
             matches = await _ds_filter_candidates(
@@ -10566,6 +10950,9 @@ async def _probe_anchor_status(query: str) -> dict:
         "vector_candidate_count": len(vector_scores),
         "entity_candidate_count": len(entity_ranked),
         "entity_query_canonicalized": recall_query != query,
+        **({
+            "entity_ticket_evaluation": "not_run_in_lightweight_probe",
+        } if entity_guard_enabled else {}),
         "final_candidate_count": len(matches),
         "has_evidence": has_evidence,
         "timing_ms": round((time.monotonic() - started) * 1000, 2),

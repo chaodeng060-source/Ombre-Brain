@@ -409,6 +409,36 @@ class BM25Index:
                     hits.setdefault(bucket_id, []).append((term, df))
         return {bucket_id: tuple(terms) for bucket_id, terms in hits.items()}
 
+    def entity_term_df_stats(
+        self,
+        terms: list[str] | tuple[str, ...],
+    ) -> dict[str, tuple[int, int]]:
+        """Return current-generation document frequency for entity terms.
+
+        Entity resolution decides which audited entity names matched; this
+        method only measures those names against the same complete token/posting
+        generation used by BM25.  A multi-token name counts documents containing
+        every token.  Missing or incomplete indexes return no evidence.
+        """
+        if not self._postings or not self._term_doc_counts or not self._ids:
+            return {}
+        corpus_count = len(self._ids)
+        stats: dict[str, tuple[int, int]] = {}
+        for raw_term in terms:
+            term = str(raw_term or "").strip()
+            tokens = tuple(dict.fromkeys(_tokenize(term)))
+            if not term or not tokens:
+                continue
+            postings = [self._postings.get(token, frozenset()) for token in tokens]
+            if not postings or any(not posting for posting in postings):
+                continue
+            matched_ids = set(postings[0])
+            for posting in postings[1:]:
+                matched_ids.intersection_update(posting)
+            if matched_ids:
+                stats[term] = (len(matched_ids), corpus_count)
+        return stats
+
     def score(self, query: str) -> dict[str, float]:
         """Return normalized BM25 scores; the rank_bm25 formula is unchanged."""
         if not _BM25_AVAILABLE or self._index is None:
