@@ -234,10 +234,9 @@ def _configure_breath(tmp_path, monkeypatch, *, guard_enabled: bool):
         max_results,
         force_keep_ids=None,
         allow_empty=False,
-        weak_entity_tickets=None,
+        **unexpected_kwargs,
     ):
         normal_rows = list(candidates)
-        ticket_rows = list(weak_entity_tickets or [])
         captures["partial_at_ds"].append(
             captures["partials"][-1] if captures["partials"] else ""
         )
@@ -248,12 +247,15 @@ def _configure_breath(tmp_path, monkeypatch, *, guard_enabled: bool):
                 "max_results": max_results,
                 "force_keep_ids": set(force_keep_ids or set()),
                 "allow_empty": allow_empty,
-                "normal_ids": [row["id"] for row in normal_rows],
-                "ticket_ids": [row["id"] for row in ticket_rows],
+                "ids": [row["id"] for row in normal_rows],
+                "weak_entity_ids": [
+                    row["id"] for row in normal_rows
+                    if row.get("weak_entity") is True
+                ],
+                "unexpected_kwargs": unexpected_kwargs,
             }
         )
-        vacancy = max(0, max_results - len(normal_rows))
-        return [*normal_rows[:max_results], *ticket_rows[:vacancy]]
+        return normal_rows[:max_results]
 
     monkeypatch.setattr(server, "_ds_filter_candidates", ds_gate)
 
@@ -265,7 +267,7 @@ def _flatten_anchor_rows(captures):
 
 
 @pytest.mark.asyncio
-async def test_breath_guard_off_preserves_legacy_entity_rrf_and_anchor(
+async def test_guard_off_is_byte_and_call_shape_equivalent_to_3e16a3f(
     tmp_path,
     monkeypatch,
 ):
@@ -283,21 +285,72 @@ async def test_breath_guard_off_preserves_legacy_entity_rrf_and_anchor(
         include_body_state=False,
     )
 
-    assert captures["rrf_channels"] == [
-        [[NORMAL_KEYWORD], [NORMAL_VECTOR], [ENTITY_LOW, ENTITY_HIGH_BOUNDARY, ENTITY_HIGH]]
-    ]
+    assert result == (
+        "[bucket_id:normal-keyword] body:normal-keyword\n"
+        "---\n"
+        "[语义关联] [bucket_id:normal-vector] body:normal-vector\n"
+        "---\n"
+        "[实体关联] [bucket_id:6cc5995aea84] body:6cc5995aea84"
+    )
+    assert captures["rrf_channels"] == [[
+        [NORMAL_KEYWORD],
+        [NORMAL_VECTOR],
+        [ENTITY_LOW, ENTITY_HIGH_BOUNDARY, ENTITY_HIGH],
+    ]]
     anchor_by_id = {row["id"]: row for row in _flatten_anchor_rows(captures)}
     assert anchor_by_id[ENTITY_LOW]["entity_match"] is True
     assert anchor_by_id[ENTITY_LOW]["anchor"] == pytest.approx(0.45)
-    assert captures["ds_calls"][0]["ticket_ids"] == []
-    assert ENTITY_LOW in captures["ds_calls"][0]["normal_ids"]
+    assert captures["ds_calls"] == [{
+        "query": "rare-name",
+        "mode": "search",
+        "max_results": 3,
+        "force_keep_ids": set(),
+        "allow_empty": True,
+        "ids": [
+            NORMAL_KEYWORD,
+            NORMAL_VECTOR,
+            ENTITY_LOW,
+            ENTITY_HIGH_BOUNDARY,
+            ENTITY_HIGH,
+        ],
+        "weak_entity_ids": [],
+        "unexpected_kwargs": {},
+    }]
     assert manager.df_calls == []
-    assert f"[bucket_id:{ENTITY_LOW}]" in result
-    assert "[实体关联]" in result
 
 
 @pytest.mark.asyncio
-async def test_breath_guard_on_routes_only_low_frequency_entity_as_same_ds_ticket(
+async def test_guard_on_ds_receives_only_normal_pool_and_never_issues_ticket(
+    tmp_path,
+    monkeypatch,
+):
+    manager, embedding, captures = _configure_breath(
+        tmp_path,
+        monkeypatch,
+        guard_enabled=True,
+    )
+
+    result = await server.breath(
+        query="rare-name",
+        max_results=3,
+        relation_depth=0,
+        include_images=False,
+        include_body_state=False,
+    )
+
+    assert len(captures["ds_calls"]) == 1
+    ds_call = captures["ds_calls"][0]
+    assert ds_call["ids"] == [NORMAL_KEYWORD, NORMAL_VECTOR]
+    assert ds_call["weak_entity_ids"] == []
+    assert ds_call["unexpected_kwargs"] == {}
+    assert ds_call["max_results"] == 3
+    assert manager.df_calls == []
+    assert "[实体门卫复核]" not in result
+    assert "weak_entity" not in result
+
+
+@pytest.mark.asyncio
+async def test_guard_on_entity_hits_do_not_enter_rrf_anchor_or_state_seed(
     tmp_path,
     monkeypatch,
 ):
@@ -316,22 +369,12 @@ async def test_breath_guard_on_routes_only_low_frequency_entity_as_same_ds_ticke
     )
 
     assert captures["rrf_channels"] == [[[NORMAL_KEYWORD], [NORMAL_VECTOR]]]
-    assert len(captures["ds_calls"]) == 1
-    ds_call = captures["ds_calls"][0]
-    assert ds_call["normal_ids"] == [NORMAL_KEYWORD, NORMAL_VECTOR]
-    assert ds_call["ticket_ids"] == [ENTITY_LOW]
-    assert ENTITY_HIGH_BOUNDARY not in ds_call["normal_ids"] + ds_call["ticket_ids"]
-    assert ENTITY_HIGH not in ds_call["normal_ids"] + ds_call["ticket_ids"]
-    assert ds_call["max_results"] == 3
-
     anchor_ids = {row["id"] for row in _flatten_anchor_rows(captures)}
     assert anchor_ids == {NORMAL_KEYWORD, NORMAL_VECTOR}
     assert captures["state_seed_ids"] == [[NORMAL_KEYWORD, NORMAL_VECTOR]]
     assert manager.search_calls == [("rare-name", server.BREATH_RECALL_POOL_SIZE)]
     assert len(embedding.queries) == 1
-    assert manager.df_calls == [
-        ("rare-name", "common-name", "very-common-name")
-    ]
+    assert manager.df_calls == []
 
     partial = captures["partial_at_ds"][0]
     assert f"bucket_id:{NORMAL_KEYWORD}" in partial
@@ -341,45 +384,5 @@ async def test_breath_guard_on_routes_only_low_frequency_entity_as_same_ds_ticke
 
     assert f"[bucket_id:{NORMAL_KEYWORD}]" in result
     assert f"[bucket_id:{NORMAL_VECTOR}]" in result
-    assert f"[bucket_id:{ENTITY_LOW}]" in result
-    assert f"[bucket_id:{ENTITY_HIGH_BOUNDARY}]" not in result
-    assert f"[bucket_id:{ENTITY_HIGH}]" not in result
-
-
-@pytest.mark.asyncio
-async def test_probe_guard_on_removes_entity_score_and_marks_ticket_evaluation_unavailable(
-    tmp_path,
-    monkeypatch,
-):
-    manager, _embedding, captures = _configure_breath(
-        tmp_path,
-        monkeypatch,
-        guard_enabled=True,
-    )
-    probe_channels = []
-    original_fuse = server.rrf_fuse_channels
-
-    def capture_probe_fuse(channels, *args, **kwargs):
-        probe_channels.append(
-            [
-                [str(bucket_id) for bucket_id, _score in ranked]
-                for ranked, _weight in channels
-            ]
-        )
-        return original_fuse(channels, *args, **kwargs)
-
-    monkeypatch.setattr(server, "rrf_fuse_channels", capture_probe_fuse)
-    monkeypatch.setattr(server, "_append_recall_status_trace", lambda _record: None)
-
-    record = await server._probe_anchor_status("rare-name")
-
-    assert probe_channels == [[[NORMAL_KEYWORD], [NORMAL_VECTOR]]]
-    assert len(captures["ds_calls"]) == 1
-    ds_call = captures["ds_calls"][0]
-    assert ds_call["normal_ids"] == [NORMAL_KEYWORD, NORMAL_VECTOR]
-    assert ds_call["ticket_ids"] == []
-    assert ENTITY_HIGH_BOUNDARY not in ds_call["normal_ids"]
-    assert ENTITY_HIGH not in ds_call["normal_ids"]
-    assert manager.df_calls == []
-    assert record["entity_candidate_count"] == 3
-    assert record["entity_ticket_evaluation"] == "not_run_in_lightweight_probe"
+    for entity_id in (ENTITY_LOW, ENTITY_HIGH_BOUNDARY, ENTITY_HIGH):
+        assert f"[bucket_id:{entity_id}]" not in result

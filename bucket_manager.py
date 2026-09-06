@@ -1314,23 +1314,6 @@ class BucketManager:
             logger.warning("[bm25] literal-DF lookup failed; guard skipped: %s", exc)
             return {}
 
-    def entity_term_df_stats(
-        self,
-        terms: list[str] | tuple[str, ...],
-    ) -> dict[str, tuple[int, int]]:
-        """Current BM25-generation DF/corpus size for resolved entity names."""
-        index = self._bm25
-        if self._bm25_mode == "off" or index is None or not terms:
-            return {}
-        lookup = getattr(index, "entity_term_df_stats", None)
-        if not callable(lookup):
-            return {}
-        try:
-            return lookup(terms)
-        except Exception as exc:
-            logger.warning("[bm25] entity-DF lookup failed; guard skipped: %s", exc)
-            return {}
-
     async def prewarm_bm25(self) -> bool:
         """Build the optional BM25 index once before requests are accepted."""
         if self._bm25_mode == "off":
