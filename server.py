@@ -2665,11 +2665,12 @@ async def _ds_filter_candidates(
         )
         return capped
 
-    # The gate is subtractive only.  With one non-empty result required, a
-    # singleton can never change: keeping it returns ``capped`` and rejecting
-    # it also falls back to ``capped`` below.  Likewise, forced candidates can
-    # never be removed.  Avoid paying for a model decision whose result is
-    # already determined locally.
+    # The legacy normal-pool decision is subtractive only; a model-kept ticket
+    # may join within the same fixed result budget below.  With one non-empty
+    # normal result required, a singleton can never change: keeping it returns
+    # ``capped`` and rejecting it also falls back to ``capped`` below.
+    # Likewise, forced candidates can never be removed.  Avoid paying for a
+    # model decision whose result is already determined locally.
     deterministic_legacy_noop = (
         (len(capped) == 1 and not allow_empty)
         or all(bucket.get("id") in keep for bucket in capped)
@@ -2776,12 +2777,37 @@ async def _ds_filter_candidates(
             bucket for bucket in capped
             if str(bucket.get("id") or "") in kept_ids
         ]
-        vacancies = max(0, max_results - len(normal_survivors))
         ticket_survivors = [
             ticket for ticket in tickets
             if str(ticket.get("id") or "") in kept_ids
-        ][:vacancies]
-        result = [*normal_survivors, *ticket_survivors]
+        ]
+        vacancies = max(0, max_results - len(normal_survivors))
+        # An under-full normal pool keeps the legacy vacancy-only contract.
+        # Replacement is enabled only when normal survivors already fill the
+        # result budget.
+        admitted_tickets = ticket_survivors[:vacancies]
+        displacement_tickets = ticket_survivors if vacancies == 0 else ()
+        for ticket in displacement_tickets:
+            scored_removable: list[tuple[float, int, int, dict]] = []
+            for index, bucket in enumerate(normal_survivors):
+                if str(bucket.get("id") or "") in keep:
+                    continue
+                score = bucket.get("_anchor_adapted_relevance_score")
+                if not isinstance(score, (int, float)):
+                    score = _anchor_adapted_relevance_score(dict(bucket))
+                if not isinstance(score, (int, float)):
+                    continue
+                # A tie displaces the later normal so the earlier ordering is
+                # as stable as possible.
+                scored_removable.append((float(score), -index, index, bucket))
+            if not scored_removable:
+                break
+            _, _, victim_index, victim = min(scored_removable)
+            del normal_survivors[victim_index]
+            admitted_ticket = dict(ticket)
+            admitted_ticket["displaced_id"] = str(victim.get("id") or "")
+            admitted_tickets.append(admitted_ticket)
+        result = [*normal_survivors, *admitted_tickets]
     if tickets and isinstance(decision_capture, dict):
         decision_capture["weak_entity_ticket_kept"] = sum(
             1 for bucket in result if bucket.get("weak_entity") is True

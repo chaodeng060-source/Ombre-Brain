@@ -166,7 +166,7 @@ def test_recorded_high_frequency_entity_noise_never_gets_a_ticket(
 
 
 @pytest.mark.asyncio
-async def test_ds_ticket_pool_is_extra_and_only_fills_model_created_vacancy(
+async def test_model_kept_ticket_fills_vacancy_without_displacement(
     monkeypatch,
 ):
     _require_ds_ticket_parameter()
@@ -211,14 +211,71 @@ async def test_ds_ticket_pool_is_extra_and_only_fills_model_created_vacancy(
         "normal-3",
         "ticket-1",
     ]
+    assert "displaced_id" not in selected[-1]
     assert len(selected) == 3
 
 
 @pytest.mark.asyncio
-async def test_model_kept_ticket_never_displaces_full_normal_survivors(monkeypatch):
+async def test_model_kept_ticket_displaces_lowest_anchor_normal_when_pool_full(
+    monkeypatch,
+):
     _require_ds_ticket_parameter()
     _enable_ds(monkeypatch)
-    normal = [_candidate(f"normal-{index}") for index in range(1, 4)]
+    normal = [
+        _candidate("normal-1", anchor=0.91),
+        _candidate("normal-2", anchor=0.12),
+        _candidate("normal-3", anchor=0.64),
+        _candidate("normal-4", anchor=0.20),
+    ]
+    tickets = [
+        _candidate("ticket-1", weak_entity=True),
+        _candidate("ticket-2", weak_entity=True),
+    ]
+
+    async def keep_everything(_query, rows, _keep, _max_results):
+        return list(rows)
+
+    monkeypatch.setattr(server, "_ds_semantic_select", keep_everything)
+
+    selected = await server._ds_filter_candidates(
+        "rare-name",
+        normal,
+        mode="search",
+        max_results=4,
+        allow_empty=True,
+        weak_entity_tickets=tickets,
+    )
+
+    assert [row["id"] for row in selected] == [
+        "normal-1",
+        "normal-3",
+        "ticket-1",
+        "ticket-2",
+    ]
+    assert [row["displaced_id"] for row in selected[-2:]] == [
+        "normal-2",
+        "normal-4",
+    ]
+    assert len(selected) == 4
+
+
+@pytest.mark.asyncio
+async def test_full_pool_displacement_preserves_forced_and_unscored_normals(
+    monkeypatch,
+):
+    _require_ds_ticket_parameter()
+    _enable_ds(monkeypatch)
+    unscored = {
+        "id": "normal-unscored",
+        "content": "body:normal-unscored",
+        "metadata": {"name": "normal-unscored"},
+    }
+    normal = [
+        _candidate("normal-forced", anchor=0.01),
+        unscored,
+        _candidate("normal-tie-earlier", anchor=0.20),
+        _candidate("normal-tie-later", anchor=0.20),
+    ]
     ticket = _candidate("ticket", weak_entity=True)
 
     async def keep_everything(_query, rows, _keep, _max_results):
@@ -230,16 +287,21 @@ async def test_model_kept_ticket_never_displaces_full_normal_survivors(monkeypat
         "rare-name",
         normal,
         mode="search",
-        max_results=3,
+        max_results=4,
+        force_keep_ids={"normal-forced"},
         allow_empty=True,
         weak_entity_tickets=[ticket],
     )
 
     assert [row["id"] for row in selected] == [
-        "normal-1",
-        "normal-2",
-        "normal-3",
+        "normal-forced",
+        "normal-unscored",
+        "normal-tie-earlier",
+        "ticket",
     ]
+    assert selected[-1]["displaced_id"] == "normal-tie-later"
+    assert "displaced_id" not in ticket
+    assert "_literal_collision_guard" not in unscored
 
 
 @pytest.mark.asyncio
