@@ -60,7 +60,12 @@ from review_queue import (
     make_z_pair_entry,
 )
 from redact import redact_obj
-from snapshot_manager import SnapshotManager, SnapshotResult
+from snapshot_manager import (
+    SnapshotError,
+    SnapshotManager,
+    SnapshotResult,
+    SnapshotRetentionError,
+)
 from bucket_manager import bucket_revision_hash
 from timeline_axis import run_timeline_sweep
 
@@ -99,6 +104,7 @@ class NightRunPolicy:
     proposer_concurrency: int = 1
     proposer_wall_budget_seconds: int = 3000
     chunk_bytes: int = 24 * 1024
+    snapshot_keep: int = 3
     barrier_timeout_seconds: float = 60.0
     vector_policy: str = "required"
 
@@ -110,6 +116,7 @@ class NightRunPolicy:
             "proposer_concurrency",
             "proposer_wall_budget_seconds",
             "chunk_bytes",
+            "snapshot_keep",
         ):
             value = getattr(self, field)
             if type(value) is not int or value <= 0:
@@ -395,6 +402,54 @@ class NightRunCoordinator:
                     lambda: self.snapshots.create_snapshot(run_id)
                 )
                 self._seal_snapshot(run_id, cutoff_iso, snapshot, counts)
+                counts["snapshots_pruned"] = 0
+                retention_task = asyncio.create_task(
+                    _await_daemon_thread(
+                        lambda: self.snapshots.prune_night_snapshots(
+                            current_snapshot_id=run_id,
+                            current_manifest_sha256=snapshot.manifest_sha256,
+                            keep=self.policy.snapshot_keep,
+                        )
+                    )
+                )
+                try:
+                    removed_snapshots = await asyncio.shield(retention_task)
+                except asyncio.CancelledError:
+                    # The filesystem operation cannot be cancelled safely.
+                    # Keep the maintenance lease until it finishes so the
+                    # ledger records the deletion facts before cancellation.
+                    while not retention_task.done():
+                        try:
+                            await asyncio.shield(retention_task)
+                        except asyncio.CancelledError:
+                            continue
+                        except BaseException:
+                            break
+                    try:
+                        removed_snapshots = retention_task.result()
+                    except SnapshotRetentionError as exc:
+                        counts["snapshots_pruned"] = len(
+                            exc.removed_snapshot_ids
+                        )
+                    except BaseException:
+                        pass
+                    else:
+                        counts["snapshots_pruned"] = len(
+                            removed_snapshots
+                        )
+                    raise
+                except SnapshotRetentionError as exc:
+                    counts["snapshots_pruned"] = len(
+                        exc.removed_snapshot_ids
+                    )
+                    raise NightRunCoordinatorError(
+                        "snapshot.retention_failed"
+                    ) from exc
+                except SnapshotError as exc:
+                    raise NightRunCoordinatorError(
+                        "snapshot.retention_failed"
+                    ) from exc
+                counts["snapshots_pruned"] = len(removed_snapshots)
 
                 self._chunk_uncovered(cutoff_iso, counts)
                 self._advance(run_id, "snapshotted", "chunked", counts)
@@ -1432,6 +1487,7 @@ class NightRunCoordinator:
         ):
             raise NightRunCoordinatorError("validation.raw_uncovered")
         required_counts = (
+            "snapshots_pruned",
             "proposer_watermark",
             "proposer_pending_before",
             "proposer_attempted",

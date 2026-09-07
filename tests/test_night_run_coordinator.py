@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any
 
 import pytest
 
+import snapshot_manager as snapshot_module
 from curated_writer import CuratedWriteCoordinator, CuratedWriteResult
 from lmc5_ledger import LMC5Ledger
 from lmc5_proposer import (
@@ -1103,6 +1105,166 @@ async def test_invalid_raw_json_stays_uncovered_and_fails_closed(
     assert harness.ledger.get_night_run("night-invalid-raw").stage == "error"
     assert len(harness.ledger.list_uncovered_raw_events(limit=10)) == 1
     assert harness.ledger.list_pending_proposer_chunks(limit=10) == ()
+
+
+@pytest.mark.asyncio
+async def test_night_snapshot_retention_runs_before_downstream_failure(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(tmp_path)
+    previous = (
+        "lmc5-night-20260904",
+        "lmc5-night-20260905",
+        "lmc5-night-20260906",
+    )
+    for snapshot_id in previous:
+        harness.snapshots.create_snapshot(snapshot_id)
+    harness.ledger.append_raw_event(
+        "room-main", "message-1", '{"duplicate":1,"duplicate":2}'
+    )
+
+    with pytest.raises(NightRunCoordinatorError) as raised:
+        await harness.coordinator.run(
+            run_id="lmc5-night-20260907",
+            cutoff=datetime.now(timezone.utc),
+        )
+
+    assert raised.value.code == "raw.invalid_json"
+    assert {
+        path.name
+        for path in harness.backups.iterdir()
+        if path.name.startswith("lmc5-night-")
+    } == {
+        "lmc5-night-20260905",
+        "lmc5-night-20260906",
+        "lmc5-night-20260907",
+    }
+    run = harness.ledger.get_night_run("lmc5-night-20260907")
+    assert run.stage == "error"
+    assert run.counts["snapshots_pruned"] == 1
+
+
+@pytest.mark.asyncio
+async def test_night_snapshot_retention_fsync_failure_records_completed_deletes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _harness(tmp_path)
+    previous = (
+        "lmc5-night-20260904",
+        "lmc5-night-20260905",
+        "lmc5-night-20260906",
+    )
+    for snapshot_id in previous:
+        harness.snapshots.create_snapshot(snapshot_id)
+    original_fsync = snapshot_module._fsync_directory
+    backup_fsyncs = 0
+
+    def fail_retention_fsync(path: Path) -> None:
+        nonlocal backup_fsyncs
+        if path == harness.backups:
+            backup_fsyncs += 1
+            if backup_fsyncs == 2:
+                raise OSError("injected retention fsync failure")
+        original_fsync(path)
+
+    monkeypatch.setattr(snapshot_module, "_fsync_directory", fail_retention_fsync)
+    with pytest.raises(NightRunCoordinatorError) as raised:
+        await harness.coordinator.run(
+            run_id="lmc5-night-20260907",
+            cutoff=datetime.now(timezone.utc),
+        )
+
+    assert raised.value.code == "snapshot.retention_failed"
+    run = harness.ledger.get_night_run("lmc5-night-20260907")
+    assert run.stage == "error"
+    assert run.counts["snapshots_pruned"] == 1
+    assert {
+        path.name
+        for path in harness.backups.iterdir()
+        if path.name.startswith("lmc5-night-")
+    } == {
+        "lmc5-night-20260905",
+        "lmc5-night-20260906",
+        "lmc5-night-20260907",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retention_fsync_fails", (False, True))
+async def test_night_snapshot_retention_drains_delete_before_recording_cancel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retention_fsync_fails: bool,
+) -> None:
+    harness = _harness(tmp_path)
+    previous = (
+        "lmc5-night-20260904",
+        "lmc5-night-20260905",
+        "lmc5-night-20260906",
+    )
+    for snapshot_id in previous:
+        harness.snapshots.create_snapshot(snapshot_id)
+    original_rmtree = snapshot_module.shutil.rmtree
+    original_fsync = snapshot_module._fsync_directory
+    delete_started = threading.Event()
+    release_delete = threading.Event()
+    backup_fsyncs = 0
+
+    def blocking_rmtree(path: Path) -> None:
+        if path.name == previous[0]:
+            delete_started.set()
+            if not release_delete.wait(timeout=5):
+                raise RuntimeError("test did not release retention delete")
+        original_rmtree(path)
+
+    def maybe_fail_retention_fsync(path: Path) -> None:
+        nonlocal backup_fsyncs
+        if path == harness.backups:
+            backup_fsyncs += 1
+            if retention_fsync_fails and backup_fsyncs == 2:
+                raise OSError("injected retention fsync failure")
+        original_fsync(path)
+
+    monkeypatch.setattr(snapshot_module.shutil, "rmtree", blocking_rmtree)
+    monkeypatch.setattr(
+        snapshot_module,
+        "_fsync_directory",
+        maybe_fail_retention_fsync,
+    )
+    task = asyncio.create_task(
+        harness.coordinator.run(
+            run_id="lmc5-night-20260907",
+            cutoff=datetime.now(timezone.utc),
+        )
+    )
+    try:
+        async with asyncio.timeout(2):
+            while not delete_started.is_set():
+                await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release_delete.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    run = harness.ledger.get_night_run("lmc5-night-20260907")
+    assert run.stage == "error"
+    assert run.errors == ("run.cancelled",)
+    assert run.counts["snapshots_pruned"] == 1
+    assert {
+        path.name
+        for path in harness.backups.iterdir()
+        if path.name.startswith("lmc5-night-")
+    } == {
+        "lmc5-night-20260905",
+        "lmc5-night-20260906",
+        "lmc5-night-20260907",
+    }
+    with harness.snapshots.maintenance_barrier.exclusive():
+        pass
 
 
 @pytest.mark.asyncio

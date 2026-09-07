@@ -13,6 +13,7 @@ from snapshot_manager import (
     SnapshotIntegrityError,
     SnapshotLimitError,
     SnapshotManager,
+    SnapshotRetentionError,
     SnapshotSecurityError,
     SnapshotValidationError,
 )
@@ -54,6 +55,14 @@ def _replace_manifest(snapshot: Path, manifest: dict) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _night_snapshot_names(backup: Path) -> set[str]:
+    return {
+        path.name
+        for path in backup.iterdir()
+        if path.name.startswith("lmc5-night-")
+    }
+
+
 def test_snapshot_hashes_files_and_uses_sqlite_backup_for_wal_data(tmp_path):
     source, backup = _roots(tmp_path)
     body = source / "dynamic" / "日常" / "memory.md"
@@ -93,6 +102,162 @@ def test_snapshot_hashes_files_and_uses_sqlite_backup_for_wal_data(tmp_path):
         "night-20260728",
         expected_manifest_sha256=result.manifest_sha256,
     ) == result
+
+
+def test_night_snapshot_retention_keeps_latest_three_and_named_anchors(
+    tmp_path: Path,
+) -> None:
+    source, backup = _roots(tmp_path)
+    (source / "dynamic" / "日常" / "memory.md").write_text(
+        "remember this",
+        encoding="utf-8",
+    )
+    manager = SnapshotManager(source, backup)
+    night_ids = (
+        "lmc5-night-20260905",
+        "lmc5-night-20260906-r2",
+        "lmc5-night-20260906-r3",
+        "lmc5-night-20260906-r10",
+        "lmc5-night-20260907",
+    )
+    results = {
+        snapshot_id: manager.create_snapshot(snapshot_id)
+        for snapshot_id in night_ids
+    }
+    manager.create_snapshot("x-timeline-preapply-20260819T1458")
+
+    removed = manager.prune_night_snapshots(
+        current_snapshot_id=night_ids[-1],
+        current_manifest_sha256=results[night_ids[-1]].manifest_sha256,
+        keep=3,
+    )
+
+    assert removed == night_ids[:2]
+    assert _night_snapshot_names(backup) == set(night_ids[2:])
+    assert (backup / "x-timeline-preapply-20260819T1458").is_dir()
+
+
+def test_night_snapshot_retention_accepts_historical_snapshot_provenance(
+    tmp_path: Path,
+) -> None:
+    source, backup = _roots(tmp_path)
+    (source / "dynamic" / "日常" / "memory.md").write_text(
+        "remember this",
+        encoding="utf-8",
+    )
+    manager = SnapshotManager(source, backup)
+    night_ids = tuple(f"lmc5-night-2026090{day}" for day in range(3, 8))
+    results = {
+        snapshot_id: manager.create_snapshot(snapshot_id)
+        for snapshot_id in night_ids
+    }
+    historical = backup / night_ids[-3]
+    manifest = _read_manifest(historical)
+    manifest["source_root_sha256"] = "0" * 64
+    manifest["exclusion_policy"]["root_directories"].remove(".recall_cache")
+    _replace_manifest(historical, manifest)
+
+    removed = manager.prune_night_snapshots(
+        current_snapshot_id=night_ids[-1],
+        current_manifest_sha256=results[night_ids[-1]].manifest_sha256,
+        keep=3,
+    )
+
+    assert removed == night_ids[:2]
+    assert _night_snapshot_names(backup) == set(night_ids[-3:])
+
+
+def test_night_snapshot_retention_rejects_damaged_retained_payload_before_delete(
+    tmp_path: Path,
+) -> None:
+    source, backup = _roots(tmp_path)
+    (source / "dynamic" / "日常" / "memory.md").write_text(
+        "remember this",
+        encoding="utf-8",
+    )
+    manager = SnapshotManager(source, backup)
+    night_ids = tuple(f"lmc5-night-2026090{day}" for day in range(4, 8))
+    results = {
+        snapshot_id: manager.create_snapshot(snapshot_id)
+        for snapshot_id in night_ids
+    }
+    damaged = backup / night_ids[-2] / "files" / "dynamic" / "日常" / "memory.md"
+    damaged.write_text("truncated", encoding="utf-8")
+
+    with pytest.raises(SnapshotIntegrityError, match="hash mismatch"):
+        manager.prune_night_snapshots(
+            current_snapshot_id=night_ids[-1],
+            current_manifest_sha256=results[night_ids[-1]].manifest_sha256,
+            keep=3,
+        )
+
+    assert _night_snapshot_names(backup) == set(night_ids)
+
+
+def test_night_snapshot_retention_checks_retained_sqlite_before_delete(
+    tmp_path: Path,
+) -> None:
+    source, backup = _roots(tmp_path)
+    connection = _make_sqlite(source / "embeddings.db")
+    manager = SnapshotManager(source, backup)
+    night_ids = tuple(f"lmc5-night-2026090{day}" for day in range(4, 8))
+    try:
+        results = {
+            snapshot_id: manager.create_snapshot(snapshot_id)
+            for snapshot_id in night_ids
+        }
+    finally:
+        connection.close()
+    damaged_snapshot = backup / night_ids[-2]
+    damaged_db = damaged_snapshot / "files" / "embeddings.db"
+    damaged_db.write_bytes(b"not a sqlite database")
+    manifest = _read_manifest(damaged_snapshot)
+    entry = next(item for item in manifest["files"] if item["path"] == "embeddings.db")
+    old_size = entry["size"]
+    entry["size"] = damaged_db.stat().st_size
+    entry["sha256"] = hashlib.sha256(damaged_db.read_bytes()).hexdigest()
+    manifest["total_bytes"] += entry["size"] - old_size
+    _replace_manifest(damaged_snapshot, manifest)
+
+    with pytest.raises(SnapshotIntegrityError, match="invalid SQLite snapshot"):
+        manager.prune_night_snapshots(
+            current_snapshot_id=night_ids[-1],
+            current_manifest_sha256=results[night_ids[-1]].manifest_sha256,
+            keep=3,
+        )
+
+    assert _night_snapshot_names(backup) == set(night_ids)
+
+
+def test_night_snapshot_retention_reports_completed_deletes_when_fsync_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, backup = _roots(tmp_path)
+    (source / "dynamic" / "日常" / "memory.md").write_text(
+        "remember this",
+        encoding="utf-8",
+    )
+    manager = SnapshotManager(source, backup)
+    night_ids = tuple(f"lmc5-night-2026090{day}" for day in range(4, 8))
+    results = {
+        snapshot_id: manager.create_snapshot(snapshot_id)
+        for snapshot_id in night_ids
+    }
+
+    def fail_fsync(_path: Path) -> None:
+        raise OSError("injected retention fsync failure")
+
+    monkeypatch.setattr(snapshot_module, "_fsync_directory", fail_fsync)
+    with pytest.raises(SnapshotRetentionError) as raised:
+        manager.prune_night_snapshots(
+            current_snapshot_id=night_ids[-1],
+            current_manifest_sha256=results[night_ids[-1]].manifest_sha256,
+            keep=3,
+        )
+
+    assert raised.value.removed_snapshot_ids == (night_ids[0],)
+    assert _night_snapshot_names(backup) == set(night_ids[1:])
 
 
 def test_snapshot_captures_nested_audit_and_pipeline_databases(tmp_path):

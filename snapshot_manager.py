@@ -52,6 +52,9 @@ _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _COORDINATION_DIRECTORIES = frozenset({".locks", ".curated-write-locks"})
 _COORDINATION_FILE_SUFFIXES = (".lock",)
 _SNAPSHOT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
+_NIGHT_SNAPSHOT_ID_RE = re.compile(
+    r"^lmc5-night-(?P<date>[0-9]{8})(?:-r(?P<attempt>[1-9][0-9]*))?$"
+)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COPY_CHUNK_SIZE = 1024 * 1024
 _MAX_MANIFEST_BYTES = 8 * 1024 * 1024
@@ -90,6 +93,19 @@ class SnapshotIntegrityError(SnapshotError):
 
 class SnapshotLimitError(SnapshotError):
     """A configured snapshot bound would be exceeded."""
+
+
+class SnapshotRetentionError(SnapshotError):
+    """Retention failed after zero or more snapshots were fully removed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        removed_snapshot_ids: Sequence[str] = (),
+    ) -> None:
+        self.removed_snapshot_ids = tuple(removed_snapshot_ids)
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -195,6 +211,21 @@ def _validate_snapshot_id(value: str) -> str:
     if not isinstance(value, str) or not _SNAPSHOT_ID_RE.fullmatch(value):
         raise SnapshotValidationError("invalid snapshot_id")
     return value
+
+
+def _night_snapshot_sort_key(value: str) -> tuple[datetime, int] | None:
+    match = _NIGHT_SNAPSHOT_ID_RE.fullmatch(value)
+    if match is None:
+        return None
+    try:
+        logical_date = datetime.strptime(match.group("date"), "%Y%m%d")
+    except ValueError as exc:
+        raise SnapshotIntegrityError("night snapshot id has invalid date") from exc
+    raw_attempt = match.group("attempt")
+    attempt = 1 if raw_attempt is None else int(raw_attempt)
+    if raw_attempt is not None and attempt < 2:
+        return None
+    return logical_date, attempt
 
 
 def _validate_manifest_digest(value: str) -> str:
@@ -374,6 +405,36 @@ def _manifest_exclusion_policy() -> dict[str, object]:
     }
 
 
+def _validate_historical_exclusion_policy(value: object) -> None:
+    """Validate the shape of a v1 policy without requiring today's exact list."""
+
+    list_fields = (
+        "root_files",
+        "root_directories",
+        "directory_names_any_depth",
+        "file_suffixes_any_depth",
+        "sqlite_sidecar_suffixes_for_captured_databases",
+    )
+    if type(value) is not dict or set(value) != {"schema", *list_fields}:
+        raise SnapshotIntegrityError(
+            "snapshot exclusion policy is invalid or unsupported"
+        )
+    if value["schema"] != EXCLUSION_POLICY_SCHEMA:
+        raise SnapshotIntegrityError(
+            "snapshot exclusion policy is invalid or unsupported"
+        )
+    for field in list_fields:
+        entries = value[field]
+        if (
+            type(entries) is not list
+            or any(type(item) is not str or not item for item in entries)
+            or len(entries) != len(set(entries))
+        ):
+            raise SnapshotIntegrityError(
+                "snapshot exclusion policy is invalid or unsupported"
+            )
+
+
 def _rename_no_replace(source: Path, destination: Path) -> None:
     """Atomically publish ``source`` without ever replacing ``destination``."""
 
@@ -500,6 +561,163 @@ class SnapshotManager:
     def create_snapshot(self, snapshot_id: str) -> SnapshotResult:
         with self.maintenance_barrier.exclusive():
             return self._create_snapshot_locked(snapshot_id)
+
+    def prune_night_snapshots(
+        self,
+        *,
+        current_snapshot_id: str,
+        current_manifest_sha256: str,
+        keep: int = 3,
+    ) -> tuple[str, ...]:
+        """Remove older scheduler snapshots after the current one is published."""
+
+        safe_current = _validate_snapshot_id(current_snapshot_id)
+        current_key = _night_snapshot_sort_key(safe_current)
+        if current_key is None:
+            return ()
+        expected_current_digest = _validate_manifest_digest(
+            current_manifest_sha256
+        )
+        keep = _validate_positive_int(keep, "keep")
+        with self.maintenance_barrier.exclusive():
+            return self._prune_night_snapshots_locked(
+                current_snapshot_id=safe_current,
+                current_manifest_sha256=expected_current_digest,
+                keep=keep,
+            )
+
+    def _prune_night_snapshots_locked(
+        self,
+        *,
+        current_snapshot_id: str,
+        current_manifest_sha256: str,
+        keep: int,
+    ) -> tuple[str, ...]:
+        self._revalidate_roots()
+        candidates: list[
+            tuple[tuple[datetime, int], str, Path, tuple[int, int]]
+        ] = []
+        try:
+            entries = list(os.scandir(self.backup_root))
+        except OSError as exc:
+            raise SnapshotSecurityError(
+                "unable to enumerate snapshot retention root"
+            ) from exc
+
+        for entry in entries:
+            sort_key = _night_snapshot_sort_key(entry.name)
+            if sort_key is None:
+                continue
+            try:
+                entry_stat = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise SnapshotSecurityError(
+                    "unable to inspect night snapshot candidate"
+                ) from exc
+            if stat.S_ISLNK(entry_stat.st_mode) or not stat.S_ISDIR(
+                entry_stat.st_mode
+            ):
+                raise SnapshotSecurityError(
+                    f"night snapshot candidate is unsafe: {entry.name}"
+                )
+            snapshot_path = Path(entry.path)
+            candidates.append(
+                (
+                    sort_key,
+                    entry.name,
+                    snapshot_path,
+                    (entry_stat.st_dev, entry_stat.st_ino),
+                )
+            )
+
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        current = [
+            item for item in candidates if item[1] == current_snapshot_id
+        ]
+        if len(current) != 1:
+            raise SnapshotIntegrityError(
+                "current night snapshot is missing from retention root"
+            )
+        if candidates[-1][1] != current_snapshot_id:
+            raise SnapshotIntegrityError(
+                "current night snapshot is not the newest published snapshot"
+            )
+
+        stale = candidates[:-keep] if len(candidates) > keep else []
+        if not stale:
+            return ()
+
+        # Only snapshots that will remain need to satisfy the recovery-point
+        # invariant. Historical snapshots may carry a prior v1 exclusion list
+        # or source-root digest, but their complete payload must still match
+        # their manifest and every SQLite file must pass quick_check.
+        retained = candidates[-keep:]
+        for _sort_key, snapshot_id, snapshot_path, expected_identity in retained:
+            try:
+                retained_stat = snapshot_path.lstat()
+            except OSError as exc:
+                raise SnapshotSecurityError(
+                    f"retained night snapshot changed before verification: {snapshot_id}"
+                ) from exc
+            if (
+                stat.S_ISLNK(retained_stat.st_mode)
+                or not stat.S_ISDIR(retained_stat.st_mode)
+                or (retained_stat.st_dev, retained_stat.st_ino)
+                != expected_identity
+            ):
+                raise SnapshotSecurityError(
+                    f"retained night snapshot changed before verification: {snapshot_id}"
+                )
+            if snapshot_id == current_snapshot_id:
+                manifest_digest = current_manifest_sha256
+            else:
+                manifest_digest, _ = _hash_file(
+                    snapshot_path / MANIFEST_NAME,
+                    max_bytes=_MAX_MANIFEST_BYTES,
+                )
+            self._verify_snapshot_root(
+                snapshot_path,
+                snapshot_id,
+                expected_manifest_sha256=manifest_digest,
+                allow_historical_provenance=True,
+            )
+
+        removed: list[str] = []
+        for _sort_key, snapshot_id, snapshot_path, expected_identity in stale:
+            try:
+                current_stat = snapshot_path.lstat()
+            except OSError as exc:
+                raise SnapshotRetentionError(
+                    f"night snapshot changed before retention: {snapshot_id}",
+                    removed_snapshot_ids=removed,
+                ) from exc
+            if (
+                stat.S_ISLNK(current_stat.st_mode)
+                or not stat.S_ISDIR(current_stat.st_mode)
+                or (current_stat.st_dev, current_stat.st_ino)
+                != expected_identity
+            ):
+                raise SnapshotRetentionError(
+                    f"night snapshot changed before retention: {snapshot_id}",
+                    removed_snapshot_ids=removed,
+                )
+            try:
+                shutil.rmtree(snapshot_path)
+            except OSError as exc:
+                raise SnapshotRetentionError(
+                    f"unable to prune night snapshot: {snapshot_id}",
+                    removed_snapshot_ids=removed,
+                ) from exc
+            removed.append(snapshot_id)
+        if removed:
+            try:
+                _fsync_directory(self.backup_root)
+            except OSError as exc:
+                raise SnapshotRetentionError(
+                    "unable to durably record snapshot retention",
+                    removed_snapshot_ids=removed,
+                ) from exc
+        return tuple(removed)
 
     def _create_snapshot_locked(self, snapshot_id: str) -> SnapshotResult:
         safe_id = _validate_snapshot_id(snapshot_id)
@@ -640,11 +858,13 @@ class SnapshotManager:
         snapshot_id: str,
         *,
         expected_manifest_sha256: str,
+        allow_historical_provenance: bool = False,
     ) -> SnapshotResult:
         snapshot_root, files, manifest_digest = self._load_manifest_at(
             snapshot_root,
             snapshot_id,
             expected_manifest_sha256=expected_manifest_sha256,
+            allow_historical_provenance=allow_historical_provenance,
         )
         actual_paths = self._enumerate_snapshot_payload(snapshot_root / FILES_DIR)
         expected_paths = {PurePosixPath(item.path) for item in files}
@@ -1124,6 +1344,7 @@ class SnapshotManager:
         snapshot_id: str,
         *,
         expected_manifest_sha256: str,
+        allow_historical_provenance: bool = False,
     ) -> tuple[Path, tuple[SnapshotFile, ...], str]:
         _assert_real_directory(snapshot_root)
         self._assert_snapshot_root_layout(snapshot_root)
@@ -1163,15 +1384,20 @@ class SnapshotManager:
             or not _SHA256_RE.fullmatch(manifest["source_root_sha256"])
         ):
             raise SnapshotIntegrityError("snapshot source identity is invalid")
-        expected_source_digest = hashlib.sha256(
-            os.fspath(self.source_root).encode("utf-8")
-        ).hexdigest()
-        if manifest["source_root_sha256"] != expected_source_digest:
-            raise SnapshotIntegrityError("snapshot belongs to a different source root")
-        if manifest["exclusion_policy"] != _manifest_exclusion_policy():
-            raise SnapshotIntegrityError(
-                "snapshot exclusion policy is invalid or unsupported"
-            )
+        if allow_historical_provenance:
+            _validate_historical_exclusion_policy(manifest["exclusion_policy"])
+        else:
+            expected_source_digest = hashlib.sha256(
+                os.fspath(self.source_root).encode("utf-8")
+            ).hexdigest()
+            if manifest["source_root_sha256"] != expected_source_digest:
+                raise SnapshotIntegrityError(
+                    "snapshot belongs to a different source root"
+                )
+            if manifest["exclusion_policy"] != _manifest_exclusion_policy():
+                raise SnapshotIntegrityError(
+                    "snapshot exclusion policy is invalid or unsupported"
+                )
         if not isinstance(manifest["created_at"], str) or not manifest["created_at"]:
             raise SnapshotIntegrityError("snapshot created_at is invalid")
         try:
