@@ -43,6 +43,7 @@ import contextvars
 import threading
 import base64
 import mimetypes
+import math
 import re
 import time
 import httpx
@@ -125,6 +126,7 @@ from status_validity import (
 from query_expand import expand_query
 from lmc5_recall_adapter import fuse_ranked_channels as lmc5_fuse_ranked_channels
 from curated_lexical_recall import pg_lexical_mode, search_curated_lexical
+from rg_literal_recall import search_rg_literal
 from vendor.anchor_memory.recall_v2 import POLICIES as ANCHOR_RECALL_POLICIES
 from recall_support import (
     expand_relation_graph,
@@ -264,6 +266,61 @@ bucket_mgr = BucketManager(config)                  # Bucket manager / 记忆桶
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 embedding_engine = EmbeddingEngine(config)            # Embedding engine / 向量化引擎
+
+
+def _delete_pg_mirror_rows(bucket_id: str) -> None:
+    """删桶后同步清掉 PG 镜像里的向量段和正文行。
+
+    PG 是 sqlite embeddings 的检索副本。只清 sqlite 的话，在下一次
+    ombre_vector_sync_cron 对齐之前（最长 15 分钟），这条已删记忆的向量
+    仍然会被 PG 召回捞上来 —— 正文空、摘要残，就是朝灯说的那种噪音。
+    """
+    try:
+        import psycopg
+    except ImportError:
+        return  # 没有 PG 的环境（本地/测试）本来就没有镜像行要清
+    dsn = os.environ.get("OMBRE_PG_RECALL_DSN", "postgresql:///ombre_mirror")
+    with psycopg.connect(dsn, connect_timeout=5) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "delete from ombre_vectors where bucket_id = %s", (bucket_id,)
+            )
+            cur.execute(
+                "delete from ombre_bodies where bucket_id = %s", (bucket_id,)
+            )
+        conn.commit()
+
+
+# 删一个桶 = 三处一起消失（md 文件 / sqlite 向量 / PG 镜像）。9/9 之前只有
+# update_bucket(delete=True) 顺手删了 sqlite，delete_bucket 工具和夜跑 apply
+# 都不删，向量索引里于是攒下 71 具空壳，每次召回都可能被捞上来。
+# 收进 BucketManager.delete() 一处注册，谁调都堵。
+def _resolve_orphan_review_rows(bucket_id: str) -> None:
+    """删桶后把 review_queue 里指向它的 pending 条目收掉，别留孤儿。
+
+    队列 append-only，所以不删行，只把 status 改成 rejected 并注明
+    「桶已删除」——以后翻账还能看到「这个桶当年被挂过待审」。
+    9/9 人名闸端到端自检时发现：测试桶删了，那条 unknown_person
+    待审还挂着，去查桶已经没了。clothing 那道闸同病。
+    """
+    queue = getattr(bucket_mgr, "_clothing_review_queue", None)
+    if queue is None:
+        return
+    for entry in queue.list_pending():
+        if str(entry.get("bucket_id") or "") != str(bucket_id):
+            continue
+        queue.resolve(
+            entry["key"],
+            "rejected",
+            reviewer="system",
+            verdict_note="桶已删除，待审条目自动收口（post-delete hook）",
+        )
+
+
+bucket_mgr.register_post_delete_hook(embedding_engine.delete_embedding)
+bucket_mgr.register_post_delete_hook(_delete_pg_mirror_rows)
+bucket_mgr.register_post_delete_hook(_resolve_orphan_review_rows)
+
 consolidation_engine = ConsolidationEngine(config, bucket_mgr, embedding_engine)  # Consolidation engine / 整理引擎（夜班）
 # Narrative layer (kernel 3): Event -> Episode -> Saga. Episode owns the loop,
 # runs saga consolidation after building episodes each cycle.
@@ -2160,21 +2217,62 @@ def _ds_conservative_failure_candidates(
     force_keep_ids: set[str],
     max_results: int,
 ) -> list[dict]:
-    """Apply one conservative, order-preserving fallback after a DS failure.
+    """Apply one conservative, deterministically ranked DS-failure fallback.
 
     This helper is intentionally isolated from successful model decisions and
     is byte-compatible with the old capped fallback while its env switch is
     off.  Exact retrieval-key rows retain their established forced contract.
     If neither a forced row nor a row at/above the Anchor floor survives, the
-    first capped row is the required one-result safety net.
+    highest request-local relevance score is the required one-result safety
+    net; bucket ID breaks score ties so upstream iteration order cannot change
+    the result. Legacy callers without a request-local score keep their
+    established input order.
     """
+    if not _ds_failure_fallback_enabled():
+        return _cap_candidates_preserving_forced(
+            candidates,
+            force_keep_ids,
+            max_results,
+        )
+
+    def candidate_anchor_score(bucket: dict) -> float | None:
+        score = bucket.get("_anchor_adapted_relevance_score")
+        if not isinstance(score, (int, float)):
+            score = _anchor_adapted_relevance_score(bucket)
+        if not isinstance(score, (int, float)):
+            return None
+        value = float(score)
+        return value if math.isfinite(value) else None
+
+    def candidate_rank_score(bucket: dict) -> float | None:
+        for field in ("_fused_relevance_score", "score"):
+            score = bucket.get(field)
+            if isinstance(score, (int, float)) and not isinstance(score, bool):
+                value = float(score)
+                if math.isfinite(value):
+                    return value
+        return None
+
+    decorated = [
+        (bucket, candidate_rank_score(bucket), index)
+        for index, bucket in enumerate(candidates)
+    ]
+    decorated.sort(
+        key=lambda row: (
+            row[1] is None,
+            -(row[1] if row[1] is not None else 0.0),
+            str(row[0].get("id") or "") if row[1] is not None else "",
+            row[2],
+        )
+    )
+    ranked = [row[0] for row in decorated]
     capped = _cap_candidates_preserving_forced(
-        candidates,
+        ranked,
         force_keep_ids,
         max_results,
     )
-    if not _ds_failure_fallback_enabled() or not capped:
-        return capped
+    if not capped:
+        return []
 
     floor = _ds_failure_anchor_floor()
     selected: list[dict] = []
@@ -2183,10 +2281,8 @@ def _ds_conservative_failure_candidates(
         if bucket_id in force_keep_ids:
             selected.append(bucket)
             continue
-        score = bucket.get("_anchor_adapted_relevance_score")
-        if not isinstance(score, (int, float)):
-            score = _anchor_adapted_relevance_score(bucket)
-        if isinstance(score, (int, float)) and float(score) >= floor:
+        score = candidate_anchor_score(bucket)
+        if score is not None and score >= floor:
             selected.append(bucket)
     return selected or capped[:1]
 
@@ -2310,6 +2406,26 @@ def _ds_select_cache_config() -> tuple[float, int]:
     return ttl, max(1, max_entries)
 
 
+_DS_FILTER_BODY_WINDOW_CHARS = 1200
+
+
+def _ds_full_body_windows_enabled() -> bool:
+    flag = os.getenv("OMBRE_DS_FILTER_FULL_BODY_WINDOWS", "0").strip().lower()
+    return flag not in {"", "0", "false", "no", "off"}
+
+
+def _ds_numbered_body_windows(content: object) -> list[dict]:
+    text = redact_embedding_input(content or "")
+    windows = [
+        {
+            "window": start // _DS_FILTER_BODY_WINDOW_CHARS + 1,
+            "text": text[start : start + _DS_FILTER_BODY_WINDOW_CHARS],
+        }
+        for start in range(0, len(text), _DS_FILTER_BODY_WINDOW_CHARS)
+    ]
+    return windows or [{"window": 1, "text": ""}]
+
+
 async def _ds_semantic_select(
     query: str,
     buckets: list[dict],
@@ -2318,11 +2434,19 @@ async def _ds_semantic_select(
 ) -> list[dict]:
     """用选定小模型判断语义相关性；纯减法，不重排、不外拉。"""
     provider, model, client, provider_kwargs = _ds_filter_provider()
+    full_body_windows = _ds_full_body_windows_enabled()
     lines = []
     for i, b in enumerate(buckets):
         name = redact_embedding_input((b.get("metadata", {}) or {}).get("name") or b.get("id", ""))
-        snippet = redact_embedding_input((b.get("content") or "").strip().replace("\n", " "))[:200]
-        lines.append(f"[{i}] {name}: {snippet}")
+        if full_body_windows:
+            lines.append(json.dumps({
+                "candidate": i,
+                "name": name,
+                "windows": _ds_numbered_body_windows(b.get("content")),
+            }, ensure_ascii=False, separators=(",", ":")))
+        else:
+            snippet = redact_embedding_input((b.get("content") or "").strip().replace("\n", " "))[:200]
+            lines.append(f"[{i}] {name}: {snippet}")
     sys_prompt = (
         "你是记忆召回的相关性过滤器。给定用户查询和一组候选记忆条目，"
         "判断每条是否与查询语义相关、值得进入上下文。"
@@ -2350,7 +2474,19 @@ async def _ds_semantic_select(
             "除非查询明确点名该工程、任务编号或同一事件，否则必须拒绝该候选。"
             "反过来也一样：只共享抽象动作或情绪词、实际对象和事件不同，必须拒绝。"
         )
-    user_prompt = f"查询：{redact_embedding_input(query)}\n\n候选：\n" + "\n".join(lines)
+    if full_body_windows:
+        sys_prompt += (
+            "\n必须读完每个候选的全部编号窗口再判断；窗口按存储正文顺序连续，"
+            "没有省略。返回 keep 时仍只使用 candidate 整数。"
+        )
+        candidate_heading = "候选（JSONL）：\n"
+    else:
+        candidate_heading = "候选：\n"
+    user_prompt = (
+        f"查询：{redact_embedding_input(query)}\n\n"
+        + candidate_heading
+        + "\n".join(lines)
+    )
     cache_material = sys_prompt + "\x00" + user_prompt
     if provider != "shared":
         # The shared/rollback path keeps its historical cache bytes exactly.
@@ -5603,6 +5739,29 @@ async def breath(
         lexical_ranked = []
         lexical_original_support = {}
 
+    # ripgrep exact-substring channel over the bucket files (朝灯 2026-09-08
+    # 19:59「有现成的好东西不用非得用差的」).  The PG literal channel above is
+    # off in production and can only annotate ids already produced by the
+    # vector/keyword channels; this one can bring in a bucket they missed.
+    # Ids are escorted into ``matches`` after the retention cutoff below.
+    # OMBRE_RG_LITERAL_ENABLED=0 turns it off.
+    rg_literal_hits = []
+    try:
+        rg_literal_hits = await search_rg_literal(
+            recall_query,
+            buckets_dir=str(getattr(bucket_mgr, "base_dir", "") or ""),
+        )
+    except Exception as exc:
+        logger.warning(
+            "rg literal channel failed; keeping existing channels: %s",
+            type(exc).__name__,
+        )
+        rg_literal_hits = []
+    if rg_literal_hits:
+        # record_recall_metric() only accepts allowlisted names and raises
+        # ValueError otherwise (took recall down for 9 min on 9/8); log instead.
+        logger.info("rg literal hits=%d", len(rg_literal_hits))
+
     candidate_started_at = time.perf_counter()
 
     # Entity channel — linked ids are advisory until their content hash and the
@@ -5964,6 +6123,58 @@ async def breath(
                 bucket_id,
                 similarity,
             )
+
+    # ripgrep exact-substring escorts: a bucket that literally contains her
+    # words enters recall even when embeddings and jieba tokens missed it.
+    # Same admission filters as the vector-strong escort; the downstream gate
+    # still judges relevance, this only guarantees the bucket is *seen*.
+    if rg_literal_hits:
+        present_ids = {str(match.get("id")) for match in matches}
+        rg_added = 0
+        for hit in rg_literal_hits:
+            bucket_id = str(hit.bucket_id)
+            if bucket_id in present_ids:
+                continue
+            bucket = bucket_cache.get(bucket_id) or await bucket_mgr.get(
+                bucket_id
+            )
+            if not bucket or not _is_main_recall_bucket(bucket):
+                continue
+            if not _passes_nonkeyword_recall_filters(
+                bucket,
+                world_filter_set=wf_set,
+                domain_filter=domain_filter,
+                created_after=created_after,
+                created_before=created_before,
+            ):
+                continue
+            if not _filter_z_fact_candidates(
+                [bucket],
+                query=recall_query,
+                intent=intent_policy["intent"],
+            ):
+                continue
+            bucket = dict(bucket)
+            bucket["rg_literal_match"] = True
+            rg_fused = round(float(hit.score) * 10.0, 6)
+            bucket["_fused_relevance_score"] = rg_fused
+            bucket["score"] = round(rg_fused, 2)
+            # Exact substring of the original query is absolute literal support.
+            bucket["_literal_relevance_score"] = 100.0
+            bucket.setdefault("_vector_relevance_score", 0.0)
+            bucket.setdefault("_original_vector_relevance_score", 0.0)
+            state_seed_by_id[bucket_id] = bucket
+            matches.append(bucket)
+            present_ids.add(bucket_id)
+            rg_added += 1
+            logger.info(
+                "rg literal escort added bucket=%s term_len=%d score=%.3f",
+                bucket_id,
+                len(hit.term),
+                hit.score,
+            )
+        if rg_added:
+            logger.info("rg literal escorts=%d", rg_added)
 
     # Relevance is the first ordering key.  Forgetting curve, sense and intent
     # remain useful, but may only adjust candidates inside one narrow fused
@@ -7729,7 +7940,7 @@ async def hold(
             logger.warning(f"Auto-edge inference failed / 自动建边失败: {e}")
 
     action = "合并→" if is_merged else "新建→"
-    base = f"{action}{result_name} {','.join(domain)}"
+    base = f"{action}[bucket_id:{bucket_id}] {result_name} {','.join(domain)}"
     if not relation_proposals:
         return base
     applied = sum(e.get("status") == "applied" for e in relation_proposals)
@@ -8127,9 +8338,9 @@ async def trace(
     # --- Delete mode / 删除模式 ---
     if delete:
         async with bucket_mgr._maintenance_barrier.shared_async():
+            # 向量 sqlite 和 PG 镜像由 bucket_mgr 的 post-delete 钩子统一清，
+            # 不再在这一条入口单独删（否则另外两条删桶入口照样漏）。
             success = await bucket_mgr.delete(bucket_id)
-            if success:
-                embedding_engine.delete_embedding(bucket_id)
         if success:
             _unlink_bucket_entities(bucket_id)
         return f"已遗忘记忆桶: {bucket_id}" if success else f"未找到记忆桶: {bucket_id}"
@@ -11621,10 +11832,12 @@ async def api_recall_receipt(request):
 @mcp.custom_route("/api/hold", methods=["POST"])
 async def api_hold(request):
     """HTTP bridge to hold tool. Body: {content, tags?, importance?, pinned?, source?,
-    domain?, feel?, chord_tag?, valence?, arousal?, source_bucket?}.
+    domain?, feel?, chord_tag?, valence?, arousal?, source_bucket?, world?}.
     HTTP 桥接 hold 工具。source 会作为额外标签合入 tags。
     feel/chord_tag/valence/arousal/source_bucket 透传给 hold——让 server 侧能替哥哥落第一人称
-    feel 桶（如逛 X 的体验沉进海马体，2026-06-04 接 C）。"""
+    feel 桶（如逛 X 的体验沉进海马体，2026-06-04 接 C）。
+    world 原样透传：留空仍走 hold 的全局 current_world。2026-09-13 之前这里没传，
+    恨海RP 每回合带 world=恨海RP 写入，全部落进了日常。"""
     from starlette.responses import JSONResponse
     try:
         body = await request.json()
@@ -11660,6 +11873,7 @@ async def api_hold(request):
     feel = bool(body.get("feel"))
     chord_tag = str(body.get("chord_tag") or "").strip()
     source_bucket = str(body.get("source_bucket") or "").strip()
+    world = str(body.get("world") or "").strip()
 
     def _num(key, default=-1.0):
         try:
@@ -11682,6 +11896,7 @@ async def api_hold(request):
             valence=valence,
             arousal=arousal,
             source_bucket=source_bucket,
+            world=world,
         )
         return JSONResponse({"result": result})
     except Exception as e:

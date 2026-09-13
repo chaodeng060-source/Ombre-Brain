@@ -13,6 +13,9 @@ LABEL org.opencontainers.image.revision="${OMBRE_SOURCE_REVISION}"
 
 WORKDIR /app
 
+# ripgrep: exact-substring recall channel over bucket files (rg_literal_recall.py)
+RUN apt-get update && apt-get install -y --no-install-recommends ripgrep && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies first (leverage Docker cache)
 # 先装依赖（利用 Docker 缓存）
 COPY requirements.txt .

@@ -41,6 +41,7 @@ KIND_Z_CONFLICT = "z_conflict"  # #2：合并时检出的事实冲突（数字/�
 KIND_METABOLISM = "metabolism"  # M：只读巡检建议，永不自动执行
 KIND_E_PROPOSAL = "e_proposal"  # E：模型只提建议，主 AI 亲自写权威体验
 KIND_CLOTHING = "clothing"  # 裸桶补衣：正文已保留，等待补检索身份
+KIND_UNKNOWN_PERSON = "unknown_person"  # 写入侧人名闸：桶里出现户口本之外的人名
 
 METABOLISM_ACTIONS = frozenset({
     "promote",
@@ -273,6 +274,50 @@ def make_clothing_entry(
         "bucket_name": bucket_name[:160],
         "content_sha256": content_sha256,
         "reason": reason[:160],
+        "source": source[:120],
+        "created": _now_iso(now),
+    }
+
+
+def make_unknown_person_entry(
+    bucket_id: str,
+    bucket_name: str,
+    mentions: "list[str] | tuple[str, ...]",
+    *,
+    content_sha256: str,
+    source: str = "bucket-create",
+    now: Optional[datetime] = None,
+) -> dict:
+    """桶里出现户口本之外的人名，挂一条待审；不拦写入、不改正文。
+
+    治「婷易」那类幻觉——模型凭空编个人名写进桶，从此成为「记忆」。
+    机器只入队，改不改由人看过再说（本模块铁律 1）。
+    """
+    bucket_id = str(bucket_id or "").strip()
+    bucket_name = str(bucket_name or "").strip()
+    content_sha256 = str(content_sha256 or "").strip().lower()
+    source = str(source or "bucket-create").strip()
+    clean = []
+    for mention in mentions or ():
+        mention = str(mention or "").strip()
+        if mention and mention not in clean:
+            clean.append(mention[:40])
+    if not bucket_id or not bucket_name:
+        raise ValueError("unknown-person entry requires bucket id and name")
+    if not clean:
+        raise ValueError("unknown-person entry requires at least one mention")
+    if not re.fullmatch(r"[0-9a-f]{64}", content_sha256):
+        raise ValueError("unknown-person entry requires a sha256 content hash")
+    return {
+        # 同一个桶只挂一次，正文改了（hash 变）才会再挂一条
+        "key": "unknown_person|" + bucket_id + "|" + content_sha256[:12],
+        "kind": KIND_UNKNOWN_PERSON,
+        "status": STATUS_PENDING,
+        "bucket_id": bucket_id,
+        "bucket_name": bucket_name[:160],
+        "mentions": clean[:12],
+        "content_sha256": content_sha256,
+        "reason": "person_not_in_roster",
         "source": source[:120],
         "created": _now_iso(now),
     }

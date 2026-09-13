@@ -55,7 +55,12 @@ from mutation_audit import MutationAuditLog
 from maintenance_barrier import MaintenanceBarrier
 from storage_safety import advisory_file_lock, atomic_write_post
 from x_provenance import normalize_x_provenance, validate_x_provenance_update
-from review_queue import ReviewQueue, make_clothing_entry
+from review_queue import (
+    ReviewQueue,
+    make_clothing_entry,
+    make_unknown_person_entry,
+)
+from unknown_person_gate import mentions_needing_review
 from timeline_axis import normalize_thread
 from bm25_index import BM25Index
 from relation_graph import (
@@ -1692,6 +1697,36 @@ class BucketManager:
                     bucket_id,
                     type(exc).__name__,
                 )
+        # 写入侧人名闸（2026-09-09）：正文里打了双链、又不在户口本上的人名，
+        # 挂一条待审。治「婷易」那类——模型凭空编个人名写进桶就成了「记忆」，
+        # 9/9 全靠朝灯自己翻到才发现。机器只入队、不改正文，桶照常落地。
+        # 户口本没播种时 mentions_needing_review 恒返回空，等于这道闸没开。
+        try:
+            unknown_people = mentions_needing_review(original_content)
+            if unknown_people:
+                self._clothing_review_queue.enqueue(
+                    make_unknown_person_entry(
+                        bucket_id,
+                        bucket_name,
+                        unknown_people,
+                        content_sha256=hashlib.sha256(
+                            original_content.encode("utf-8")
+                        ).hexdigest(),
+                        source=actor,
+                    )
+                )
+                logger.info(
+                    "Unknown person queued for review / 人名待审: %s %s",
+                    bucket_id,
+                    list(unknown_people),
+                )
+        except Exception as exc:
+            # 记忆本身是权威的，闸挂了也绝不能挡住桶写入。
+            logger.warning(
+                "Unknown-person gate unavailable for %s: %s",
+                bucket_id,
+                type(exc).__name__,
+            )
         if bucket_type != "archived":
             try:
                 await self.auto_link_created_bucket(bucket_id)
@@ -2550,6 +2585,28 @@ class BucketManager:
     # ---------------------------------------------------------
     # Delete bucket
     # ---------------------------------------------------------
+    def register_post_delete_hook(self, hook) -> None:
+        """登记一个「删桶之后还要清掉的派生索引」，签名 hook(bucket_id) -> None。
+
+        由 server 启动时注册（向量 sqlite、PG 镜像）。同步执行，删桶不是热路径。
+        """
+        if not hasattr(self, "_post_delete_hooks"):
+            self._post_delete_hooks = []
+        self._post_delete_hooks.append(hook)
+
+    def _run_post_delete_hooks(self, bucket_id: str) -> None:
+        for hook in getattr(self, "_post_delete_hooks", ()):
+            try:
+                hook(bucket_id)
+            except Exception as e:
+                # 文件已经删掉了，钩子失败不能让调用方以为没删成；
+                # 只记账，剩下的交给每 15 分钟的 ombre_vector_sync_cron 兜底。
+                name = getattr(hook, "__name__", repr(hook))
+                logger.error(
+                    f"Post-delete hook failed / 删桶后清派生索引失败 "
+                    f"{name}({bucket_id}): {e}"
+                )
+
     async def delete(self, bucket_id: str, actor: str = "system") -> bool:
         async with self._write_guard(bucket_id):
             file_path = self._find_bucket_file(bucket_id)
@@ -2590,6 +2647,7 @@ class BucketManager:
                 logger.error(f"Failed to delete bucket file / 删除桶文件失败: {bucket_id}: {e}")
                 return False
 
+        self._run_post_delete_hooks(bucket_id)
         logger.info(f"Deleted bucket / 删除记忆桶: {bucket_id}")
         return True
 

@@ -55,3 +55,25 @@ async def test_api_hold_defaults_no_feel(monkeypatch):
     assert captured["feel"] is False
     assert captured["chord_tag"] == ""
     assert captured["valence"] == -1  # 缺省哨兵，hold 内部自算
+    assert captured["world"] == ""  # 不带 world 仍走全局 current_world
+
+
+@pytest.mark.asyncio
+async def test_api_hold_forwards_explicit_world(monkeypatch):
+    """2026-09-13：恨海RP 带 world=恨海RP 走 HTTP 写入，桥不传 world，全部落进日常。"""
+    captured = {}
+
+    async def fake_hold(**kwargs):
+        captured.update(kwargs)
+        return "OK"
+
+    monkeypatch.setattr(server, "hold", fake_hold)
+
+    class FakeReq:
+        async def json(self):
+            return {"content": "【恨海RP · 虚构剧情】一回合", "domain": "恨海RP", "world": " 恨海RP "}
+
+    resp = await server.api_hold(FakeReq())
+    assert resp.status_code == 200
+    assert captured["world"] == "恨海RP"
+    assert captured["domain"] == "恨海RP"
