@@ -11,7 +11,12 @@ from typing import Any
 
 import pytest
 
-from curated_writer import CuratedWriteCoordinator, CuratedWriteResult
+from curated_writer import (
+    CuratedWriteCoordinator,
+    CuratedWriteIntegrityError,
+    CuratedWriteResult,
+    IdempotencyConflictError,
+)
 from lmc5_ledger import LMC5Ledger
 from lmc5_proposer import (
     ProposerBatch,
@@ -1445,3 +1450,247 @@ async def test_dispatch_three_consecutive_retryables_open_circuit(
     assert counts["dispatch_retryable"] == 3
     assert counts["dispatch_pending_after"] == 4
     assert counts["dispatch_circuit_breaker"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "axis", "code"),
+    [
+        (
+            CuratedWriteIntegrityError(
+                "curated-write bucket body no longer matches its receipt"
+            ),
+            "Z",
+            "z.curated_integrity_conflict",
+        ),
+        (
+            IdempotencyConflictError(
+                "idempotency key is already bound to a different payload"
+            ),
+            "X",
+            "x.curated_idempotency_conflict",
+        ),
+    ],
+)
+async def test_dispatch_curated_conflict_defers_head_and_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    axis: str,
+    code: str,
+) -> None:
+    harness = _harness(tmp_path)
+    records = (
+        SimpleNamespace(candidate_id=1, axis=axis, idempotency_key="head"),
+        SimpleNamespace(candidate_id=2, axis="E", idempotency_key="next"),
+    )
+    statuses = {"head": "pending", "next": "pending"}
+    transitions: list[tuple[str, str, str | None]] = []
+    seen: list[int] = []
+
+    def list_candidates(
+        status: str,
+        *,
+        limit: int,
+        after: int | None = None,
+    ):
+        return tuple(
+            record
+            for record in records
+            if statuses[record.idempotency_key] == status
+            and (after is None or record.candidate_id > after)
+        )[:limit]
+
+    def transition_candidate(
+        key: str,
+        status: str,
+        *,
+        expected_status: str,
+        error_code: str | None = None,
+    ) -> None:
+        assert statuses[key] == expected_status
+        statuses[key] = status
+        transitions.append((key, status, error_code))
+
+    async def dispatch(record, _counts) -> None:
+        seen.append(record.candidate_id)
+        if record.candidate_id == 1:
+            raise error
+        statuses[record.idempotency_key] = "ready"
+
+    monkeypatch.setattr(harness.ledger, "list_candidates", list_candidates)
+    monkeypatch.setattr(harness.ledger, "transition_candidate", transition_candidate)
+    monkeypatch.setattr(harness.coordinator, "_dispatch_candidate", dispatch)
+    counts: dict[str, int] = {}
+
+    await harness.coordinator._dispatch_pending(counts)
+
+    assert seen == [1, 2]
+    assert transitions == [("head", "deferred", code)]
+    assert counts[f"{axis.lower()}_deferred"] == 1
+    assert counts["dispatch_curated_conflict"] == 1
+    assert counts["dispatch_retryable"] == 0
+    assert counts["dispatch_circuit_breaker"] == 0
+    assert counts["dispatch_pending_after"] == 0
+
+
+_FACT_CONTENT = "主色: 墨绿"
+_EVENT_CONTENT = "朝灯今晚想看星星"
+
+
+class _ReadyEmbedding(_RetryEmbedding):
+    async def generate_and_store(self, bucket_id: str, content: str) -> bool:
+        self.calls += 1
+        self.stored.add(bucket_id)
+        return True
+
+    @staticmethod
+    def _prepare_embedding_record(vector):
+        return vector
+
+    @staticmethod
+    def _max_prepared_similarity(a, b) -> float:
+        return 0.0
+
+
+def _fact_then_event_provider(prompt: str) -> dict[str, Any]:
+    chunk = json.loads(prompt.split("INPUT=", 1)[1])["chunks"][0]
+    candidates = [
+        {
+            "type": kind,
+            "title": title,
+            "content": content,
+            "importance": 7,
+            "thread_hint": thread,
+            "relation_hints": [],
+            "source_chunk_ids": [chunk["id"]],
+            "evidence": chunk["text"][:12],
+            "risk": "normal",
+        }
+        for kind, title, content, thread in (
+            ("fact", "新主色", _FACT_CONTENT, "ui"),
+            ("event", "夜间候选", _EVENT_CONTENT, "night"),
+        )
+    ]
+    body = json.dumps(
+        {"schema_version": 1, "candidates": candidates}, ensure_ascii=False
+    )
+    return {"choices": [{"finish_reason": "stop", "message": {"content": body}}]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["legacy_key_footer", "edited_body"])
+async def test_night_z_replay_after_body_drift_keeps_body_receipt_and_later_work(
+    tmp_path: Path,
+    test_config: dict[str, Any],
+    bucket_mgr,
+    drift: str,
+) -> None:
+    from consolidation_engine import ConsolidationEngine
+    from decay_engine import DecayEngine
+
+    prior_id = await bucket_mgr.create(
+        content="主色: 浅绿", name="旧主色", bucket_type="dynamic"
+    )
+    root = Path(test_config["buckets_dir"])
+    ledger = LMC5Ledger(
+        root / ".lmc5" / "pipeline.sqlite3",
+        maintenance_root=root,
+    )
+    embedding = _ReadyEmbedding()
+    curated = CuratedWriteCoordinator(bucket_mgr, embedding)
+    coordinator = NightRunCoordinator(
+        ledger=ledger,
+        snapshots=SnapshotManager(root, tmp_path / "night-snapshots"),
+        proposer=StrictOmbreProposer(
+            _fact_then_event_provider,
+            timeout_seconds=1,
+            model="test-model",
+            provider_name="test-provider",
+        ),
+        curated=curated,
+        decay_engine=DecayEngine(test_config, bucket_mgr),
+        consolidation_engine=ConsolidationEngine(test_config, bucket_mgr, embedding),
+        bucket_manager=bucket_mgr,
+    )
+    queue = ReviewQueue(root / "review_queue.jsonl", maintenance_root=root)
+    coordinator.review_queue = queue
+    coordinator.fact_slot_registry = {
+        "preference.ui.primary_color": frozenset({"主色"})
+    }
+    coordinator._fact_slot_config = {
+        "preference.ui.primary_color": {"aliases": ["主色"]}
+    }
+
+    if drift == "legacy_key_footer":
+        drifted = _FACT_CONTENT + "\n\n[检索钥匙: 墨绿]"
+        drift_updates: dict[str, Any] = {
+            "content": drifted,
+            "retrieval_keys": ["墨绿"],
+        }
+    else:
+        drifted = "主色: 墨绿（后来手工改过）"
+        drift_updates = {"content": drifted}
+    original_create = bucket_mgr.create
+
+    async def create_like_0817_runtime(*args, **kwargs):
+        bucket_id = await original_create(*args, **kwargs)
+        if kwargs.get("content") == _FACT_CONTENT:
+            assert await bucket_mgr.update(bucket_id, **drift_updates)
+        return bucket_id
+
+    bucket_mgr.create = create_like_0817_runtime
+    ledger.append_raw_event(
+        "room-main",
+        "night-body-drift",
+        '{"message":"主色改成墨绿，今晚想看星星"}',
+    )
+
+    outcome = await coordinator.run(
+        run_id=f"night-body-drift-{drift}",
+        cutoff=datetime.now(timezone.utc),
+    )
+
+    assert outcome.run.stage == "complete"
+    assert outcome.counts["x_ready"] == 2
+    assert outcome.counts["m_computed"] == 2
+    assert "timeline_scanned" in outcome.counts
+    assert ledger.list_candidates("pending") == ()
+    curated_buckets = [
+        bucket
+        for bucket in await bucket_mgr.list_all(include_archive=True)
+        if (bucket.get("metadata") or {}).get("curated_write_key")
+    ]
+    fact_buckets = [b for b in curated_buckets if b["content"].startswith("主色")]
+    assert len(fact_buckets) == 1
+    assert fact_buckets[0]["content"] == drifted
+    assert [b["content"] for b in curated_buckets if b not in fact_buckets] == [
+        _EVENT_CONTENT
+    ]
+    with sqlite3.connect(curated.ledger_path) as conn:
+        receipts = conn.execute(
+            "SELECT status, bucket_id FROM curated_writes"
+        ).fetchall()
+    assert sorted(receipts) == sorted(
+        ("completed", bucket["id"]) for bucket in curated_buckets
+    )
+    assert embedding.calls == 2
+    deferred = {
+        (record.axis, record.error_code)
+        for record in ledger.list_candidates("deferred")
+    }
+    if drift == "legacy_key_footer":
+        assert deferred == set()
+        assert outcome.counts["z_review_ready"] == 1
+        pairs = queue.list_pending("z_conflict")
+        assert len(pairs) == 1
+        assert {pairs[0]["current_bucket_id"], pairs[0]["historical_bucket_id"]} == {
+            fact_buckets[0]["id"],
+            prior_id,
+        }
+        for bucket_id in (fact_buckets[0]["id"], prior_id):
+            assert "fact_status" not in (await bucket_mgr.get(bucket_id))["metadata"]
+    else:
+        assert deferred == {("Z", "z.curated_integrity_conflict")}
+        assert outcome.counts["dispatch_curated_conflict"] == 1
+        assert queue.list_pending("z_conflict") == []

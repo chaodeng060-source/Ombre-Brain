@@ -285,3 +285,90 @@ async def test_concurrent_same_key_creates_one_bucket_and_one_vector(
     assert len(embedding.calls) == 1
     visible = await bucket_mgr.list_all(include_archive=False)
     assert [bucket["id"] for bucket in visible] == [first.bucket_id]
+
+
+_DRIFT_CONTENT = "Full apply estimated to take 3 hours tonight, night run 继续"
+
+
+def _legacy_key_footer(keys: list[str]) -> str:
+    return "\n\n[检索钥匙: " + " / ".join(keys) + "]"
+
+
+@pytest.mark.asyncio
+async def test_completed_receipt_replays_over_legacy_retrieval_key_footer(
+    test_config, bucket_mgr
+):
+    embedding = FakeEmbedding()
+    writer = CuratedWriteCoordinator(bucket_mgr, embedding)
+    options = {"domain": ["测试"], "name": "夜跑估时"}
+    first = await writer.write(
+        idempotency_key="legacy:footer",
+        content=_DRIFT_CONTENT,
+        vector_policy="required",
+        bucket_options=options,
+    )
+    keys = ["night", "3 hours"]
+    legacy_body = _DRIFT_CONTENT + _legacy_key_footer(keys)
+    assert await bucket_mgr.update(
+        first.bucket_id, content=legacy_body, retrieval_keys=keys
+    )
+    receipt_before = dict(writer._read_row("legacy:footer"))
+
+    replay = await writer.write(
+        idempotency_key="legacy:footer",
+        content=_DRIFT_CONTENT,
+        vector_policy="required",
+        bucket_options=options,
+    )
+
+    assert replay == first
+    assert (await bucket_mgr.get(first.bucket_id))["content"] == legacy_body
+    assert dict(writer._read_row("legacy:footer")) == receipt_before
+    assert len(embedding.calls) == 1
+    assert [b["id"] for b in await bucket_mgr.list_all(include_archive=True)] == [
+        first.bucket_id
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("meta_keys", "body"),
+    [
+        (["night"], _DRIFT_CONTENT + "\n\n[检索钥匙: night / 3 hours]"),
+        ([], _DRIFT_CONTENT + "\n\n[检索钥匙: night]"),
+        ("night", _DRIFT_CONTENT + "\n\n[检索钥匙: night]"),
+        (["night"], _DRIFT_CONTENT + "\n\n[检索钥匙: night]\n补一句"),
+        (["night"], _DRIFT_CONTENT + "\n[检索钥匙: night]"),
+        (["night", "3 hours"], _DRIFT_CONTENT + "\n\n[检索钥匙: night、3 hours]"),
+        (["night"], _DRIFT_CONTENT.replace("3 hours", "4 hours") + "\n\n[检索钥匙: night]"),
+    ],
+    ids=[
+        "keys-differ",
+        "keys-empty",
+        "keys-not-list",
+        "footer-not-tail",
+        "single-newline",
+        "wrong-separator",
+        "body-edited",
+    ],
+)
+async def test_legacy_footer_tolerance_stays_bound_to_exact_keys(
+    test_config, bucket_mgr, meta_keys, body
+):
+    writer = CuratedWriteCoordinator(bucket_mgr, FakeEmbedding())
+    first = await writer.write(
+        idempotency_key="legacy:guard",
+        content=_DRIFT_CONTENT,
+        vector_policy="required",
+    )
+    assert await bucket_mgr.update(
+        first.bucket_id, content=body, retrieval_keys=meta_keys
+    )
+
+    with pytest.raises(CuratedWriteIntegrityError, match="body no longer matches"):
+        await writer.write(
+            idempotency_key="legacy:guard",
+            content=_DRIFT_CONTENT,
+            vector_policy="required",
+        )
+    assert (await bucket_mgr.get(first.bucket_id))["content"] == body

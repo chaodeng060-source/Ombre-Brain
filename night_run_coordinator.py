@@ -20,6 +20,7 @@ import asyncio
 import contextvars
 import hashlib
 import json
+import logging
 import math
 import re
 import threading
@@ -27,7 +28,12 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
-from curated_writer import CuratedWriteCoordinator, CuratedWriteResult
+from curated_writer import (
+    CuratedWriteCoordinator,
+    CuratedWriteIntegrityError,
+    CuratedWriteResult,
+    IdempotencyConflictError,
+)
 from lmc5_ledger import (
     CandidateRecord,
     EventIdentity,
@@ -64,6 +70,8 @@ from snapshot_manager import SnapshotManager, SnapshotResult
 from bucket_manager import bucket_revision_hash
 from timeline_axis import run_timeline_sweep
 
+
+logger = logging.getLogger("ombre_brain.night_run_coordinator")
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -459,6 +467,7 @@ class NightRunCoordinator:
                 self._mark_error(run_id, exc.code, counts)
             raise
         except Exception as exc:
+            logger.exception("night run %s failed with an unclassified error", run_id)
             if started:
                 self._mark_error(run_id, "run.internal", counts)
             raise NightRunCoordinatorError("run.internal") from exc
@@ -890,6 +899,7 @@ class NightRunCoordinator:
         counts["dispatch_attempted"] = 0
         counts["dispatch_retryable"] = 0
         counts["dispatch_circuit_breaker"] = 0
+        counts["dispatch_curated_conflict"] = 0
         consecutive_errors = 0
         after: int | None = None
         while True:
@@ -911,6 +921,8 @@ class NightRunCoordinator:
                 counts["dispatch_attempted"] += 1
                 try:
                     await self._dispatch_candidate(record, counts)
+                except (CuratedWriteIntegrityError, IdempotencyConflictError) as exc:
+                    self._defer_curated_conflict(record, exc, counts)
                 except NightRunCoordinatorError as exc:
                     if exc.code not in _RETRYABLE_DISPATCH_CODES:
                         raise
@@ -1334,6 +1346,23 @@ class NightRunCoordinator:
         )
         key = f"{record.axis.lower()}_deferred"
         counts[key] = counts.get(key, 0) + 1
+
+    def _defer_curated_conflict(
+        self,
+        record: CandidateRecord,
+        exc: CuratedWriteIntegrityError | IdempotencyConflictError,
+        counts: dict[str, int],
+    ) -> None:
+        kind = "idempotency" if isinstance(exc, IdempotencyConflictError) else "integrity"
+        code = f"{record.axis.lower()}.curated_{kind}_conflict"
+        logger.warning(
+            "night dispatch deferred candidate %s as %s: %s",
+            record.candidate_id,
+            code,
+            exc,
+        )
+        self._defer(record, code, counts)
+        counts["dispatch_curated_conflict"] += 1
 
     async def _run_metabolism(self, counts: dict[str, int]) -> None:
         self._assert_report_only()

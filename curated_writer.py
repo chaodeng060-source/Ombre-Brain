@@ -47,6 +47,23 @@ _INCOMPLETE_STATUSES = frozenset(
     {"preparing", "body_pending", "retryable"}
 )
 _KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$")
+_LEGACY_KEY_FOOTER_RE = re.compile(r"\n\n\[检索钥匙: ([^\]\n]+)\]")
+
+
+def _is_legacy_key_footer(body: Any, content: str, metadata: dict) -> bool:
+    # 2026-08-17 runtime appended this line to fresh bodies; 8/18 kept those buckets as-is.
+    if not isinstance(body, str) or not body.startswith(content):
+        return False
+    match = _LEGACY_KEY_FOOTER_RE.fullmatch(body[len(content):])
+    keys = metadata.get("retrieval_keys")
+    if (
+        match is None
+        or type(keys) is not list
+        or not keys
+        or any(type(key) is not str or not key for key in keys)
+    ):
+        return False
+    return match.group(1) == " / ".join(keys)
 
 
 class CuratedWriteError(RuntimeError):
@@ -393,7 +410,8 @@ class CuratedWriteCoordinator:
                 "curated-write receipt references a missing bucket"
             )
         meta = bucket.get("metadata", {}) or {}
-        if bucket.get("content") != content:
+        body = bucket.get("content")
+        if body != content and not _is_legacy_key_footer(body, content, meta):
             raise CuratedWriteIntegrityError(
                 "curated-write bucket body no longer matches its receipt"
             )
