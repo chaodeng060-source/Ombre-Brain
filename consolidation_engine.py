@@ -23,12 +23,21 @@
 # ============================================================
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
+import math
+import threading
+from array import array
 from datetime import datetime
 
 from utils import PROTECTED_RESOLVE_DOMAINS
+
+try:  # Optional accelerator; without numpy the exact pure-Python scorer runs.
+    import numpy as _np
+except Exception:  # pragma: no cover - exercised by patching _np = None
+    _np = None
 
 logger = logging.getLogger("ombre_brain.consolidation")
 
@@ -40,6 +49,357 @@ logger = logging.getLogger("ombre_brain.consolidation")
 _EXEMPT_TYPES = ("permanent", "feel", "archived", "episode", "saga")
 _PAIRWISE_YIELD_EVERY = 64
 _VECTOR_LOAD_YIELD_EVERY = 16
+
+# ---------------------------------------------------------------------------
+# Vectorized duplicate screening (2026-09-14 night-run lock incident: the
+# pure-Python full scan of ~11.6k buckets, ~68M pairs, held the night run's
+# exclusive maintenance lease for hours).
+#
+# float64 block matrix products only SCREEN pairs.  A pair whose screened
+# cosine lies inside +/-_VECTOR_SCREEN_MARGIN of the threshold, or whose
+# round(sim, 4) is not stable inside that margin, is recomputed with the
+# original EmbeddingEngine._max_prepared_similarity kernel.  For records whose
+# segment norms are 0 or inside [_VECTOR_SAFE_NORM_MIN, _VECTOR_SAFE_NORM_MAX]
+# the legacy kernel can neither raise nor overflow, and the float64 screening
+# error is bounded by a few * dimension * 2.2e-16 (~1e-12 at 1024 dims), far
+# below the margin.  Every other record (prepare error, unsafe norm) and every
+# cross-dimension pair goes through the legacy per-pair evaluation, so the
+# pairs, the rounded similarities, the error strings and their order are
+# identical to the legacy scorer.
+# ---------------------------------------------------------------------------
+_VECTOR_SCREEN_MARGIN = 1e-6
+_VECTOR_SAFE_NORM_MIN = 1e-100
+_VECTOR_SAFE_NORM_MAX = 1e100
+_VECTOR_MAX_DIMENSION = 1 << 20
+_VECTOR_BLOCK_BYTES = 48 * 1024 * 1024
+_VECTOR_ASSEMBLE_YIELD_EVERY = 256
+_EVENT_PAIR = 0
+_EVENT_ERROR = 1
+
+
+def _stock_vector_kernel(engine) -> bool:
+    """True only for the unmodified EmbeddingEngine similarity kernel.
+
+    The matrix screen mirrors that exact kernel.  Subclass or instance
+    overrides (including test doubles) keep the legacy per-pair scorer.
+    """
+
+    try:
+        from embedding_engine import EmbeddingEngine
+    except Exception:
+        return False
+    if not isinstance(engine, EmbeddingEngine):
+        return False
+    instance_attrs = getattr(engine, "__dict__", {})
+    for name in (
+        "_prepare_embedding_record",
+        "_max_prepared_similarity",
+        "_embedding_segments",
+    ):
+        if name in instance_attrs:
+            return False
+        if getattr(type(engine), name, None) is not getattr(
+            EmbeddingEngine, name, None
+        ):
+            return False
+    return True
+
+
+def _vector_threshold_supported(threshold) -> bool:
+    return (
+        not isinstance(threshold, bool)
+        and isinstance(threshold, (int, float))
+        and math.isfinite(float(threshold))
+    )
+
+
+def _vector_record_is_safe(record) -> bool:
+    """Whether a prepared record can be screened by float64 matrices."""
+
+    try:
+        dimension = len(record[0][0])
+    except Exception:
+        return False
+    if not 0 < dimension <= _VECTOR_MAX_DIMENSION:
+        return False
+    for segment in record:
+        try:
+            values, norm = segment
+        except Exception:
+            return False
+        if (
+            not isinstance(values, array)
+            or values.typecode != "d"
+            or len(values) != dimension
+            or type(norm) is not float
+        ):
+            return False
+        if norm == 0.0:
+            continue
+        if not _VECTOR_SAFE_NORM_MIN <= norm <= _VECTOR_SAFE_NORM_MAX:
+            return False
+    return True
+
+
+async def _run_vector_block(function):
+    """Run one bounded CPU block on a daemon worker thread.
+
+    The event loop stays free while the block runs and regains control
+    between blocks.  A daemon thread (not the default executor) never holds
+    interpreter shutdown; the context is copied like the night run's leaves.
+    """
+
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    context = contextvars.copy_context()
+
+    def deliver(value, error) -> None:
+        if future.done():
+            return
+        if error is not None:
+            future.set_exception(error)
+        else:
+            future.set_result(value)
+
+    def run() -> None:
+        value = None
+        error = None
+        try:
+            value = context.run(function)
+        except BaseException as exc:  # transported to the awaiting task
+            error = exc
+        try:
+            loop.call_soon_threadsafe(deliver, value, error)
+        except RuntimeError:
+            pass  # loop already closed after cancellation
+
+    threading.Thread(
+        target=run,
+        name="consolidation-vector-block",
+        daemon=True,
+    ).start()
+    return await future
+
+
+class _VectorScan:
+    """One vectorized duplicate scan over a stable ``embs`` snapshot."""
+
+    def __init__(self, engine, ids, embs, threshold, new_mask):
+        self.engine = engine
+        self.ids = ids
+        self.embs = embs
+        self.threshold = threshold
+        self.new_mask = new_mask
+        self.prepared: dict[int, tuple] = {}
+        self.prepare_errors: dict[int, str] = {}
+        self.groups: dict[int, list[int]] = {}
+        self.group_of: dict[int, int] = {}
+        self.slow: list[int] = []
+
+    # -- preparation --------------------------------------------------------
+    def prepare(self) -> None:
+        prepare = self.engine._prepare_embedding_record
+        for index, bucket_id in enumerate(self.ids):
+            try:
+                record = prepare(self.embs[bucket_id])
+            except Exception as exc:
+                self.prepare_errors[index] = type(exc).__name__
+                self.slow.append(index)
+                continue
+            self.prepared[index] = record
+            if _vector_record_is_safe(record):
+                dimension = len(record[0][0])
+                self.groups.setdefault(dimension, []).append(index)
+                self.group_of[index] = dimension
+            else:
+                self.slow.append(index)
+
+    def _in_scope(self, left: int, right: int) -> bool:
+        return self.new_mask is None or self.new_mask[left] or self.new_mask[right]
+
+    # -- legacy per-pair evaluation (bad/unsafe/cross-dimension pairs) ------
+    def _legacy_event(self, left: int, right: int):
+        if left in self.prepare_errors:
+            return (left, right, _EVENT_ERROR, self.prepare_errors[left])
+        if right in self.prepare_errors:
+            return (left, right, _EVENT_ERROR, self.prepare_errors[right])
+        try:
+            sim = self.engine._max_prepared_similarity(
+                self.prepared[left],
+                self.prepared[right],
+            )
+        except Exception as exc:
+            return (left, right, _EVENT_ERROR, type(exc).__name__)
+        if sim < self.threshold:
+            return None
+        return (left, right, _EVENT_PAIR, round(sim, 4))
+
+    def slow_events(self) -> list[tuple]:
+        events: list[tuple] = []
+        total = len(self.ids)
+        slow_set = set(self.slow)
+        for slow_index in self.slow:
+            for other in range(total):
+                if other == slow_index or (other in slow_set and other < slow_index):
+                    continue
+                left, right = (
+                    (slow_index, other) if slow_index < other else (other, slow_index)
+                )
+                if not self._in_scope(left, right):
+                    continue
+                event = self._legacy_event(left, right)
+                if event is not None:
+                    events.append(event)
+        if len(self.groups) > 1:
+            fast = sorted(self.group_of)
+            for position, left in enumerate(fast):
+                left_group = self.group_of[left]
+                for right in fast[position + 1:]:
+                    if self.group_of[right] == left_group:
+                        continue
+                    if not self._in_scope(left, right):
+                        continue
+                    event = self._legacy_event(left, right)
+                    if event is not None:
+                        events.append(event)
+        return events
+
+    # -- matrix screening -----------------------------------------------------
+    def build_group(self, members: list[int]):
+        counts = _np.fromiter(
+            (len(self.prepared[index]) for index in members),
+            dtype=_np.int64,
+            count=len(members),
+        )
+        starts = _np.zeros(len(members), dtype=_np.int64)
+        if len(members) > 1:
+            _np.cumsum(counts[:-1], out=starts[1:])
+        total_rows = int(counts.sum())
+        dimension = len(self.prepared[members[0]][0][0])
+        matrix = _np.empty((total_rows, dimension), dtype=_np.float64)
+        row = 0
+        for index in members:
+            for values, norm in self.prepared[index]:
+                if norm == 0.0:
+                    matrix[row].fill(0.0)
+                else:
+                    matrix[row] = _np.frombuffer(values, dtype=_np.float64)
+                    matrix[row] /= norm
+                row += 1
+        return matrix, starts, counts
+
+    def _classify(self, members, left_positions, right_positions, values):
+        """Turn screened candidates into pair events (exact where needed)."""
+
+        events: list[tuple] = []
+        threshold = self.threshold
+        upper = threshold + _VECTOR_SCREEN_MARGIN
+        kernel = self.engine._max_prepared_similarity
+        for left_position, right_position, value in zip(
+            left_positions.tolist(),
+            right_positions.tolist(),
+            values.tolist(),
+        ):
+            left = members[left_position]
+            right = members[right_position]
+            if value >= upper:
+                low = round(value - _VECTOR_SCREEN_MARGIN, 4)
+                if low == round(value + _VECTOR_SCREEN_MARGIN, 4):
+                    events.append((left, right, _EVENT_PAIR, low))
+                    continue
+            try:
+                sim = kernel(self.prepared[left], self.prepared[right])
+            except Exception as exc:  # unreachable for safe records
+                events.append((left, right, _EVENT_ERROR, type(exc).__name__))
+                continue
+            if sim < threshold:
+                continue
+            events.append((left, right, _EVENT_PAIR, round(sim, 4)))
+        return events
+
+    def row_budget(self, total_rows: int) -> int:
+        return max(1, _VECTOR_BLOCK_BYTES // (8 * max(1, total_rows)))
+
+    def full_blocks(self, starts, counts, total_rows):
+        budget = self.row_budget(total_rows)
+        blocks = []
+        begin = 0
+        count = len(counts)
+        while begin < count:
+            end = begin
+            rows = 0
+            while end < count and (end == begin or rows + int(counts[end]) <= budget):
+                rows += int(counts[end])
+                end += 1
+            blocks.append((begin, end))
+            begin = end
+        return blocks
+
+    def score_full_block(self, members, matrix, starts, counts, begin, end):
+        floor = self.threshold - _VECTOR_SCREEN_MARGIN
+        total_rows = matrix.shape[0]
+        row_start = int(starts[begin])
+        row_end = int(starts[end]) if end < len(members) else total_rows
+        products = matrix[row_start:row_end] @ matrix[row_start:].T
+        if int(counts[begin:end].max()) > 1:
+            products = _np.maximum.reduceat(
+                products, starts[begin:end] - row_start, axis=0
+            )
+        if int(counts[begin:].max()) > 1:
+            products = _np.maximum.reduceat(
+                products, starts[begin:] - row_start, axis=1
+            )
+        _np.maximum(products, 0.0, out=products)
+        mask = _np.triu(products >= floor, k=1)
+        rows, cols = _np.nonzero(mask)
+        values = products[rows, cols]
+        return self._classify(members, rows + begin, cols + begin, values)
+
+    def new_blocks(self, new_positions, counts, total_rows):
+        budget = self.row_budget(total_rows)
+        blocks = []
+        begin = 0
+        count = len(new_positions)
+        while begin < count:
+            end = begin
+            rows = 0
+            while end < count and (
+                end == begin or rows + int(counts[new_positions[end]]) <= budget
+            ):
+                rows += int(counts[new_positions[end]])
+                end += 1
+            blocks.append(new_positions[begin:end])
+            begin = end
+        return blocks
+
+    def score_new_block(self, members, matrix, starts, counts, is_new, block):
+        floor = self.threshold - _VECTOR_SCREEN_MARGIN
+        block = _np.asarray(block, dtype=_np.int64)
+        row_indices = _np.concatenate(
+            [
+                _np.arange(int(starts[p]), int(starts[p]) + int(counts[p]))
+                for p in block
+            ]
+        )
+        products = matrix[row_indices] @ matrix.T
+        if int(counts[block].max()) > 1:
+            offsets = _np.zeros(len(block), dtype=_np.int64)
+            if len(block) > 1:
+                _np.cumsum(counts[block][:-1], out=offsets[1:])
+            products = _np.maximum.reduceat(products, offsets, axis=0)
+        if int(counts.max()) > 1:
+            products = _np.maximum.reduceat(products, starts, axis=1)
+        _np.maximum(products, 0.0, out=products)
+        columns = _np.arange(len(members), dtype=_np.int64)
+        # A new/new pair is produced once, from its smaller position.
+        excluded = is_new[None, :] & (columns[None, :] <= block[:, None])
+        mask = (products >= floor) & ~excluded
+        rows, cols = _np.nonzero(mask)
+        values = products[rows, cols]
+        own = block[rows]
+        left_positions = _np.minimum(own, cols)
+        right_positions = _np.maximum(own, cols)
+        return self._classify(members, left_positions, right_positions, values)
 
 
 class ConsolidationEngine:
@@ -184,46 +544,74 @@ class ConsolidationEngine:
             )
             == self._duplicate_cache_vector_order
         )
+        vectorized = self._vectorized_scoring_available(threshold)
         if can_increment:
             old_ids = set(self._duplicate_cache_vector_digests or {})
             current_ids = list(embs)
             new_ids = [bucket_id for bucket_id in current_ids if bucket_id not in old_ids]
             new_set = set(new_ids)
-            new_positions = [
-                index
-                for index, bucket_id in enumerate(current_ids)
-                if bucket_id in new_set
-            ]
-            pair_ids = []
-            for index, left in enumerate(current_ids):
-                if left in new_set:
-                    pair_ids.extend(
-                        (left, right) for right in current_ids[index + 1:]
-                    )
-                    continue
-                pair_ids.extend(
-                    (left, current_ids[position])
-                    for position in new_positions
-                    if position > index
+            scored = None
+            if vectorized:
+                scored = await self._try_score_pairs_vectorized(
+                    candidates,
+                    embs,
+                    threshold,
+                    new_ids=new_set,
                 )
-            added_pairs, pair_errors = await self._score_pair_ids(
-                candidates,
-                embs,
-                pair_ids,
-                threshold,
-            )
+            if scored is not None:
+                added_pairs, pair_errors = scored
+                old_count = len(current_ids) - len(new_ids)
+                pairs_scored = (
+                    len(current_ids) * (len(current_ids) - 1) // 2
+                    - old_count * (old_count - 1) // 2
+                )
+            else:
+                new_positions = [
+                    index
+                    for index, bucket_id in enumerate(current_ids)
+                    if bucket_id in new_set
+                ]
+                pair_ids = []
+                for index, left in enumerate(current_ids):
+                    if left in new_set:
+                        pair_ids.extend(
+                            (left, right) for right in current_ids[index + 1:]
+                        )
+                        continue
+                    pair_ids.extend(
+                        (left, current_ids[position])
+                        for position in new_positions
+                        if position > index
+                    )
+                added_pairs, pair_errors = await self._score_pair_ids(
+                    candidates,
+                    embs,
+                    pair_ids,
+                    threshold,
+                )
+                pairs_scored = len(pair_ids)
             pairs = self._top_pairs(
                 [*(self._duplicate_cache_pairs or []), *added_pairs],
                 current_ids,
             )
             self._last_duplicate_scan_mode = "incremental_append"
-            self._last_duplicate_pairs_scored = len(pair_ids)
+            self._last_duplicate_pairs_scored = pairs_scored
         else:
-            pairs, pair_errors = await self._score_duplicate_pairs(
-                candidates,
-                embs,
-                threshold,
-            )
+            scored = None
+            if vectorized:
+                scored = await self._try_score_pairs_vectorized(
+                    candidates,
+                    embs,
+                    threshold,
+                )
+            if scored is not None:
+                pairs, pair_errors = scored
+            else:
+                pairs, pair_errors = await self._score_duplicate_pairs(
+                    candidates,
+                    embs,
+                    threshold,
+                )
             self._last_duplicate_scan_mode = "full"
             self._last_duplicate_pairs_scored = len(embs) * (len(embs) - 1) // 2
         self._read_errors.extend(pair_errors)
@@ -343,6 +731,129 @@ class ConsolidationEngine:
             if scored % _PAIRWISE_YIELD_EVERY == 0:
                 await asyncio.sleep(0)
         return self._top_pairs(pairs, list(embs)), errors
+
+    def _vectorized_scoring_available(self, threshold) -> bool:
+        return bool(
+            _np is not None
+            and _vector_threshold_supported(threshold)
+            and _stock_vector_kernel(self.embedding_engine)
+        )
+
+    async def _try_score_pairs_vectorized(
+        self,
+        candidates: list[dict],
+        embs: dict[str, list],
+        threshold: float,
+        *,
+        new_ids: set[str] | None = None,
+    ) -> tuple[list[dict], list[str]] | None:
+        """Vectorized scoring; ``None`` means "use the legacy scorer"."""
+
+        try:
+            return await self._score_pairs_vectorized(
+                candidates,
+                embs,
+                threshold,
+                new_ids=new_ids,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # The legacy scorer is authoritative: it reproduces any genuine
+            # data error (for example a malformed candidate) exactly.
+            logger.warning(
+                "Vectorized duplicate scan failed, using exact legacy scan / "
+                "向量化查重失败，退回逐对精算: %s",
+                type(exc).__name__,
+            )
+            return None
+
+    async def _score_pairs_vectorized(
+        self,
+        candidates: list[dict],
+        embs: dict[str, list],
+        threshold: float,
+        *,
+        new_ids: set[str] | None = None,
+    ) -> tuple[list[dict], list[str]]:
+        """Exact equivalent of ``_score_pair_ids`` over the full scan
+        (``new_ids is None``) or the incremental append scan (pairs with at
+        least one id in ``new_ids``), with block matrix screening."""
+
+        ids = list(embs)
+        if len(ids) < 2 or (new_ids is not None and not new_ids):
+            return self._top_pairs([], ids), []
+        new_mask = (
+            None if new_ids is None else [bucket_id in new_ids for bucket_id in ids]
+        )
+        scan = _VectorScan(self.embedding_engine, ids, embs, threshold, new_mask)
+        await _run_vector_block(scan.prepare)
+
+        events: list[tuple] = []
+        for dimension in sorted(scan.groups):
+            members = scan.groups[dimension]
+            if len(members) < 2:
+                continue
+            matrix, starts, counts = await _run_vector_block(
+                lambda members=members: scan.build_group(members)
+            )
+            total_rows = matrix.shape[0]
+            if new_mask is None:
+                for begin, end in scan.full_blocks(starts, counts, total_rows):
+                    events.extend(
+                        await _run_vector_block(
+                            lambda begin=begin, end=end: scan.score_full_block(
+                                members, matrix, starts, counts, begin, end
+                            )
+                        )
+                    )
+            else:
+                is_new = _np.fromiter(
+                    (new_mask[index] for index in members),
+                    dtype=bool,
+                    count=len(members),
+                )
+                new_positions = [
+                    position
+                    for position, index in enumerate(members)
+                    if new_mask[index]
+                ]
+                for block in scan.new_blocks(new_positions, counts, total_rows):
+                    events.extend(
+                        await _run_vector_block(
+                            lambda block=block: scan.score_new_block(
+                                members, matrix, starts, counts, is_new, block
+                            )
+                        )
+                    )
+            del matrix
+        if scan.slow or len(scan.groups) > 1:
+            events.extend(await _run_vector_block(scan.slow_events))
+
+        events.sort(key=lambda event: (event[0], event[1]))
+        by_id = {b["id"]: b for b in candidates}
+        pairs: list[dict] = []
+        errors: list[str] = []
+        for position, (left, right, kind, payload) in enumerate(events, start=1):
+            a = ids[left]
+            b = ids[right]
+            if kind == _EVENT_ERROR:
+                errors.append(f"find_duplicates.cosine:{a}:{b}:{payload}")
+            else:
+                ma = by_id[a]["metadata"]
+                mb = by_id[b]["metadata"]
+                pairs.append({
+                    "a_id": a,
+                    "a_name": ma.get("name", a),
+                    "a_len": len(by_id[a].get("content", "") or ""),
+                    "b_id": b,
+                    "b_name": mb.get("name", b),
+                    "b_len": len(by_id[b].get("content", "") or ""),
+                    "similarity": payload,
+                })
+            if position % _VECTOR_ASSEMBLE_YIELD_EVERY == 0:
+                await asyncio.sleep(0)
+        return self._top_pairs(pairs, ids), errors
 
     def _top_pairs(
         self,

@@ -50,6 +50,9 @@ DEFAULT_PROPOSER_JSON_OBJECT = False
 DEFAULT_PROPOSER_MAX_CHUNKS_PER_RUN = 16
 DEFAULT_PROPOSER_CONCURRENCY = 1
 DEFAULT_PROPOSER_WALL_BUDGET_SECONDS = 3000
+DEFAULT_DISPATCH_MAX_CANDIDATES_PER_RUN = 500
+DEFAULT_DISPATCH_WALL_BUDGET_SECONDS = 1800
+MAX_DISPATCH_CANDIDATES_PER_RUN = 100_000
 MIN_PROPOSER_MAX_TOKENS = 512
 MAX_PROPOSER_MAX_TOKENS = 8192
 MAX_NIGHT_ATTEMPTS = 32
@@ -175,6 +178,39 @@ def _proposer_wall_budget_seconds(config: dict[str, Any]) -> int:
     )
     if type(value) is not int or not 1 <= value < 3600:
         raise NightRunRuntimeError("proposer.wall_budget_invalid")
+    return value
+
+
+def _dispatch_max_candidates_per_run(config: dict[str, Any]) -> int:
+    section = config.get("lmc5_night", {})
+    if section is None:
+        section = {}
+    if type(section) is not dict:
+        raise NightRunRuntimeError("dispatch.candidate_cap_invalid")
+    value = section.get(
+        "dispatch_max_candidates_per_run",
+        DEFAULT_DISPATCH_MAX_CANDIDATES_PER_RUN,
+    )
+    if (
+        type(value) is not int
+        or not 1 <= value <= MAX_DISPATCH_CANDIDATES_PER_RUN
+    ):
+        raise NightRunRuntimeError("dispatch.candidate_cap_invalid")
+    return value
+
+
+def _dispatch_wall_budget_seconds(config: dict[str, Any]) -> int:
+    section = config.get("lmc5_night", {})
+    if section is None:
+        section = {}
+    if type(section) is not dict:
+        raise NightRunRuntimeError("dispatch.wall_budget_invalid")
+    value = section.get(
+        "dispatch_wall_budget_seconds",
+        DEFAULT_DISPATCH_WALL_BUDGET_SECONDS,
+    )
+    if type(value) is not int or not 1 <= value < 3600:
+        raise NightRunRuntimeError("dispatch.wall_budget_invalid")
     return value
 
 
@@ -461,6 +497,8 @@ def build_night_run_runtime(
     max_chunks_per_run = _proposer_max_chunks_per_run(config)
     proposer_concurrency = _proposer_concurrency(config)
     wall_budget_seconds = _proposer_wall_budget_seconds(config)
+    dispatch_max_candidates = _dispatch_max_candidates_per_run(config)
+    dispatch_wall_budget_seconds = _dispatch_wall_budget_seconds(config)
     max_attempts = _night_max_attempts(config)
     provider_timeout = 75.0
     provider = OpenAIChatProvider(
@@ -544,6 +582,8 @@ def build_night_run_runtime(
             proposer_max_chunks_per_run=max_chunks_per_run,
             proposer_concurrency=proposer_concurrency,
             proposer_wall_budget_seconds=wall_budget_seconds,
+            dispatch_max_candidates_per_run=dispatch_max_candidates,
+            dispatch_wall_budget_seconds=dispatch_wall_budget_seconds,
         ),
     )
     return NightRunRuntime(

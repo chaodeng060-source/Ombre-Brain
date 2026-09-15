@@ -19,18 +19,28 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import errno
+import math
 import os
 import stat
 import threading
+import time
 import uuid
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator, BinaryIO, Iterator
+from typing import Any, AsyncIterator, BinaryIO, Iterator, Mapping
 
 
 LOCK_DIRECTORY = ".locks"
 LOCK_NAME = "lmc5-maintenance.lock"
+
+# Machine code callers surface when a writer could not get its lease in time
+# (HTTP 503 body ``code`` / MCP error text).
+MAINTENANCE_BUSY_CODE = "maintenance.busy"
+# config.yaml: maintenance_barrier.shared_lease_timeout_seconds (0 = legacy
+# unbounded wait).  The server applies it once its startup components exist.
+DEFAULT_SHARED_LEASE_TIMEOUT_SECONDS = 60.0
+_SYNC_POLL_SECONDS = 0.025
 
 
 class MaintenanceBarrierError(RuntimeError):
@@ -40,9 +50,107 @@ class MaintenanceBarrierError(RuntimeError):
 class MaintenanceBarrierTimeout(MaintenanceBarrierError):
     """A lease did not become available within the requested timeout."""
 
+    code = MAINTENANCE_BUSY_CODE
+
 
 class _MaintenanceBarrierBusy(MaintenanceBarrierError):
     """The non-blocking file-lock probe found an active conflicting lease."""
+
+    code = MAINTENANCE_BUSY_CODE
+
+
+# Every "the vault is under maintenance, retry later" failure.
+MAINTENANCE_BUSY_ERRORS = (MaintenanceBarrierTimeout, _MaintenanceBarrierBusy)
+
+
+class _DefaultTimeout:
+    """Sentinel: use the process-wide default for this lease mode."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "DEFAULT"
+
+
+DEFAULT = _DefaultTimeout()
+
+# ``None`` keeps the historical unbounded shared wait for library users,
+# CLI tools and tests; the network server configures a finite bound.
+_shared_lease_timeout_seconds: float | None = None
+_shared_lease_timeout_guard = threading.Lock()
+
+
+def _validated_timeout(value: Any) -> float | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) <= 0
+    ):
+        raise ValueError("lease timeout must be None or a finite positive number")
+    return float(value)
+
+
+def configure_shared_lease_timeout(seconds: float | None) -> float | None:
+    """Bound non-nested shared-lease waits process-wide; return the old value.
+
+    Nested (same task/thread) reuse of an already held lease never waits and
+    is unaffected.  Exclusive leases keep their explicit per-call timeouts.
+    """
+
+    global _shared_lease_timeout_seconds
+    validated = _validated_timeout(seconds)
+    with _shared_lease_timeout_guard:
+        previous = _shared_lease_timeout_seconds
+        _shared_lease_timeout_seconds = validated
+    return previous
+
+
+def shared_lease_timeout() -> float | None:
+    return _shared_lease_timeout_seconds
+
+
+def shared_lease_timeout_from_config(config: Mapping[str, Any] | None) -> float | None:
+    """Read ``maintenance_barrier.shared_lease_timeout_seconds``.
+
+    Missing or invalid values use the 60 second default (never an accidental
+    unbounded wait); an explicit ``0`` restores the legacy unbounded wait.
+    """
+
+    section = (config or {}).get("maintenance_barrier", {}) if isinstance(
+        config, Mapping
+    ) else {}
+    if not isinstance(section, Mapping):
+        return DEFAULT_SHARED_LEASE_TIMEOUT_SECONDS
+    value = section.get(
+        "shared_lease_timeout_seconds",
+        DEFAULT_SHARED_LEASE_TIMEOUT_SECONDS,
+    )
+    if (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and float(value) == 0
+    ):
+        return None
+    try:
+        validated = _validated_timeout(value)
+    except ValueError:
+        return DEFAULT_SHARED_LEASE_TIMEOUT_SECONDS
+    return DEFAULT_SHARED_LEASE_TIMEOUT_SECONDS if validated is None else validated
+
+
+def _resolve_timeout(mode: str, timeout: Any) -> float | None:
+    if timeout is DEFAULT:
+        return _shared_lease_timeout_seconds if mode == "shared" else None
+    return timeout
+
+
+def _timeout_error(timeout: float | None) -> MaintenanceBarrierTimeout:
+    waited = "" if timeout is None else f" after {timeout:g}s"
+    return MaintenanceBarrierTimeout(
+        f"{MAINTENANCE_BUSY_CODE}: maintenance lease acquisition timed out"
+        f"{waited}; memory maintenance is in progress, retry later"
+    )
 
 
 @dataclass
@@ -501,7 +609,9 @@ def _acquire_handle(
             errno.EAGAIN,
             errno.EWOULDBLOCK,
         }:
-            raise _MaintenanceBarrierBusy("maintenance barrier is busy") from exc
+            raise _MaintenanceBarrierBusy(
+                f"{MAINTENANCE_BUSY_CODE}: maintenance barrier is busy"
+            ) from exc
         raise MaintenanceBarrierError(
             "unable to acquire maintenance lock"
         ) from exc
@@ -616,6 +726,29 @@ def _leave(key: tuple[str, str]) -> _BarrierHandle | None:
         return held.handle
 
 
+def _acquire_handle_bounded(
+    path: Path,
+    mode: str,
+    *,
+    timeout: float,
+) -> _BarrierHandle:
+    """Thread-side bounded wait: poll the non-blocking probe until a deadline.
+
+    Every failed probe releases whatever it partially locked inside
+    ``_acquire_handle``, so a timed-out waiter leaves no flock behind.
+    """
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return _acquire_handle(path, mode, blocking=False)
+        except _MaintenanceBarrierBusy as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _timeout_error(timeout) from exc
+            time.sleep(min(_SYNC_POLL_SECONDS, remaining))
+
+
 async def _acquire_handle_async(
     path: Path,
     mode: str,
@@ -631,9 +764,7 @@ async def _acquire_handle_async(
             if deadline is not None:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    raise MaintenanceBarrierTimeout(
-                        "maintenance lease acquisition timed out"
-                    ) from exc
+                    raise _timeout_error(timeout) from exc
                 await asyncio.sleep(min(0.025, remaining))
             else:
                 await asyncio.sleep(0.025)
@@ -647,7 +778,7 @@ class MaintenanceBarrier:
         self.lock_path = _prepare_lock_path(self.root)
 
     @contextmanager
-    def _sync_lease(self, mode: str) -> Iterator[None]:
+    def _sync_lease(self, mode: str, *, timeout: Any = DEFAULT) -> Iterator[None]:
         key = _nested_key(self.lock_path, mode)
         context_token = None
         if key is None:
@@ -655,11 +786,22 @@ class MaintenanceBarrier:
             # its peer task owns the exclusive lease.  Sync leaf calls may
             # still run there, but they fail closed rather than block.
             blocking = _current_task_id() is None
-            handle = _acquire_handle(
-                self.lock_path,
-                mode,
-                blocking=blocking,
-            )
+            wait = _resolve_timeout(mode, timeout) if blocking else None
+            if blocking and wait is not None:
+                # Worker/daemon threads (raw-event ingest, ledger leaves) get
+                # the same bounded wait as async writers, so a stuck exclusive
+                # holder cannot pile up blocked threads forever.
+                handle = _acquire_handle_bounded(
+                    self.lock_path,
+                    mode,
+                    timeout=wait,
+                )
+            else:
+                handle = _acquire_handle(
+                    self.lock_path,
+                    mode,
+                    blocking=blocking,
+                )
             try:
                 key, context_token = _register_new(
                     self.lock_path,
@@ -687,7 +829,7 @@ class MaintenanceBarrier:
         self,
         mode: str,
         *,
-        timeout: float | None = None,
+        timeout: Any = DEFAULT,
     ) -> AsyncIterator[None]:
         key = _nested_key(self.lock_path, mode)
         context_token = None
@@ -695,7 +837,7 @@ class MaintenanceBarrier:
             handle = await _acquire_handle_async(
                 self.lock_path,
                 mode,
-                timeout=timeout,
+                timeout=_resolve_timeout(mode, timeout),
             )
             try:
                 key, context_token = _register_new(
@@ -719,13 +861,22 @@ class MaintenanceBarrier:
                 if context_token is not None:
                     _LEASE_CONTEXT.reset(context_token)
 
-    def shared(self):
-        return self._sync_lease("shared")
+    def shared(self, *, timeout: Any = DEFAULT):
+        """Sync shared lease.
+
+        In an event-loop task a conflicting lease fails closed immediately
+        (unchanged).  In a thread the wait is bounded by ``timeout``; the
+        default is the process-wide shared bound (``None`` = unbounded).
+        """
+
+        return self._sync_lease("shared", timeout=timeout)
 
     def exclusive(self):
         return self._sync_lease("exclusive")
 
-    def shared_async(self, *, timeout: float | None = None):
+    def shared_async(self, *, timeout: Any = DEFAULT):
+        """Async shared lease; the default timeout is the process-wide bound."""
+
         return self._async_lease("shared", timeout=timeout)
 
     def exclusive_async(self, *, timeout: float | None = None):

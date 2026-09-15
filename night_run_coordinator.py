@@ -20,6 +20,7 @@ import asyncio
 import contextvars
 import hashlib
 import json
+import logging
 import math
 import re
 import threading
@@ -27,7 +28,12 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
-from curated_writer import CuratedWriteCoordinator, CuratedWriteResult
+from curated_writer import (
+    CuratedWriteCoordinator,
+    CuratedWriteIntegrityError,
+    CuratedWriteResult,
+    IdempotencyConflictError,
+)
 from lmc5_ledger import (
     CandidateRecord,
     EventIdentity,
@@ -65,6 +71,8 @@ from bucket_manager import bucket_revision_hash
 from timeline_axis import run_timeline_sweep
 
 
+logger = logging.getLogger("ombre_brain.night_run_coordinator")
+
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CANDIDATE_SCHEMA = "ombre.lmc5-axis-candidate/v1"
@@ -101,6 +109,11 @@ class NightRunPolicy:
     chunk_bytes: int = 24 * 1024
     barrier_timeout_seconds: float = 60.0
     vector_policy: str = "required"
+    # 2026-09-14: one night dispatched a four-week backlog (2363 candidates)
+    # inside the exclusive lease for ~3 hours.  Anything past either bound
+    # stays pending for the next run (terminal stage "deferred").
+    dispatch_max_candidates_per_run: int = 500
+    dispatch_wall_budget_seconds: int = 1800
 
     def __post_init__(self) -> None:
         for field in (
@@ -110,6 +123,8 @@ class NightRunPolicy:
             "proposer_concurrency",
             "proposer_wall_budget_seconds",
             "chunk_bytes",
+            "dispatch_max_candidates_per_run",
+            "dispatch_wall_budget_seconds",
         ):
             value = getattr(self, field)
             if type(value) is not int or value <= 0:
@@ -124,6 +139,10 @@ class NightRunPolicy:
             raise ValueError("proposer concurrency cannot exceed 8")
         if self.proposer_wall_budget_seconds >= 3600:
             raise ValueError("proposer wall budget must be below 3600 seconds")
+        if self.dispatch_max_candidates_per_run > 100_000:
+            raise ValueError("dispatch run candidate cap cannot exceed 100000")
+        if self.dispatch_wall_budget_seconds >= 3600:
+            raise ValueError("dispatch wall budget must be below 3600 seconds")
         timeout = self.barrier_timeout_seconds
         if (
             isinstance(timeout, bool)
@@ -459,6 +478,7 @@ class NightRunCoordinator:
                 self._mark_error(run_id, exc.code, counts)
             raise
         except Exception as exc:
+            logger.exception("night run %s failed with an unclassified error", run_id)
             if started:
                 self._mark_error(run_id, "run.internal", counts)
             raise NightRunCoordinatorError("run.internal") from exc
@@ -890,6 +910,12 @@ class NightRunCoordinator:
         counts["dispatch_attempted"] = 0
         counts["dispatch_retryable"] = 0
         counts["dispatch_circuit_breaker"] = 0
+        counts["dispatch_curated_conflict"] = 0
+        counts["dispatch_deferred_budget"] = 0
+        counts["dispatch_cap_reached"] = 0
+        counts["dispatch_wall_budget_exhausted"] = 0
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.policy.dispatch_wall_budget_seconds
         consecutive_errors = 0
         after: int | None = None
         while True:
@@ -908,9 +934,37 @@ class NightRunCoordinator:
                 # completed.  Leaving it here must not make this page spin.
                 if record.axis == "M":
                     continue
+                cap_reached = (
+                    counts["dispatch_attempted"]
+                    >= self.policy.dispatch_max_candidates_per_run
+                )
+                if cap_reached or loop.time() >= deadline:
+                    # Stop between candidates: nothing in flight is cut off,
+                    # and every unvisited candidate simply stays pending for
+                    # the next run.  Retryables of this run are pending too.
+                    if cap_reached:
+                        counts["dispatch_cap_reached"] = 1
+                    else:
+                        counts["dispatch_wall_budget_exhausted"] = 1
+                    pending_after = self._pending_candidate_counts()[0]
+                    counts["dispatch_pending_after"] = pending_after
+                    counts["dispatch_deferred_budget"] = max(
+                        0, pending_after - counts["dispatch_retryable"]
+                    )
+                    logger.warning(
+                        "night dispatch budget reached: attempted=%d "
+                        "deferred=%d cap_reached=%d wall_budget_exhausted=%d",
+                        counts["dispatch_attempted"],
+                        counts["dispatch_deferred_budget"],
+                        counts["dispatch_cap_reached"],
+                        counts["dispatch_wall_budget_exhausted"],
+                    )
+                    return
                 counts["dispatch_attempted"] += 1
                 try:
                     await self._dispatch_candidate(record, counts)
+                except (CuratedWriteIntegrityError, IdempotencyConflictError) as exc:
+                    self._defer_curated_conflict(record, exc, counts)
                 except NightRunCoordinatorError as exc:
                     if exc.code not in _RETRYABLE_DISPATCH_CODES:
                         raise
@@ -1335,6 +1389,23 @@ class NightRunCoordinator:
         key = f"{record.axis.lower()}_deferred"
         counts[key] = counts.get(key, 0) + 1
 
+    def _defer_curated_conflict(
+        self,
+        record: CandidateRecord,
+        exc: CuratedWriteIntegrityError | IdempotencyConflictError,
+        counts: dict[str, int],
+    ) -> None:
+        kind = "idempotency" if isinstance(exc, IdempotencyConflictError) else "integrity"
+        code = f"{record.axis.lower()}.curated_{kind}_conflict"
+        logger.warning(
+            "night dispatch deferred candidate %s as %s: %s",
+            record.candidate_id,
+            code,
+            exc,
+        )
+        self._defer(record, code, counts)
+        counts["dispatch_curated_conflict"] += 1
+
     async def _run_metabolism(self, counts: dict[str, int]) -> None:
         self._assert_report_only()
         decay = await self.decay_engine.run_decay_cycle()
@@ -1445,6 +1516,9 @@ class NightRunCoordinator:
             "dispatch_retryable",
             "dispatch_pending_after",
             "dispatch_circuit_breaker",
+            "dispatch_deferred_budget",
+            "dispatch_cap_reached",
+            "dispatch_wall_budget_exhausted",
         )
         if any(key not in counts for key in required_counts):
             raise NightRunCoordinatorError("validation.proposer_counts")
@@ -1471,11 +1545,24 @@ class NightRunCoordinator:
         dispatch_retryable = counts["dispatch_retryable"]
         dispatch_pending = counts["dispatch_pending_after"]
         dispatch_breaker = counts["dispatch_circuit_breaker"]
+        dispatch_deferred = counts["dispatch_deferred_budget"]
+        dispatch_cap = counts["dispatch_cap_reached"]
+        dispatch_wall = counts["dispatch_wall_budget_exhausted"]
+        budget_stop = bool(dispatch_cap or dispatch_wall)
         if (
             dispatch_retryable > dispatch_attempted
             or dispatch_breaker not in {0, 1}
+            or dispatch_cap not in {0, 1}
+            or dispatch_wall not in {0, 1}
+            or (dispatch_cap and dispatch_wall)
+            or (dispatch_breaker and budget_stop)
             or (dispatch_breaker and dispatch_retryable < 3)
-            or (not dispatch_breaker and dispatch_pending != dispatch_retryable)
+            or dispatch_attempted > self.policy.dispatch_max_candidates_per_run
+            or (dispatch_deferred and not budget_stop)
+            or (
+                not dispatch_breaker
+                and dispatch_pending != dispatch_retryable + dispatch_deferred
+            )
             or (dispatch_breaker and dispatch_pending < dispatch_retryable)
         ):
             raise NightRunCoordinatorError("validation.dispatch_counts")

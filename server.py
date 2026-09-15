@@ -255,6 +255,12 @@ from night_run_runtime import (
     NightRunRuntimeError,
     build_night_run_runtime,
 )
+from maintenance_barrier import (
+    MAINTENANCE_BUSY_CODE,
+    MAINTENANCE_BUSY_ERRORS,
+    configure_shared_lease_timeout,
+    shared_lease_timeout_from_config,
+)
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -329,6 +335,33 @@ saga_engine = SagaEngine(config, bucket_mgr, dehydrator)
 episode_engine = EpisodeEngine(config, bucket_mgr, embedding_engine, dehydrator, saga_engine=saga_engine)
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 sensory_engine = SensoryEngine(config["buckets_dir"])  # External body-state sidecar / 外部身体状态层
+
+# --- Bounded writer waits on the maintenance barrier (2026-09-14) ---
+# A night run once held the exclusive lease for ~5 hours and every HTTP/MCP/
+# hook writer waited on it forever.  From here on (startup construction above
+# keeps its old wait) a non-nested shared lease waits at most
+# maintenance_barrier.shared_lease_timeout_seconds (default 60, 0 = legacy
+# unbounded) and then fails with MaintenanceBarrierTimeout -> HTTP 503
+# maintenance.busy / MCP error text "maintenance.busy: ...".  The night run's
+# own nested writes reuse its exclusive lease and never wait.
+configure_shared_lease_timeout(shared_lease_timeout_from_config(config))
+logger.info(
+    "Maintenance barrier shared lease wait bound / 普通写入等锁上限: %s",
+    "unbounded" if shared_lease_timeout_from_config(config) is None
+    else f"{shared_lease_timeout_from_config(config):g}s",
+)
+
+
+def _maintenance_busy_response(code: str = MAINTENANCE_BUSY_CODE):
+    from starlette.responses import JSONResponse
+
+    return JSONResponse(
+        {
+            "error": "memory maintenance is in progress; retry later",
+            "code": code,
+        },
+        status_code=503,
+    )
 
 # --- 待审队列（#2 Z轴事实演化 + #3 关系闸的共用 pending 存储）---
 # 落在 <buckets_dir>/review_queue.jsonl。机器提议只进 pending；Z 冲突默认
@@ -3553,7 +3586,9 @@ async def lmc5_raw_events_hook(request):
                 return _get_lmc5_ledger().append_raw_events(normalized)
 
         results = await _await_daemon_thread(append_under_ingest_guard)
-    except RawIngestBusy:
+    except (RawIngestBusy, *MAINTENANCE_BUSY_ERRORS):
+        # The ledger's shared maintenance lease is bounded; a night run that
+        # outlasts it pauses ingest exactly like the deployment guard does.
         return JSONResponse(
             {
                 "error": "raw-event ingest is paused",
@@ -11899,6 +11934,9 @@ async def api_hold(request):
             world=world,
         )
         return JSONResponse({"result": result})
+    except MAINTENANCE_BUSY_ERRORS as e:
+        logger.warning(f"/api/hold paused by memory maintenance / 维护中: {e}")
+        return _maintenance_busy_response()
     except Exception as e:
         logger.error(f"/api/hold failed / 失败: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -12214,6 +12252,14 @@ if __name__ == "__main__":
         # cancel streaming/SSE bodies and is therefore unsuitable here.
         _OMBRE_API_TOKEN = require_api_token()
         _OMBRE_MCP_TOKEN = require_mcp_token()
+
+        # Any custom route that lets a bounded lease wait escape answers
+        # 503 maintenance.busy instead of a generic 500.
+        async def _maintenance_busy_handler(_request, _exc):
+            return _maintenance_busy_response()
+
+        for _busy_error in MAINTENANCE_BUSY_ERRORS:
+            _app.add_exception_handler(_busy_error, _maintenance_busy_handler)
 
         _app.add_middleware(APIBearerAuthMiddleware, token=_OMBRE_API_TOKEN)
         _app.add_middleware(MCPBearerAuthMiddleware, token=_OMBRE_MCP_TOKEN)
