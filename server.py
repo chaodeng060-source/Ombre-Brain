@@ -1387,11 +1387,6 @@ def _timeline_recall_neighbors(
     if neighbor_window == 0:
         return []
 
-    candidates = [
-        bucket
-        for bucket in buckets
-        if isinstance(bucket, dict) and _is_main_recall_bucket(bucket)
-    ]
     wf_set = (
         {str(value).strip() for value in world_filter}
         if world_filter is not None
@@ -1427,7 +1422,12 @@ def _timeline_recall_neighbors(
                 return False
         return True
 
-    candidates = [bucket for bucket in candidates if eligible(bucket)]
+    # World/domain checks are metadata-only. Do them before archive realpath
+    # checks: an RP request must not stat thousands of unrelated daily paths.
+    candidates = [
+        bucket for bucket in buckets
+        if isinstance(bucket, dict) and eligible(bucket) and _is_main_recall_bucket(bucket)
+    ]
     candidates = _filter_z_fact_candidates(
         candidates,
         query=query,
@@ -1439,7 +1439,7 @@ def _timeline_recall_neighbors(
         if bucket.get("id")
     }
     return timeline_neighbors(
-        buckets,
+        candidates,
         seed_ids,
         neighbor_window=neighbor_window,
         max_results=max_results,
@@ -11862,6 +11862,43 @@ async def api_recall_receipt(request):
         "failed": failed,
         **status,
     })
+
+
+@mcp.custom_route("/api/hold-status", methods=["GET"])
+async def api_hold_status(request):
+    """Read-only confirmation of exact stored content after a lost hold reply.
+
+    No hold replay, provider call, body disclosure or mutation. Absence is
+    unconfirmed, not failed: the original hold may still be processing.
+    """
+    from starlette.responses import JSONResponse
+
+    digest = str(request.query_params.get("content_sha256") or "")
+    world = request.query_params.get("world")
+    if (not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or not isinstance(world, str) or len(world) > 160):
+        return JSONResponse({"error": "content_sha256 and explicit world required"}, status_code=400)
+    world = world.strip()
+    result = {"state": "unconfirmed", "world": world, "content_sha256": digest}
+
+    def matches(bucket):
+        return (isinstance(bucket, dict)
+                and str((bucket.get("metadata") or {}).get("world") or "").strip() == world
+                and isinstance(bucket.get("content"), str)
+                and hashlib.sha256(bucket["content"].strip().encode("utf-8")).hexdigest() == digest)
+
+    try:
+        for bucket in await _borrow_recall_buckets():
+            if not matches(bucket) or not _is_main_recall_bucket(bucket):
+                continue
+            # A stale resident match alone cannot prove durable storage.
+            stored = await bucket_mgr.get(str(bucket.get("id") or ""))
+            if matches(stored) and _is_main_recall_bucket(stored):
+                return JSONResponse({**result, "state": "stored", "bucket_id": stored["id"]})
+    except Exception as exc:
+        logger.warning("Hold confirmation unavailable: %s", type(exc).__name__)
+        return JSONResponse(result, status_code=503)
+    return JSONResponse(result)
 
 
 @mcp.custom_route("/api/hold", methods=["POST"])

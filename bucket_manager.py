@@ -552,7 +552,11 @@ class BucketManager:
         self._recall_snapshot_generation[cache_key] = (
             self._recall_snapshot_generation.get(cache_key, 0) + 1
         )
-        self._recall_snapshot_disk_token[cache_key] = disk_token
+        # A known write updates the resident tuple, not the last observed disk
+        # revision. Keep that revision so reconciliation can parse only changed
+        # files and distinguish our own writes from genuine external edits.
+        if disk_token is not None or cache_key not in self._recall_snapshot_disk_token:
+            self._recall_snapshot_disk_token[cache_key] = disk_token
 
     def _refresh_recall_snapshot_entry(
         self,
@@ -671,12 +675,24 @@ class BucketManager:
                 self._scan_recall_snapshot_sync,
                 dirs,
             )
-            if self._recall_snapshot_disk_token.get(cache_key) == disk_token:
+            previous_token = self._recall_snapshot_disk_token.get(cache_key)
+            if previous_token == disk_token:
                 return
-            buckets = await asyncio.to_thread(
+            current = self._recall_snapshot_cache.get(cache_key, ())
+            by_path = {str(bucket.get("path", "")): bucket for bucket in current}
+            previous_revisions = {row[0]: row[1:] for row in (previous_token or ())}
+            changed_paths = [
+                row[0] for row in disk_token
+                if row[0] not in by_path or previous_revisions.get(row[0]) != row[1:]
+            ]
+            changed_buckets = await asyncio.to_thread(
                 self._load_recall_snapshot_sync,
-                paths,
+                changed_paths,
             )
+            for path in changed_paths:
+                by_path.pop(path, None)
+            by_path.update({str(bucket.get("path", "")): bucket for bucket in changed_buckets})
+            buckets = tuple(by_path[path] for path in paths if path in by_path)
             after_paths, after_token = await asyncio.to_thread(
                 self._scan_recall_snapshot_sync,
                 dirs,
@@ -685,6 +701,18 @@ class BucketManager:
                 return
             async with self._recall_snapshot_lock:
                 if generation != self._recall_snapshot_generation.get(cache_key, 0):
+                    return
+                # create() can publish a Path while a disk scan loads a str;
+                # that representation difference is not an external mutation.
+                before = {str(b.get("path", "")): {**b, "path": str(b.get("path", ""))}
+                          for b in current}
+                after = {str(b.get("path", "")): {**b, "path": str(b.get("path", ""))}
+                         for b in buckets}
+                if before == after:
+                    # Known incremental writes are already reflected in BM25
+                    # and E's snapshot token. Observing their new file stats
+                    # must not schedule a full index rebuild or evict E again.
+                    self._recall_snapshot_disk_token[cache_key] = disk_token
                     return
                 self._replace_recall_snapshot(
                     cache_key,

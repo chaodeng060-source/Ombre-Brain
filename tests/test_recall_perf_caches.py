@@ -197,6 +197,7 @@ def _fresh_bucket(body: str) -> dict:
 
 
 def test_async_fallback_returns_immediately_and_backfills(monkeypatch):
+    monkeypatch.setattr(server, "_ds_offpeak_now", lambda: True)
     dehy = _SlowDehydrator()
     mgr = _WriterMgr()
     monkeypatch.setattr(server, "dehydrator", dehy)
@@ -259,6 +260,7 @@ def test_async_fallback_disabled_keeps_synchronous_path(monkeypatch):
 
 def test_backfill_write_extends_e_axis_cache_instead_of_evicting(monkeypatch):
     """夏刀互搏回归：补写 summary 不得炸掉 E 轴小抽屉（16:11 实测抓到的）。"""
+    monkeypatch.setattr(server, "_ds_offpeak_now", lambda: True)
     dehy = _SlowDehydrator()
 
     class _TokenWriterMgr(_WriterMgr):
