@@ -1628,6 +1628,50 @@ class LMC5Ledger:
         finally:
             connection.close()
 
+    def get_raw_event(self, identity: EventIdentity) -> RawEventRecord:
+        """Return one durable raw event by its exact identity.
+
+        Read-only lookup the night-run proposer uses to rebuild a fresh,
+        slimmer model input for an already-chunked event without ever
+        mutating the append-only ``raw_events``/``event_chunks`` tables.
+        """
+
+        safe_session = _identifier(identity.session_id, "session_id")
+        safe_source = _identifier(identity.source_event_id, "source_event_id")
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT id, session_id, source_event_id, payload,
+                       payload_digest, recorded_at
+                FROM raw_events
+                WHERE session_id = ? AND source_event_id = ?
+                """,
+                (safe_session, safe_source),
+            ).fetchone()
+            if row is None:
+                raise LedgerStateError("raw event does not exist")
+            payload = bytes(row["payload"])
+            if _sha256(payload) != row["payload_digest"]:
+                raise LedgerCorruptionError(
+                    "persisted raw-event digest does not match"
+                )
+            return RawEventRecord(
+                row_id=int(row["id"]),
+                identity=EventIdentity(
+                    row["session_id"], row["source_event_id"]
+                ),
+                payload=payload,
+                payload_digest=row["payload_digest"],
+                recorded_at=row["recorded_at"],
+            )
+        except LedgerError:
+            raise
+        except sqlite3.DatabaseError as exc:
+            raise LedgerCorruptionError("unable to read raw event") from exc
+        finally:
+            connection.close()
+
     def list_pending_proposer_chunks(
         self,
         *,
@@ -1739,6 +1783,116 @@ class LMC5Ledger:
                 connection.rollback()
             raise LedgerCorruptionError(
                 "unable to read pending proposer chunks"
+            ) from exc
+        finally:
+            connection.close()
+
+    def list_pending_proposer_chunks_for_event(
+        self,
+        identity: EventIdentity,
+        *,
+        through: int,
+    ) -> tuple[PendingProposerChunk, ...]:
+        """Return every still-pending chunk sourced from exactly one event.
+
+        Unlike :meth:`list_pending_proposer_chunks`, this ignores the
+        caller's per-run fetch page and returns one event's *complete*
+        pending set, so the night-run proposer can safely retire every
+        sibling chunk of a multi-chunk event in one grouped decision instead
+        of leaving stragglers pending forever behind a moving page cursor.
+
+        Deliberately skips ``_verify_proposer_outcomes`` -- a full scan of
+        ``chunk_proposer_outcomes`` -- unlike :meth:`list_pending_proposer_chunks`.
+        The night-run proposer calls this once per distinct event discovered
+        inside the same page it already fetched via
+        :meth:`list_pending_proposer_chunks`, which just ran that same
+        full-table check; repeating it here would turn one O(rows) scan per
+        page into one per *event* (up to ``proposer_max_chunks_per_run``
+        extra full scans per run) while the whole run holds the exclusive
+        maintenance lease. The per-row content-digest check below still
+        guards against a corrupted chunk body.
+        """
+
+        safe_session = _identifier(identity.session_id, "session_id")
+        safe_source = _identifier(identity.source_event_id, "source_event_id")
+        safe_through = _after_id(through)
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            rows = connection.execute(
+                """
+                SELECT ec.rowid AS row_id, ec.chunk_id, ec.content,
+                       ec.content_digest, ec.created_at,
+                       (
+                           SELECT COUNT(*)
+                           FROM chunk_proposer_outcomes retry
+                           WHERE retry.chunk_id = ec.chunk_id
+                             AND retry.outcome = 'retryable_error'
+                       ) AS retry_count
+                FROM event_chunks ec
+                JOIN chunk_sources cs ON cs.chunk_id = ec.chunk_id
+                JOIN raw_events re ON re.id = cs.raw_event_id
+                WHERE re.session_id = ? AND re.source_event_id = ?
+                  AND ec.rowid <= ?
+                  AND NOT EXISTS(
+                      SELECT 1
+                      FROM chunk_proposer_outcomes cpo
+                      WHERE cpo.chunk_id = ec.chunk_id
+                        AND cpo.outcome IN (
+                            'zero_candidates', 'candidates_persisted'
+                        )
+                  )
+                ORDER BY ec.rowid
+                """,
+                (safe_session, safe_source, safe_through),
+            ).fetchall()
+            results: list[PendingProposerChunk] = []
+            for row in rows:
+                content = bytes(row["content"])
+                if _sha256(content) != row["content_digest"]:
+                    raise LedgerCorruptionError(
+                        "persisted event-chunk digest does not match"
+                    )
+                source_rows = connection.execute(
+                    """
+                    SELECT re.session_id, re.source_event_id
+                    FROM chunk_sources cs
+                    JOIN raw_events re ON re.id = cs.raw_event_id
+                    WHERE cs.chunk_id = ?
+                    ORDER BY re.session_id, re.source_event_id
+                    """,
+                    (row["chunk_id"],),
+                ).fetchall()
+                sources = tuple(
+                    EventIdentity(source["session_id"], source["source_event_id"])
+                    for source in source_rows
+                )
+                if not sources:
+                    raise LedgerCorruptionError(
+                        "event chunk has no persisted source events"
+                    )
+                results.append(
+                    PendingProposerChunk(
+                        row_id=int(row["row_id"]),
+                        chunk_id=row["chunk_id"],
+                        content=content,
+                        content_digest=row["content_digest"],
+                        source_event_ids=sources,
+                        created_at=row["created_at"],
+                        retry_count=int(row["retry_count"]),
+                    )
+                )
+            connection.commit()
+            return tuple(results)
+        except LedgerError:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.DatabaseError as exc:
+            if connection.in_transaction:
+                connection.rollback()
+            raise LedgerCorruptionError(
+                "unable to read pending proposer chunks for event"
             ) from exc
         finally:
             connection.close()

@@ -78,7 +78,7 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CANDIDATE_SCHEMA = "ombre.lmc5-axis-candidate/v1"
 _SNAPSHOT_RECEIPT_SCHEMA = "ombre.lmc5-snapshot-receipt/v1"
 _METABOLISM_RECEIPT_SCHEMA = "ombre.lmc5-metabolism-receipt/v1"
-_CHUNK_SCHEMA = "ombre.lmc5-redacted-event/v1"
+_CHUNK_SCHEMA = "ombre.lmc5-redacted-event/v2"
 _REDACTION_VERSION = "redact_obj/v1"
 _RETRYABLE_DISPATCH_CODES = frozenset(
     {
@@ -89,6 +89,20 @@ _RETRYABLE_DISPATCH_CODES = frozenset(
     }
 )
 _M_RECEIPT_YIELD_EVERY = 16
+# 2026-09-15: night-run backlog stats showed one assistant reply routinely
+# spends tens of KB on `thinking`/`tools`/`resultMeta` that the proposer
+# never needed -- it only ever asked the model to read redacted transcript
+# text.  Both freshly cut chunks (_event_parts) and the grouped-by-event
+# proposer reconstruction (_slim_proposer_text) drop these keys before the
+# model ever sees them.  Bumping _CHUNK_SCHEMA above keeps new chunk ids
+# from colliding with pre-existing "fat" chunks already in the ledger.
+_SLIM_EXCLUDED_PAYLOAD_KEYS = frozenset({"resultMeta", "thinking", "tools"})
+# Must match lmc5_ledger.proposer_backlog_stats's own "retry_count >= 3"
+# quarantine threshold so a night run stops calling the model on an event
+# exactly when the ledger starts reporting it as quarantined -- never later
+# (wasted retries on a poison event) and never earlier (early-exiting a
+# healthy retry).
+_QUARANTINE_RETRY_THRESHOLD = 3
 
 
 class NightRunCoordinatorError(RuntimeError):
@@ -262,6 +276,38 @@ def _split_utf8(payload: bytes, limit: int) -> tuple[bytes, ...]:
         parts.append(payload[start:end])
         start = end
     return tuple(parts)
+
+
+def _slim_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop the keys the proposer never needs from a redacted payload dict."""
+
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in _SLIM_EXCLUDED_PAYLOAD_KEYS
+    }
+
+
+def _redacted_slim_envelope(record: RawEventRecord) -> dict[str, Any]:
+    """Build the one canonical envelope shape shared by chunking and proposing.
+
+    ``_event_parts`` uses this to decide what gets durably stored as new
+    ``event_chunks`` content; the night-run proposer's grouped-by-event path
+    (``_slim_proposer_text``) uses the exact same function to rebuild a fresh
+    model input straight from ``raw_events`` for a pending event, regardless
+    of whether its on-disk chunks predate this slimming change.
+    """
+
+    raw = _load_json_object(record.payload, code="raw.invalid_json")
+    redacted = redact_obj(raw)
+    return {
+        "payload": _slim_payload(redacted),
+        "recorded_at": record.recorded_at,
+        "redaction": _REDACTION_VERSION,
+        "schema": _CHUNK_SCHEMA,
+        "session_id": record.identity.session_id,
+        "source_event_id": record.identity.source_event_id,
+    }
 
 
 def _relation_json(relation: RelationHint) -> dict[str, Any]:
@@ -581,16 +627,7 @@ class NightRunCoordinator:
     def _event_parts(
         self, record: RawEventRecord
     ) -> tuple[tuple[str, bytes], ...]:
-        raw = _load_json_object(record.payload, code="raw.invalid_json")
-        redacted = redact_obj(raw)
-        envelope = {
-            "payload": redacted,
-            "recorded_at": record.recorded_at,
-            "redaction": _REDACTION_VERSION,
-            "schema": _CHUNK_SCHEMA,
-            "session_id": record.identity.session_id,
-            "source_event_id": record.identity.source_event_id,
-        }
+        envelope = _redacted_slim_envelope(record)
         canonical = _canonical_bytes(envelope, code="raw.invalid_value")
         split = _split_utf8(canonical, self.policy.chunk_bytes)
         results: list[tuple[str, bytes]] = []
@@ -624,17 +661,102 @@ class NightRunCoordinator:
         counts["proposer_retryable"] = 0
         counts["proposer_circuit_breaker"] = 0
         counts["proposer_wall_budget_exhausted"] = 0
+        # Grouped-by-event accounting (2026-09-15 proposer-slim): one model
+        # call now resolves a representative chunk plus every pending
+        # sibling chunk of the same raw event, so proposer_max_chunks_per_run
+        # bounds model *calls*, not chunk rows.  The pre-existing counters
+        # above keep their old chunk-level meaning (see _finalize_event_success).
+        counts["proposer_events"] = 0
+        counts["proposer_model_calls"] = 0
+        counts["proposer_no_text_events"] = 0
+        counts["proposer_sibling_chunks_closed"] = 0
+        counts["proposer_slim_truncated"] = 0
 
-        pending_rows = self.ledger.list_pending_proposer_chunks(
-            limit=self.policy.proposer_max_chunks_per_run,
-            through=watermark,
-            prioritize_retries=True,
-        )
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.policy.proposer_wall_budget_seconds
+        call_budget = self.policy.proposer_max_chunks_per_run
+
+        to_call: list[
+            tuple[PendingProposerChunk, tuple[PendingProposerChunk, ...], str]
+        ] = []
+        seen_events: set[EventIdentity] = set()
+        cursor: int | None = None
+        first_page = True
+        while len(to_call) < call_budget:
+            if loop.time() >= deadline:
+                counts["proposer_wall_budget_exhausted"] = 1
+                break
+            page = self.ledger.list_pending_proposer_chunks(
+                limit=self.policy.pending_page_size,
+                after=(None if first_page else cursor),
+                through=watermark,
+                prioritize_retries=first_page,
+            )
+            first_page = False
+            if not page:
+                break
+            page_max = max(chunk.row_id for chunk in page)
+            cursor = page_max if cursor is None else max(cursor, page_max)
+            for chunk in page:
+                if loop.time() >= deadline:
+                    counts["proposer_wall_budget_exhausted"] = 1
+                    break
+                if len(chunk.source_event_ids) != 1:
+                    raise NightRunCoordinatorError(
+                        "proposer.source_cardinality"
+                    )
+                event_id = chunk.source_event_ids[0]
+                if event_id in seen_events:
+                    continue
+                seen_events.add(event_id)
+                group = self.ledger.list_pending_proposer_chunks_for_event(
+                    event_id, through=watermark
+                )
+                if not group:
+                    raise NightRunCoordinatorError(
+                        "proposer.event_group_missing"
+                    )
+                for member in group:
+                    if (
+                        len(member.source_event_ids) != 1
+                        or member.source_event_ids[0] != event_id
+                    ):
+                        raise NightRunCoordinatorError(
+                            "proposer.source_cardinality"
+                        )
+                if any(
+                    member.retry_count >= _QUARANTINE_RETRY_THRESHOLD
+                    for member in group
+                ):
+                    # Isolate by event: a quarantined representative must not
+                    # let a fresh (retry_count=0) sibling take over as the
+                    # new representative and restart the retry clock.  Leave
+                    # every chunk in the group untouched and pending.
+                    continue
+                representative = min(group, key=lambda member: member.row_id)
+                siblings = tuple(
+                    member
+                    for member in group
+                    if member.chunk_id != representative.chunk_id
+                )
+                text, truncated, has_text = self._slim_proposer_text(event_id)
+                counts["proposer_events"] += 1
+                if truncated:
+                    counts["proposer_slim_truncated"] += 1
+                if not has_text:
+                    # Observation only (2026-09-15 correction): an earlier
+                    # version skipped the model call here entirely.  Every
+                    # event -- with or without a top-level `text` field --
+                    # now spends exactly one real model call below.
+                    counts["proposer_no_text_events"] += 1
+                to_call.append((representative, siblings, text))
+                if len(to_call) >= call_budget:
+                    break
+            if len(to_call) >= call_budget:
+                break
 
         async def propose_one(
-            pending: PendingProposerChunk,
+            representative: PendingProposerChunk,
             text: str,
             timeout: float,
         ) -> ProposerBatch:
@@ -647,37 +769,20 @@ class NightRunCoordinator:
                             "proposer.relation_targets_invalid"
                         )
                 return await self.proposer.propose(
-                    (ProposerChunk(id=pending.chunk_id, text=text),),
+                    (ProposerChunk(id=representative.chunk_id, text=text),),
                     relation_targets,
                 )
 
             return await asyncio.wait_for(call(), timeout=timeout)
 
-        decoded: list[tuple[PendingProposerChunk, str]] = []
-        for pending in pending_rows:
-            if len(pending.source_event_ids) != 1:
-                raise NightRunCoordinatorError(
-                    "proposer.source_cardinality"
-                )
-            try:
-                text = pending.content.decode("utf-8", errors="strict")
-            except UnicodeError as exc:
-                raise NightRunCoordinatorError(
-                    "proposer.chunk_utf8"
-                ) from exc
-            decoded.append((pending, text))
-
         consecutive_errors = 0
         next_index = 0
-        active: dict[
-            asyncio.Task[ProposerBatch],
-            tuple[int, PendingProposerChunk],
-        ] = {}
+        active: dict[asyncio.Task[ProposerBatch], int] = {}
 
         def schedule_available() -> None:
             nonlocal next_index
             while (
-                next_index < len(decoded)
+                next_index < len(to_call)
                 and len(active) < self.policy.proposer_concurrency
                 and not counts["proposer_circuit_breaker"]
                 and not counts["proposer_wall_budget_exhausted"]
@@ -686,13 +791,13 @@ class NightRunCoordinator:
                 if remaining <= 0:
                     counts["proposer_wall_budget_exhausted"] = 1
                     return
-                pending, text = decoded[next_index]
+                representative, _siblings, text = to_call[next_index]
                 task = asyncio.create_task(
-                    propose_one(pending, text, remaining)
+                    propose_one(representative, text, remaining)
                 )
-                active[task] = (next_index, pending)
+                active[task] = next_index
                 next_index += 1
-                counts["proposer_attempted"] += 1
+                counts["proposer_model_calls"] += 1
 
         schedule_available()
         try:
@@ -701,9 +806,10 @@ class NightRunCoordinator:
                     active,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                ordered = sorted(done, key=lambda task: active[task][0])
+                ordered = sorted(done, key=lambda task: active[task])
                 for task in ordered:
-                    _index, pending = active.pop(task)
+                    index = active.pop(task)
+                    representative, siblings, _text = to_call[index]
                     try:
                         result: ProposerBatch | BaseException = task.result()
                     except BaseException as exc:
@@ -711,10 +817,11 @@ class NightRunCoordinator:
                     if isinstance(result, asyncio.TimeoutError):
                         self._record_proposer_error(
                             run_id,
-                            pending,
+                            representative,
                             "provider.run_budget",
                         )
                         counts["proposer_retryable"] += 1
+                        counts["proposer_attempted"] += 1
                         counts["proposer_errors"] = counts[
                             "proposer_retryable"
                         ]
@@ -725,9 +832,10 @@ class NightRunCoordinator:
                         continue
                     if isinstance(result, ProposerContractError):
                         self._record_proposer_error(
-                            run_id, pending, result.code
+                            run_id, representative, result.code
                         )
                         counts["proposer_retryable"] += 1
+                        counts["proposer_attempted"] += 1
                         counts["proposer_errors"] = counts[
                             "proposer_retryable"
                         ]
@@ -739,46 +847,13 @@ class NightRunCoordinator:
                         raise result
                     consecutive_errors = 0
                     counts["proposer_circuit_breaker"] = 0
-                    candidate_specs = self._candidate_specs(
+                    self._finalize_event_success(
                         run_id=run_id,
-                        pending=pending,
+                        representative=representative,
+                        siblings=siblings,
+                        counts=counts,
                         batch=result,
                     )
-                    with self.ledger.transaction() as tx:
-                        candidate_keys: list[str] = []
-                        for key, axis, payload in candidate_specs:
-                            tx.record_candidate(
-                                key,
-                                axis,
-                                payload,
-                                (pending.chunk_id,),
-                            )
-                            candidate_keys.append(key)
-                        outcome = (
-                            "candidates_persisted"
-                            if candidate_keys
-                            else "zero_candidates"
-                        )
-                        outcome_key = self._proposer_outcome_key(
-                            run_id=run_id,
-                            pending=pending,
-                            batch=result,
-                            candidate_keys=candidate_keys,
-                            outcome=outcome,
-                        )
-                        tx.record_chunk_proposer_outcome(
-                            outcome_key,
-                            pending.chunk_id,
-                            outcome,
-                            candidate_keys=candidate_keys,
-                        )
-                    counts["proposer_succeeded"] += 1
-                    counts["proposer_chunks"] = counts[
-                        "proposer_succeeded"
-                    ]
-                    counts["candidates"] = counts.get(
-                        "candidates", 0
-                    ) + len(candidate_specs)
                 schedule_available()
         finally:
             if active:
@@ -792,6 +867,122 @@ class NightRunCoordinator:
         counts["proposer_unattempted_after"] = after.unattempted
         counts.setdefault("proposer_errors", 0)
         counts.setdefault("proposer_chunks", 0)
+
+    def _slim_proposer_text(
+        self, identity: EventIdentity
+    ) -> tuple[str, bool, bool]:
+        """Rebuild one event's model input fresh from ``raw_events``.
+
+        Returns ``(text, truncated, has_text)``.  ``text`` is always the
+        slimmed envelope encoded as the model input string -- every event
+        spends exactly one real model call now, whether or not it has a
+        non-blank top-level ``text`` field.  (2026-09-15 correction: an
+        earlier version returned ``None``/skipped the model call for
+        events with no top-level ``text``, but that field is proposer
+        shorthand, not a universal event contract; production has other
+        event shapes, and short-circuiting on it silently dropped them
+        from proposer coverage instead of just costing an extra call.)
+        ``has_text`` is kept purely as an observational counter
+        (``proposer_no_text_events``); it never changes control flow.
+        This always reconstructs from the raw event rather than trusting
+        on-disk chunk content, so it behaves identically for chunks cut
+        before and after the _CHUNK_SCHEMA v2 slimming change.
+        """
+
+        record = self.ledger.get_raw_event(identity)
+        envelope = _redacted_slim_envelope(record)
+        canonical = _canonical_bytes(envelope, code="raw.invalid_value")
+        truncated = len(canonical) > self.policy.chunk_bytes
+        if truncated:
+            canonical = _split_utf8(canonical, self.policy.chunk_bytes)[0]
+        try:
+            text = canonical.decode("utf-8", errors="strict")
+        except UnicodeError as exc:
+            raise NightRunCoordinatorError("proposer.chunk_utf8") from exc
+        spoken = envelope["payload"].get("text")
+        has_text = isinstance(spoken, str) and bool(spoken.strip())
+        return text, truncated, has_text
+
+    def _finalize_event_success(
+        self,
+        *,
+        run_id: str,
+        representative: PendingProposerChunk,
+        siblings: tuple[PendingProposerChunk, ...],
+        counts: dict[str, int],
+        batch: ProposerBatch,
+    ) -> None:
+        """Record one event's terminal *successful* proposer outcome.
+
+        Every event spends exactly one real model call now (see
+        ``_slim_proposer_text``), so ``batch`` is always a real
+        ``ProposerBatch`` here, possibly with zero candidates.  Every
+        pending sibling chunk of the same event closes as
+        ``zero_candidates`` in the same ledger transaction as the
+        representative, so no stray chunk is ever left pending forever.
+        """
+
+        candidate_specs = self._candidate_specs(
+            run_id=run_id, pending=representative, batch=batch
+        )
+        with self.ledger.transaction() as tx:
+            candidate_keys: list[str] = []
+            for key, axis, payload in candidate_specs:
+                tx.record_candidate(
+                    key, axis, payload, (representative.chunk_id,)
+                )
+                candidate_keys.append(key)
+            outcome = (
+                "candidates_persisted" if candidate_keys else "zero_candidates"
+            )
+            outcome_key = self._proposer_outcome_key(
+                run_id=run_id,
+                pending=representative,
+                batch=batch,
+                candidate_keys=candidate_keys,
+                outcome=outcome,
+            )
+            tx.record_chunk_proposer_outcome(
+                outcome_key,
+                representative.chunk_id,
+                outcome,
+                candidate_keys=candidate_keys,
+            )
+            for sibling in siblings:
+                tx.record_chunk_proposer_outcome(
+                    self._sibling_outcome_key(
+                        run_id=run_id,
+                        representative=representative,
+                        sibling=sibling,
+                    ),
+                    sibling.chunk_id,
+                    "zero_candidates",
+                )
+        counts["proposer_succeeded"] += 1 + len(siblings)
+        counts["proposer_attempted"] += 1 + len(siblings)
+        counts["proposer_chunks"] = counts["proposer_succeeded"]
+        counts["proposer_sibling_chunks_closed"] += len(siblings)
+        counts["candidates"] = counts.get("candidates", 0) + len(
+            candidate_specs
+        )
+
+    @staticmethod
+    def _sibling_outcome_key(
+        *,
+        run_id: str,
+        representative: PendingProposerChunk,
+        sibling: PendingProposerChunk,
+    ) -> str:
+        identity = {
+            "chunk_id": sibling.chunk_id,
+            "content_digest": sibling.content_digest,
+            "outcome": "zero_candidates",
+            "representative_chunk_id": representative.chunk_id,
+            "run_id": run_id,
+        }
+        return "proposer-success:v1:" + _canonical_digest(
+            identity, code="proposer.outcome_identity"
+        )
 
     def _record_proposer_error(
         self,
@@ -1527,8 +1718,19 @@ class NightRunCoordinator:
         retryable = counts["proposer_retryable"]
         pending_before = counts["proposer_pending_before"]
         pending_after = counts["proposer_pending_after"]
+        # proposer_max_chunks_per_run now bounds model *calls*
+        # (proposer_model_calls): one call can close a representative chunk
+        # plus every pending sibling of its event, so chunk-level
+        # proposer_attempted can legitimately exceed the call cap.  The
+        # five proposer-slim counters (proposer_events/model_calls/
+        # no_text_events/sibling_chunks_closed/slim_truncated) are
+        # observational and deliberately excluded from required_counts so
+        # a counts dict from an older (pre-slim) code path still validates;
+        # a missing proposer_model_calls falls back to the pre-slim
+        # assumption of one model call per attempted chunk.
+        model_calls = counts.get("proposer_model_calls", attempted)
         if (
-            attempted > self.policy.proposer_max_chunks_per_run
+            model_calls > self.policy.proposer_max_chunks_per_run
             or attempted != succeeded + retryable
             or pending_before != succeeded + pending_after
         ):
