@@ -22,6 +22,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import threading
 from dataclasses import asdict, dataclass
@@ -680,8 +681,12 @@ class NightRunCoordinator:
             tuple[PendingProposerChunk, tuple[PendingProposerChunk, ...], str]
         ] = []
         seen_events: set[EventIdentity] = set()
-        cursor: int | None = None
-        first_page = True
+        # Prefer a recent backlog without changing ledger ordering or outcomes.
+        # Zero (the default) preserves the original oldest-first traversal.
+        start_rowid = int(os.environ.get("OMBRE_PROPOSER_START_ROWID", "0"))
+        recent_pass = start_rowid > 0
+        cursor: int | None = start_rowid - 1 if recent_pass else None
+        first_page = not recent_pass
         while len(to_call) < call_budget:
             if loop.time() >= deadline:
                 counts["proposer_wall_budget_exhausted"] = 1
@@ -694,6 +699,14 @@ class NightRunCoordinator:
             )
             first_page = False
             if not page:
+                if recent_pass:
+                    recent_pass = False
+                    cursor = None
+                    first_page = True
+                    # Calls are queued before outcomes are persisted. Keep
+                    # seen_events across both passes to avoid queuing twice;
+                    # the ledger excludes terminal chunks on later runs.
+                    continue
                 break
             page_max = max(chunk.row_id for chunk in page)
             cursor = page_max if cursor is None else max(cursor, page_max)

@@ -772,6 +772,86 @@ async def test_retryable_head_chunk_does_not_block_later_proposals(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start", "call_budget", "expected_rows"),
+    [
+        ("3", 2, [3, 4]),
+        ("3", 8, [3, 4, 1, 2]),
+        ("99", 8, [1, 2, 3, 4]),
+        ("0", 2, [1, 2]),
+        (None, 2, [1, 2]),
+    ],
+)
+async def test_proposer_start_rowid_orders_pages_and_drains_without_repeats(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start: str | None,
+    call_budget: int,
+    expected_rows: list[int],
+) -> None:
+    if start is None:
+        monkeypatch.delenv("OMBRE_PROPOSER_START_ROWID", raising=False)
+    else:
+        monkeypatch.setenv("OMBRE_PROPOSER_START_ROWID", start)
+    harness = _harness(
+        tmp_path,
+        empty_provider=True,
+        policy=NightRunPolicy(
+            pending_page_size=1, proposer_max_chunks_per_run=call_budget
+        ),
+    )
+    for index in range(4):
+        harness.ledger.append_raw_event(
+            "test-session", f"event-{index}", json.dumps({"text": f"event {index}"})
+        )
+    pages: list[tuple[int | None, bool, list[int]]] = []
+    list_pending = harness.ledger.list_pending_proposer_chunks
+
+    def capture_page(**kwargs: Any) -> Any:
+        page = list_pending(**kwargs)
+        pages.append(
+            (kwargs["after"], kwargs["prioritize_retries"], [c.row_id for c in page])
+        )
+        return page
+
+    monkeypatch.setattr(harness.ledger, "list_pending_proposer_chunks", capture_page)
+    cutoff = datetime.now(timezone.utc)
+    first = await harness.coordinator.run(run_id="start-rowid-1", cutoff=cutoff)
+    with sqlite3.connect(harness.ledger.path) as connection:
+        row_by_chunk = dict(connection.execute("SELECT chunk_id, rowid FROM event_chunks"))
+
+    def proposed_rows() -> list[int]:
+        return [
+            row_by_chunk[json.loads(prompt.split("INPUT=", 1)[1])["chunks"][0]["id"]]
+            for prompt in harness.provider.prompts
+        ]
+
+    assert proposed_rows() == expected_rows
+    assert first.counts["proposer_model_calls"] == len(expected_rows)
+    assert first.counts["proposer_pending_after"] == 4 - len(expected_rows)
+    if start is not None and int(start) > 0:
+        assert pages[0][0:2] == (int(start) - 1, False)
+        assert all(row >= int(start) for row in pages[0][2])
+        if call_budget > len(expected_rows):
+            assert any(after is None and priority for after, priority, _ in pages)
+    else:
+        assert pages[0] == (None, True, [1])
+
+    second = await harness.coordinator.run(run_id="start-rowid-2", cutoff=cutoff)
+    assert second.run.stage == "complete"
+    assert second.counts["proposer_pending_after"] == 0
+    assert sorted(proposed_rows()) == [1, 2, 3, 4]
+    assert len(proposed_rows()) == len(set(proposed_rows()))
+    third = await harness.coordinator.run(run_id="start-rowid-3", cutoff=cutoff)
+    assert third.counts["proposer_model_calls"] == 0
+    with sqlite3.connect(harness.ledger.path) as connection:
+        assert connection.execute(
+            "SELECT count(*), count(DISTINCT chunk_id) FROM chunk_proposer_outcomes "
+            "WHERE outcome IN ('zero_candidates', 'candidates_persisted')"
+        ).fetchone() == (4, 4)
+
+
+@pytest.mark.asyncio
 async def test_proposer_cap_defers_then_next_run_drains_without_repeats(
     tmp_path: Path,
 ) -> None:
