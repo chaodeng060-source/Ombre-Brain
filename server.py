@@ -1822,6 +1822,11 @@ def _ds_gate_timeout() -> float:
         return 8.0
 
 
+# 主线失败后，剩余预算少于这个数就不再试备用线——打一次模型至少要一秒多，
+# 余额不够还硬打，只会把这一轮拖过 Ombre 的 11 秒截止线，反而交回半截。
+_DS_FALLBACK_MIN_BUDGET_SEC = 1.5
+
+
 def _normalize_anchor_recall_policy(value: str) -> str:
     policy = str(value or "search").strip().lower()
     return policy if policy in ANCHOR_RECALL_POLICIES else "search"
@@ -2371,6 +2376,55 @@ _DS_SELECT_CACHE: dict[str, tuple[float, list[int]]] = {}
 _DS_FILTER_PROVIDER_CLIENTS: dict[tuple[str, str, str], object] = {}
 
 
+# 2026-09-16 朝灯拍板的备用线：主线 ApiRoute gemini-3.7-flash 9/15 16:38–23:12
+# 连续 502，门卫十二连挂、候选原样全放行＝她傍晚看到的那批噪音。
+# 「批准通道」这道校验不删，改成显式白名单：每条允许的线路都要在这里写明，
+# 拼错或没登记的组合照旧 raise，不给静默降级留口子（同 balanced 那个坑的教训）。
+_DS_FILTER_APPROVED_CHANNELS = {
+    ("https://apiroute.top/v1", "gemini-3.7-flash"),
+    ("https://api.deepseek.com/v1", "deepseek-chat"),
+    ("https://api.deepseek.com", "deepseek-chat"),
+}
+
+
+def _ds_channel_is_approved(base_url: str, model: str) -> bool:
+    return (base_url.rstrip("/"), model) in {
+        (u.rstrip("/"), m) for u, m in _DS_FILTER_APPROVED_CHANNELS
+    }
+
+
+def _ds_filter_fallback_provider() -> tuple[str, str, object, dict] | None:
+    """备用线。没配就返回 None——不配置＝行为与改动前完全一致。
+
+    只在主线失败后用，且与主线共用同一份总等待预算（见 _ds_filter_candidates），
+    不会因为多试一条线就让朝灯多等。
+    """
+    api_key = os.getenv("OMBRE_DS_FILTER_FALLBACK_API_KEY", "").strip()
+    if not api_key:
+        return None
+    base_url = os.getenv(
+        "OMBRE_DS_FILTER_FALLBACK_BASE_URL", "https://api.deepseek.com/v1"
+    ).strip().rstrip("/")
+    model = os.getenv("OMBRE_DS_FILTER_FALLBACK_MODEL", "deepseek-chat").strip()
+    if not base_url or not model:
+        raise RuntimeError("ds_filter fallback credentials are incomplete")
+    if not _ds_channel_is_approved(base_url, model):
+        raise RuntimeError("ds_filter fallback route does not match an approved channel")
+    identity = (
+        base_url,
+        model,
+        hashlib.sha256(api_key.encode("utf-8")).hexdigest(),
+    )
+    client = _DS_FILTER_PROVIDER_CLIENTS.get(identity)
+    if client is None:
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        _DS_FILTER_PROVIDER_CLIENTS[identity] = client
+    # DeepSeek 不吃 gemini 那条 reasoning_effort 参数，别带过去（8/20 试死过一次）。
+    return "fallback-deepseek", model, client, {}
+
+
 def _ds_filter_provider() -> tuple[str, str, object, dict]:
     """Resolve only the ds_filter provider; dehydration remains untouched."""
     provider = os.getenv("OMBRE_DS_FILTER_PROVIDER", "shared").strip().lower()
@@ -2394,7 +2448,7 @@ def _ds_filter_provider() -> tuple[str, str, object, dict]:
     model = os.getenv("OMBRE_DS_FILTER_MODEL", "gemini-3.7-flash").strip()
     if not api_key or not base_url or not model:
         raise RuntimeError("ApiRoute Gemini ds_filter credentials are incomplete")
-    if base_url != "https://apiroute.top/v1" or model != "gemini-3.7-flash":
+    if not _ds_channel_is_approved(base_url, model):
         raise RuntimeError("ApiRoute Gemini ds_filter route does not match the approved channel")
 
     identity = (
@@ -2464,9 +2518,17 @@ async def _ds_semantic_select(
     buckets: list[dict],
     keep: set[str],
     max_results: int,
+    *,
+    provider_override: tuple[str, str, object, dict] | None = None,
 ) -> list[dict]:
-    """用选定小模型判断语义相关性；纯减法，不重排、不外拉。"""
-    provider, model, client, provider_kwargs = _ds_filter_provider()
+    """用选定小模型判断语义相关性；纯减法，不重排、不外拉。
+
+    provider_override 传入时走备用线（主线失败后的第二次尝试），
+    其余行为——提示词、解析、缓存键——与主线完全一致。
+    """
+    provider, model, client, provider_kwargs = (
+        provider_override if provider_override is not None else _ds_filter_provider()
+    )
     full_body_windows = _ds_full_body_windows_enabled()
     lines = []
     for i, b in enumerate(buckets):
@@ -2685,10 +2747,55 @@ async def _ds_filter_candidates(
         record_decision("fallback", outcome, len(capped), len(result))
         return result
 
+    # 2026-09-16：主备共用一份总预算。主线快速失败（9/15 的 502 白等 3.7 秒）时
+    # 剩下的时间拿去试备用线；主线是耗满超时，就没有余额、直接走保守回退——
+    # 绝不因为多一条线让朝灯多等一轮。
+    _gate_budget = _ds_gate_timeout()
+    _gate_started = time.monotonic()
+
+    async def try_fallback_line(primary_outcome: str) -> list[dict] | None:
+        """返回备用线结果；没配、没余额或备用线也挂了都返回 None。"""
+        remaining = _gate_budget - (time.monotonic() - _gate_started)
+        if remaining < _DS_FALLBACK_MIN_BUDGET_SEC:
+            logger.info(
+                "DS filter fallback line skipped: 预算只剩 %.2fs，不够再打一次",
+                max(0.0, remaining),
+            )
+            return None
+        try:
+            spare = _ds_filter_fallback_provider()
+        except Exception as exc:
+            logger.warning("DS filter fallback provider unavailable: %s", type(exc).__name__)
+            return None
+        if spare is None:
+            return None
+        try:
+            kept_spare = await asyncio.wait_for(
+                _ds_semantic_select(
+                    query, capped, keep, max_results, provider_override=spare
+                ),
+                timeout=remaining,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "DS filter fallback line also failed after primary=%s (%s)",
+                primary_outcome, type(exc).__name__,
+            )
+            return None
+        spare_result = kept_spare if kept_spare or allow_empty else capped
+        record_decision("fallback_line", "ok", len(capped), len(spare_result))
+        logger.info(
+            "DS filter served by fallback line after primary=%s input=%d kept=%d",
+            primary_outcome, len(capped), len(spare_result),
+        )
+        return spare_result
+
     try:
         kept = await asyncio.wait_for(
             _ds_semantic_select(query, capped, keep, max_results),
-            timeout=_ds_gate_timeout(),
+            timeout=_gate_budget,
         )
     except asyncio.CancelledError:
         result = failure_result("timeout")
@@ -2700,6 +2807,10 @@ async def _ds_filter_candidates(
         )
         raise
     except asyncio.TimeoutError as e:
+        # 超时＝预算已耗尽，try_fallback_line 会自行判定没余额并跳过。
+        spare = await try_fallback_line("timeout")
+        if spare is not None:
+            return spare
         result = failure_result("timeout")
         logger.warning(
             "DS filter used conservative fallback outcome=timeout "
@@ -2708,6 +2819,9 @@ async def _ds_filter_candidates(
         )
         return result
     except DSFilterInvalidPayloadError as e:
+        spare = await try_fallback_line("invalid")
+        if spare is not None:
+            return spare
         result = failure_result("invalid")
         logger.warning(
             "DS filter used conservative fallback outcome=invalid "
@@ -2716,6 +2830,9 @@ async def _ds_filter_candidates(
         )
         return result
     except Exception as e:
+        spare = await try_fallback_line("error")
+        if spare is not None:
+            return spare
         result = failure_result("error")
         logger.warning(
             "DS filter used conservative fallback outcome=error "
