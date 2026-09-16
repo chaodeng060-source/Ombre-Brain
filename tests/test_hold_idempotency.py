@@ -56,6 +56,18 @@ def files(manager):
 
 
 @pytest.mark.asyncio
+async def test_keyed_bucket_remains_visible_to_literal_recall_and_patrol(runtime):
+    from rg_literal_recall import bucket_id_from_path
+    from patrol import _bucket_filename_shape
+    manager, *_ = runtime
+    result = await write()
+    path = files(manager)[0]
+    assert bucket_id_from_path(str(path)) == result["bucket_id"]
+    assert _bucket_filename_shape({"source_kind": "markdown",
+        "frontmatter_id": result["bucket_id"], "source_basename": path.name}) is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", [{}, {"feel": True}, {"pinned": True}])
 async def test_first_write_and_replay_do_not_touch_existing_body_or_metadata(runtime, mode):
     manager, analyze, embedding = runtime

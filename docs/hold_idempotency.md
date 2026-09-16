@@ -9,7 +9,8 @@ The write identity is SHA256 of the versioned JSON tuple:
 `["ombre.hold/v1", event_key, effective_world, feel, pinned, body_sha256]`.
 
 HTTP content is trimmed as before; SHA256 is of that exact UTF-8 body. The first
-24 hex digits of the identity are the bucket ID. The full identity and body
+12 hex digits of the identity are the bucket ID, matching literal recall and
+patrol's existing ID contract. The full identity and body
 SHA256 are written into the first Markdown frontmatter, atomically with its body.
 The existing per-bucket process/file lock protects check-and-create. A replay
 re-reads the file, checks both hashes and actual body equality, logs
@@ -25,9 +26,14 @@ Same text in another event/world/storage mode, or changed text in the same
 event, remains a separate write. Keyed writes bypass heuristic merging. This
 is deliberate: world+text alone cannot distinguish two real occurrences of the
 same words. Callers must provide a stable, namespaced occurrence identity.
+Skipping heuristic merging changes bucket growth and candidate-pool composition:
+identified imprint events now use one event/body per bucket. The 24-hour report
+must include total new buckets as well as repeated bodies before accepting that tradeoff.
 The Twin imprint adapter uses its durable source event ID; legacy candidates
 use occurrence timestamp, session and original conversation fields. Cached
 pre-fix requests receive that key at send time, without another model judgment.
+If either timestamp or session is missing and no durable event ID exists, do not
+send a key: retain the legacy random-ID path rather than infer identity from text.
 
 There is no backfill, scan-to-delete, migration or mutation of existing buckets.
 Old unmarked buckets are not assumed to be the same event: a still-pending old
@@ -41,9 +47,11 @@ Independent write-loss review must precede production changes. Deploy Ombre
 before loading the Twin writer change, and never restart an active Twin reply.
 Prepare the source archive from the reviewed commit with `git archive`; verify
 the production env/container anchor and the live/source reconciliation manifest.
-The current manifest includes the narrow changed module hashes; unrelated live
-drift must still pass the existing deployer's own checks. No secrets belong in
-an archive or a public diff.
+The server manifest is deliberately UNRECONCILED: the live DS fallback differs
+from this branch's parent. Do not deploy this branch as a whole-tree archive.
+First preserve the live fallback in a controlled integration tree, apply this
+patch, review the combined diff and regenerate the manifest from that tree.
+No secrets belong in an archive or a public diff.
 
 ```sh
 bash scripts/deploy_hold_idempotency.sh --env-file /operator/production.env \

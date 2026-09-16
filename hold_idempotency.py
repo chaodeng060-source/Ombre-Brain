@@ -36,7 +36,7 @@ class HoldWriteIdentity:
 
     @property
     def bucket_id(self) -> str:
-        return self.digest[:24]
+        return self.digest[:12]
 
     def verify(self, metadata: dict, stored_content: str, requested_content: str) -> None:
         if (metadata.get("hold_write_identity") != self.digest
