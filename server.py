@@ -3137,10 +3137,6 @@ def _recall_dehydrate_async_enabled() -> bool:
     return flag not in {"0", "false", "off"}
 
 
-_DEHYDRATE_BACKFILL_PENDING: set[str] = set()
-_DEHYDRATE_BACKFILL_SEM = asyncio.Semaphore(2)
-
-
 def _ds_offpeak_now(now: datetime | None = None) -> bool:
     """朝灯 2026-08-28 定的错峰约束：非实时的 DS 调用避开她的工作时段。
 
@@ -3157,91 +3153,6 @@ def _ds_offpeak_now(now: datetime | None = None) -> bool:
     return not (9 <= hour < 12 or 14 <= hour < 18)
 
 
-async def _extend_e_axis_cache_after_summary_write(token_pre) -> None:
-    """Re-key the E-axis cache after a summary-only frontmatter write.
-
-    cache_recall_dehydration touches only ``dehydrated_summary`` /
-    ``dehydrated_content_hash`` — fields the E grouping never reads — yet the
-    write moves the directory snapshot and would evict the cache, forcing the
-    next beat back onto a full-library rescan (the two perf fixes fighting
-    each other).  Extension is gated on ``token_pre`` (snapshot taken before
-    the write) still matching the cache: if any real bucket write slipped in
-    before ours, the tokens disagree and we leave eviction to do its job.
-    The remaining race (another write between our write and the token read
-    below) can only delay one freshly-authored E row until the next write —
-    it cannot corrupt existing rows, because summary writes never change the
-    fields the grouping reads.
-    """
-    cache = _E_AXIS_ROWS_CACHE
-    if token_pre is None or cache["token"] != token_pre:
-        return
-    token_fn = getattr(bucket_mgr, "recall_snapshot_token", None)
-    if not callable(token_fn):
-        token_fn = getattr(bucket_mgr, "list_all_snapshot_token", None)
-    if not callable(token_fn):
-        return
-    try:
-        cache["token"] = await token_fn(include_archive=False)
-    except Exception as exc:
-        logger.warning(
-            "E-axis cache token extension failed; next beat rebuilds: %s",
-            type(exc).__name__,
-        )
-        cache["token"] = None
-
-
-def _schedule_recall_dehydration_backfill(bucket_id: str, content: str, body_hash: str) -> None:
-    """Compute the LLM summary off the recall path and persist it for next beat."""
-    if not bucket_id or bucket_id in _DEHYDRATE_BACKFILL_PENDING:
-        return
-    if not _ds_offpeak_now():
-        # 工作时段不补摘要（朝灯 8/28 错峰令）；不进 pending，
-        # 下次召回撞到同桶会重新调度，晚间自然放行。
-        return
-    _DEHYDRATE_BACKFILL_PENDING.add(bucket_id)
-
-    async def _run() -> None:
-        try:
-            async with _DEHYDRATE_BACKFILL_SEM:
-                with_source = getattr(dehydrator, "dehydrate_with_source", None)
-                if not callable(with_source):
-                    return
-                raw_summary, _source = await with_source(content, None, write_cache=False)
-                if not isinstance(raw_summary, str) or len(raw_summary.strip()) < 10:
-                    return
-                writer = getattr(bucket_mgr, "cache_recall_dehydration", None)
-                if callable(writer):
-                    token_fn = getattr(bucket_mgr, "recall_snapshot_token", None)
-                    if not callable(token_fn):
-                        token_fn = getattr(
-                            bucket_mgr,
-                            "list_all_snapshot_token",
-                            None,
-                        )
-                    token_pre = (
-                        await token_fn(include_archive=False)
-                        if callable(token_fn)
-                        else None
-                    )
-                    persisted = await writer(
-                        bucket_id,
-                        expected_content_hash=body_hash,
-                        summary=raw_summary,
-                    )
-                    if persisted:
-                        await _extend_e_axis_cache_after_summary_write(token_pre)
-        except Exception as exc:
-            logger.warning(
-                "Async recall dehydration backfill failed for %s: %s",
-                bucket_id,
-                type(exc).__name__,
-            )
-        finally:
-            _DEHYDRATE_BACKFILL_PENDING.discard(bucket_id)
-
-    asyncio.create_task(_run())
-
-
 def _frontmatter_dehydration_cache_enabled() -> bool:
     cfg = config.get("dehydration", {}) or {}
     return cfg.get("recall_frontmatter_cache_enabled", True) is not False
@@ -3254,115 +3165,40 @@ async def _dehydrate_for_recall(
     bucket: dict | None = None,
     allow_async_fallback: bool = False,
 ) -> str:
-    """Render recall text and persist only its derived bucket summary.
+    """Render caller-local metadata around a strict, shared derived summary.
 
-    ``dehydrated_summary`` is valid while the exact Markdown body hash is
-    unchanged.  The write path is isolated from ``last_active`` and other
-    factual metadata, so caching cannot heat a bucket or alter ranking.
+    Recall never reads unversioned bucket summaries or writes vault frontmatter.
     """
-    cache_enabled = _frontmatter_dehydration_cache_enabled()
-    bucket_metadata = (
-        bucket.get("metadata", {})
-        if isinstance(bucket, dict) and isinstance(bucket.get("metadata"), dict)
-        else {}
-    )
-    raw_body = str(bucket.get("content") or "") if isinstance(bucket, dict) else ""
-    body_hash = hashlib.sha256(raw_body.encode("utf-8")).hexdigest() if bucket else ""
-    stored_summary = bucket_metadata.get("dehydrated_summary")
-    if (
-        cache_enabled
-        and isinstance(stored_summary, str)
-        and len(stored_summary.strip()) >= 10
-        and bucket_metadata.get("dehydrated_content_hash") == body_hash
-    ):
-        record_recall_dehydration("frontmatter_hits")
-        formatter = getattr(dehydrator, "format_dehydration_summary", None)
-        if callable(formatter):
-            return formatter(stored_summary.strip(), metadata)
-        return stored_summary.strip()
-
-    if cache_enabled and bucket and allow_async_fallback and _recall_dehydrate_async_enabled():
-        # Recall beats must not wait on a live LLM summary.  Serve a truncated
-        # body now, push the real dehydration to a background task that writes
-        # the frontmatter cache, and let the next beat hit it.  Quality dips
-        # once per bucket, latency spike disappears every time.
-        fallback_id = str(bucket.get("id") or "")
-        if fallback_id:
-            _schedule_recall_dehydration_backfill(fallback_id, content, body_hash)
-            record_recall_dehydration("passthrough_async")
-            squashed = " ".join(content.split())
-            fallback = squashed[:300] + ("…" if len(squashed) > 300 else "")
-            formatter = getattr(dehydrator, "format_dehydration_summary", None)
-            if callable(formatter):
-                return formatter(fallback, metadata)
-            return fallback
-
-    with_source = getattr(dehydrator, "dehydrate_with_source", None)
-    if callable(with_source):
-        raw_summary, source = await with_source(
+    strict = getattr(dehydrator, "dehydrate_recall_with_source", None)
+    if callable(strict):
+        raw_summary, source = await strict(
             content,
-            None,
-            write_cache=False,
-        )
-        formatter = getattr(dehydrator, "format_dehydration_summary", None)
-        rendered = (
-            formatter(raw_summary, metadata)
-            if callable(formatter)
-            else raw_summary
+            raw_body=str(bucket.get("content") or "") if bucket else content,
+            allow_async_fallback=bool(
+                bucket and bucket.get("id") and allow_async_fallback
+                and _frontmatter_dehydration_cache_enabled()
+                and _recall_dehydrate_async_enabled()
+            ),
+            schedule_async=_ds_offpeak_now(),
         )
     else:
-        # Test doubles and older rollback implementations keep the original
-        # dehydrate signature.  Production always uses the source-aware path.
-        rendered = await dehydrator.dehydrate(
-            content,
-            metadata,
-            write_cache=False,
-        )
-        raw_summary = rendered
-        source = "computed"
-
-    if source == "cached":
-        record_recall_dehydration("backfilled")
-    elif source == "computed":
-        record_recall_dehydration("computed")
-    else:
-        record_recall_dehydration("passthrough")
-
-    if cache_enabled and bucket and source != "passthrough":
-        writer = getattr(bucket_mgr, "cache_recall_dehydration", None)
-        persisted = False
-        if callable(writer):
-            try:
-                token_fn = getattr(bucket_mgr, "recall_snapshot_token", None)
-                if not callable(token_fn):
-                    token_fn = getattr(
-                        bucket_mgr,
-                        "list_all_snapshot_token",
-                        None,
-                    )
-                token_pre = (
-                    await token_fn(include_archive=False)
-                    if callable(token_fn)
-                    else None
-                )
-                persisted = await writer(
-                    str(bucket.get("id") or ""),
-                    expected_content_hash=body_hash,
-                    summary=raw_summary,
-                )
-                if persisted:
-                    # Same summary-only write as the async backfill path: keep
-                    # the E-axis cache alive instead of letting this evict it.
-                    await _extend_e_axis_cache_after_summary_write(token_pre)
-            except Exception as exc:
-                logger.warning(
-                    "Recall summary frontmatter write failed for %s: %s",
-                    bucket.get("id"),
-                    type(exc).__name__,
-                )
-        if not persisted:
-            record_recall_dehydration("persist_failed")
-    return rendered
+        # Older rollback implementations and test doubles have no strict API.
+        # Keep their read-only call signature, never reinstate bucket writes.
+        with_source = getattr(dehydrator, "dehydrate_with_source", None)
+        if not callable(with_source):
+            return await dehydrator.dehydrate(content, metadata, write_cache=False)
+        raw_summary, source = await with_source(content, None, write_cache=False)
+    metric = {
+        "memory_hit": "backfilled",
+        "persistent_hit": "backfilled",
+        "coalesced_hit": "backfilled",
+        "cached": "backfilled",
+        "computed": "computed",
+        "passthrough_async": "passthrough_async",
+    }.get(source, "passthrough")
+    record_recall_dehydration(metric)
+    formatter = getattr(dehydrator, "format_dehydration_summary", None)
+    return formatter(raw_summary, metadata) if callable(formatter) else raw_summary
 
 
 def _local_partial_recall_text(

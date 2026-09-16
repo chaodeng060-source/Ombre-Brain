@@ -271,11 +271,9 @@ async def test_breath_y_walk_applies_z_gate_without_writing_dehydration_cache(
             )()
         },
     )()
-    main_summary = await restarted.dehydrate(main["content"], write_cache=False)
-    current_summary = await restarted.dehydrate(
-        current["content"],
-        write_cache=False,
-    )
+    main_summary, main_source = await restarted.dehydrate_recall_with_source(main["content"])
+    current_summary, current_source = await restarted.dehydrate_recall_with_source(current["content"])
     assert "只读召回摘要" in main_summary
     assert "只读召回摘要" in current_summary
+    assert main_source == current_source == "persistent_hit"
     assert restarted_completions.requests == []

@@ -196,15 +196,15 @@ def _fresh_bucket(body: str) -> dict:
     return {"id": "b-async-1", "content": body, "metadata": {}}
 
 
-def test_async_fallback_returns_immediately_and_backfills(monkeypatch):
+def test_async_fallback_returns_immediately_and_backfills(monkeypatch, test_config):
+    from tests.test_recall_summary_reuse import make, SUMMARY
     monkeypatch.setattr(server, "_ds_offpeak_now", lambda: True)
-    dehy = _SlowDehydrator()
+    dehy, provider = make(test_config)
     mgr = _WriterMgr()
     monkeypatch.setattr(server, "dehydrator", dehy)
     monkeypatch.setattr(server, "bucket_mgr", mgr)
     monkeypatch.setattr(server, "config", {"dehydration": {}})
     monkeypatch.delenv("OMBRE_RECALL_DEHYDRATE_ASYNC", raising=False)
-    server._DEHYDRATE_BACKFILL_PENDING.clear()
 
     body = "这是一个还没有脱水缓存的长桶正文 " * 30
 
@@ -216,22 +216,16 @@ def test_async_fallback_returns_immediately_and_backfills(monkeypatch):
             allow_async_fallback=True,
         )
         # Immediate degraded summary, no synchronous LLM call.
-        assert dehy.calls == 0
+        assert len(provider.requests) == 0
         assert summary.startswith("这是一个还没有脱水缓存的长桶正文")
         assert len(summary) <= 301
-        # Background task computes and persists the real summary.
-        await asyncio.sleep(0)
-        for _ in range(20):
-            if mgr.writes:
-                break
-            await asyncio.sleep(0.01)
-        assert dehy.calls == 1
-        assert len(mgr.writes) == 1
-        bucket_id, content_hash, written = mgr.writes[0]
-        assert bucket_id == "b-async-1"
-        assert content_hash == hashlib.sha256(body.encode("utf-8")).hexdigest()
-        assert written.startswith("LLM 摘要：")
-        assert not server._DEHYDRATE_BACKFILL_PENDING
+        # Only the disposable sidecar is filled; no bucket write or E-axis
+        # cache retokening is necessary anymore.
+        await asyncio.gather(*(entry.task for entry in dehy._recall_summary_flights.values()))
+        assert len(provider.requests) == 1
+        assert mgr.writes == []
+        assert await server._dehydrate_for_recall(body, {}, bucket=_fresh_bucket(body)) == SUMMARY
+        assert not dehy._recall_summary_flights
     asyncio.run(scenario())
 
 
@@ -242,7 +236,6 @@ def test_async_fallback_disabled_keeps_synchronous_path(monkeypatch):
     monkeypatch.setattr(server, "bucket_mgr", mgr)
     monkeypatch.setattr(server, "config", {"dehydration": {}})
     monkeypatch.setenv("OMBRE_RECALL_DEHYDRATE_ASYNC", "0")
-    server._DEHYDRATE_BACKFILL_PENDING.clear()
 
     body = "开关关闭时保持原同步行为的桶正文"
 
@@ -258,10 +251,11 @@ def test_async_fallback_disabled_keeps_synchronous_path(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_backfill_write_extends_e_axis_cache_instead_of_evicting(monkeypatch):
-    """夏刀互搏回归：补写 summary 不得炸掉 E 轴小抽屉（16:11 实测抓到的）。"""
+def test_summary_reuse_keeps_e_axis_cache_without_bucket_write(monkeypatch, test_config):
+    """Derived cache must not move the vault snapshot or evict E-axis rows."""
+    from tests.test_recall_summary_reuse import make
     monkeypatch.setattr(server, "_ds_offpeak_now", lambda: True)
-    dehy = _SlowDehydrator()
+    dehy, provider = make(test_config)
 
     class _TokenWriterMgr(_WriterMgr):
         def __init__(self):
@@ -285,7 +279,6 @@ def test_backfill_write_extends_e_axis_cache_instead_of_evicting(monkeypatch):
     monkeypatch.setattr(server, "bucket_mgr", mgr)
     monkeypatch.setattr(server, "config", {"dehydration": {}})
     monkeypatch.delenv("OMBRE_RECALL_DEHYDRATE_ASYNC", raising=False)
-    server._DEHYDRATE_BACKFILL_PENDING.clear()
     server._E_AXIS_ROWS_CACHE["token"] = ("key", ("snap", 1))
     server._E_AXIS_ROWS_CACHE["cfg"] = (True, 0.3)
     server._E_AXIS_ROWS_CACHE["rows"] = {"kept": ()}
@@ -296,13 +289,10 @@ def test_backfill_write_extends_e_axis_cache_instead_of_evicting(monkeypatch):
         await server._dehydrate_for_recall(
             body, {}, bucket=_fresh_bucket(body), allow_async_fallback=True,
         )
-        for _ in range(20):
-            if mgr.writes:
-                break
-            await asyncio.sleep(0.01)
-        await asyncio.sleep(0.02)
-        # Cache token followed the write instead of being left stale/evicted.
-        assert server._E_AXIS_ROWS_CACHE["token"] == ("key", ("snap", 2))
+        await asyncio.gather(*(entry.task for entry in dehy._recall_summary_flights.values()))
+        assert len(provider.requests) == 1
+        assert mgr.writes == []
+        assert server._E_AXIS_ROWS_CACHE["token"] == ("key", ("snap", 1))
         assert server._E_AXIS_ROWS_CACHE["rows"] == {"kept": ()}
     asyncio.run(scenario())
     _reset_e_cache()
@@ -329,7 +319,6 @@ def test_backfill_write_does_not_extend_when_world_moved_first(monkeypatch):
     monkeypatch.setattr(server, "bucket_mgr", mgr)
     monkeypatch.setattr(server, "config", {"dehydration": {}})
     monkeypatch.delenv("OMBRE_RECALL_DEHYDRATE_ASYNC", raising=False)
-    server._DEHYDRATE_BACKFILL_PENDING.clear()
     stale_token = ("key", ("snap", 1))
     server._E_AXIS_ROWS_CACHE["token"] = stale_token
     server._E_AXIS_ROWS_CACHE["cfg"] = (True, 0.3)

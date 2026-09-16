@@ -82,7 +82,7 @@ class _SourceAwareDehydrator:
 
 
 @pytest.mark.asyncio
-async def test_frontmatter_hit_skips_dehydrator_and_trace_counts_sources(monkeypatch):
+async def test_unversioned_frontmatter_is_not_reused_or_written(monkeypatch):
     manager = _RecordingManager()
     source = _SourceAwareDehydrator()
     monkeypatch.setattr(server, "bucket_mgr", manager)
@@ -123,13 +123,11 @@ async def test_frontmatter_hit_skips_dehydrator_and_trace_counts_sources(monkeyp
 
     assert first.startswith("第一次\n")
     assert second.startswith("第二次\n")
-    assert source.calls == 1
-    assert manager.writes[0][0] == "bucket-a"
-    assert manager.writes[0][1]["expected_content_hash"] == body_hash
-    assert receipt["dehydration"] == {
-        "computed": 1,
-        "frontmatter_hits": 1,
-    }
+    # This legacy test double has no strict shared cache. Neither read should
+    # trust a bucket summary with an unknown model/prompt contract.
+    assert source.calls == 2
+    assert manager.writes == []
+    assert receipt["dehydration"] == {"computed": 2}
 
 
 @pytest.mark.asyncio
@@ -166,6 +164,4 @@ async def test_content_change_invalidates_frontmatter_summary(monkeypatch):
 
     assert "新算出的原始摘要" in result
     assert source.calls == 1
-    assert manager.writes[0][1]["expected_content_hash"] == hashlib.sha256(
-        new_body.encode("utf-8")
-    ).hexdigest()
+    assert manager.writes == []

@@ -30,8 +30,10 @@ import sqlite3
 import logging
 import asyncio
 import stat
+import time
 from collections import OrderedDict
-from contextlib import closing
+from contextlib import closing, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from openai import AsyncOpenAI
 from e_axis_shadow import strict_json_loads
@@ -46,11 +48,28 @@ READ_ONLY_DEHYDRATION_CACHE_LIMIT = 256
 RECALL_DEHYDRATION_CACHE_LIMIT = 8192
 RECALL_DEHYDRATION_CACHE_SCHEMA_V1 = "ombre.recall-dehydration/v1"
 RECALL_DEHYDRATION_CACHE_SCHEMA = "ombre.recall-dehydration/v2"
+RECALL_SUMMARY_REUSE_SCHEMA = "ombre.recall-summary-strict/v1"
 RECALL_REDACTION_CONTRACT = "redact_embedding_input/v1"
 RECALL_OUTPUT_CONTRACT = "normalized-summary/v1"
 RECALL_LEGACY_PROMPT_SHA256 = (
     "4e55aaa28a183fe953a99f205873f05d484fc624d6c97609327aea5bd019b17a"
 )
+
+
+@dataclass(frozen=True)
+class _RecallSummaryRequest:
+    key: str
+    body_hash: str
+    model: str
+    request_json: str
+    client: object
+
+
+@dataclass
+class _RecallSummaryFlight:
+    task: asyncio.Task
+    waiters: int = 0
+    detached: bool = False
 
 
 class SelfContainmentError(RuntimeError):
@@ -960,6 +979,8 @@ class Dehydrator:
             "recall_dehydration_cache.db",
         )
         self._read_only_summary_cache: OrderedDict[str, str] = OrderedDict()
+        self._recall_summary_flights: dict[str, _RecallSummaryFlight] = {}
+        self._recall_summary_backfill_sem = asyncio.Semaphore(2)
         self._init_cache_db()
         self._init_recall_cache_db()
 
@@ -1196,8 +1217,9 @@ class Dehydrator:
             f"{serialized}\x00{content}".encode()
         ).hexdigest()
 
-    def _get_recall_cached_summary(self, content: str) -> str | None:
+    def _get_recall_cached_summary(self, content: str, *, cache_key: str | None = None) -> str | None:
         """Read the disposable recall cache without mutating any database."""
+        cache_key = cache_key or self._recall_cache_key(content)
         cache_path = Path(self.recall_cache_db_path).absolute()
         if not cache_path.is_file():
             return None
@@ -1211,7 +1233,7 @@ class Dehydrator:
                 row = conn.execute(
                     "SELECT summary FROM recall_dehydration_cache "
                     "WHERE cache_key = ?",
-                    (self._recall_cache_key(content),),
+                    (cache_key,),
                 ).fetchone()
         except (OSError, sqlite3.Error) as exc:
             logger.warning(
@@ -1226,7 +1248,7 @@ class Dehydrator:
             logger.warning(
                 "Ignoring near-empty recall dehydration cache entry: "
                 "cache_key=%s length=%d",
-                self._recall_cache_key(content)[:12],
+                cache_key[:12],
                 len(summary),
             )
             return None
@@ -1282,7 +1304,9 @@ class Dehydrator:
             return False
         return row is not None
 
-    def _set_recall_cached_summary(self, content: str, summary: str) -> bool:
+    def _set_recall_cached_summary(
+        self, content: str, summary: str, *, snapshot: _RecallSummaryRequest | None = None,
+    ) -> bool:
         """Persist a derived recall summary; cache failures never fail recall."""
         summary = self._normalize_dehydration_summary(summary)
         content_hash = hashlib.sha256(content.encode()).hexdigest()
@@ -1302,11 +1326,11 @@ class Dehydrator:
                     "(cache_key, content_hash, summary, model, cache_schema) "
                     "VALUES (?, ?, ?, ?, ?)",
                     (
-                        self._recall_cache_key(content),
-                        content_hash,
+                        snapshot.key if snapshot else self._recall_cache_key(content),
+                        snapshot.body_hash if snapshot else content_hash,
                         summary,
-                        self.model,
-                        RECALL_DEHYDRATION_CACHE_SCHEMA,
+                        snapshot.model if snapshot else self.model,
+                        RECALL_SUMMARY_REUSE_SCHEMA if snapshot else RECALL_DEHYDRATION_CACHE_SCHEMA,
                     ),
                 )
                 row_count = conn.execute(
@@ -1330,9 +1354,9 @@ class Dehydrator:
             return False
         return True
 
-    def _get_read_only_memory_summary(self, content: str) -> str | None:
+    def _get_read_only_memory_summary(self, content: str, *, cache_key: str | None = None) -> str | None:
         """Read a recall-only summary without touching persistent storage."""
-        cache_key = self._read_only_cache_key(content)
+        cache_key = cache_key or self._read_only_cache_key(content)
         summary = self._read_only_summary_cache.pop(cache_key, None)
         if summary is None:
             return None
@@ -1342,12 +1366,12 @@ class Dehydrator:
         self._read_only_summary_cache[cache_key] = summary
         return summary
 
-    def _set_read_only_memory_summary(self, content: str, summary: str) -> None:
+    def _set_read_only_memory_summary(self, content: str, summary: str, *, cache_key: str | None = None) -> None:
         """Bound repeated recall misses without writing the SQLite cache."""
         summary = self._normalize_dehydration_summary(summary)
         if not self._is_usable_dehydration_summary(summary):
             return
-        cache_key = self._read_only_cache_key(content)
+        cache_key = cache_key or self._read_only_cache_key(content)
         self._read_only_summary_cache.pop(cache_key, None)
         self._read_only_summary_cache[cache_key] = summary
         while len(self._read_only_summary_cache) > READ_ONLY_DEHYDRATION_CACHE_LIMIT:
@@ -1837,6 +1861,123 @@ class Dehydrator:
             self._set_read_only_memory_summary(content, result)
 
         return _result(self._format_output(result, metadata), "computed")
+
+    def _recall_summary_request(self, content: str, raw_body: str) -> _RecallSummaryRequest:
+        """Freeze cache identity and actual provider request before any await."""
+        request = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": DEHYDRATE_PROMPT},
+                {"role": "user", "content": content[:3000]},
+            ],
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+        }
+        if self.recall_dehydration_disable_thinking:
+            request["extra_body"] = {"thinking": {"type": "disabled"}}
+        body_hash = hashlib.sha256(raw_body.encode()).hexdigest()
+        contract = {
+            "schema": RECALL_SUMMARY_REUSE_SCHEMA,
+            "body_sha256": body_hash,
+            "input_sha256": hashlib.sha256(content.encode()).hexdigest(),
+            "base_url": self.base_url,
+            "client_base_url": str(getattr(self.client, "base_url", self.base_url)),
+            "redaction": RECALL_REDACTION_CONTRACT,
+            "output": RECALL_OUTPUT_CONTRACT,
+            "request": request,
+        }
+        key = hashlib.sha256(json.dumps(contract, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        return _RecallSummaryRequest(key, body_hash, self.model, json.dumps(request), self.client)
+
+    @staticmethod
+    def _log_recall_summary(event: str, key: str, *, saved: int = 0) -> None:
+        logger.info("recall_summary_cache at=%.6f event=%s key=%s saved_calls=%d", time.time(), event, key, saved)
+
+    async def _compute_recall_summary(self, snapshot: _RecallSummaryRequest, *, background: bool) -> str:
+        try:
+            async with self._recall_summary_backfill_sem if background else nullcontext():
+                self._log_recall_summary("provider_start", snapshot.key)
+                response = await snapshot.client.chat.completions.create(**json.loads(snapshot.request_json))
+            result = response.choices[0].message.content if response.choices else ""
+            result = self._normalize_dehydration_summary(result)
+            if not self._is_usable_dehydration_summary(result):
+                raise RuntimeError("脱水 API 返回空或过短摘要")
+            # Only the disposable sidecar is written. Never write the legacy DB
+            # or a bucket; the same frozen key labels both request and result.
+            self._set_recall_cached_summary("", result, snapshot=snapshot)
+            self._set_read_only_memory_summary("", result, cache_key=snapshot.key)
+            self._log_recall_summary("computed", snapshot.key)
+            return result
+        except asyncio.CancelledError:
+            self._log_recall_summary("cancelled", snapshot.key)
+            raise
+        except Exception:
+            self._log_recall_summary("failure", snapshot.key)
+            raise
+
+    async def dehydrate_recall_with_source(
+        self, content: str, *, raw_body: str | None = None, allow_async_fallback: bool = False,
+        schedule_async: bool = True,
+    ) -> tuple[str, str]:
+        """Strict exact-body summary reuse; metadata stays local to each caller.
+
+        No migration from unversioned frontmatter, legacy DB or old namespaces.
+        One event-loop producer owns each key. Cancelling one waiter cannot
+        cancel another; a detached async-backfill owner keeps its task alive.
+        """
+        raw_body = content if raw_body is None else raw_body
+        if not content or not content.strip():
+            return "（空记忆 / empty memory）", "passthrough"
+        content = redact_embedding_input(content)
+        if count_tokens_approx(content) < 100:
+            return content, "passthrough"
+        snapshot = self._recall_summary_request(content, raw_body)
+        self._log_recall_summary("request", snapshot.key)
+        for source, reader in (("memory_hit", self._get_read_only_memory_summary),
+                               ("persistent_hit", self._get_recall_cached_summary)):
+            cached = reader(content, cache_key=snapshot.key)
+            if cached:
+                self._set_read_only_memory_summary(content, cached, cache_key=snapshot.key)
+                self._log_recall_summary(source, snapshot.key, saved=int(not allow_async_fallback or schedule_async))
+                return cached, source
+        if allow_async_fallback and (not schedule_async or not self.api_available):
+            self._log_recall_summary("passthrough_deferred", snapshot.key)
+            squashed = " ".join(content.split())
+            return squashed[:300] + ("…" if len(squashed) > 300 else ""), "passthrough_async"
+        if not self.api_available:
+            raise RuntimeError("脱水 API 不可用，请配置 OMBRE_API_KEY")
+        flight = self._recall_summary_flights.get(snapshot.key)
+        joined = flight is not None
+        if flight is None:
+            task = asyncio.create_task(self._compute_recall_summary(snapshot, background=allow_async_fallback))
+            flight = _RecallSummaryFlight(task)
+            self._recall_summary_flights[snapshot.key] = flight
+
+            def finished(done):
+                if self._recall_summary_flights.get(snapshot.key) is flight:
+                    self._recall_summary_flights.pop(snapshot.key, None)
+                # Detached producer failures are already logged, and must be
+                # retrieved even if no waiting request survives.
+                if not done.cancelled():
+                    done.exception()
+
+            task.add_done_callback(finished)
+        if allow_async_fallback:
+            flight.detached = True
+            self._log_recall_summary("passthrough_async", snapshot.key)
+            squashed = " ".join(content.split())
+            return squashed[:300] + ("…" if len(squashed) > 300 else ""), "passthrough_async"
+        flight.waiters += 1
+        try:
+            summary = await asyncio.shield(flight.task)
+            if joined:
+                self._log_recall_summary("coalesced_hit", snapshot.key, saved=1)
+            return summary, "coalesced_hit" if joined else "computed"
+        finally:
+            flight.waiters -= 1
+            if not flight.waiters and not flight.detached and not flight.task.done():
+                self._recall_summary_flights.pop(snapshot.key, None)
+                flight.task.cancel()
 
     async def dehydrate_with_source(
         self,
