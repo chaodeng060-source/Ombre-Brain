@@ -1450,8 +1450,9 @@ class BucketManager:
         e_growth_delta: str = "",
         e_source_bucket_id: str = "",
         e_proposal_key: str = "",
+        hold_write_identity=None,
     ) -> str:
-        bucket_id = generate_bucket_id()
+        bucket_id = hold_write_identity.bucket_id if hold_write_identity else generate_bucket_id()
         domain = domain or ["未分类"]
         tags = list(tags) if tags else []
         original_content = str(content or "")
@@ -1535,6 +1536,9 @@ class BucketManager:
         else:
             metadata["needs_clothing"] = True
             metadata["clothing_reason"] = "no_literal_retrieval_key"
+        if hold_write_identity:
+            metadata["hold_write_identity"] = hold_write_identity.digest
+            metadata["hold_body_sha256"] = hold_write_identity.body_sha256
         e_fields = (
             e_authored_by,
             e_initial_priority,
@@ -1683,6 +1687,15 @@ class BucketManager:
 
         post = frontmatter.Post(linked_content, **metadata)
         async with self._write_guard(bucket_id):
+            # Same deterministic ID uses the existing cross-process bucket
+            # lock, even if concurrent auto-tagging suggested different paths.
+            if hold_write_identity:
+                existing_path = self._find_bucket_file(bucket_id)
+                if existing_path:
+                    existing = self._safe_load_post(existing_path)
+                    hold_write_identity.verify(existing.metadata, existing.content, original_content)
+                    logger.info("hold replay skipped bucket=%s identity=%s", bucket_id, hold_write_identity.digest)
+                    return bucket_id
             os.makedirs(target_dir, exist_ok=True)
             event_id = self.audit_log.begin(
                 actor=actor,

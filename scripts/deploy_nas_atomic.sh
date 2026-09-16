@@ -440,6 +440,7 @@ payload = {
     "previous_image_id": "$old_image",
     "rollback_container": "$rollback_container",
     "rollback_container_id": "$container_id",
+    "previous_source_dir": "$previous",
     "compose_project": "$compose_project",
     "data_dir": "$OMBRE_DATA_DIR",
     "host_port": 8001,

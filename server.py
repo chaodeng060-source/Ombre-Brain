@@ -4382,6 +4382,7 @@ async def _merge_or_create(
     recall_before_write: bool = False,
     entities: list[dict] | None = None,
     x_provenance: dict | None = None,
+    hold_write_identity=None,
 ) -> tuple[str, str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -4532,7 +4533,7 @@ async def _merge_or_create(
     # world="" 即日常桶，只在日常桶之间合并；通用桶单独按通用合并。
     # 合并候选必须在同一个 world 内（避免日常桶被角色记忆合并污染或反过来）。
     world_filter = [(world or "").strip()]
-    if recall_before_write or _has_redactable_secret(content):
+    if hold_write_identity or recall_before_write or _has_redactable_secret(content):
         existing = []
     else:
         try:
@@ -4633,7 +4634,10 @@ async def _merge_or_create(
             chord_tag=chord_tag,
             sense=detected_senses or None,
             x_provenance=x_provenance,
+            **({"hold_write_identity": hold_write_identity} if hold_write_identity else {}),
         )
+        if hold_write_identity and hold_write_identity.replayed:
+            return bucket_id, name or bucket_id, False
         # --- Generate embedding for new bucket ---
         # 扫盘 #10：失败留痕，否则新桶语义检索召不回且无任何日志线索
         try:
@@ -7936,11 +7940,9 @@ async def hold(
     world: str = "",
     chord_tag: str = "",
     domain: str = "",
+    idempotency_key: str = "",
 ) -> str:
     """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。image_base64=可选,base64编码的图片数据,会上传到R2并把URL插入正文(允许此条记忆带图)。image_filename=图片名称提示(默认image)。world=显式指定世界归属,留空时走全局current_world(日常聊天=空,角色扮演=具体世界名),"通用"表示跨世界设定。feel桶不归属世界。chord_tag=可选和弦记号串(如"Em(maj7) → A13#11 · 92bpm · f"),作为情绪色调索引,只用于跨窗口标记,不参与表达。紧张系和弦(m(maj7)/♭9/dim等)加动作词disambiguator(盯/压/憋/狂),一行最多4个和弦,段落切换用"; "分隔,详见 INTERNALS.md 5.12。feel桶不打chord_tag。merge时若新带chord_tag会覆盖旧桶。domain=显式指定主题域(csv),非空时override dehydrator 自动推断,用于跨 Agent 工程日志隔离(如 hajimi-工程)。feel/pinned 路径同样适用。"""
-    await _ensure_decay_background()
-    _maybe_start_backfill()
-
     # --- Input validation / 输入校验 ---
     if not content or not content.strip():
         return "内容为空，无法存储。"
@@ -7951,6 +7953,22 @@ async def hold(
     # --- Resolve effective world / 解析当前桶的 world 归属 ---
     # 显式传 world > 全局 current_world。feel 桶在下面单独处理（feel 跨世界）。
     effective_world = (world or "").strip() or (config.get("current_world", "") or "").strip()
+    # Only an explicit source-event key enables replay suppression. Body-only
+    # equality cannot distinguish different occurrences of the same sentence.
+    identity = None
+    if idempotency_key:
+        from hold_idempotency import HoldWriteIdentity
+        if image_base64:
+            raise ValueError("idempotency_key currently supports text-only hold")
+        identity = HoldWriteIdentity.build(idempotency_key, content, effective_world, feel=feel, pinned=pinned)
+        existing = await bucket_mgr.get(identity.bucket_id)
+        if existing:
+            identity.verify(existing.get("metadata", {}), existing.get("content", ""), content)
+            logger.info("hold replay skipped bucket=%s identity=%s", identity.bucket_id, identity.digest)
+            return identity.result()
+
+    await _ensure_decay_background()
+    _maybe_start_backfill()
 
     # --- Optional image upload to R2 / 可选：上传图片到 R2 ---
     # If image_base64 provided and R2 configured, upload and prepend URL
@@ -7996,7 +8014,10 @@ async def hold(
                 arousal=feel_arousal,
                 name=None,
                 bucket_type="feel",
+                **({"hold_write_identity": identity} if identity else {}),
             )
+            if identity and identity.replayed:
+                return identity.result()
             try:
                 await embedding_engine.generate_and_store(bucket_id, content)
             except Exception:
@@ -8055,7 +8076,10 @@ async def hold(
                 pinned=True,
                 world=effective_world,
                 chord_tag=chord_tag,
+                **({"hold_write_identity": identity} if identity else {}),
             )
+            if identity and identity.replayed:
+                return identity.result()
             try:
                 await embedding_engine.generate_and_store(bucket_id, content)
             except Exception:
@@ -8078,7 +8102,10 @@ async def hold(
         world=effective_world,
         chord_tag=chord_tag,
         entities=analysis.get("entities", []),
+        **({"hold_write_identity": identity} if identity else {}),
     )
+    if identity and identity.replayed:
+        return identity.result()
     _mark_briefing_cache_dirty("hold_merge" if is_merged else "hold_create")
 
     # --- Step 3: safe relations write directly; dangerous ones stay pending ---
@@ -12036,6 +12063,13 @@ async def api_hold(request):
     content = str(body.get("content") or "").strip()
     if not content:
         return JSONResponse({"error": "content required"}, status_code=400)
+    from hold_idempotency import HoldWriteIdentity, HoldWriteConflict, validate_event_key
+    key = None
+    if "idempotency_key" in body:
+        try:
+            key = validate_event_key(body["idempotency_key"])
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
 
     raw_tags = body.get("tags") or []
     if isinstance(raw_tags, list):
@@ -12073,6 +12107,12 @@ async def api_hold(request):
     valence = _num("valence")
     arousal = _num("arousal")
 
+    # Capture the same request-owned world before hold can await analysis.
+    # A concurrent current_world change must not change the returned receipt.
+    identity = None
+    if key is not None:
+        effective_world = world or (config.get("current_world", "") or "").strip()
+        identity = HoldWriteIdentity.build(key, content, effective_world, feel=feel, pinned=pinned)
     try:
         result = await hold(
             content=content,
@@ -12086,8 +12126,16 @@ async def api_hold(request):
             arousal=arousal,
             source_bucket=source_bucket,
             world=world,
+            **({"idempotency_key": key} if key is not None else {}),
         )
+        if identity is not None:
+            # Do not emit provenance-receipt fields: this endpoint has not
+            # implemented that separate protocol. The body ID is sufficient.
+            return JSONResponse({"result": result, "bucket_id": identity.bucket_id,
+                                 "replayed": result.startswith("已存在→")})
         return JSONResponse({"result": result})
+    except HoldWriteConflict as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
     except MAINTENANCE_BUSY_ERRORS as e:
         logger.warning(f"/api/hold paused by memory maintenance / 维护中: {e}")
         return _maintenance_busy_response()
