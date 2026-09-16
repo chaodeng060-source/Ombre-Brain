@@ -1927,6 +1927,44 @@ def _literal_collision_vector_floor() -> float:
     return max(0.0, min(1.0, floor))
 
 
+def _vector_evidence_demotion_enabled() -> bool:
+    """Whether candidates with no semantic retrieval evidence lose their rank."""
+    return os.getenv(
+        "OMBRE_VECTOR_EVIDENCE_DEMOTION", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _demote_evidenceless_candidates(fused_pairs, vector_ranked, entity_ranked):
+    """Rank candidates the semantic channels actually retrieved ahead of the rest.
+
+    RRF fuses positions, not absolute relevance, so a purely lexical collision
+    always holds a rank and can take the leading slot even when no semantic
+    channel retrieved it at all. Reordering is stable and removes nothing: the
+    fused scores, the candidate set and every later budget stay untouched.
+
+    2026-09-16 replay over 59 recorded production turns: leading candidates with
+    no retrieval evidence fell 25% -> 1%, 53 candidates were demoted, and only
+    2 turns had too few evidenced candidates to refill the top three.
+    """
+    if not _vector_evidence_demotion_enabled():
+        return fused_pairs
+    evidenced = {bid for bid, _ in (vector_ranked or [])}
+    evidenced.update(bid for bid, _ in (entity_ranked or []))
+    if not evidenced:
+        # Nothing was retrieved semantically this turn; demoting everything
+        # would only shuffle the same lexical order.
+        return fused_pairs
+    supported = [pair for pair in fused_pairs if pair[0] in evidenced]
+    unsupported = [pair for pair in fused_pairs if pair[0] not in evidenced]
+    if not unsupported or not supported:
+        return fused_pairs
+    logger.info(
+        "vector evidence demotion: %d/%d candidates lack retrieval evidence",
+        len(unsupported), len(fused_pairs),
+    )
+    return supported + unsupported
+
+
 def _common_literal_lacks_semantic_support(
     bucket: dict,
     vector_similarity: float,
@@ -5837,6 +5875,9 @@ async def breath(
     fused_pairs = lmc5_fuse_ranked_channels(
         channels,
         k=rrf_cfg.get("k", 60),
+    )
+    fused_pairs = _demote_evidenceless_candidates(
+        fused_pairs, vector_ranked, entity_ranked
     )
 
     # Passive upstream comparison. It reuses the candidate IDs and scores
