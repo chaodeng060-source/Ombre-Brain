@@ -13,7 +13,7 @@ from pathlib import Path
 import time
 from zoneinfo import ZoneInfo
 
-from retrieval_hints import canonical_json, content_hash
+from retrieval_hints import PROMPT_VERSION, bound_source_context, canonical_json, content_hash
 from retrieval_hints_storage import active
 
 TZ = ZoneInfo("Asia/Shanghai")
@@ -46,7 +46,7 @@ class NightBatch:
     def __init__(self, *, enabled, backfill_enabled, store, generator, peer, load_source,
                  publish_lock, worker_lock, maintenance_lock=nullcontext,
                  now=lambda: datetime.now(TZ), monotonic=time.monotonic, busy=lambda: False,
-                 tokenizer=None, limit=200, max_seconds=1800):
+                 tokenizer=None, limit=200, max_seconds=1800, load_source_context=lambda bucket: ()):
         if not 1 <= limit <= 200 or not 0 < max_seconds <= 1800:
             raise ValueError("pilot_budget")
         self.enabled, self.backfill_enabled = enabled, backfill_enabled
@@ -54,6 +54,9 @@ class NightBatch:
         self.publish_lock, self.worker_lock, self.maintenance_lock = publish_lock, worker_lock, maintenance_lock
         self.now, self.monotonic, self.busy = now, monotonic, busy
         self.tokenizer, self.limit, self.max_seconds = tokenizer, limit, max_seconds
+        self.load_source_context = load_source_context
+        self.schema_version = getattr(generator, "schema_version", 1)
+        self.prompt_version = getattr(generator, "prompt_version", PROMPT_VERSION)
 
     def _room(self, deadline, seconds=0):
         return night_seconds_left(self.now()) > seconds and deadline - self.monotonic() > seconds
@@ -74,7 +77,8 @@ class NightBatch:
             return {"status": "outside_night_window", "outbound_calls": 0}
         if len(approved_sources) > 200 or len({r["bucket_id"] for r in approved_sources}) != len(approved_sources):
             raise ValueError("pilot_requires_at_most_200_distinct_ids")
-        batch_id = content_hash(canonical_json(approved_sources))
+        batch_id = content_hash(canonical_json(approved_sources if self.schema_version == 1 else
+                                  {"sources": approved_sources, "prompt_version": self.prompt_version}))
         deadline = self.monotonic() + self.max_seconds
         try:
             with self.worker_lock():
@@ -105,26 +109,32 @@ class NightBatch:
                 continue
             # Restore interrupted PG publication before considering any model call.
             pending = [r for r in self.store.pending() if r["bucket_id"] == bid
-                       and r["source_content_sha256"] == item["source_content_sha256"]]
-            if self.store.lookup(bucket) is not None:
+                       and r["source_content_sha256"] == item["source_content_sha256"]
+                       and r["prompt_version"] == self.prompt_version]
+            published = self.store.lookup(bucket)
+            if published is not None and published["payload"]["schema_version"] >= self.schema_version:
                 continue
             if not pending:
                 known = [j for j in self.store.jobs() if j["bucket_id"] == bid
-                         and json.loads(j["source_json"])["source_content_sha256"] == item["source_content_sha256"]]
+                         and json.loads(j["source_json"])["source_content_sha256"] == item["source_content_sha256"]
+                         and json.loads(j["source_json"])["prompt_version"] == self.prompt_version]
                 if known and known[0]["attempts"]:
                     continue  # timeout/crash may already be billed; never blind retry.
-                if not self.backfill_enabled and not (known and known[0]["kind"] == "new_write"):
+                if not self.backfill_enabled and bid not in new_ids:
                     continue
                 spent = sum(j["attempts"] for j in self.store.jobs() if j["bucket_id"] in allowed)
                 if spent >= 200 or processed >= self.limit or not self._room(deadline, self.generator.timeout_s + 2):
                     state["status"] = "budget_or_window_deferred"
                     break
                 with self._write(deadline):
-                    key = self.store.register(bucket, kind=known[0]["kind"] if known else "backfill")
+                    key = self.store.register(bucket, kind="new_write" if bid in new_ids else "backfill",
+                                              schema_version=self.schema_version)
                     if not self.store.reserve(key):
                         continue
                 # NO production/maintenance lease is held during this await.
-                result = await self.generator.generate(bucket.get("content") or "")
+                generation_options = ({"source_context": bound_source_context(bucket, self.load_source_context(bucket))}
+                                      if self.schema_version == 2 else {})
+                result = await self.generator.generate(bucket.get("content") or "", **generation_options)
                 processed += 1
                 state["outbound_calls"] += result.outbound_calls
                 state["receipts"].append({"bucket_id": bid, "status": result.status, "usage": result.usage,

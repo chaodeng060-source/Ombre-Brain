@@ -15,8 +15,8 @@ from pathlib import Path
 import sqlite3
 
 from retrieval_hints import (
-    PROMPT_VERSION, Generation, canonical_json, content_hash, lexical_text,
-    parse_hints, source_record,
+    PROMPT_VERSION, PROMPT_VERSION_V2, Generation, bound_source_context, canonical_json,
+    content_hash, lexical_text, parse_hints, source_proof, source_record,
 )
 
 
@@ -88,12 +88,12 @@ class HintsStore:
         finally:
             db.close()
 
-    def register(self, bucket, *, kind="backfill"):
+    def register(self, bucket, *, kind="backfill", schema_version=1):
         if not active(bucket):
             return None
         if kind not in {"new_write", "backfill"}:
             raise ValueError("job kind")
-        source = source_record(bucket)
+        source = source_record(bucket, prompt_version=PROMPT_VERSION_V2 if schema_version == 2 else PROMPT_VERSION)
         key = _job_key(source)
         with self._connect(write=True) as db:
             db.execute("INSERT OR IGNORE INTO jobs VALUES (?,?,?,?, 'queued',0,NULL,?)",
@@ -137,8 +137,9 @@ class HintsStore:
     def stage(self, bucket, result: Generation, *, lexical_version="jieba-search-v1", tokens=None):
         if result.status != "ok" or not active(bucket):
             raise ValueError("only successful active sources can be staged")
-        payload = parse_hints(canonical_json(result.payload), bucket.get("content") or "")
-        source = source_record(bucket)
+        context = bound_source_context(bucket, result.source_context)
+        payload = parse_hints(canonical_json(result.payload), bucket.get("content") or "", source_context=context)
+        source = source_record(bucket, prompt_version=PROMPT_VERSION_V2 if payload["schema_version"] == 2 else PROMPT_VERSION)
         terms = lexical_text(payload)
         if tokens is None:
             from bm25_index import _tokenize
@@ -146,6 +147,8 @@ class HintsStore:
         row = {**source, "payload": payload, "payload_sha256": content_hash(canonical_json(payload)),
                "lexical_text": " ".join(tokens(terms)),
                "lexical_version": lexical_version}
+        if payload["schema_version"] == 2:
+            row["attribution_source"] = source_proof(context)
         version = content_hash(canonical_json(row))
         row.update(version=version, generated_at=_now(), usage=result.usage,
                    requested_model=result.requested_model, response_model=result.response_model)
@@ -173,6 +176,10 @@ class HintsStore:
         if (not active(bucket) or str(bucket["id"]) != row["bucket_id"]
                 or content_hash(bucket.get("content") or "") != row["source_content_sha256"]):
             raise SourceChanged("source_changed_or_inactive")
+        if row["payload"].get("schema_version") == 2:
+            current = source_record(bucket)
+            if any(current[key] != row.get(key) for key in ("source_event_ids", "source_digest")):
+                raise SourceChanged("source_identity_changed")
 
     def publish(self, bid, version, peer, load_current):
         row = self._version(bid, version)
@@ -182,7 +189,8 @@ class HintsStore:
         if (not mirrored or canonical_json(mirrored["payload"]) != canonical_json(row["payload"])
                 or mirrored["source_content_sha256"] != row["source_content_sha256"]
                 or mirrored["lexical_text"] != row["lexical_text"]
-                or mirrored["lexical_version"] != row["lexical_version"]):
+                or mirrored["lexical_version"] != row["lexical_version"]
+                or mirrored.get("attribution_source") != row.get("attribution_source")):
             raise VersionConflict("peer_mismatch")
         peer.ready(bid, version)
         self._check_source(row, load_current())
@@ -227,7 +235,7 @@ class HintsStore:
                 self._check_source(row, bucket)
             except SourceChanged:
                 continue
-            source = source_record(bucket)  # Current author/world/path, not stale generation metadata.
+            source = source_record(bucket, prompt_version=row["prompt_version"])  # Current author/world/path.
             records.append({**row, **source, "source_kind": "bucket_body",
                             "source_link_status": "present_unverified" if source["source_links"] else "missing"})
             seen.add(row["bucket_id"])
