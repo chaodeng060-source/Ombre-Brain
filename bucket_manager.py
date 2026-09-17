@@ -425,6 +425,80 @@ class BucketManager:
                 config.get("audit", {}),
             )
         self._bucket_locks: dict[str, asyncio.Lock] = {}
+        from retrieval_hints import enabled as hints_enabled
+        self._retrieval_hints_enabled = hints_enabled()
+        self._retrieval_hints_store = None
+        self._retrieval_hint_rows = {}
+        self._retrieval_hints_check_at = 0.0
+        self._retrieval_dict_stamp = None
+        self._retrieval_dict_enabled = False
+        if self._retrieval_hints_enabled:
+            from retrieval_hints_storage import HintsStore
+            self._retrieval_hints_store = HintsStore(os.path.join(self.base_dir, ".retrieval_hints"))
+            self._retrieval_dict_enabled = hints_enabled("OMBRE_PRIVATE_RECALL_DICT_ENABLED")
+
+    async def _queue_retrieval_hints(self, bucket_id: str) -> None:
+        if not getattr(self, "_retrieval_hints_enabled", False):
+            return
+        def register():
+            path = self._find_bucket_file(bucket_id)
+            bucket = self._load_bucket(path) if path else None
+            if bucket:
+                self._retrieval_hints_store.register(bucket, kind="new_write")
+        try:
+            # Only bounded local registration, never network/model work. If
+            # interrupted or busy, the night difference scan repairs the gap.
+            await asyncio.wait_for(asyncio.to_thread(register), timeout=.15)
+        except Exception as exc:
+            logger.warning("retrieval hints registration deferred: %s", type(exc).__name__)
+
+    def _attach_retrieval_hints(self, bucket, rows=None):
+        if not getattr(self, "_retrieval_hints_enabled", False):
+            return bucket
+        from retrieval_hints import content_hash
+        row = (self._retrieval_hint_rows if rows is None else rows).get(str(bucket.get("id", "")))
+        if row and row["source_content_sha256"] == content_hash(bucket.get("content") or ""):
+            return {**bucket, "retrieval_hints_v1": row}
+        return bucket
+
+    def _build_hinted_bm25_index(self, buckets):
+        from retrieval_tokenizer import RetrievalTokenizer
+        rows = self._retrieval_hints_store.published_snapshot()
+        tokenizer = (RetrievalTokenizer.from_file(self._retrieval_hints_store.directory / "userdict.txt")
+                     if self._retrieval_dict_enabled else None)
+        return self._build_bm25_index(
+            [self._attach_retrieval_hints(bucket, rows) for bucket in buckets],
+            tokenizer=tokenizer, hints_enabled=True,
+        )
+
+    async def _refresh_retrieval_hint_index(self, buckets):
+        if not getattr(self, "_retrieval_hints_enabled", False) or time.monotonic() < self._retrieval_hints_check_at:
+            return
+        self._retrieval_hints_check_at = time.monotonic() + 5.0
+        try:
+            rows = await asyncio.to_thread(self._retrieval_hints_store.published_snapshot)
+            old = self._retrieval_hint_rows
+            changed = {bid for bid in set(old) | set(rows)
+                       if old.get(bid, {}).get("version") != rows.get(bid, {}).get("version")}
+            self._retrieval_hint_rows = rows
+            dictionary_changed = False
+            if self._retrieval_dict_enabled:
+                stat = (self._retrieval_hints_store.directory / "userdict.txt").stat()
+                stamp = (stat.st_mtime_ns, stat.st_size)
+                dictionary_changed = stamp != self._retrieval_dict_stamp
+                self._retrieval_dict_stamp = stamp
+            # A batch/dictionary change uses the existing off-thread generation
+            # builder; never do hundreds of COW updates on the chat event loop.
+            if dictionary_changed or len(changed) > 8:
+                self._mark_bm25_dirty()
+                return
+            for bucket in buckets:
+                if str(bucket.get("id", "")) in changed:
+                    if not self._apply_bm25_incremental(bucket=bucket, visible=True):
+                        self._mark_bm25_dirty()
+                        break
+        except Exception as exc:
+            logger.warning("retrieval hints refresh deferred: %s", type(exc).__name__)
 
     def _lock_for(self, bucket_id: str) -> asyncio.Lock:
         lock = self._bucket_locks.get(bucket_id)
@@ -886,6 +960,7 @@ class BucketManager:
                     "content": str(bucket.get("content", "")),
                     "path": str(bucket.get("path", "")),
                 }
+                delta_bucket = self._attach_retrieval_hints(delta_bucket)
             fresh = self._bm25_with_delta(
                 current,
                 bucket=delta_bucket,
@@ -1079,8 +1154,8 @@ class BucketManager:
         }
 
     @staticmethod
-    def _build_bm25_index(buckets: list[dict]) -> BM25Index:
-        index = BM25Index()
+    def _build_bm25_index(buckets: list[dict], *, tokenizer=None, hints_enabled=False) -> BM25Index:
+        index = BM25Index(tokenizer=tokenizer, hints_enabled=hints_enabled) if (tokenizer or hints_enabled) else BM25Index()
         index.build(buckets)
         # Validate literal navigation keys beside the same complete BM25
         # generation. Requests then scan a small resident key table instead of
@@ -1238,10 +1313,11 @@ class BucketManager:
             # Startup runs before requests exist, so an inline build avoids
             # jieba's extremely slow first-use path in a fresh worker thread.
             # Dirty live rebuilds retain the upstream worker-thread behavior.
+            builder = self._build_hinted_bm25_index if getattr(self, "_retrieval_hints_enabled", False) else self._build_bm25_index
             fresh = (
-                await asyncio.to_thread(self._build_bm25_index, buckets)
+                await asyncio.to_thread(builder, buckets)
                 if offload
-                else self._build_bm25_index(buckets)
+                else builder(buckets)
             )
             # A write may invalidate the snapshot while jieba is building it.
             # Never let that stale build clear the newer dirty generation.
@@ -1780,6 +1856,7 @@ class BucketManager:
                     bucket_id,
                     exc,
                 )
+        await self._queue_retrieval_hints(bucket_id)
         return bucket_id
 
     # ---------------------------------------------------------
@@ -2166,6 +2243,7 @@ class BucketManager:
                 return False
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
+        await self._queue_retrieval_hints(bucket_id)
         return True
 
     # ---------------------------------------------------------
@@ -2883,8 +2961,10 @@ class BucketManager:
         # request.  The current query uses the last complete index while a
         # fresh index is built and swapped atomically in a background thread.
         bm25_scores: dict[str, float] = {}
+        hint_matches = {}
         bm25_shadow_ready = False
         if self._bm25_mode != "off" and self._bm25 is not None:
+            await self._refresh_retrieval_hint_index(all_buckets)
             if self._bm25_dirty and not self._bm25_rebuilding:
                 # Never build 13k rows on every dirty request. One timer owns the
                 # next generation while this request uses the old complete one.
@@ -2896,6 +2976,8 @@ class BucketManager:
                     getattr(self._bm25, "_index", None) is not None
                 )
                 bm25_scores = await asyncio.to_thread(self._bm25.score, query)
+                if getattr(self, "_retrieval_hints_enabled", False):
+                    hint_matches = self._bm25.hint_matches(query)
             except Exception as exc:
                 logger.warning("[bm25] score failed; skipping this dimension: %s", exc)
 
@@ -3059,6 +3141,8 @@ class BucketManager:
                             normalized *= mood_factor
                     scored_bucket = dict(bucket)
                     scored_bucket["score"] = round(normalized, 2)
+                    if str(bucket.get("id", "")) in hint_matches:
+                        scored_bucket["hint_match"] = list(hint_matches[str(bucket["id"])])
                     if mood_factor != 1.0:
                         scored_bucket["_mood_congruent_factor"] = round(mood_factor, 4)
                     if relevance_first:

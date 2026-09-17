@@ -130,7 +130,7 @@ class _LazyIdf:
 class BM25Index:
     """In-memory BM25 with copy-on-write single-document generations."""
 
-    def __init__(self):
+    def __init__(self, *, tokenizer=None, hints_enabled=False):
         self._index = None
         self._ids: list[str] = []
         # term -> immutable bucket-id set.  Only touched postings are copied by
@@ -139,6 +139,13 @@ class BM25Index:
         self._term_doc_counts: dict[str, int] = {}
         self._df_histogram: dict[int, int] = {}
         self._total_doc_length = 0
+        self._tokenizer = tokenizer or _tokenize
+        self._hints_enabled = hints_enabled
+        self._custom_tokenizer = tokenizer
+        self.lexical_version = getattr(tokenizer, "version", "jieba-search-v1")
+        self._body_postings: dict[str, frozenset[str]] = {}
+        self._body_tokens: dict[str, frozenset[str]] = {}
+        self._hint_tokens: dict[str, frozenset[str]] = {}
 
     @property
     def available(self) -> bool:
@@ -160,6 +167,30 @@ class BM25Index:
             " ".join(str(value) for value in domain),
         ])
         return _tokenize(text)
+
+    def _document_tokens(self, bucket):
+        # OFF keeps the original method (including whitespace/token details).
+        if self._custom_tokenizer is None:
+            body = self._bucket_tokens(bucket)
+        else:
+            meta = bucket.get("metadata") or {}
+            tags, domain = meta.get("tags") or [], meta.get("domain") or []
+            body = self._tokenizer(" ".join([
+                meta.get("name") or "", (bucket.get("content") or "")[:1200],
+                " ".join(str(t) for t in ([tags] if isinstance(tags, str) else tags)),
+                " ".join(str(t) for t in ([domain] if isinstance(domain, str) else domain)),
+            ]))
+        hints = []
+        if self._hints_enabled and bucket.get("retrieval_hints_v1"):
+            from retrieval_hints import content_hash, lexical_text, parse_hints, canonical_json
+            row = bucket["retrieval_hints_v1"]
+            if (row.get("bucket_id") == str(bucket.get("id", ""))
+                    and row.get("source_content_sha256") == content_hash(bucket.get("content") or "")):
+                payload = parse_hints(canonical_json(row["payload"]), bucket.get("content") or "")
+                hints = list(dict.fromkeys(self._tokenizer(lexical_text(payload))))
+        # No TF amplification from repeated aliases or tokens already in body.
+        body_set = set(body)
+        return body + [t for t in hints if t not in body_set], body, hints
 
     @staticmethod
     def _frequencies(tokens: list[str]) -> dict[str, int]:
@@ -223,11 +254,21 @@ class BM25Index:
             return
         corpus: list[list[str]] = []
         ids: list[str] = []
+        body_postings = {}
+        self._body_tokens = {}
+        self._hint_tokens = {}
         for bucket in buckets:
-            tokens = self._bucket_tokens(bucket)
+            tokens, body, hints = self._document_tokens(bucket)
             if tokens:
                 corpus.append(tokens)
                 ids.append(bucket["id"])
+                if self._hints_enabled:
+                    self._body_tokens[bucket["id"]] = frozenset(body)
+                    self._hint_tokens[bucket["id"]] = frozenset(hints)
+                    for term in set(body):
+                        body_postings.setdefault(term, set()).add(bucket["id"])
+
+        self._body_postings = {term: frozenset(ids) for term, ids in body_postings.items()}
 
         self._index = _BM25Okapi(corpus) if corpus else None
         self._ids = ids
@@ -264,7 +305,7 @@ class BM25Index:
                 self._index.average_idf,
             )
 
-    def _replace_document(self, bucket_id: str, tokens: list[str]):
+    def _replace_document(self, bucket_id: str, tokens: list[str], *, body=(), hints=()):
         if not _BM25_AVAILABLE or self._index is None:
             raise RuntimeError("incremental BM25 requires a complete resident generation")
 
@@ -318,7 +359,7 @@ class BM25Index:
             doc_freqs.append(new_frequencies)
             doc_len.append(len(tokens))
 
-        fresh = BM25Index()
+        fresh = BM25Index(tokenizer=self._custom_tokenizer, hints_enabled=self._hints_enabled)
         fresh._index = self._rank_index_from_parts(
             self._index,
             doc_freqs,
@@ -331,6 +372,25 @@ class BM25Index:
         fresh._term_doc_counts = term_doc_counts
         fresh._df_histogram = df_histogram
         fresh._total_doc_length = sum(doc_len)
+        if self._hints_enabled:
+            fresh._body_postings = dict(self._body_postings)
+            fresh._body_tokens = dict(self._body_tokens)
+            fresh._hint_tokens = dict(self._hint_tokens)
+            for term in self._body_tokens.get(bucket_id, frozenset()) | frozenset(body):
+                posting = set(self._body_postings.get(term, ()))
+                posting.discard(bucket_id)
+                if term in body:
+                    posting.add(bucket_id)
+                if posting:
+                    fresh._body_postings[term] = frozenset(posting)
+                else:
+                    fresh._body_postings.pop(term, None)
+            if tokens:
+                fresh._body_tokens[bucket_id] = frozenset(body)
+                fresh._hint_tokens[bucket_id] = frozenset(hints)
+            else:
+                fresh._body_tokens.pop(bucket_id, None)
+                fresh._hint_tokens.pop(bucket_id, None)
         return fresh
 
     def with_upsert(self, bucket: dict):
@@ -338,7 +398,8 @@ class BM25Index:
         bucket_id = str(bucket.get("id", ""))
         if not bucket_id:
             raise ValueError("incremental BM25 upsert requires bucket id")
-        return self._replace_document(bucket_id, self._bucket_tokens(bucket))
+        tokens, body, hints = self._document_tokens(bucket)
+        return self._replace_document(bucket_id, tokens, body=body, hints=hints)
 
     def with_delete(self, bucket_id: str):
         """Return a complete generation without one bucket (idempotent)."""
@@ -364,14 +425,15 @@ class BM25Index:
             return {}
         hits: dict[str, list[str]] = {}
         seen: set[str] = set()
-        for term in _tokenize(query):
+        postings = self._body_postings if self._hints_enabled else self._postings
+        for term in self._tokenizer(query):
             if term in seen or len(term) < max(1, min_term_chars):
                 continue
             seen.add(term)
-            df = self._term_doc_counts.get(term, 0)
+            df = len(postings.get(term, ()))
             if df <= 0 or df > max_df:
                 continue
-            for bucket_id in self._postings.get(term, ()):
+            for bucket_id in postings.get(term, ()):
                 hits.setdefault(bucket_id, []).append(term)
         return {bucket_id: tuple(terms) for bucket_id, terms in hits.items()}
 
@@ -396,14 +458,15 @@ class BM25Index:
 
         hits: dict[str, list[tuple[str, int]]] = {}
         seen: set[str] = set()
-        for term in _tokenize(query):
+        postings = self._body_postings if self._hints_enabled else self._postings
+        for term in self._tokenizer(query):
             if term in seen or len(term) < max(1, min_term_chars):
                 continue
             seen.add(term)
-            df = int(self._term_doc_counts.get(term, 0) or 0)
+            df = len(postings.get(term, ()))
             if df <= 0:
                 continue
-            posting = self._postings.get(term, ())
+            posting = postings.get(term, ())
             for bucket_id in targets:
                 if bucket_id in posting:
                     hits.setdefault(bucket_id, []).append((term, df))
@@ -413,7 +476,7 @@ class BM25Index:
         """Return normalized BM25 scores; the rank_bm25 formula is unchanged."""
         if not _BM25_AVAILABLE or self._index is None:
             return {}
-        tokens = _tokenize(query)
+        tokens = self._tokenizer(query)
         if not tokens:
             return {}
         raw = self._index.get_scores(tokens)
@@ -425,3 +488,8 @@ class BM25Index:
             for bucket_id, score in zip(self._ids, raw)
             if score > 0
         }
+
+    def hint_matches(self, query: str) -> dict[str, tuple[str, ...]]:
+        terms = set(self._tokenizer(query))
+        return {bid: tuple(sorted(terms & tokens)) for bid, tokens in self._hint_tokens.items()
+                if terms & tokens}
