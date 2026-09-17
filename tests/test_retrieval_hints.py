@@ -70,6 +70,19 @@ def test_source_metadata_is_local_and_body_bound():
     assert "content" not in source_record(bucket)
 
 
+def test_source_event_identity_is_preserved_not_replaced_by_bucket_date():
+    bucket = {"id": "synthetic-a", "content": BODY, "metadata": {
+        "source_event_ids": ["event-old"], "source_session": "room:test",
+        "source_kind": "conversation", "source_digest": "source-digest",
+        "created": "2026-09-14"}}
+    source = source_record(bucket)
+    assert source["source_event_ids"] == ["event-old"]
+    assert source["source_session"] == "room:test"
+    assert source["source_kind"] == "conversation"
+    assert source["source_digest"] == "source-digest"
+    assert "event_at" not in source  # Admission time is not event time.
+
+
 @pytest.mark.asyncio
 async def test_off_does_not_read_provider_configuration(monkeypatch):
     def fail(*args, **kwargs):
