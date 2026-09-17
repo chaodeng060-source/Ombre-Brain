@@ -67,6 +67,9 @@ class HintsStore:
                 CREATE TABLE IF NOT EXISTS published (
                     bucket_id TEXT PRIMARY KEY, version TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS batch_state (
+                    batch_id TEXT PRIMARY KEY, state_json TEXT NOT NULL
+                );
             """)
         os.chmod(self.path, 0o600)
         self._initialized = True
@@ -119,14 +122,29 @@ class HintsStore:
             db.execute("UPDATE jobs SET state=?, result_json=? WHERE job_key=?",
                        ("generated" if result.status == "ok" else result.status, canonical_json(receipt), key))
 
+    def get_batch_state(self, batch_id):
+        if not self.path.exists():
+            return None
+        with self._connect() as db:
+            row = db.execute("SELECT state_json FROM batch_state WHERE batch_id=?", (batch_id,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def set_batch_state(self, batch_id, state):
+        with self._connect(write=True) as db:
+            db.execute("INSERT INTO batch_state VALUES (?,?) ON CONFLICT(batch_id) DO UPDATE SET state_json=excluded.state_json",
+                       (batch_id, canonical_json(state)))
+
     def stage(self, bucket, result: Generation, *, lexical_version="jieba-search-v1", tokens=None):
         if result.status != "ok" or not active(bucket):
             raise ValueError("only successful active sources can be staged")
         payload = parse_hints(canonical_json(result.payload), bucket.get("content") or "")
         source = source_record(bucket)
         terms = lexical_text(payload)
+        if tokens is None:
+            from bm25_index import _tokenize
+            tokens = _tokenize
         row = {**source, "payload": payload, "payload_sha256": content_hash(canonical_json(payload)),
-               "lexical_text": " ".join(tokens(terms)) if tokens else terms,
+               "lexical_text": " ".join(tokens(terms)),
                "lexical_version": lexical_version}
         version = content_hash(canonical_json(row))
         row.update(version=version, generated_at=_now(), usage=result.usage,
