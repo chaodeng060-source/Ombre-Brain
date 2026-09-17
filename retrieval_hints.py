@@ -211,6 +211,7 @@ class Generation:
     error: str = ""
     outbound_calls: int = 0
     source_context: tuple[dict, ...] = ()  # Local validation only; never added to backfill model input.
+    generation_provenance: dict | None = None  # Existing proposer receipt, not another model call.
 
 
 class Generator:

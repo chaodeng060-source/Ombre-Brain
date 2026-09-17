@@ -110,7 +110,7 @@ class NightBatch:
             # Restore interrupted PG publication before considering any model call.
             pending = [r for r in self.store.pending() if r["bucket_id"] == bid
                        and r["source_content_sha256"] == item["source_content_sha256"]
-                       and r["prompt_version"] == self.prompt_version]
+                       and r["payload"]["schema_version"] >= self.schema_version]
             published = self.store.lookup(bucket)
             if published is not None and published["payload"]["schema_version"] >= self.schema_version:
                 continue

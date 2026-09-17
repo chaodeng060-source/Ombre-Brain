@@ -149,6 +149,9 @@ class HintsStore:
                "lexical_version": lexical_version}
         if payload["schema_version"] == 2:
             row["attribution_source"] = source_proof(context)
+            if result.generation_provenance is not None:
+                row["generation_origin"] = "night_proposer"
+                row["proposer"] = result.generation_provenance
         version = content_hash(canonical_json(row))
         row.update(version=version, generated_at=_now(), usage=result.usage,
                    requested_model=result.requested_model, response_model=result.response_model)

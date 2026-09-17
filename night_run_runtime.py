@@ -511,11 +511,13 @@ def build_night_run_runtime(
         disable_thinking=disable_thinking,
         json_object=json_object,
     )
+    from retrieval_hints import enabled as hints_enabled
     proposer = StrictOmbreProposer(
         provider,
         timeout_seconds=provider_timeout + 5.0,
         model=model,
         provider_name="openai-compatible",
+        retrieval_hints_enabled=hints_enabled() and hints_enabled("OMBRE_RETRIEVAL_ATTRIBUTION_ENABLED"),
     )
     snapshots = SnapshotManager(config["buckets_dir"], snapshot_root)
     curated = CuratedWriteCoordinator(bucket_manager, embedding_engine)

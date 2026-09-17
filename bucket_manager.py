@@ -427,6 +427,7 @@ class BucketManager:
         self._bucket_locks: dict[str, asyncio.Lock] = {}
         from retrieval_hints import enabled as hints_enabled
         self._retrieval_hints_enabled = hints_enabled()
+        self._retrieval_attribution_enabled = self._retrieval_hints_enabled and hints_enabled("OMBRE_RETRIEVAL_ATTRIBUTION_ENABLED")
         self._retrieval_hints_store = None
         self._retrieval_hint_rows = {}
         self._retrieval_hints_check_at = 0.0
@@ -444,13 +445,28 @@ class BucketManager:
             path = self._find_bucket_file(bucket_id)
             bucket = self._load_bucket(path) if path else None
             if bucket:
-                self._retrieval_hints_store.register(bucket, kind="new_write")
+                self._retrieval_hints_store.register(bucket, kind="new_write",
+                    schema_version=2 if self._retrieval_attribution_enabled else 1)
         try:
             # Only bounded local registration, never network/model work. If
             # interrupted or busy, the night difference scan repairs the gap.
             await asyncio.wait_for(asyncio.to_thread(register), timeout=.15)
         except Exception as exc:
             logger.warning("retrieval hints registration deferred: %s", type(exc).__name__)
+
+    async def stage_proposed_retrieval_hints(self, bucket_id, payload, source_context, *, proposer_provenance):
+        if not getattr(self, "_retrieval_attribution_enabled", False):
+            return None
+        from retrieval_hints import Generation
+        def stage():
+            path = self._find_bucket_file(bucket_id)
+            bucket = self._load_bucket(path) if path else None
+            if not bucket:
+                return None
+            return self._retrieval_hints_store.stage(bucket, Generation(
+                "ok", payload, requested_model=str(proposer_provenance.get("model", "")),
+                source_context=source_context, generation_provenance=proposer_provenance))
+        return await asyncio.to_thread(stage)
 
     def _attach_retrieval_hints(self, bucket, rows=None):
         if not getattr(self, "_retrieval_hints_enabled", False):
@@ -460,6 +476,20 @@ class BucketManager:
         if row and row["source_content_sha256"] == content_hash(bucket.get("content") or ""):
             return {**bucket, "retrieval_hints_v1": row}
         return bucket
+
+    def retrieval_attribution_eligible(self, bucket):
+        """Only published, source-current quoted=true excludes a candidate."""
+        if not getattr(self, "_retrieval_attribution_enabled", False):
+            return True
+        row = self._retrieval_hint_rows.get(str(bucket.get("id", "")))
+        if not row or row.get("payload", {}).get("quoted") is not True:
+            return True
+        from retrieval_hints_storage import HintsStore, SourceChanged
+        try:
+            HintsStore._check_source(row, bucket)
+        except SourceChanged:
+            return True  # A changed source is unknown, never a stale exclusion.
+        return False
 
     def _build_hinted_bm25_index(self, buckets):
         from retrieval_tokenizer import RetrievalTokenizer
@@ -2916,6 +2946,10 @@ class BucketManager:
 
         if not all_buckets:
             return []
+
+        if getattr(self, "_retrieval_attribution_enabled", False):
+            await self._refresh_retrieval_hint_index(all_buckets)
+            all_buckets = [b for b in all_buckets if self.retrieval_attribution_eligible(b)]
 
         # --- 修复域过滤的脆弱迭代 ---
         if domain_filter:

@@ -170,6 +170,7 @@ class CandidateDraft:
     source_chunk_ids: tuple[str, ...]
     evidence: str
     risk: str
+    retrieval_hints: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,7 +302,7 @@ def _expect_exact_mapping(
 
 
 def _candidate_as_json(candidate: CandidateDraft) -> dict[str, Any]:
-    return {
+    result = {
         "type": candidate.type,
         "title": candidate.title,
         "content": candidate.content,
@@ -320,6 +321,9 @@ def _candidate_as_json(candidate: CandidateDraft) -> dict[str, Any]:
         "evidence": candidate.evidence,
         "risk": candidate.risk,
     }
+    if candidate.retrieval_hints is not None:
+        result["retrieval_hints"] = candidate.retrieval_hints
+    return result
 
 
 class StrictOmbreProposer:
@@ -335,6 +339,7 @@ class StrictOmbreProposer:
         max_chunks: int = 256,
         model: str = "unspecified",
         provider_name: str = "injected",
+        retrieval_hints_enabled: bool = False,
     ) -> None:
         if not callable(provider):
             raise ValueError("provider must be callable")
@@ -371,6 +376,8 @@ class StrictOmbreProposer:
         self.max_chunks = max_chunks
         self.model = model
         self.provider_name = provider_name
+        self.retrieval_hints_enabled = bool(retrieval_hints_enabled)
+        self.schema_version = 2 if self.retrieval_hints_enabled else SCHEMA_VERSION
 
     async def propose(
         self,
@@ -420,13 +427,13 @@ class StrictOmbreProposer:
             )
 
         normalized = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": self.schema_version,
             "candidates": [
                 _candidate_as_json(candidate) for candidate in candidates
             ],
         }
         return ProposerBatch(
-            schema_version=SCHEMA_VERSION,
+            schema_version=self.schema_version,
             candidates=candidates,
             prompt_digest=_digest_text(effective_prompt),
             output_digest=_digest_text(_canonical_json(normalized)),
@@ -596,7 +603,7 @@ class StrictOmbreProposer:
         max_candidates: int,
     ) -> str:
         schema = {
-            "schema_version": 1,
+            "schema_version": self.schema_version,
             "candidates": [
                 {
                     "type": sorted(CANDIDATE_TYPES),
@@ -618,6 +625,15 @@ class StrictOmbreProposer:
                 }
             ],
         }
+        if self.retrieval_hints_enabled:
+            term = {"text": "string <=48 chars", "evidence": "literal substring of candidate.content <=160 chars"}
+            schema["candidates"][0]["retrieval_hints"] = {
+                "schema_version": 2, **{name: [term] for name in
+                    ("who", "where", "when", "what", "aliases", "keywords", "anchors")},
+                "keywords_short_reason": "insufficient_evidence or null",
+                "attribution": ["self", "quoted", "unknown"], "quoted": "false, true, or null",
+                "attribution_evidence": ["literal substring of a cited INPUT chunk <=160 chars"],
+            }
         payload = {
             "allowed_relation_targets": sorted(targets),
             "chunks": [
@@ -648,6 +664,28 @@ class StrictOmbreProposer:
             "emit that separately as relationship_moment. risk must be "
             "exactly normal or review."
         )
+        if self.retrieval_hints_enabled:
+            rules += (
+                " One candidate represents one sourced event/decision, not each paragraph. "
+                "Only within the provided source, combine the same event on the same day with "
+                "the same speaker and object; keep different dates, objects and contrary decisions "
+                "separate. Do not merge stored buckets or infer cross-chunk history. "
+                "The summary must retain at least one concrete source anchor (name, project, "
+                "explicit event time or specific named event); do not turn record/admission time "
+                "into event time. If no anchored event is supported, use candidates:[]. "
+                "retrieval_hints use only candidate.content and the cited chunk, no other history. "
+                "who/where/when/what/anchors have at most 4 items, aliases at most 6, keywords "
+                "usually 5..10; fewer keywords require insufficient_evidence, otherwise null. "
+                "Do not pad with generic words. who/where/when/anchors text must be literal "
+                "in its content evidence; anchors text must also occur in a cited source. "
+                "Distinguish actual speaker/experience from forwarded text, quotations and fiction. "
+                "attribution self/quoted/unknown corresponds exactly to quoted false/true/null. "
+                "Mixed speakers, AI interpretations, corrections or uncertain identity are unknown; "
+                "quotation marks alone and first-person pronouns do not prove forwarding or self. "
+                "content <=20 characters is always unknown. attribution_evidence is 1..3 "
+                "literal source spans for self/quoted; unknown has []. The model cannot certify "
+                "source IDs. Never make fictional characters into the actual speaker."
+            )
         return f"{rules}\nINPUT={_canonical_json(payload)}"
 
     def _build_contract_repair_prompt(
@@ -663,6 +701,8 @@ class StrictOmbreProposer:
             targets,
             max_candidates=_COMPACT_RETRY_MAX_CANDIDATES,
         )
+        if self.retrieval_hints_enabled:
+            detail = detail.replace("schema_version as integer 1", "schema_version as integer 2")
         return f"{instruction} {detail}\n{compact_prompt}"
 
     def _build_incomplete_retry_prompt(
@@ -781,7 +821,7 @@ class StrictOmbreProposer:
         )
         if (
             not _is_plain_int(root["schema_version"])
-            or root["schema_version"] != SCHEMA_VERSION
+            or root["schema_version"] != self.schema_version
             or not isinstance(root["candidates"], list)
             or len(root["candidates"]) > max_candidates
         ):
@@ -804,7 +844,7 @@ class StrictOmbreProposer:
     ) -> CandidateDraft:
         candidate = _expect_exact_mapping(
             raw,
-            _CANDIDATE_FIELDS,
+            _CANDIDATE_FIELDS | ({"retrieval_hints"} if self.retrieval_hints_enabled else set()),
             "schema_candidate",
             "candidate does not exactly match schema",
         )
@@ -885,6 +925,17 @@ class StrictOmbreProposer:
             self._validate_relation(relation, targets)
             for relation in candidate["relation_hints"]
         )
+        hints = None
+        if self.retrieval_hints_enabled:
+            from retrieval_hints import HintError, parse_hints
+            try:
+                hints = parse_hints(_canonical_json(candidate["retrieval_hints"]), candidate["content"],
+                    source_context=tuple({"event_id": source_id, "text": chunk_by_id[source_id]}
+                                         for source_id in bound_source_ids))
+                if hints["schema_version"] != 2 or not hints["anchors"]:
+                    raise HintError("new_summary_anchor_required")
+            except (ValueError, TypeError) as exc:
+                raise ProposerContractError("schema_candidate", "invalid source-bound retrieval hints") from exc
         return CandidateDraft(
             type=candidate["type"],
             title=candidate["title"],
@@ -895,6 +946,7 @@ class StrictOmbreProposer:
             source_chunk_ids=bound_source_ids,
             evidence=evidence,
             risk=candidate["risk"],
+            retrieval_hints=hints,
         )
 
     @staticmethod

@@ -321,7 +321,7 @@ def _relation_json(relation: RelationHint) -> dict[str, Any]:
 
 
 def _draft_json(draft: CandidateDraft) -> dict[str, Any]:
-    return {
+    result = {
         "content": draft.content,
         "evidence": draft.evidence,
         "importance": draft.importance,
@@ -334,6 +334,9 @@ def _draft_json(draft: CandidateDraft) -> dict[str, Any]:
         "title": draft.title,
         "type": draft.type,
     }
+    if draft.retrieval_hints is not None:
+        result["retrieval_hints"] = draft.retrieval_hints
+    return result
 
 
 async def _await_daemon_thread(function):
@@ -1332,7 +1335,7 @@ class NightRunCoordinator:
             or type(write_key) is not str
         ):
             raise NightRunCoordinatorError("candidate.persisted_invalid")
-        return await self.curated.write(
+        result = await self.curated.write(
             idempotency_key=write_key,
             content=content,
             vector_policy=self.policy.vector_policy,
@@ -1350,6 +1353,22 @@ class NightRunCoordinator:
             },
             actor="lmc5:night",
         )
+        # Stage already generated fields, never call another model or mutate
+        # the original write receipt. The night publisher reconciles PG later.
+        if (result.success and result.bucket_id and isinstance(draft.get("retrieval_hints"), dict)
+                and getattr(self.bucket_manager, "_retrieval_attribution_enabled", False)):
+            try:
+                context = tuple({"event_id": event_id,
+                    "text": self._slim_proposer_text(EventIdentity(session_id, event_id))[0]}
+                    for event_id in event_ids)
+                await self.bucket_manager.stage_proposed_retrieval_hints(
+                    result.bucket_id, draft["retrieval_hints"], context,
+                    proposer_provenance=payload.get("proposer", {}))
+            except Exception as exc:
+                # Original bucket is successful; its new_write difference job
+                # and persisted candidate retain a recoverable source of work.
+                logger.warning("retrieval hints staging deferred: %s", type(exc).__name__)
+        return result
 
     async def _dispatch_y(
         self,
