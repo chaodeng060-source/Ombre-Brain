@@ -1,6 +1,7 @@
 from copy import deepcopy
 
 import jieba
+import pytest
 
 from bm25_index import BM25Index, _tokenize
 from retrieval_hints import source_record
@@ -68,3 +69,14 @@ def test_private_dictionary_does_not_mutate_global_or_old_generation():
     assert index.with_upsert(documents()[0]).lexical_version == private.version
     assert index._tokenizer is private
     assert BM25Index().lexical_version == "jieba-search-v1"
+
+
+def test_private_dictionary_uses_same_case_normalization_as_queries():
+    private = RetrievalTokenizer(b"OrionRouter 100000 nz\nCedar-Bridge 100000 nz\n")
+    assert private._tokenizer.FREQ.get("orionrouter") == 100000
+    assert private._tokenizer.FREQ.get("cedar-bridge") == 100000
+    assert "orionrouter" in private("ORIONROUTER")
+    assert "cedar-bridge" in private("Cedar-Bridge")
+    assert "private-lower-v2" in private.version
+    with pytest.raises(ValueError, match="duplicate"):
+        RetrievalTokenizer(b"OrionRouter 100 nz\norionrouter 100 nz\n")

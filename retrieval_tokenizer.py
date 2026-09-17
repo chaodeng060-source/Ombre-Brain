@@ -12,19 +12,21 @@ class RetrievalTokenizer:
     def __init__(self, dictionary: bytes):
         import jieba
         text = dictionary.decode("utf-8")
-        seen = set()
+        seen, normalized = set(), []
         for line in text.splitlines():
             if not line.strip():
                 continue
             fields = line.split()
+            fields[0] = fields[0].lower()
             if len(fields) > 3 or fields[0] in seen:
                 raise ValueError("invalid_or_duplicate_dictionary_entry")
             if len(fields) >= 2 and (not fields[1].isdigit() or int(fields[1]) <= 0):
                 raise ValueError("invalid_dictionary_frequency")
             seen.add(fields[0])
-        self.version = "jieba-search-v1+private-" + hashlib.sha256(dictionary).hexdigest()
+            normalized.append(" ".join(fields))
+        self.version = "jieba-search-v1+private-lower-v2-" + hashlib.sha256(dictionary).hexdigest()
         self._tokenizer = jieba.Tokenizer()
-        self._tokenizer.load_userdict(io.StringIO(text))
+        self._tokenizer.load_userdict(io.StringIO("\n".join(normalized)))
 
     @classmethod
     def from_file(cls, path):
