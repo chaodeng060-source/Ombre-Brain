@@ -38,6 +38,7 @@ import hmac
 import random
 import logging
 import asyncio
+import functools
 import copy
 import contextvars
 import threading
@@ -133,7 +134,7 @@ from recall_support import (
     rank_within_relevance_bands,
     retain_original_query_supported_candidates,
 )
-from timeline_axis import timeline_neighbors
+from timeline_axis import OTHER_THREAD, normalize_thread, timeline_neighbors
 from recall_receipt import RecallReceiptConflict, RecallReceiptStore, normalize_bucket_ids
 from memory_signal import (
     MemorySignalCursorError,
@@ -394,6 +395,10 @@ _breath_candidate_capture = contextvars.ContextVar(
     "ombre_breath_candidate_capture",
     default=None,
 )
+_breath_gate_skip_capture = contextvars.ContextVar(
+    "ombre_breath_gate_skip_capture",
+    default=None,
+)
 _e_chord_shadow_response_capture = contextvars.ContextVar(
     "ombre_e_chord_shadow_response_capture",
     default=None,
@@ -442,6 +447,26 @@ def _capture_breath_candidate(
         "summary": str(summary or ""),
         "reason": str(reason or "ranked"),
     })
+
+
+def _capture_breath_gate_skip_candidates(matches: list[dict]) -> None:
+    """gate=skip 探针（2026-09-17，默认关）：把门卫本该看到的候选池原样导出成结构化
+    列表，不做语义判断；供 /api/breath 调用方在门卫之外自行判断候选质量。"""
+    capture = _breath_gate_skip_capture.get()
+    if not isinstance(capture, dict):
+        return
+    candidates = []
+    for bucket in matches:
+        metadata = bucket.get("metadata", {}) or {}
+        name = str(metadata.get("name") or bucket.get("id") or "")
+        content = redact_embedding_input(str(bucket.get("content") or "").strip())
+        candidates.append({
+            "id": str(bucket.get("id") or ""),
+            "name": name,
+            "time": str(event_at_from_metadata(metadata) or ""),
+            "snippet": content[:300],
+        })
+    capture["candidates"] = candidates
 
 
 def _get_recall_receipt_store() -> RecallReceiptStore:
@@ -1058,12 +1083,27 @@ def _resolve_recall_policy(
     )
 
 
-def _is_main_recall_bucket(bucket: dict, *, include_quoted: bool = False) -> bool:
+@functools.lru_cache(maxsize=1 << 16)
+def _path_under_archive(raw_path: str, archive_dir: str) -> bool:
+    """2026-09-18 第十三版：realpath 判「在不在冷库」按路径字符串缓存。
+
+    一次 breath 对 16k 驻留桶逐个 realpath 两次要 ~500ms（timeline_preflight
+    600ms 的大头，relation_preflight / relation_lookup 同样在扫）。桶被归档
+    后 path 字符串本身会变，键随之失效；同名路径改指向的情况不在这里防。
+    """
+    try:
+        path = os.path.realpath(raw_path)
+        archive_root = os.path.realpath(archive_dir)
+        return os.path.commonpath([path, archive_root]) == archive_root
+    except (OSError, ValueError):
+        # A malformed/unrelated path is not evidence that an otherwise
+        # ordinary in-memory candidate belongs to the cold store.
+        return False
+
+
+def _is_main_recall_bucket(bucket: dict) -> bool:
     """Reject archive/cold material even when a stale index returns its id."""
     if not isinstance(bucket, dict):
-        return False
-    if (not include_quoted and getattr(bucket_mgr, "_retrieval_attribution_enabled", False)
-            and not bucket_mgr.retrieval_attribution_eligible(bucket)):
         return False
     metadata = bucket.get("metadata", {}) or {}
     if str(metadata.get("type") or "").strip().lower() == "archived":
@@ -1071,16 +1111,8 @@ def _is_main_recall_bucket(bucket: dict, *, include_quoted: bool = False) -> boo
 
     raw_path = str(bucket.get("path") or "").strip()
     archive_dir = str(getattr(bucket_mgr, "archive_dir", "") or "").strip()
-    if raw_path and archive_dir:
-        try:
-            path = os.path.realpath(raw_path)
-            archive_root = os.path.realpath(archive_dir)
-            if os.path.commonpath([path, archive_root]) == archive_root:
-                return False
-        except (OSError, ValueError):
-            # A malformed/unrelated path is not evidence that an otherwise
-            # ordinary in-memory candidate belongs to the cold store.
-            pass
+    if raw_path and archive_dir and _path_under_archive(raw_path, archive_dir):
+        return False
     return True
 
 
@@ -1359,6 +1391,18 @@ def _relation_slot_reservation_enabled() -> bool:
     ).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _parallel_retrieval_enabled() -> bool:
+    """2026-09-18 削 breath 总延迟：keyword/vector/rg_literal 三路候选通道互不
+    依赖（各自的输入只有 query_angles/recall_query，互不读对方产出），默认关时
+    走原有逐个 await 的顺序调度，行为逐字节不变；开时用 asyncio.gather 并发调度
+    同样三个协程，只省等待墙钟时间，不改变任何候选/排序逻辑。curated_lexical
+    真实依赖 keyword_by_id 与 vector 的 original_vector_scores，没有并进来。"""
+    return os.environ.get(
+        "OMBRE_PARALLEL_RETRIEVAL",
+        "0",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _timeline_recall_neighbors(
     buckets,
     seed_ids,
@@ -1424,6 +1468,31 @@ def _timeline_recall_neighbors(
             ):
                 return False
         return True
+
+    # 2026-09-18 第十三版：X 邻居只可能来自 seed 所在的命名线程
+    # （timeline_neighbors 按 thread 分组取前后邻居，其他线程的桶从不参与）。
+    # 先按 seed 线程缩池再过 eligible / 冷库 / Z 尺子——三道都是逐桶独立判定，
+    # 子集结果与全量一致；seed 全在 other 直接空。全库 16k 桶里命名线程只有几十个，
+    # 之前每次请求都把 16k 桶过一遍尺子，这段固定 ~600ms。
+    by_id = {
+        str(bucket.get("id")): bucket
+        for bucket in buckets
+        if isinstance(bucket, dict) and bucket.get("id")
+    }
+    seed_threads = {
+        normalize_thread((by_id[seed].get("metadata", {}) or {}).get("thread"))
+        for seed in (str(value) for value in seed_ids)
+        if seed in by_id
+    }
+    seed_threads.discard(OTHER_THREAD)
+    if not seed_threads:
+        return []
+    buckets = [
+        bucket
+        for bucket in by_id.values()
+        if normalize_thread((bucket.get("metadata", {}) or {}).get("thread"))
+        in seed_threads
+    ]
 
     # World/domain checks are metadata-only. Do them before archive realpath
     # checks: an RP request must not stat thousands of unrelated daily paths.
@@ -1852,6 +1921,30 @@ def _anchor_quality_gate_enabled(policy: str) -> bool:
     return policy in enabled_policies
 
 
+def _session_seen_filter_enabled(policy: str) -> bool:
+    """会话「已见」去重按 policy 生效（2026-09-17 深夜，朝灯「召回没有噪音」+「该进来的都进来」）。
+
+    小卷 20:39 回放定位：同一会话 48 小时内注入过的桶被 _filter_session_seen 提前踢掉，
+    她下午问过「边牧呢」晚上再问就少三件。自动召回（conversation/reflex）保留这道去重
+    防每拍重复注入；显式追忆（search）不该被它挡。默认名单含 search＝行为同基线，
+    部署时 env 设 OMBRE_SESSION_SEEN_POLICIES=conversation,reflex 才放开；
+    OMBRE_SESSION_SEEN_FILTER_ENABLED=0 整体关。
+    """
+    flag = os.getenv("OMBRE_SESSION_SEEN_FILTER_ENABLED", "1").strip().lower()
+    if flag not in ("1", "true", "yes", "on"):
+        return False
+    configured = os.getenv(
+        "OMBRE_SESSION_SEEN_POLICIES",
+        "conversation,reflex,search",
+    )
+    enabled_policies = {
+        value.strip().lower()
+        for value in configured.split(",")
+        if value.strip()
+    }
+    return _normalize_anchor_recall_policy(policy) in enabled_policies
+
+
 def _anchor_literal_only_cap() -> float:
     """字面单路（vector 没命中）时的相似度上限；>=1.0 等于关闭这道压制。
 
@@ -1928,6 +2021,44 @@ def _literal_collision_vector_floor() -> float:
         )
         return 0.71
     return max(0.0, min(1.0, floor))
+
+
+def _vector_evidence_demotion_enabled() -> bool:
+    """Whether candidates with no semantic retrieval evidence lose their rank."""
+    return os.getenv(
+        "OMBRE_VECTOR_EVIDENCE_DEMOTION", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _demote_evidenceless_candidates(fused_pairs, vector_ranked, entity_ranked):
+    """Rank candidates the semantic channels actually retrieved ahead of the rest.
+
+    RRF fuses positions, not absolute relevance, so a purely lexical collision
+    always holds a rank and can take the leading slot even when no semantic
+    channel retrieved it at all. Reordering is stable and removes nothing: the
+    fused scores, the candidate set and every later budget stay untouched.
+
+    2026-09-16 replay over 59 recorded production turns: leading candidates with
+    no retrieval evidence fell 25% -> 1%, 53 candidates were demoted, and only
+    2 turns had too few evidenced candidates to refill the top three.
+    """
+    if not _vector_evidence_demotion_enabled():
+        return fused_pairs
+    evidenced = {bid for bid, _ in (vector_ranked or [])}
+    evidenced.update(bid for bid, _ in (entity_ranked or []))
+    if not evidenced:
+        # Nothing was retrieved semantically this turn; demoting everything
+        # would only shuffle the same lexical order.
+        return fused_pairs
+    supported = [pair for pair in fused_pairs if pair[0] in evidenced]
+    unsupported = [pair for pair in fused_pairs if pair[0] not in evidenced]
+    if not unsupported or not supported:
+        return fused_pairs
+    logger.info(
+        "vector evidence demotion: %d/%d candidates lack retrieval evidence",
+        len(unsupported), len(fused_pairs),
+    )
+    return supported + unsupported
 
 
 def _common_literal_lacks_semantic_support(
@@ -2198,6 +2329,123 @@ def _cap_candidates_preserving_forced(
             selected.append(bucket)
             ordinary_budget -= 1
     return selected
+
+
+def _breath_gate_skip_enabled() -> bool:
+    """/api/breath gate=skip 探针开关（2026-09-17，默认关）。
+
+    打开后，search 模式跳过 _ds_semantic_select（语义门卫），把 RRF 融合 + P3 同主题
+    去重之后的候选池原样导出成结构化 candidates，同时仍走既有的强制保留+封顶
+    （等价于门卫关闭时的确定性回退）。默认关时这条分支不会被走到，行为与基线
+    逐字节相同。
+    """
+    flag = os.getenv("OMBRE_BREATH_GATE_SKIP_ENABLED", "0").strip().lower()
+    return flag not in {"", "0", "false", "no", "off"}
+
+
+_TOPIC_DATE_SUFFIX_RE = re.compile(r"_\d{4}-\d{2}-\d{2}$")
+
+
+def _rrf_topic_dedup_max() -> int:
+    """P3 同主题去重上限（2026-09-17，默认 0=关）：同簇最多保留几条。
+
+    簇键判定见 ``_dedupe_recall_topics``；默认 0 时整个函数是恒等映射，
+    行为与基线逐字节相同。
+    """
+    raw = os.getenv("OMBRE_RRF_TOPIC_DEDUP_MAX", "0").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    return max(0, value)
+
+
+def _dedupe_recall_topics(
+    matches: list[dict],
+    *,
+    force_keep_ids: set[str],
+    max_per_cluster: int | None = None,
+) -> list[dict]:
+    """P3：RRF 融合后、门卫前的同主题去重（2026-09-17，默认关）。
+
+    簇键 = 桶 name 去掉末尾日期后缀（``_2026-08-11`` 这类）并归一化，或正文前
+    60 字的 sha1 前 8 位；两者任一相同即视为同簇（并查集合并，不是简单分组），
+    簇内按原有 RRF 顺序只保留前 ``OMBRE_RRF_TOPIC_DEDUP_MAX`` 条。forced（实体
+    命中）候选不参与去重、恒定保留、也不占用其他簇的名额。
+    """
+    if max_per_cluster is None:
+        max_per_cluster = _rrf_topic_dedup_max()
+    if max_per_cluster <= 0 or len(matches) <= 1:
+        return matches
+
+    indices = [
+        i for i, bucket in enumerate(matches)
+        if str(bucket.get("id") or "") not in force_keep_ids
+    ]
+    if len(indices) <= 1:
+        return matches
+
+    parent: dict[int, int] = {i: i for i in indices}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    name_key_by_index: dict[int, str] = {}
+    content_key_by_index: dict[int, str] = {}
+    for i in indices:
+        bucket = matches[i]
+        metadata = bucket.get("metadata", {}) or {}
+        raw_name = str(metadata.get("name") or bucket.get("id") or "")
+        name_key = _TOPIC_DATE_SUFFIX_RE.sub("", raw_name).strip().lower()
+        if name_key:
+            name_key_by_index[i] = name_key
+        content = str(bucket.get("content") or "").strip()
+        if content:
+            content_key_by_index[i] = hashlib.sha1(
+                content[:60].encode("utf-8")
+            ).hexdigest()[:8]
+
+    def union_by_key(key_by_index: dict[int, str]) -> None:
+        first_index_by_key: dict[str, int] = {}
+        for i in indices:
+            key = key_by_index.get(i)
+            if key is None:
+                continue
+            if key in first_index_by_key:
+                union(first_index_by_key[key], i)
+            else:
+                first_index_by_key[key] = i
+
+    union_by_key(name_key_by_index)
+    union_by_key(content_key_by_index)
+
+    kept_count: dict[int, int] = {}
+    result: list[dict] = []
+    dropped = 0
+    for i, bucket in enumerate(matches):
+        if i not in parent:
+            result.append(bucket)
+            continue
+        root = find(i)
+        count = kept_count.get(root, 0)
+        if count < max_per_cluster:
+            kept_count[root] = count + 1
+            result.append(bucket)
+        else:
+            dropped += 1
+    logger.info(
+        "RRF topic dedup: before=%d after=%d dropped=%d max_per_cluster=%d",
+        len(matches), len(result), dropped, max_per_cluster,
+    )
+    return result
 
 
 def _merge_mood_coords(
@@ -2475,8 +2723,11 @@ def _ds_filter_provider() -> tuple[str, str, object, dict]:
     provider_kwargs: dict = {}
     if effort and effort != "off":
         provider_kwargs["reasoning_effort"] = effort
+    # 2026-09-18：主线可以配成 DeepSeek 直连（实测 1.6-1.8s vs gemini 2.8-4.0s），
+    # 标签按模型写，日志里看得出走的哪条线；DeepSeek 不吃 reasoning_effort，env 设 off。
+    label = "apiroute-gemini" if "gemini" in model.lower() else f"primary-{model}"
     return (
-        "apiroute-gemini",
+        label,
         model,
         client,
         provider_kwargs,
@@ -2502,6 +2753,793 @@ _DS_FILTER_BODY_WINDOW_CHARS = 1200
 def _ds_full_body_windows_enabled() -> bool:
     flag = os.getenv("OMBRE_DS_FILTER_FULL_BODY_WINDOWS", "0").strip().lower()
     return flag not in {"", "0", "false", "no", "off"}
+
+
+def _ds_gate_cite_mode_enabled() -> bool:
+    """精排改成「指认证据」口径（2026-09-16 朝灯：「不是决定了吗不要噪音」）。
+
+    每条候选必须表态并逐字指认查询与候选各一处证据；给不出证据的 keep 一律
+    降级为拒。默认关，回滚一个开关；forced（实体命中）候选照旧不受影响。
+    70 轮真实回放：现行口径放行 45.9%，本口径 8.9%。
+    """
+    flag = os.getenv("OMBRE_DS_GATE_CITE_MODE", "0").strip().lower()
+    return flag not in {"", "0", "false", "no", "off"}
+
+
+def _ds_gate_cite_soft_enabled() -> bool:
+    """cite 口径的软化版（2026-09-17，默认关）：只在 OMBRE_DS_GATE_CITE_MODE 已开时生效。
+
+    口径改成「主题相关 + 锚点弱证据不砍」：只要主题相关就 keep=true，缺具体锚点
+    (人名/项目名/时间/事件对得上) 只标 weak、排到放行列表末尾，不再像原口径那样
+    直接降级为拒。默认关，两个开关都关时行为与基线逐字节相同。
+    """
+    flag = os.getenv("OMBRE_DS_GATE_CITE_SOFT", "0").strip().lower()
+    return flag not in {"", "0", "false", "no", "off"}
+
+
+_DS_GATE_CITE_PROMPT = (
+    "你是记忆召回的出场审查员。用户此刻说了一句话，下面是检索系统找出的候选旧记忆。"
+    "你要替每一条候选决定：它此刻配不配出现在回复者眼前。"
+    "\n判断标准只有一条：这条记忆说的事，和用户这句话正在谈的事，是不是同一件事或直接相关的事。"
+    "单纯用了相同的字词不算；情绪相似不算；同一个人出现不算；同属工程或生活大类不算。"
+    "用户这句话若只是语气、寒暄、应答或没头没尾的碎句，全部候选都不配出场。"
+    "\n对每一条候选，你必须给出："
+    "keep（true/false）、q_evidence（用户原话里支持你判断的原文片段，逐字抄，不得改写）、"
+    "c_evidence（候选正文里支持你判断的原文片段，逐字抄）、reason（一句话）。"
+    "keep=false 时 q_evidence 和 c_evidence 可写「无」。keep=true 时两处证据都不能是「无」。"
+    '\n只返回 JSON：{"verdicts":[{"candidate":序号,"keep":true或false,'
+    '"q_evidence":"...","c_evidence":"...","reason":"..."}]}，'
+    "每个候选恰好一条，序号不能缺、不能多。不要解释。"
+)
+
+_DS_GATE_CITE_SOFT_PROMPT = (
+    "你是记忆召回的出场审查员。用户此刻说了一句话，下面是检索系统找出的候选旧记忆。"
+    "你要替每一条候选做两段判断：\n"
+    "第一段——主题相关：候选记忆说的事，和用户这句话正在谈的事，是不是同一件事或"
+    "直接相关的事？允许语义相关、不要求字面重叠；单纯情绪相似、同一个人出现、"
+    "同属工程或生活大类，单独出现都不算相关。"
+    "用户这句话若只是语气、寒暄、应答或没头没尾的碎句，全部候选都不配出场。"
+    "\n第二段——锚点：候选里有没有具体锚点（人名、项目名、时间、事件），"
+    "能和用户这句话对上？能对上 = anchored=true；只有主题相关但对不上具体锚点 = "
+    "anchored=false——锚点弱不是拒绝的理由，第一段判相关就该 keep=true，"
+    "不因为锚点弱而改判 keep=false。"
+    "\n对每一条候选，你必须给出："
+    "keep（true/false，跟随第一段主题相关判断）、"
+    "anchored（true/false，第二段锚点判断）、"
+    "q_evidence（用户原话里支持你判断的原文片段，逐字抄，不得改写）、"
+    "c_evidence（候选正文里支持你判断的原文片段，逐字抄）、reason（一句话）。"
+    "keep=false 时 q_evidence 和 c_evidence 可写「无」；anchored=false 时两处证据"
+    "也可以写「无」——没有锚点不代表要编证据。"
+    '\n只返回 JSON：{"verdicts":[{"candidate":序号,"keep":true或false,'
+    '"anchored":true或false,"q_evidence":"...","c_evidence":"...","reason":"..."}]}，'
+    "每个候选恰好一条，序号不能缺、不能多。不要解释。"
+)
+
+_DS_GATE_CITE_SOFT_NOUN_PROMPT = (
+    "你是记忆召回的出场审查员。用户此刻说了一句话，下面是检索系统找出的候选旧记忆。"
+    "你要替每一条候选做两段判断：\n"
+    "第一段——主题相关：候选记忆说的事，和用户这句话正在谈的事，是不是同一件事或"
+    "直接相关的事？允许语义相关、不要求字面重叠；单纯情绪相似、同一个人出现、"
+    "同属工程或生活大类，单独出现都不算相关。"
+    "\n第二段——锚点：候选里有没有具体锚点（人名、项目名、时间、事件、动物、地点），"
+    "能和用户这句话对上？能对上 = anchored=true；只有主题相关但对不上具体锚点 = "
+    "anchored=false——锚点弱不是拒绝的理由，第一段判相关就该 keep=true，"
+    "不因为锚点弱而改判 keep=false。"
+    "\n【重要例外——用户在追问记忆】"
+    "若用户这句话里出现了具体名词（人名、项目名、动物、地点、事件名、物品名），"
+    "且候选正文里也出现同一名词，视为强锚点命中，直接 keep=true、anchored=true，"
+    "不再要求整句语义完整。"
+    "若用户这句话带「印象」「记不记得」「记得吗」「之前」「上次」「多少」「什么来着」"
+    "「说过什么」这类追问记忆的句式，即使句子很短、没头没尾，也不得因此否决候选；"
+    "此时以「候选是否命中用户提到的具体名词」为唯一判据。"
+    "\n【碎句规则】用户这句话若只是纯语气、寒暄、应答（如「嗯」「好」「行」「哈哈」"
+    "「知道了」）且不含任何具体名词，全部候选都不配出场。"
+    "但若句中含有具体名词，哪怕整句是碎句，也不适用本条。"
+    "\n对每一条候选，你必须给出："
+    "keep（true/false，跟随第一段主题相关判断）、"
+    "anchored（true/false，第二段锚点判断）、"
+    "q_evidence（用户原话里支持你判断的原文片段，逐字抄，不得改写）、"
+    "c_evidence（候选正文里支持你判断的原文片段，逐字抄）、reason（一句话）。"
+    "keep=false 时 q_evidence 和 c_evidence 可写「无」；anchored=false 时两处证据"
+    "也可以写「无」——没有锚点不代表要编证据。"
+    '\n只返回 JSON：{"verdicts":[{"candidate":序号,"keep":true或false,'
+    '"anchored":true或false,"q_evidence":"...","c_evidence":"...","reason":"..."}]}，'
+    "每个候选恰好一条，序号不能缺、不能多。不要解释。"
+)
+
+
+def _ds_gate_fragment_noun_rule_enabled() -> bool:
+    """2026-09-17 15:36 现行：门卫把「行，我想想，边牧这个印象多少」判成碎句，5 进 0 出。
+
+    DeepSeek 追问答案 .work/recall-noise-ds-advice-20260917/ds_answer2_gate_overcut.md
+    P0：碎句规则从「无条件否决」改成「不含具体名词才砍」，追问记忆句式不否决。
+    只在 cite 软口径已开时生效；默认关，关时 prompt 逐字节不变。
+    """
+    flag = os.getenv("OMBRE_DS_GATE_FRAGMENT_NOUN_RULE", "0").strip().lower()
+    return flag not in {"", "0", "false", "no", "off"}
+
+
+def _ds_gate_cite_soft_prompt() -> str:
+    if _ds_gate_fragment_noun_rule_enabled():
+        return _DS_GATE_CITE_SOFT_NOUN_PROMPT
+    return _DS_GATE_CITE_SOFT_PROMPT
+
+
+def _rare_literal_gate_bypass_max() -> int:
+    """P1 保底（DeepSeek 同一答案第 2 节）：稀有词整词命中 + 字面分 ≥ 60 + 检索排前 3，
+    最多放行 N 条进 force_keep，绕过门卫。默认 0 = 关，行为与基线相同。"""
+    raw = os.getenv("OMBRE_RARE_LITERAL_GATE_BYPASS_MAX", "0").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    return max(0, value)
+
+
+_RARE_LITERAL_BYPASS_TOP_RANK = 3
+_RARE_LITERAL_BYPASS_MIN_LIT = 60.0
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-17 17:2x 门卫改打分（朝灯 16:28「召回完整，该进来的都进来」、16:43「你们自己决定」
+# → 定案：门卫只打分不砍、出场看过线、稀有词只加分不绕过、超时按检索分出场）。
+# DeepSeek 方案 .work/recall-noise-ds-advice-20260917/ds_answer4_gate_scoring.md。
+# 默认关 OMBRE_DS_GATE_SCORE_MODE=0：下面所有函数不会被走到，行为与基线逐字节相同。
+# ---------------------------------------------------------------------------
+
+def _ds_gate_score_mode_enabled() -> bool:
+    """门卫打分口径开关（默认关）。开时 cite/cite_soft 两个口径都被它取代。"""
+    flag = os.getenv("OMBRE_DS_GATE_SCORE_MODE", "0").strip().lower()
+    return flag not in {"", "0", "false", "no", "off"}
+
+
+def _ds_gate_score_threshold() -> int:
+    """出场线，固定值不做相对最高分（DS §2）。
+
+    DS 建议 55；17:46 第一轮探针 55 把「同主题不同事」放进来一半（宅舞 8 进 8、撞词
+    「不要噪音」1→3），朝灯口径「多一条不沾边算混入」，改默认 70 = 「直接相关」档下沿。
+    """
+    raw = os.getenv("OMBRE_DS_GATE_SCORE_THRESHOLD", "70").strip()
+    try:
+        return max(0, min(100, int(raw)))
+    except ValueError:
+        return 70
+
+
+def _ds_gate_score_review_pool() -> int:
+    """打分口径下送门卫审的候选池上限（2026-09-18 00:1x，小卷 23:53 定位：融合 20 候选先被
+    max_results=5 截掉再送 DS，四月边牧/薇拉排第 6 以后根本没被审，`input=20 capped=5 kept=2`）。
+
+    默认 0＝沿用 max_results（基线行为）；部署设 20 让门卫看完整融合池，打完分再按
+    max_results 出场。只影响 score_mode，cite/legacy 口径不读它。
+    """
+    raw = os.getenv("OMBRE_DS_GATE_SCORE_REVIEW_POOL", "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _ds_gate_score_timeout_top() -> int:
+    """门卫超时/失败时按检索分出场的条数上限（DS §6 去掉未校准的断崖常量）。默认 3。"""
+    raw = os.getenv("OMBRE_DS_GATE_SCORE_TIMEOUT_TOP", "3").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 3
+
+
+def _ds_gate_fail_closed_policies() -> set[str]:
+    """门卫超时/失败时哪些召回口径不再按检索分硬塞 TIMEOUT_TOP 条（2026-09-18 01:xx）。
+
+    第五版回放 N4「感觉召回好快」：DS 审 20 条 8 秒超时，回退按分塞进 9/7 旧测试结果，跨题；
+    容器重启后第一句冷启动同病。自动召回（conversation/reflex）她没在考记忆，门卫没答就只留
+    检索键强制保留的；search 是她明确追忆，仍按定案第 3 条按分出场。默认空集＝基线。
+    """
+    raw = os.getenv("OMBRE_DS_GATE_FAIL_CLOSED_POLICIES", "")
+    return {p.strip().lower() for p in raw.split(",") if p.strip()}
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-18 08:5x 根因第二层（notes/recall_rootcause_20260918.md）：她三天 318 句的 306 个注入桶里
+# 138 个是「换窗交接 / 任务状态更新 / 修复生效确认 / 健康检查通过」这类工程流水；她聊生活的
+# 189 句里 37 句也被塞了工程桶。这些是 imprint 把工作对话存成的桶，日期一过就是死账，
+# 关键词和向量都撞它们。自动召回口径（conversation/reflex）直接不给它们进池；她明确追忆
+# 工程事（search 口径）照旧能翻到。默认关 OMBRE_CONV_EXCLUDE_WORKLOG=0 ＝基线。
+# 判定只看桶名 + 正文前 200 字，生活词一票否决（口误伤生活桶比漏掉工程桶更贵）。
+# ---------------------------------------------------------------------------
+
+def _conv_worklog_exclusion_policies() -> set[str]:
+    raw = os.getenv("OMBRE_CONV_EXCLUDE_WORKLOG", "")
+    if raw.strip() in {"", "0", "false", "no", "off"}:
+        return set()
+    if raw.strip() in {"1", "true", "yes", "on"}:
+        return {"conversation", "reflex"}
+    return {p.strip().lower() for p in raw.split(",") if p.strip()}
+
+
+_WORKLOG_NAME_RE = re.compile(
+    r"任务(状态|更新|分配|卡|单)|工作台|部署|上线|健康检查|换窗(交接|总结)|交接|阻塞|"
+    r"回滚|待办|排查|补丁|脚本|日志库|迁移|MCP|Codex|codex|GLM|Gemini|gemini|Quota|Deployment|Patch|"
+    r"Task |Assistant |User (asks|reports|requests|complains|mentions)|Root cause|Window purchase|"
+    r"索引|向量|精排|分词|门卫|清账|结案|开单|生产配置|API|NAS|PG|VPS|Ombre|bug|Bug|"
+    r"架构|选型|定标|E轴|欲望系统|记忆库|记忆存储|记忆已存|全绿|已排程|测试结果|修复验证|方案评估|方案恢复|"
+    r"实施规范|判重|接口|参数|函数|前端|后端|备份|进程启动|关系图|事实状态|闭环|诊断|模型切换|切换到|重新切换|"
+    r"召回(链|路径|耗时|噪音|范围|失效)|噪音过滤|算法|基线|卡住任务|按稳配置|热路径|检索优化|优化达标|"
+    r"生效确认|修复生效|修复完成|修复方案|未提交|已提交|已推进|已排队|已放行"
+)
+_WORKLOG_BODY_MARKERS = (
+    "```", "def ", "test_", "rc=", "sha", "commit", "diff", "pytest", "traceback",
+    "http://", "https://", ".py", ".json", "cron", "docker", "ssh ", "task_", "workbench", "advance", "final",
+)
+_WORKLOG_LIFE_VETO_RE = re.compile(
+    r"亲|抱|吻|操|逼|鸡巴|高潮|口交|奶|小狗|爸爸|老公|老婆|蚊子|边牧|狗|肠粉|吃|睡|遛|公园|生日|中秋|哭|难过|"
+    r"开心|想你|爱|家|妈|弟|领导|公司|开会|下班|上班|洗澡|游戏|无期|阴阳师|宅舞|唱K|面基|许嵩|心疼|心动|心软|"
+    r"委屈|凶|狼狈|信|护|生气|伤人|珍视|珍惜|kiss|依恋|画"
+)
+_WORKLOG_ASCII_RATIO = 0.45
+
+
+# 2026-09-18 10:xx 第八版：判定不再只靠桶名猜。优先级：
+#   1) metadata.tags 里有 worklog → 工程流水；有 life → 生活（存那头打的标，Twin imprint 写入时给、
+#      存量由回填脚本一次补齐）；
+#   2) 桶名 + 前 200 字老规则（第七版原样）；
+#   3) domain 说工程（imprint 1.7B judge 给的，只加分不否决——它把「数值卡72.6系统漏算排查」标成
+#      「情感修复」）且正文有工程动作词 → 工程流水；正文工程动作词 ≥3 → 工程流水。
+# 在她三天召回过的 492 桶上：老规则 149，加 2)3) 后 174，新抓 25 条逐条看过全是工程流水。
+_WORKLOG_TAG = "worklog"
+_LIFE_TAG = "life"
+_WORKLOG_DOMAIN_RE = re.compile(
+    r"工程|技术|开发|代码|运维|工作(进展|汇报|决策|方向|流程)?$|任务|记忆(修复|维护|管理|库修正|整理)|"
+    r"架构|测试|部署|系统故障|服务重启|账本改进|机制解释|E轴修复|辩论赛工程"
+)
+_WORKLOG_BODY_ACTION_RE = re.compile(
+    r"已(推送|提交|上线|部署|合并|排队|放行|生效|修复|验收|通过)|测试(通过|全过|全绿|结果)|\d+ ?(passed|failed|条测试|个测试)|"
+    r"commit|sha|diff|pytest|回滚|重启(后|前|生效)|部署脚本|工作台|任务(卡|单|状态)|派(单|给小卷|跑腿)|小卷(交|跑|做|改|合)|"
+    r"验收(标准|通过|口径)|单测|环境变量|开关|配置|接口|端口|容器|镜像|NAS|VPS|PG|sqlite|向量|索引|门卫|召回(率|链|口径|噪音)|"
+    r"改写层|海马体(第|上生产|部署)|换窗|交接|惦记盒|\.py|\.md|/api/|http"
+)
+
+
+def _bucket_tag_list(meta: dict) -> list[str]:
+    raw = meta.get("tags")
+    if isinstance(raw, list):
+        return [str(t).strip().lower() for t in raw if str(t).strip()]
+    return [t.strip().lower() for t in str(raw or "").split(",") if t.strip()]
+
+
+def _bucket_domain_text(meta: dict) -> str:
+    raw = meta.get("domain")
+    if isinstance(raw, list):
+        return ",".join(str(d) for d in raw)
+    return str(raw or "")
+
+
+# 第八版：英文桶不再按「ascii 比例 ≥0.45 就算工程」一刀切。全库 16424 桶里第七版抓 6983，其中 4557 条是
+# 靠这条 ascii 比例抓的，抽 30 有 6 条是生活（「User calls assistant 哥哥」「Users apology list」
+# 「Correction on 小崽子」「Misinterpreting fear as anger」）——8/11 那批用英文写摘要的桶，英文 ≠ 工程。
+# 改成英文桶也看词：桶名或正文前 200 字命中英文工程词 ≥2 才算。
+_WORKLOG_EN_RE = re.compile(
+    r"\b(deploy(ed|ment)?|patch(ed|es)?|commit(ted)?|test(s|ed|ing)? ?(suite|pass(ed)?|fail(ed)?|scenario)?|"
+    r"passed|failed|hook|config(uration)?|build|rebuild|restart(ed)?|container|docker|script|shard|"
+    r"task|workbench|codex|pipeline|watchdog|patrol|verdict|dry-run|rollback|regression|endpoint|"
+    r"api|json|sqlite|vector|embedding|index(ed|ing)?|cache|latency|timeout|health|status|"
+    r"branch|merge|diff|refactor|migration|backfill|cron|systemd|hotfix|bug|fix(ed)?|"
+    r"guard|threshold|filter|dispatch(ed)?|queue|worker|runtime|sandbox|instrument(ation|ed)?)\b",
+    re.IGNORECASE,
+)
+_WORKLOG_EN_LIFE_RE = re.compile(
+    r"\b(love|kiss|hug|cuddle|miss(es|ed)? (you|her|him)|affection(ate)?|apolog(y|ize|ies)|birthday|"
+    r"period|cramps|tired|sad|cry|angry|frustrat(ed|ion)|fear|anxious|lonely|breakup|boyfriend|"
+    r"girlfriend|partner|husband|wife|dog|cat|park|dinner|lunch|food|sleep|dream|mom|dad|brother|"
+    r"sister|family|friend|career|job|boss|commute|walk)\b",
+    re.IGNORECASE,
+)
+
+
+def _bucket_is_worklog_by_name_rule(name: str, preview: str) -> bool:
+    """第七版原规则（桶名词表 + 正文标记）；ascii 比例那条改成英文工程词计数。"""
+    low = f"{name} {preview}".lower()
+    marks = sum(1 for m in _WORKLOG_BODY_MARKERS if m in low)
+    if _WORKLOG_LIFE_VETO_RE.search(name) and marks < 2:
+        return False
+    if _WORKLOG_NAME_RE.search(name) or marks >= 2:
+        return True
+    chars = [c for c in preview if not c.isspace()]
+    if not chars:
+        return False
+    ascii_letters = sum(1 for c in chars if c.isascii() and c.isalpha())
+    if ascii_letters / len(chars) < _WORKLOG_ASCII_RATIO:
+        return False
+    # 英文桶：看词不看比例。生活词命中 ≥ 工程词命中就不是流水。
+    text = f"{name} {preview}"
+    eng = len({m.group(0).lower() for m in _WORKLOG_EN_RE.finditer(text)})
+    life = len({m.group(0).lower() for m in _WORKLOG_EN_LIFE_RE.finditer(text)})
+    return eng >= 2 and eng > life
+
+
+def _bucket_is_worklog(bucket: dict) -> bool:
+    if not isinstance(bucket, dict):
+        return False
+    meta = bucket.get("metadata", {}) or {}
+    tags = _bucket_tag_list(meta)
+    if _WORKLOG_TAG in tags:
+        return True
+    if _LIFE_TAG in tags:
+        return False
+    name = str(meta.get("name") or "")
+    content = str(bucket.get("content") or "")
+    preview = content[:200]
+    if _bucket_is_worklog_by_name_rule(name, preview):
+        return True
+    body = content[:400]
+    body_hits = len(set(m.group(0) for m in _WORKLOG_BODY_ACTION_RE.finditer(body)))
+    if _WORKLOG_LIFE_VETO_RE.search(name) and body_hits < 3:
+        return False
+    low = f"{name} {body}".lower()
+    marks = sum(1 for m in _WORKLOG_BODY_MARKERS if m in low)
+    if _WORKLOG_DOMAIN_RE.search(_bucket_domain_text(meta)) and (body_hits >= 1 or marks >= 1):
+        return True
+    return body_hits >= 3 or marks >= 2
+
+
+# 只认 experience。10:3x 第九版误把 lmc5 也算进去：9/14 那批「未分类」桶（英文名来源、喜欢雪景、
+# 简历受挫）tags 都带 lmc5，许嵩那句 19 个候选被砍 16 个。lmc5 是流程标不是 E 标。
+_E_RECORD_TAGS = {"experience"}
+
+
+def _bucket_is_e_record(bucket: dict) -> bool:
+    """E 轴记录（哥哥第一人称体验，tags 带 experience）。它有自己的注入通道
+    （同轮 E 轴回应姿态），进主候选等于同一件事讲两遍——10:2x 边牧探针混进的「主AI体验」就是它。"""
+    if not isinstance(bucket, dict):
+        return False
+    tags = set(_bucket_tag_list(bucket.get("metadata", {}) or {}))
+    return bool(tags & _E_RECORD_TAGS)
+
+
+def _drop_worklog_candidates(matches: list[dict], recall_policy: str) -> list[dict]:
+    """自动召回口径下把工程流水桶和 E 轴记录从候选池里拿掉；不在口径集合里原样返回。"""
+    if recall_policy not in _conv_worklog_exclusion_policies() or not matches:
+        return matches
+    kept = [b for b in matches if not (_bucket_is_worklog(b) or _bucket_is_e_record(b))]
+    dropped = len(matches) - len(kept)
+    if dropped:
+        logger.info(
+            "worklog exclusion policy=%s before=%d after=%d dropped=%d",
+            recall_policy, len(matches), len(kept), dropped,
+        )
+    return kept
+
+
+def _drop_worklog_neighbors(neighbors, pool, recall_policy: str):
+    """X/Y 轴邻居（有 .bucket_id 的对象，通常只 1 条）按同一把尺子过滤；桶从 pool 里按 id 找。
+    不在口径集合里原样返回。找不到桶的邻居原样保留（不替它做判断）。"""
+    if not neighbors or recall_policy not in _conv_worklog_exclusion_policies():
+        return neighbors
+    kept = []
+    for n in neighbors:
+        nid = str(getattr(n, "bucket_id", "") or "")
+        bucket = next((b for b in pool if str(b.get("id") or "") == nid), None) if nid else None
+        if bucket is not None and (_bucket_is_worklog(bucket) or _bucket_is_e_record(bucket)):
+            logger.info("worklog exclusion neighbor policy=%s dropped=%s", recall_policy, nid)
+            continue
+        kept.append(n)
+    return kept
+
+
+# DS 建议 25/15/封顶 35；第一轮探针加分把 35 分撞词抬到 70，收成 15/10/封顶 20：
+# 门卫至少给到 50（沾边）才救得回来，纯撞词救不回。
+# 18:13 第二轮探针：精确检索键命中的 force_keep 成了最大混入源（「我在打游戏」直放
+# 绳艺桶、「不要噪音」直放分手桶、「边牧呢」直放今天的考记忆流水）——DS 诊断说的
+# 「直放和门卫打架没仲裁」就是它。打分口径下检索键命中也只加分（+20），不再直放；
+# 三项合计封顶 30。超时回退仍按检索键置顶（那条路没有分数可依）。
+_DS_SCORE_BONUS_RARE_TERM = 15
+_DS_SCORE_BONUS_LITERAL = 10
+_DS_SCORE_BONUS_LITERAL_MIN = 60.0
+_DS_SCORE_BONUS_EXACT_KEY = 20
+_DS_SCORE_BONUS_CAP = 30
+
+_DS_GATE_SCORE_PROMPT = (
+    "你是记忆召回打分员，不是裁判。只给每条候选打 0～100 的分，不做 keep/kill 决定。"
+    "分数回答的是同一个问题：伴侣要回应用户这句话，这条旧事是不是他必须想起来的。"
+    "\n分数分档（严格按此锚定）："
+    "\n90～100：同一件事。候选讲的就是用户问的那件事本身（同一事件/同一对象/同一经历）。"
+    "\n70～89：直接相关。候选是那件事的一部分、前置、后续，或同一对象的不同侧面；"
+    "或者是背景：候选说明用户句里提到的人、物、地点、作品、活动对用户本人意味着什么"
+    "（来历、关系、偏好、为什么在意），不知道它就接不住这句话。"
+    "例：用户说「许嵩要结婚了」，候选「用户的英文名取自许嵩」→ 70+；"
+    "用户说「妈妈打电话来了」，候选「用户和母亲的关系」→ 70+。"
+    "\n40～69：同主题不同事。同一个人/同一类活动/同一话题，但不是用户问的那件事，"
+    "回应这句话也不需要它。"
+    "\n10～39：只是撞词。候选里出现用户句中的某个词，但语义无关。"
+    "\n0～9：完全无关。"
+    "\n打分规则（必须遵守）："
+    "\n1. 用户句是碎句/追问（如「X 呢」「X 这个印象多少」「那 X 呢」「记不记得 X」）时，"
+    "把 X 当作完整问句「关于 X 的记忆」来理解，不要因为句子不完整就压低分。"
+    "\n2. 候选是摘要/提炼/转述，只要语义指向同一件事就给 90+。不要因为候选里没有"
+    "用户原话的字面引用而扣分，语义等价即可。"
+    "\n3. 候选正文里出现用户句中的词或近义词，但整句语义与用户所问无关（例如用户说"
+    "「决定」而候选讲分手、用户说「打游戏」而候选讲封号、用户说「不要噪音」指记忆"
+    "召回混进无关内容而候选讲「别打扰我/不联系/别弹窗」），判 10～39，不要给 40+。"
+    "同一个词在不同领域（系统/工程 vs 生活/关系）指的不是同一件事。"
+    "\n4. 候选讲的是「关于 X 的记忆有没有存对、搜不搜得到、谁考谁、纠错、补丁、上线、"
+    "系统流程」这类元层面/工程流水，而不是 X 本身发生的生活事，判 10～39，不论存入"
+    "日期、即使 X 与用户句一致。用户问「X 呢」要的是 X 本身的经历，不是关于 X 的记忆账。"
+    "\n5. 候选是真实发生的生活事（哪怕是今天早上摸了一只狗），正常按语义打分，"
+    "不因「今天」压分。"
+    "\n6. 用户句若只是纯语气、寒暄、应答（「嗯」「好」「哈哈」「知道了」）且不含任何"
+    "具体名词，全部候选判 0～9；句中含具体名词时不适用本条。"
+    '\n只返回 JSON：{"scores":[{"candidate":序号,"relevance":0到100的整数,"reason":"一句话不超过20字"}]}，'
+    "每个候选恰好一条，序号不能缺、不能多，顺序与输入一致。不要解释。"
+)
+
+
+def _ds_gate_score_split() -> int:
+    """打分口径下门卫分批并行的每批上限（2026-09-18 11:2x，她「速度那边有想法吗」）。
+
+    粽子那句：门卫审 20 条 2.2 秒，是整句 4.2 秒的一半。打分是逐条独立的绝对分（prompt 锚定档位，
+    不做候选间比较），所以拆成两批同时发、再按原序拼回，语义不变，墙钟约砍半。
+    默认 0＝不拆（第十一版行为）。部署设 10。只影响 score_mode。
+    """
+    raw = os.getenv("OMBRE_DS_GATE_SCORE_SPLIT", "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+async def _ds_score_one_batch(
+    *,
+    sys_prompt: str,
+    query: str,
+    buckets: list[dict],
+    provider: str,
+    model: str,
+    client,
+    provider_kwargs: dict,
+    full_body_windows: bool,
+) -> list[int]:
+    """打分口径：给一批候选（局部序号 0..n-1）打分，返回按序的 relevance 列表。走同一套缓存。"""
+    lines = []
+    for i, b in enumerate(buckets):
+        name = redact_embedding_input((b.get("metadata", {}) or {}).get("name") or b.get("id", ""))
+        if full_body_windows:
+            lines.append(json.dumps({
+                "candidate": i, "name": name,
+                "windows": _ds_numbered_body_windows(b.get("content")),
+            }, ensure_ascii=False, separators=(",", ":")))
+        else:
+            snippet = redact_embedding_input((b.get("content") or "").strip().replace("\n", " "))[:200]
+            stored = _ds_bucket_stored_date(b)
+            suffix = f"（存于 {stored}）" if stored else ""
+            lines.append(f"[{i}] {name}{suffix}: {snippet}")
+    heading = "候选（JSONL）：\n" if full_body_windows else "候选：\n"
+    user_prompt = f"查询：{redact_embedding_input(query)}\n\n" + heading + "\n".join(lines)
+    cache_material = sys_prompt + "\x00" + user_prompt
+    if provider != "shared":
+        cache_material = provider + "\x00" + model + "\x00" + cache_material
+    cache_key = hashlib.sha256(cache_material.encode("utf-8")).hexdigest()
+    ttl, max_entries = _ds_select_cache_config()
+    cached = _DS_SELECT_CACHE.get(cache_key)
+    if ttl > 0 and cached is not None and cached[0] + ttl >= time.monotonic():
+        scores = list(cached[1])
+        del _DS_SELECT_CACHE[cache_key]
+        _DS_SELECT_CACHE[cache_key] = (cached[0], scores)
+        return scores
+    resp = await client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": sys_prompt},
+                  {"role": "user", "content": user_prompt}],
+        max_tokens=DS_FILTER_MAX_TOKENS,
+        temperature=0.0,
+        **provider_kwargs,
+    )
+    raw_value = resp.choices[0].message.content if resp.choices else ""
+    raw = raw_value if isinstance(raw_value, str) else ""
+    scores = _parse_ds_score_verdicts(raw, len(buckets))
+    if scores is None:
+        logger.error(
+            "DS filter batch invalid response parse_reason=%s raw_chars=%d raw_sha256=%s response=%s",
+            "non_string_content" if not isinstance(raw_value, str) else "score_contract_violation",
+            len(raw), hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            _safe_chat_completion_diagnostics(resp),
+        )
+        raise DSFilterInvalidPayloadError("score_contract_violation")
+    if ttl > 0:
+        if len(_DS_SELECT_CACHE) >= max_entries:
+            _DS_SELECT_CACHE.pop(next(iter(_DS_SELECT_CACHE)))
+        _DS_SELECT_CACHE[cache_key] = (time.monotonic(), list(scores))
+    return scores
+
+
+def _ds_gate_score_bonus(bucket: dict, exact_key_ids: set[str] | None = None) -> int:
+    """稀有词/字面/检索键命中只加分不绕过（DS §3）：稀有整词 +15、字面分≥60 +10、
+    精确检索键命中 +20，合计封顶 +30。"""
+    if not isinstance(bucket, dict):
+        return 0
+    bonus = 0
+    if exact_key_ids and str(bucket.get("id") or "") in exact_key_ids:
+        bonus += _DS_SCORE_BONUS_EXACT_KEY
+    if bucket.get("_rare_literal_terms"):
+        bonus += _DS_SCORE_BONUS_RARE_TERM
+    try:
+        lit = float(bucket.get("_literal_relevance_score"))
+    except (TypeError, ValueError):
+        lit = 0.0
+    if lit >= _DS_SCORE_BONUS_LITERAL_MIN:
+        bonus += _DS_SCORE_BONUS_LITERAL
+    return min(_DS_SCORE_BONUS_CAP, bonus)
+
+
+def _ds_bucket_stored_date(bucket: dict) -> str:
+    """候选存入日期 YYYY-MM-DD（给打分 prompt 判「今天的工程流水」用），取不到返回空串。"""
+    if not isinstance(bucket, dict):
+        return ""
+    metadata = bucket.get("metadata", {}) or {}
+    for key in ("event_at", "created", "recorded_at", "created_at"):
+        value = metadata.get(key) or bucket.get(key)
+        if isinstance(value, str) and len(value) >= 10:
+            return value[:10]
+    return ""
+
+
+def _ds_today_local_date() -> str:
+    from datetime import datetime, timedelta, timezone
+    return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+
+
+def _parse_ds_score_verdicts(raw: str, count: int) -> list[int] | None:
+    """解析打分口径：每个候选恰好一条 {candidate, relevance}。
+
+    返回按候选序号排好的 relevance 列表（长度 == count）。合同不满足（缺候选、重号、
+    越界、relevance 非整数或超出 0..100）返回 None，交调用方按 invalid 走既有回退。
+    """
+    parsed: list[int] | None = None
+    for payload in _ds_json_payloads(raw):
+        if not isinstance(payload, dict):
+            continue
+        scores = payload.get("scores")
+        if not isinstance(scores, list):
+            continue
+        by_index: dict[int, int] = {}
+        valid = True
+        for item in scores:
+            if not isinstance(item, dict):
+                valid = False
+                break
+            index = item.get("candidate")
+            if (
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or not (0 <= index < count)
+                or index in by_index
+            ):
+                valid = False
+                break
+            relevance = item.get("relevance")
+            if isinstance(relevance, bool) or not isinstance(relevance, (int, float)):
+                valid = False
+                break
+            value = int(round(float(relevance)))
+            if not (0 <= value <= 100):
+                valid = False
+                break
+            by_index[index] = value
+        if valid and len(by_index) == count:
+            parsed = [by_index[i] for i in range(count)]
+    return parsed
+
+
+def _ds_score_mode_select(
+    buckets: list[dict],
+    scores: list[int],
+    keep: set[str],
+    max_results: int,
+) -> list[dict]:
+    """打分口径出场：final = min(100, relevance + bonus)，过线的按 final 降序。
+
+    ``keep``（精确检索键命中）在这条路上只换 +20 加分、不直放：18:13 探针证明直放是
+    最大混入源。出场后再按同簇只留 1 条（门卫前那层留 2 是给门卫看的，出场只要 1）。
+    """
+    threshold = _ds_gate_score_threshold()
+    decorated: list[tuple[int, int, dict]] = []
+    for index, bucket in enumerate(buckets):
+        relevance = scores[index] if index < len(scores) else 0
+        final = min(100, relevance + _ds_gate_score_bonus(bucket, keep))
+        bucket["_ds_gate_relevance"] = relevance
+        bucket["_ds_gate_final"] = final
+        if final >= threshold:
+            decorated.append((-final, index, bucket))
+    decorated.sort(key=lambda row: (row[0], row[1]))
+    selected = [row[2] for row in decorated]
+    logger.info(
+        "DS gate score verdict input=%d passed=%d threshold=%d raw=%s finals=%s keyed=%d ids=%s",
+        len(buckets), len(selected), threshold,
+        [int(b.get("_ds_gate_relevance", 0)) for b in buckets],
+        [int(b.get("_ds_gate_final", 0)) for b in buckets],
+        sum(1 for b in buckets if str(b.get("id") or "") in keep),
+        [str(b.get("id") or "")[:12] for b in buckets],
+    )
+    selected = _dedupe_recall_topics(selected, force_keep_ids=set(), max_per_cluster=1)
+    return selected[:max(0, max_results)]
+
+
+def _ds_score_mode_timeout_candidates(
+    candidates: list[dict],
+    *,
+    force_keep_ids: set[str],
+    max_results: int,
+) -> list[dict]:
+    """门卫超时/失败时不砍（定案第 3 条）：forced 置顶，其余按检索分降序，最多出 TIMEOUT_TOP 条。"""
+    top = min(max_results, _ds_gate_score_timeout_top())
+    if top <= 0 or not candidates:
+        return []
+
+    def rank_score(bucket: dict) -> float:
+        for field in ("_fused_relevance_score", "score"):
+            value = bucket.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                fv = float(value)
+                if math.isfinite(fv):
+                    return fv
+        return float("-inf")
+
+    decorated = [
+        (0 if str(b.get("id") or "") in force_keep_ids else 1, -rank_score(b), i, b)
+        for i, b in enumerate(candidates)
+    ]
+    decorated.sort(key=lambda row: (row[0], row[1], row[2]))
+    ranked = [row[3] for row in decorated]
+    ranked = _dedupe_recall_topics(ranked, force_keep_ids=force_keep_ids, max_per_cluster=1)
+    return _cap_candidates_preserving_forced(ranked, force_keep_ids, top)
+
+
+def _rare_literal_gate_bypass_ids(candidates: list[dict]) -> set[str]:
+    """从 RRF 顺序的候选里挑出可绕过门卫的 id；开关关返回空集。"""
+    limit = _rare_literal_gate_bypass_max()
+    if limit <= 0 or not candidates:
+        return set()
+    picked: set[str] = set()
+    for bucket in candidates[:_RARE_LITERAL_BYPASS_TOP_RANK]:
+        if not isinstance(bucket, dict):
+            continue
+        bucket_id = str(bucket.get("id") or "")
+        rare_terms = bucket.get("_rare_literal_terms") or ()
+        if not bucket_id or not rare_terms:
+            continue
+        try:
+            lit = float(bucket.get("_literal_relevance_score"))
+        except (TypeError, ValueError):
+            continue
+        if lit < _RARE_LITERAL_BYPASS_MIN_LIT:
+            continue
+        picked.add(bucket_id)
+        if len(picked) >= limit:
+            break
+    if picked:
+        logger.info(
+            "rare literal gate bypass: %d id(s) forced past DS gate %s",
+            len(picked), sorted(picked),
+        )
+    return picked
+
+
+_DS_CITE_NO_EVIDENCE = {"", "无", "none", "null", "n/a", "na", "-"}
+
+
+def _parse_ds_cite_verdicts_soft(raw: str, count: int) -> tuple[list[int], int] | None:
+    """cite 口径的软化解析（配 ``_DS_GATE_CITE_SOFT_PROMPT``）。
+
+    keep=true 但 anchored=false 或证据缺失的不再降级为拒，标 weak、排到保留列表
+    末尾（strong 在前、weak 在后，各自升序）；返回值仍是 (保留序号列表, 降级条数)
+    以兼容调用方，本口径不做强制降级，第二项恒为 0，weak 数量单独走 logger.info。
+    合同不满足时返回 None，交由调用方按 invalid 走既有保守回退。
+    """
+    parsed: tuple[list[int], int] | None = None
+    for payload in _ds_json_payloads(raw):
+        if not isinstance(payload, dict):
+            continue
+        verdicts = payload.get("verdicts")
+        if not isinstance(verdicts, list):
+            continue
+        strong: list[int] = []
+        weak: list[int] = []
+        seen: set[int] = set()
+        valid = True
+        for verdict in verdicts:
+            if not isinstance(verdict, dict):
+                valid = False
+                break
+            index = verdict.get("candidate")
+            if (
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or not (0 <= index < count)
+                or index in seen
+            ):
+                valid = False
+                break
+            decision = verdict.get("keep")
+            if not isinstance(decision, bool):
+                valid = False
+                break
+            anchored = verdict.get("anchored")
+            if not isinstance(anchored, bool):
+                valid = False
+                break
+            seen.add(index)
+            if decision:
+                q_evidence = str(verdict.get("q_evidence") or "").strip().lower()
+                c_evidence = str(verdict.get("c_evidence") or "").strip().lower()
+                no_evidence = (
+                    q_evidence in _DS_CITE_NO_EVIDENCE
+                    or c_evidence in _DS_CITE_NO_EVIDENCE
+                )
+                if not anchored or no_evidence:
+                    weak.append(index)
+                else:
+                    strong.append(index)
+        if valid and len(seen) == count:
+            parsed = (sorted(strong) + sorted(weak), 0)
+            if weak:
+                logger.info(
+                    "DS gate cite soft verdict input=%d strong=%d weak=%d",
+                    count, len(strong), len(weak),
+                )
+    return parsed
+
+
+def _parse_ds_cite_verdicts(raw: str, count: int) -> tuple[list[int], int] | None:
+    """解析 cite 口径：每个候选恰好一条 verdict；keep=true 却给不出两处证据 → 降级为拒。
+
+    返回 (保留序号升序, 降级条数)。合同不满足（缺候选、重号、越界、keep 非布尔）
+    返回 None，由调用方按 invalid 走既有保守回退——坏协议不冒充判断。
+
+    2026-09-17：OMBRE_DS_GATE_CITE_SOFT=1 时改走 ``_parse_ds_cite_verdicts_soft``；
+    开关关时不进这个分支，下面的解析逐字节不变。
+    """
+    if _ds_gate_cite_soft_enabled():
+        return _parse_ds_cite_verdicts_soft(raw, count)
+    parsed: tuple[list[int], int] | None = None
+    for payload in _ds_json_payloads(raw):
+        if not isinstance(payload, dict):
+            continue
+        verdicts = payload.get("verdicts")
+        if not isinstance(verdicts, list):
+            continue
+        keep: list[int] = []
+        seen: set[int] = set()
+        downgraded = 0
+        valid = True
+        for verdict in verdicts:
+            if not isinstance(verdict, dict):
+                valid = False
+                break
+            index = verdict.get("candidate")
+            if (
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or not (0 <= index < count)
+                or index in seen
+            ):
+                valid = False
+                break
+            decision = verdict.get("keep")
+            if not isinstance(decision, bool):
+                valid = False
+                break
+            seen.add(index)
+            if decision:
+                q_evidence = str(verdict.get("q_evidence") or "").strip().lower()
+                c_evidence = str(verdict.get("c_evidence") or "").strip().lower()
+                if q_evidence in _DS_CITE_NO_EVIDENCE or c_evidence in _DS_CITE_NO_EVIDENCE:
+                    downgraded += 1
+                    decision = False
+            if decision:
+                keep.append(index)
+        if valid and len(seen) == count:
+            parsed = (sorted(keep), downgraded)
+    return parsed
 
 
 def _ds_numbered_body_windows(content: object) -> list[dict]:
@@ -2533,6 +3571,22 @@ async def _ds_semantic_select(
         provider_override if provider_override is not None else _ds_filter_provider()
     )
     full_body_windows = _ds_full_body_windows_enabled()
+    score_mode = _ds_gate_score_mode_enabled()
+    split = _ds_gate_score_split() if score_mode else 0
+    if split and len(buckets) > split:
+        # 2026-09-18 门卫分批并行（默认关）：逐条绝对分，拆批不改语义；按原序拼回后走同一出场逻辑。
+        sys_prompt_split = _DS_GATE_SCORE_PROMPT + f"\n今天是 {_ds_today_local_date()}。"
+        batches = [buckets[i:i + split] for i in range(0, len(buckets), split)]
+        parts = await asyncio.gather(*(
+            _ds_score_one_batch(
+                sys_prompt=sys_prompt_split, query=query, buckets=batch,
+                provider=provider, model=model, client=client,
+                provider_kwargs=provider_kwargs, full_body_windows=full_body_windows,
+            ) for batch in batches
+        ))
+        scores: list[int] = [s for part in parts for s in part]
+        logger.info("DS gate score split input=%d batches=%d", len(buckets), len(batches))
+        return _ds_score_mode_select(buckets, scores, keep, max_results)
     lines = []
     for i, b in enumerate(buckets):
         name = redact_embedding_input((b.get("metadata", {}) or {}).get("name") or b.get("id", ""))
@@ -2544,38 +3598,58 @@ async def _ds_semantic_select(
             }, ensure_ascii=False, separators=(",", ":")))
         else:
             snippet = redact_embedding_input((b.get("content") or "").strip().replace("\n", " "))[:200]
-            lines.append(f"[{i}] {name}: {snippet}")
-    sys_prompt = (
-        "你是记忆召回的相关性过滤器。给定用户查询和一组候选记忆条目，"
-        "判断每条是否与查询语义相关、值得进入上下文。"
-        '只返回 JSON：{"keep": [相关条目的序号整数数组]}，不要解释。'
-        "宁可多留也别漏掉明显相关的；只剔除与查询确实无关的。"
-    )
-    if provider == "apiroute-gemini":
-        sys_prompt += (
-            "正确候选优先保留。只有明确与查询毫无关系时才删除；"
-            "不确定、部分相关、同一事件后续、同一人物或同一项目上下文都保留。"
-            "宁可放过噪音，不可错杀正确候选。"
-            # 2026-08-29 判空授权:只防误杀不授权判空,碎句会被按章全保。
-            "\n例外——查询本身没有实质检索意图时(纯语气词、寒暄、应答,"
-            "或没头没尾的指代碎句,如「嗯嗯」「哈哈哈」「还有…」「好了」),"
-            '返回 {"keep": []}:此时不注入任何旧记忆才是正确行为。'
-            "只要查询含具体的人名、事件、物品、地点、时间或明确话题,"
-            "哪怕口语化,仍按上述规则保留。"
+            stored = _ds_bucket_stored_date(b) if score_mode else ""
+            suffix = f"（存于 {stored}）" if stored else ""
+            lines.append(f"[{i}] {name}{suffix}: {snippet}")
+    cite_mode = _ds_gate_cite_mode_enabled()
+    if score_mode:
+        # 2026-09-17 门卫改打分（默认关 OMBRE_DS_GATE_SCORE_MODE）：取代 cite / cite_soft
+        # 两个口径；只出 relevance，不出 keep/kill，出场看 _ds_score_mode_select。
+        sys_prompt = _DS_GATE_SCORE_PROMPT + f"\n今天是 {_ds_today_local_date()}。"
+    elif cite_mode:
+        # 2026-09-16 朝灯定「不要噪音」：整段换成指认证据口径，主备两条线同款。
+        # 2026-09-17：OMBRE_DS_GATE_CITE_SOFT=1 时换成软化口径（见
+        # _DS_GATE_CITE_SOFT_PROMPT）；开关关时取值不变，逐字节走原口径。
+        sys_prompt = (
+            _ds_gate_cite_soft_prompt()
+            if _ds_gate_cite_soft_enabled()
+            else _DS_GATE_CITE_PROMPT
         )
-    if _literal_collision_guard_enabled():
-        sys_prompt += (
-            "\n以下规则优先于上面的宽松保留规则：必须与正在谈论的事件、对象或项目相关；"
-            "仅出现同一人物名字不算相关。"
-            "只共享「单子、任务、验收、慢、修、提速」等泛词，不算相关。"
-            "当查询在生活、亲密、情话或身体语境，而候选只是工程任务、修复、验收记录时，"
-            "除非查询明确点名该工程、任务编号或同一事件，否则必须拒绝该候选。"
-            "反过来也一样：只共享抽象动作或情绪词、实际对象和事件不同，必须拒绝。"
+    else:
+        sys_prompt = (
+            "你是记忆召回的相关性过滤器。给定用户查询和一组候选记忆条目，"
+            "判断每条是否与查询语义相关、值得进入上下文。"
+            '只返回 JSON：{"keep": [相关条目的序号整数数组]}，不要解释。'
+            "宁可多留也别漏掉明显相关的；只剔除与查询确实无关的。"
         )
+        if provider == "apiroute-gemini":
+            sys_prompt += (
+                "正确候选优先保留。只有明确与查询毫无关系时才删除；"
+                "不确定、部分相关、同一事件后续、同一人物或同一项目上下文都保留。"
+                "宁可放过噪音，不可错杀正确候选。"
+                # 2026-08-29 判空授权:只防误杀不授权判空,碎句会被按章全保。
+                "\n例外——查询本身没有实质检索意图时(纯语气词、寒暄、应答,"
+                "或没头没尾的指代碎句,如「嗯嗯」「哈哈哈」「还有…」「好了」),"
+                '返回 {"keep": []}:此时不注入任何旧记忆才是正确行为。'
+                "只要查询含具体的人名、事件、物品、地点、时间或明确话题,"
+                "哪怕口语化,仍按上述规则保留。"
+            )
+        if _literal_collision_guard_enabled():
+            sys_prompt += (
+                "\n以下规则优先于上面的宽松保留规则：必须与正在谈论的事件、对象或项目相关；"
+                "仅出现同一人物名字不算相关。"
+                "只共享「单子、任务、验收、慢、修、提速」等泛词，不算相关。"
+                "当查询在生活、亲密、情话或身体语境，而候选只是工程任务、修复、验收记录时，"
+                "除非查询明确点名该工程、任务编号或同一事件，否则必须拒绝该候选。"
+                "反过来也一样：只共享抽象动作或情绪词、实际对象和事件不同，必须拒绝。"
+            )
     if full_body_windows:
         sys_prompt += (
             "\n必须读完每个候选的全部编号窗口再判断；窗口按存储正文顺序连续，"
-            "没有省略。返回 keep 时仍只使用 candidate 整数。"
+            "没有省略。"
+            + ("返回 scores 时 candidate 仍只使用整数。" if score_mode
+               else "返回 verdicts 时 candidate 仍只使用整数。" if cite_mode
+               else "返回 keep 时仍只使用 candidate 整数。")
         )
         candidate_heading = "候选（JSONL）：\n"
     else:
@@ -2616,13 +3690,29 @@ async def _ds_semantic_select(
         )
         raw_value = resp.choices[0].message.content if resp.choices else ""
         raw = raw_value if isinstance(raw_value, str) else ""
-        idxs = _parse_ds_keep_indices(raw, len(buckets))
+        if score_mode:
+            # 打分口径：idxs 装的是按候选序号排好的 relevance 列表（缓存键含 prompt，不会与
+            # keep 序号列表串味）。
+            idxs = _parse_ds_score_verdicts(raw, len(buckets))
+        elif cite_mode:
+            cite_parsed = _parse_ds_cite_verdicts(raw, len(buckets))
+            idxs = None if cite_parsed is None else cite_parsed[0]
+            if cite_parsed is not None:
+                logger.info(
+                    "DS gate cite verdict input=%d keep=%d downgraded=%d",
+                    len(buckets), len(cite_parsed[0]), cite_parsed[1],
+                )
+        else:
+            idxs = _parse_ds_keep_indices(raw, len(buckets))
         if idxs is None:
-            parse_reason = (
-                _ds_invalid_payload_reason(raw, len(buckets))
-                if isinstance(raw_value, str)
-                else "non_string_content"
-            )
+            if not isinstance(raw_value, str):
+                parse_reason = "non_string_content"
+            elif score_mode:
+                parse_reason = "score_contract_violation"
+            elif cite_mode:
+                parse_reason = "cite_contract_violation"
+            else:
+                parse_reason = _ds_invalid_payload_reason(raw, len(buckets))
             # Preserve the provider-refusal category needed for diagnosis without
             # writing arbitrary model output into logs.
             raw_head = (
@@ -2647,6 +3737,8 @@ async def _ds_semantic_select(
             if len(_DS_SELECT_CACHE) >= max_entries:
                 _DS_SELECT_CACHE.pop(next(iter(_DS_SELECT_CACHE)))
             _DS_SELECT_CACHE[cache_key] = (time.monotonic(), list(idxs))
+    if score_mode:
+        return _ds_score_mode_select(buckets, list(idxs), keep, max_results)
     keep_idx = set(idxs)
     selected = [
         b for i, b in enumerate(buckets)
@@ -2663,6 +3755,7 @@ async def _ds_filter_candidates(
     max_results: int,
     force_keep_ids: set[str] = None,
     allow_empty: bool = False,
+    recall_policy: str = "",
 ) -> list[dict]:
     """
     召回候选的注入裁剪 + 可选小模型语义门控。
@@ -2697,10 +3790,15 @@ async def _ds_filter_candidates(
         record_decision("deterministic_noop", "noop", 0, 0)
         return []
     keep = force_keep_ids or set()
-    capped = _cap_candidates_preserving_forced(candidates, keep, max_results)
     gate_enabled = _ds_gate_enabled(mode)
+    # 打分口径下门卫看更大的池子（默认 0＝基线 max_results），出场仍按 max_results。
+    review_pool = max_results
+    if gate_enabled and query and _ds_gate_score_mode_enabled():
+        review_pool = max(max_results, _ds_gate_score_review_pool())
+    capped = _cap_candidates_preserving_forced(candidates, keep, review_pool)
 
     if not gate_enabled or not query or not capped:
+        capped = _cap_candidates_preserving_forced(capped, keep, max_results)
         if not gate_enabled or not query:
             record_decision("disabled", "disabled", len(capped), len(capped))
         else:
@@ -2724,9 +3822,11 @@ async def _ds_filter_candidates(
     # it also falls back to ``capped`` below.  Likewise, forced candidates can
     # never be removed.  Avoid paying for a model decision whose result is
     # already determined locally.
-    if (len(capped) == 1 and not allow_empty) or all(
-        bucket.get("id") in keep for bucket in capped
+    if (len(capped) == 1 and not allow_empty) or (
+        not _ds_gate_score_mode_enabled()
+        and all(bucket.get("id") in keep for bucket in capped)
     ):
+        # 打分口径下检索键命中只是加分，全 keyed 也要打分，不走这个直放捷径。
         record_decision(
             "deterministic_noop",
             "noop",
@@ -2741,12 +3841,29 @@ async def _ds_filter_candidates(
         )
         return capped
 
+    score_mode = _ds_gate_score_mode_enabled()
+
     def failure_result(outcome: str) -> list[dict]:
-        result = _ds_conservative_failure_candidates(
-            capped,
-            force_keep_ids=keep,
-            max_results=max_results,
-        )
+        if score_mode and recall_policy in _ds_gate_fail_closed_policies():
+            # 2026-09-18：自动召回口径门卫没答就不猜，只留检索键强制保留的（字面证据）。
+            result = [
+                b for b in capped if str(b.get("id") or "") in keep
+            ][:max_results]
+            record_decision("fallback_closed", outcome, len(capped), len(result))
+            return result
+        if score_mode:
+            # 2026-09-17 定案第 3 条：门卫超时/失败不砍，按检索分出场，不打第二次检索。
+            result = _ds_score_mode_timeout_candidates(
+                capped,
+                force_keep_ids=keep,
+                max_results=max_results,
+            )
+        else:
+            result = _ds_conservative_failure_candidates(
+                capped,
+                force_keep_ids=keep,
+                max_results=max_results,
+            )
         record_decision("fallback", outcome, len(capped), len(result))
         return result
 
@@ -2787,7 +3904,8 @@ async def _ds_filter_candidates(
                 primary_outcome, type(exc).__name__,
             )
             return None
-        spare_result = kept_spare if kept_spare or allow_empty else capped
+        # 打分口径下「全部不过线」是可信结果（它不是 kill 是分数），不再退回 capped 全放。
+        spare_result = kept_spare if kept_spare or allow_empty or score_mode else capped
         record_decision("fallback_line", "ok", len(capped), len(spare_result))
         logger.info(
             "DS filter served by fallback line after primary=%s input=%d kept=%d",
@@ -2844,7 +3962,7 @@ async def _ds_filter_candidates(
         )
         return result
 
-    result = kept if kept or allow_empty else capped
+    result = kept if kept or allow_empty or score_mode else capped
     record_decision("model", "ok", len(capped), len(result))
     logger.info(
         "DS filter mode=%s query=%r input=%d capped=%d kept=%d",
@@ -2979,12 +4097,8 @@ async def _borrow_recall_buckets():
     """Borrow the resident read-only corpus used by breath request paths."""
     snapshot_fn = getattr(bucket_mgr, "borrow_recall_snapshot", None)
     if callable(snapshot_fn):
-        buckets = await snapshot_fn(include_archive=False)
-    else:
-        buckets = await bucket_mgr.list_all(include_archive=False)
-    if getattr(bucket_mgr, "_retrieval_attribution_enabled", False):
-        await bucket_mgr._refresh_retrieval_hint_index(buckets)
-    return buckets
+        return await snapshot_fn(include_archive=False)
+    return await bucket_mgr.list_all(include_archive=False)
 
 
 def _emit_upstream_fusion_shadow(payload: dict) -> bool:
@@ -5072,8 +6186,9 @@ async def breath(
     e_chord_attempt: int = 0,
     first_screen_limit: int = 0,
     e_chord_live_enabled: bool = False,
+    gate: str = "",
 ) -> str | list[TextContent | ImageContent]:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认6000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制注入数量上限(默认8,最大50; 内部仍先召回20条给过滤器)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿安全关系边双向召回邻居的跳数(默认1,0=关闭,最大2)，关联证据单独列出且不改变主排序。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。session_id=同一会话内对已浮现动态桶去重。include_images=True时,白名单图桶会随文本返回 MCP image content。include_body_state=False时只关闭外部身体状态块,不改变记忆检索。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。"""
+    """检索/浮现记忆。gate="skip" 且 OMBRE_BREATH_GATE_SKIP_ENABLED=1 时,search 模式跳过语义门卫,把候选池结构化导出(见 _capture_breath_gate_skip_candidates),不改变其余检索行为;省略或开关关时无效果。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认6000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制注入数量上限(默认8,最大50; 内部仍先召回20条给过滤器)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿安全关系边双向召回邻居的跳数(默认1,0=关闭,最大2)，关联证据单独列出且不改变主排序。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。session_id=同一会话内对已浮现动态桶去重。include_images=True时,白名单图桶会随文本返回 MCP image content。include_body_state=False时只关闭外部身体状态块,不改变记忆检索。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。"""
     with recall_stage("setup"):
         await _ensure_decay_background()
         await _ensure_consolidation_background()
@@ -5396,154 +6511,213 @@ async def breath(
     keyword_by_id: dict[str, dict] = {}
     original_bm25_scores: dict[str, float] = {}
     original_bm25_shadow_scores: dict[str, float] = {}
-    try:
-        with recall_stage("keyword_bucket_load"):
-            keyword_candidates = await _borrow_recall_buckets()
-        keyword_candidate_by_id = {
-            str(bucket["id"]): bucket
-            for bucket in keyword_candidates
-            if bucket.get("id")
-        }
-        record_recall_metric("keyword_bucket_count", len(keyword_candidates))
-        with recall_stage("keyword_search"):
-            for angle_index, angle in enumerate(query_angles):
-                for bucket in await bucket_mgr.search(
-                    angle,
-                    limit=intent_policy["keyword_top_k"],
-                    domain_filter=domain_filter,
-                    world_filter=world_filter,
-                    query_valence=mood_valence,
-                    query_arousal=mood_arousal,
-                    created_after=created_after,
-                    created_before=created_before,
-                    relevance_first=True,
-                    # Keep a broad relevance-ranked keyword pool for RRF. The
-                    # original-query literal/vector evidence gate below decides
-                    # eligibility after both channels are available.
-                    relevance_candidate_floor=0.0,
-                    preloaded_buckets=keyword_candidates,
-                ):
-                    if angle_index == 0:
-                        original_bm25_scores[str(bucket["id"])] = float(
-                            bucket.get("_bm25_relevance_score", 0.0) or 0.0
-                        )
-                        original_bm25_shadow_scores[str(bucket["id"])] = float(
-                            bucket.get("_bm25_shadow_score", 0.0) or 0.0
-                        )
-                    existing = keyword_by_id.get(bucket["id"])
-                    if existing is None or bucket.get("score", 0) > existing.get("score", 0):
-                        keyword_by_id[bucket["id"]] = bucket
-        state_seed_by_id.update({
-            str(bucket["id"]): bucket
-            for bucket in keyword_by_id.values()
-            if bucket.get("id") and _is_main_recall_bucket(bucket)
-        })
-        keyword_matches = _filter_z_fact_candidates(
-            (
-                bucket
+    _keyword_channel_failed = object()
+
+    # 2026-09-18 削 breath 总延迟：keyword_search / vector 两路互不依赖对方的产出
+    # （各自只读 query_angles 等早于两路的既有变量），原来却逐个 await，白等一路
+    # 的整段耗时。拆成两个协程，OMBRE_PARALLEL_RETRIEVAL=0（默认）时下面 else 分支
+    # 仍是同一顺序逐个 await，等价于原地内联代码；开关只改调度方式，两路各自的
+    # 判断/异常处理原样保留，见 tools/ombre_parallel_retrieval_20260918.py 之前的
+    # 依赖分析。rg_literal 同样与这两路互不依赖，一并并发发起（见下方 rg_literal_task）；
+    # curated_lexical 真实读 keyword_by_id 与 original_vector_scores，做不到并发，
+    # 留在两路都完成之后原样顺序执行。
+    async def _run_keyword_channel():
+        try:
+            with recall_stage("keyword_bucket_load"):
+                keyword_candidates = await _borrow_recall_buckets()
+            keyword_candidate_by_id = {
+                str(bucket["id"]): bucket
+                for bucket in keyword_candidates
+                if bucket.get("id")
+            }
+            record_recall_metric("keyword_bucket_count", len(keyword_candidates))
+            with recall_stage("keyword_search"):
+                for angle_index, angle in enumerate(query_angles):
+                    for bucket in await bucket_mgr.search(
+                        angle,
+                        limit=intent_policy["keyword_top_k"],
+                        domain_filter=domain_filter,
+                        world_filter=world_filter,
+                        query_valence=mood_valence,
+                        query_arousal=mood_arousal,
+                        created_after=created_after,
+                        created_before=created_before,
+                        relevance_first=True,
+                        # Keep a broad relevance-ranked keyword pool for RRF. The
+                        # original-query literal/vector evidence gate below decides
+                        # eligibility after both channels are available.
+                        relevance_candidate_floor=0.0,
+                        preloaded_buckets=keyword_candidates,
+                    ):
+                        if angle_index == 0:
+                            original_bm25_scores[str(bucket["id"])] = float(
+                                bucket.get("_bm25_relevance_score", 0.0) or 0.0
+                            )
+                            original_bm25_shadow_scores[str(bucket["id"])] = float(
+                                bucket.get("_bm25_shadow_score", 0.0) or 0.0
+                            )
+                        existing = keyword_by_id.get(bucket["id"])
+                        if existing is None or bucket.get("score", 0) > existing.get("score", 0):
+                            keyword_by_id[bucket["id"]] = bucket
+            state_seed_by_id.update({
+                str(bucket["id"]): bucket
                 for bucket in keyword_by_id.values()
-                if _is_main_recall_bucket(bucket)
-            ),
-            query=recall_query,
-            intent=intent_policy["intent"],
-        )
-    except Exception as e:
-        logger.error(
-            "Keyword search failed / 关键词检索失败: %s",
-            e,
-            exc_info=True,
-        )
-        if _strict_recall_errors.get():
-            raise RecallOperationalError("keyword_search_failed") from e
-        return "检索过程出错，请稍后重试。"
+                if bucket.get("id") and _is_main_recall_bucket(bucket)
+            })
+            keyword_matches = _filter_z_fact_candidates(
+                (
+                    bucket
+                    for bucket in keyword_by_id.values()
+                    if _is_main_recall_bucket(bucket)
+                ),
+                query=recall_query,
+                intent=intent_policy["intent"],
+            )
+        except Exception as e:
+            logger.error(
+                "Keyword search failed / 关键词检索失败: %s",
+                e,
+                exc_info=True,
+            )
+            if _strict_recall_errors.get():
+                raise RecallOperationalError("keyword_search_failed") from e
+            return _keyword_channel_failed
+        return keyword_candidates, keyword_candidate_by_id, keyword_matches
 
     # Vector channel — sim>0.5 floor blocks high-cosine noise
     vector_scores: dict[str, float] = {}
     original_vector_scores: dict[str, float] = {}
     e_semantic_scores: dict[str, float] = {}
-    try:
-        for angle_index, angle in enumerate(query_angles):
-            status_search = getattr(
-                embedding_engine,
-                "search_similar_with_status",
-                None,
-            )
-            selected_score_search = getattr(
-                embedding_engine,
-                "search_similar_with_selected_scores",
-                None,
-            )
-            if (
-                angle_index == 0
-                and e_recall_cfg is not None
-                and e_recall_cfg.semantic_resonance_enabled
-                and callable(selected_score_search)
-            ):
-                (
-                    vector_hits,
-                    vector_status,
-                    selected_scores,
-                ) = await selected_score_search(
-                    angle,
-                    top_k=intent_policy["vector_top_k"],
-                    score_bucket_ids=e_rows_by_bucket,
+
+    async def _run_vector_channel():
+        nonlocal e_semantic_scores
+        try:
+            for angle_index, angle in enumerate(query_angles):
+                status_search = getattr(
+                    embedding_engine,
+                    "search_similar_with_status",
+                    None,
                 )
-                for bucket_id, similarity in selected_scores.items():
-                    normalized_id = str(bucket_id)
-                    rows = e_rows_by_bucket.get(normalized_id)
-                    if not rows:
-                        continue
-                    try:
-                        normalized_similarity = float(similarity)
-                    except (TypeError, ValueError):
-                        continue
-                    if semantic_resonance_score(
-                        rows[0],
-                        normalized_similarity,
-                    ) is None:
-                        continue
-                    e_semantic_scores[normalized_id] = normalized_similarity
-            elif callable(status_search):
-                vector_hits, vector_status = await status_search(
-                    angle,
-                    top_k=intent_policy["vector_top_k"],
+                selected_score_search = getattr(
+                    embedding_engine,
+                    "search_similar_with_selected_scores",
+                    None,
                 )
-            else:
-                # Keep the long-standing lightweight embedding adapter
-                # contract.  Production EmbeddingEngine exposes status_search;
-                # existing integrations that only expose search_similar keep
-                # their previous behavior.
-                vector_hits = await embedding_engine.search_similar(
-                    angle,
-                    top_k=intent_policy["vector_top_k"],
-                )
-                vector_status = "ok"
-            if vector_status != "ok":
-                if _strict_recall_errors.get():
-                    raise RecallOperationalError("vector_search_failed")
-                # Vector retrieval is optional.  A bounded remote failure keeps
-                # the already-computed lexical candidates and is surfaced as a
-                # completed partial result rather than a whole-request deadline.
-                mark_recall_partial()
-                logger.warning(
-                    "Vector search degraded to lexical-only: %s",
-                    vector_status,
-                )
-                continue
-            for bid, sim in vector_hits:
-                if sim <= 0.5:
+                if (
+                    angle_index == 0
+                    and e_recall_cfg is not None
+                    and e_recall_cfg.semantic_resonance_enabled
+                    and callable(selected_score_search)
+                ):
+                    (
+                        vector_hits,
+                        vector_status,
+                        selected_scores,
+                    ) = await selected_score_search(
+                        angle,
+                        top_k=intent_policy["vector_top_k"],
+                        score_bucket_ids=e_rows_by_bucket,
+                    )
+                    for bucket_id, similarity in selected_scores.items():
+                        normalized_id = str(bucket_id)
+                        rows = e_rows_by_bucket.get(normalized_id)
+                        if not rows:
+                            continue
+                        try:
+                            normalized_similarity = float(similarity)
+                        except (TypeError, ValueError):
+                            continue
+                        if semantic_resonance_score(
+                            rows[0],
+                            normalized_similarity,
+                        ) is None:
+                            continue
+                        e_semantic_scores[normalized_id] = normalized_similarity
+                elif callable(status_search):
+                    vector_hits, vector_status = await status_search(
+                        angle,
+                        top_k=intent_policy["vector_top_k"],
+                    )
+                else:
+                    # Keep the long-standing lightweight embedding adapter
+                    # contract.  Production EmbeddingEngine exposes status_search;
+                    # existing integrations that only expose search_similar keep
+                    # their previous behavior.
+                    vector_hits = await embedding_engine.search_similar(
+                        angle,
+                        top_k=intent_policy["vector_top_k"],
+                    )
+                    vector_status = "ok"
+                if vector_status != "ok":
+                    if _strict_recall_errors.get():
+                        raise RecallOperationalError("vector_search_failed")
+                    # Vector retrieval is optional.  A bounded remote failure keeps
+                    # the already-computed lexical candidates and is surfaced as a
+                    # completed partial result rather than a whole-request deadline.
+                    mark_recall_partial()
+                    logger.warning(
+                        "Vector search degraded to lexical-only: %s",
+                        vector_status,
+                    )
                     continue
-                if sim > vector_scores.get(bid, 0.0):
-                    vector_scores[bid] = sim
-                if angle_index == 0 and sim > original_vector_scores.get(bid, 0.0):
-                    original_vector_scores[bid] = sim
-        vector_ranked = list(vector_scores.items())
-    except Exception as e:
-        logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
-        if _strict_recall_errors.get():
-            raise RecallOperationalError("vector_search_failed") from e
-        vector_ranked = []
-        e_semantic_scores = {}
+                for bid, sim in vector_hits:
+                    if sim <= 0.5:
+                        continue
+                    if sim > vector_scores.get(bid, 0.0):
+                        vector_scores[bid] = sim
+                    if angle_index == 0 and sim > original_vector_scores.get(bid, 0.0):
+                        original_vector_scores[bid] = sim
+            vector_ranked = list(vector_scores.items())
+        except Exception as e:
+            logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
+            if _strict_recall_errors.get():
+                raise RecallOperationalError("vector_search_failed") from e
+            vector_ranked = []
+            e_semantic_scores = {}
+        return vector_ranked
+
+    async def _run_rg_literal_channel():
+        # ripgrep exact-substring channel over the bucket files (朝灯 2026-09-08
+        # 19:59「有现成的好东西不用非得用差的」).  Independent of keyword/vector:
+        # only needs recall_query and the on-disk bucket dir.
+        try:
+            return await search_rg_literal(
+                recall_query,
+                buckets_dir=str(getattr(bucket_mgr, "base_dir", "") or ""),
+            )
+        except Exception as exc:
+            logger.warning(
+                "rg literal channel failed; keeping existing channels: %s",
+                type(exc).__name__,
+            )
+            return []
+
+    if _parallel_retrieval_enabled():
+        keyword_task = asyncio.create_task(_run_keyword_channel())
+        vector_task = asyncio.create_task(_run_vector_channel())
+        rg_literal_task = asyncio.create_task(_run_rg_literal_channel())
+        try:
+            keyword_result, vector_ranked = await asyncio.gather(keyword_task, vector_task)
+        except BaseException:
+            for _pending_task in (keyword_task, vector_task, rg_literal_task):
+                if not _pending_task.done():
+                    _pending_task.cancel()
+            await asyncio.gather(
+                keyword_task, vector_task, rg_literal_task, return_exceptions=True
+            )
+            raise
+        if keyword_result is _keyword_channel_failed:
+            if not rg_literal_task.done():
+                rg_literal_task.cancel()
+            return "检索过程出错，请稍后重试。"
+    else:
+        keyword_result = await _run_keyword_channel()
+        if keyword_result is _keyword_channel_failed:
+            return "检索过程出错，请稍后重试。"
+        vector_ranked = await _run_vector_channel()
+        rg_literal_task = None
+
+    keyword_candidates, keyword_candidate_by_id, keyword_matches = keyword_result
 
     # Production's one-pass vector API scores every requested E anchor against
     # the original query while making the normal top-k.  Lightweight adapters
@@ -5744,18 +6918,14 @@ async def breath(
     # vector/keyword channels; this one can bring in a bucket they missed.
     # Ids are escorted into ``matches`` after the retention cutoff below.
     # OMBRE_RG_LITERAL_ENABLED=0 turns it off.
-    rg_literal_hits = []
-    try:
-        rg_literal_hits = await search_rg_literal(
-            recall_query,
-            buckets_dir=str(getattr(bucket_mgr, "base_dir", "") or ""),
-        )
-    except Exception as exc:
-        logger.warning(
-            "rg literal channel failed; keeping existing channels: %s",
-            type(exc).__name__,
-        )
-        rg_literal_hits = []
+    # 2026-09-18: independent of keyword/vector/curated_lexical, so when
+    # parallel retrieval is on it was already kicked off above alongside
+    # keyword/vector (rg_literal_task); off (default) keeps it right here,
+    # sequential, same spot as before.
+    if rg_literal_task is not None:
+        rg_literal_hits = await rg_literal_task
+    else:
+        rg_literal_hits = await _run_rg_literal_channel()
     if rg_literal_hits:
         # record_recall_metric() only accepts allowlisted names and raises
         # ValueError otherwise (took recall down for 9 min on 9/8); log instead.
@@ -5844,6 +7014,9 @@ async def breath(
     fused_pairs = lmc5_fuse_ranked_channels(
         channels,
         k=rrf_cfg.get("k", 60),
+    )
+    fused_pairs = _demote_evidenceless_candidates(
+        fused_pairs, vector_ranked, entity_ranked
     )
 
     # Passive upstream comparison. It reuses the candidate IDs and scores
@@ -6318,10 +7491,16 @@ async def breath(
             content_suppressed,
             content_fingerprint_errors,
         )
-    matches = _filter_session_seen(matches, session_id)
+    seen_filter_on = _session_seen_filter_enabled(recall_policy)
+    if seen_filter_on:
+        matches = _filter_session_seen(matches, session_id)
+    else:
+        logger.info("Session seen filter skipped for policy=%s", recall_policy)
     record_recall_stage("candidate_processing", time.perf_counter() - candidate_started_at)
     with recall_stage("anchor_gate"):
         matches = _filter_anchor_policy_candidates(matches, recall_policy)
+    # 2026-09-18 根因第二层：自动召回口径不给工程流水桶进池（默认关＝基线）。
+    matches = _drop_worklog_candidates(matches, recall_policy)
     candidate_started_at = time.perf_counter()
     matches = align_fact_state_candidates(
         matches,
@@ -6341,24 +7520,34 @@ async def breath(
         created_before=created_before,
         excluded_ids=(
             {str(bucket.get("id")) for bucket in matches if bucket.get("id")}
-            | _session_seen_bucket_ids(list(state_seed_by_id.values()), session_id)
-            | _load_session_seen_ids(session_id)
+            | (
+                _session_seen_bucket_ids(list(state_seed_by_id.values()), session_id)
+                | _load_session_seen_ids(session_id)
+                if seen_filter_on
+                else set()
+            )
         ),
         limit=state_link_budget,
     )
-    state_link_candidates = _filter_session_seen(state_link_candidates, session_id)
+    if seen_filter_on:
+        state_link_candidates = _filter_session_seen(state_link_candidates, session_id)
     record_recall_stage("candidate_processing", time.perf_counter() - candidate_started_at)
     with recall_stage("anchor_gate"):
         state_link_candidates = _filter_anchor_policy_candidates(
             state_link_candidates,
             recall_policy,
-        )[:state_link_budget]
-    if getattr(bucket_mgr, "_retrieval_attribution_enabled", False):
-        matches = [b for b in matches if bucket_mgr.retrieval_attribution_eligible(b)]
-        state_link_candidates = [b for b in state_link_candidates
-                                 if bucket_mgr.retrieval_attribution_eligible(b)]
+        )
+    # 2026-09-18 第八版：状态链候选是另一条进池通道，第七版只在主候选上过了工程流水判定，
+    # 「记忆召回丢失排查」「主AI体验」从这里绕进来（10:2x 台式探针）。同一把尺子再过一次。
+    state_link_candidates = _drop_worklog_candidates(state_link_candidates, recall_policy)[:state_link_budget]
     ds_max_results = max(0, max_results - len(state_link_candidates))
     ds_force_keep_ids = _exact_retrieval_key_ids(recall_query, matches)
+    # 2026-09-17 15:36 边牧现行：稀有词整词命中排第一也被门卫砍。默认关
+    # OMBRE_RARE_LITERAL_GATE_BYPASS_MAX=0 时是空集并集，行为不变。
+    ds_force_keep_ids = set(ds_force_keep_ids) | _rare_literal_gate_bypass_ids(matches)
+    # P3 同主题去重（2026-09-17，默认关 OMBRE_RRF_TOPIC_DEDUP_MAX=0）：RRF 融合后、
+    # 门卫前，恒等映射直到显式开启。
+    matches = _dedupe_recall_topics(matches, force_keep_ids=ds_force_keep_ids)
     pre_ds_partial_matches = matches
     if (
         _ds_gate_enabled("search")
@@ -6368,11 +7557,18 @@ async def breath(
         # The API deadline cancels the active DS call and returns this snapshot.
         # Prepare it with the same failure policy as internal timeout/error so
         # an outer cancellation cannot bypass the conservative gate.
-        pre_ds_partial_matches = _ds_conservative_failure_candidates(
-            matches,
-            force_keep_ids=ds_force_keep_ids,
-            max_results=ds_max_results,
-        )
+        if _ds_gate_score_mode_enabled():
+            pre_ds_partial_matches = _ds_score_mode_timeout_candidates(
+                matches,
+                force_keep_ids=ds_force_keep_ids,
+                max_results=ds_max_results,
+            )
+        else:
+            pre_ds_partial_matches = _ds_conservative_failure_candidates(
+                matches,
+                force_keep_ids=ds_force_keep_ids,
+                max_results=ds_max_results,
+            )
     with recall_stage("assembly"):
         with recall_breakdown("assembly", "partial_snapshot_pre_ds"):
             set_recall_partial_result(_local_partial_recall_text(
@@ -6382,7 +7578,21 @@ async def breath(
                 state_profile=state_profile,
             ))
     with recall_stage("ds_filter"):
-        if chord_shadow_config is None:
+        gate_skip_active = (
+            str(gate or "").strip().lower() == "skip"
+            and _breath_gate_skip_enabled()
+        )
+        if gate_skip_active:
+            # 2026-09-17 探针（默认关 OMBRE_BREATH_GATE_SKIP_ENABLED）：跳过
+            # _ds_semantic_select，把门卫本该看到的候选池原样导出给调用方；仍走
+            # 既有的强制保留+封顶，等价于门卫关闭时的确定性回退，唯一区别是
+            # 多导出一份结构化 candidates（见 api_breath）。
+            _capture_breath_gate_skip_candidates(matches)
+            matches = _cap_candidates_preserving_forced(
+                matches, ds_force_keep_ids, ds_max_results
+            )
+            chord_shadow_ds_decision_source = "gate_skip"
+        elif chord_shadow_config is None:
             matches = await _ds_filter_candidates(
                 recall_query,
                 matches,
@@ -6390,6 +7600,7 @@ async def breath(
                 max_results=ds_max_results,
                 force_keep_ids=ds_force_keep_ids,
                 allow_empty=allow_empty_recall,
+                recall_policy=recall_policy,
             )
         else:
             ds_decision_capture: dict[str, str] = {}
@@ -6404,6 +7615,7 @@ async def breath(
                     max_results=ds_max_results,
                     force_keep_ids=ds_force_keep_ids,
                     allow_empty=allow_empty_recall,
+                    recall_policy=recall_policy,
                 )
             finally:
                 _ds_filter_decision_capture.reset(ds_capture_token)
@@ -6460,6 +7672,8 @@ async def breath(
                     | _load_session_seen_ids(session_id)
                 ),
             )
+            # 2026-09-18 第十一版：X 轴邻居是第三条进池通道，同一把尺子（工程流水 / E 记录）再过一次。
+            timeline_probe = _drop_worklog_neighbors(timeline_probe, timeline_buckets, recall_policy)
             if timeline_probe:
                 timeline_slot_reserved = True
                 timeline_fallback_matches = matches[primary_limit_with_timeline:]
@@ -6550,6 +7764,8 @@ async def breath(
                     | _load_session_seen_ids(session_id)
                 ),
             )
+            # 2026-09-18 第十一版：Y 轴邻居同样过尺子（10:4x 边牧探针「主AI体验」、打游戏「海马体工程冲刺日」从这进）。
+            relation_probe = _drop_worklog_neighbors(relation_probe, relation_graph_buckets, recall_policy)
             if relation_probe:
                 relation_slot_reserved = True
                 relation_fallback_matches = matches[-1:]
@@ -11651,11 +12867,14 @@ async def api_breath(request):
 
     requested_policy = str(body.get("policy") or "search").strip().lower()
     recall_policy = _normalize_anchor_recall_policy(requested_policy)
+    gate_arg = str(body.get("gate") or "").strip()
     timing_token = begin_recall_timing()
     e_chord_response_capture: dict[str, object] = {}
     e_chord_capture_token = _e_chord_shadow_response_capture.set(
         e_chord_response_capture
     )
+    gate_skip_capture: dict[str, object] = {}
+    gate_skip_capture_token = _breath_gate_skip_capture.set(gate_skip_capture)
     breath_task = None
     partial = False
     deadline = False
@@ -11685,6 +12904,7 @@ async def api_breath(request):
                 e_chord_attempt=_int_arg("e_chord_attempt", 0),
                 first_screen_limit=_int_arg("first_screen_limit", 0),
                 e_chord_live_enabled=body.get("e_chord_live_enabled") is True,
+                gate=gate_arg,
             ))
             done, _pending = await asyncio.wait(
                 {breath_task},
@@ -11728,6 +12948,7 @@ async def api_breath(request):
         logger.info("breath_timing=%s", json.dumps(timing, sort_keys=True))
     finally:
         _e_chord_shadow_response_capture.reset(e_chord_capture_token)
+        _breath_gate_skip_capture.reset(gate_skip_capture_token)
         reset_recall_timing(timing_token)
 
     if isinstance(result, str):
@@ -11751,6 +12972,9 @@ async def api_breath(request):
     bypass_delivery = e_chord_response_capture.get("bypass_delivery")
     if isinstance(bypass_delivery, dict):
         response_payload["e_chord_bypass_delivery"] = bypass_delivery
+    gate_candidates = gate_skip_capture.get("candidates")
+    if isinstance(gate_candidates, list):
+        response_payload["candidates"] = gate_candidates
     return JSONResponse(response_payload)
 
 
@@ -11880,11 +13104,11 @@ async def api_hold_status(request):
 
     try:
         for bucket in await _borrow_recall_buckets():
-            if not matches(bucket) or not _is_main_recall_bucket(bucket, include_quoted=True):
+            if not matches(bucket) or not _is_main_recall_bucket(bucket):
                 continue
             # A stale resident match alone cannot prove durable storage.
             stored = await bucket_mgr.get(str(bucket.get("id") or ""))
-            if matches(stored) and _is_main_recall_bucket(stored, include_quoted=True):
+            if matches(stored) and _is_main_recall_bucket(stored):
                 return JSONResponse({**result, "state": "stored", "bucket_id": stored["id"]})
     except Exception as exc:
         logger.warning("Hold confirmation unavailable: %s", type(exc).__name__)

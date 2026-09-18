@@ -425,110 +425,6 @@ class BucketManager:
                 config.get("audit", {}),
             )
         self._bucket_locks: dict[str, asyncio.Lock] = {}
-        from retrieval_hints import enabled as hints_enabled
-        self._retrieval_hints_enabled = hints_enabled()
-        self._retrieval_attribution_enabled = self._retrieval_hints_enabled and hints_enabled("OMBRE_RETRIEVAL_ATTRIBUTION_ENABLED")
-        self._retrieval_hints_store = None
-        self._retrieval_hint_rows = {}
-        self._retrieval_hints_check_at = 0.0
-        self._retrieval_dict_stamp = None
-        self._retrieval_dict_enabled = False
-        if self._retrieval_hints_enabled:
-            from retrieval_hints_storage import HintsStore
-            self._retrieval_hints_store = HintsStore(os.path.join(self.base_dir, ".retrieval_hints"))
-            self._retrieval_dict_enabled = hints_enabled("OMBRE_PRIVATE_RECALL_DICT_ENABLED")
-
-    async def _queue_retrieval_hints(self, bucket_id: str) -> None:
-        if not getattr(self, "_retrieval_hints_enabled", False):
-            return
-        def register():
-            path = self._find_bucket_file(bucket_id)
-            bucket = self._load_bucket(path) if path else None
-            if bucket:
-                self._retrieval_hints_store.register(bucket, kind="new_write",
-                    schema_version=2 if self._retrieval_attribution_enabled else 1)
-        try:
-            # Only bounded local registration, never network/model work. If
-            # interrupted or busy, the night difference scan repairs the gap.
-            await asyncio.wait_for(asyncio.to_thread(register), timeout=.15)
-        except Exception as exc:
-            logger.warning("retrieval hints registration deferred: %s", type(exc).__name__)
-
-    async def stage_proposed_retrieval_hints(self, bucket_id, payload, source_context, *, proposer_provenance):
-        if not getattr(self, "_retrieval_attribution_enabled", False):
-            return None
-        from retrieval_hints import Generation
-        def stage():
-            path = self._find_bucket_file(bucket_id)
-            bucket = self._load_bucket(path) if path else None
-            if not bucket:
-                return None
-            return self._retrieval_hints_store.stage(bucket, Generation(
-                "ok", payload, requested_model=str(proposer_provenance.get("model", "")),
-                source_context=source_context, generation_provenance=proposer_provenance))
-        return await asyncio.to_thread(stage)
-
-    def _attach_retrieval_hints(self, bucket, rows=None):
-        if not getattr(self, "_retrieval_hints_enabled", False):
-            return bucket
-        from retrieval_hints import content_hash
-        row = (self._retrieval_hint_rows if rows is None else rows).get(str(bucket.get("id", "")))
-        if row and row["source_content_sha256"] == content_hash(bucket.get("content") or ""):
-            return {**bucket, "retrieval_hints_v1": row}
-        return bucket
-
-    def retrieval_attribution_eligible(self, bucket):
-        """Only published, source-current quoted=true excludes a candidate."""
-        if not getattr(self, "_retrieval_attribution_enabled", False):
-            return True
-        row = self._retrieval_hint_rows.get(str(bucket.get("id", "")))
-        if not row or row.get("payload", {}).get("quoted") is not True:
-            return True
-        from retrieval_hints_storage import HintsStore, SourceChanged
-        try:
-            HintsStore._check_source(row, bucket)
-        except SourceChanged:
-            return True  # A changed source is unknown, never a stale exclusion.
-        return False
-
-    def _build_hinted_bm25_index(self, buckets):
-        from retrieval_tokenizer import RetrievalTokenizer
-        rows = self._retrieval_hints_store.published_snapshot()
-        tokenizer = (RetrievalTokenizer.from_file(self._retrieval_hints_store.directory / "userdict.txt")
-                     if self._retrieval_dict_enabled else None)
-        return self._build_bm25_index(
-            [self._attach_retrieval_hints(bucket, rows) for bucket in buckets],
-            tokenizer=tokenizer, hints_enabled=True,
-        )
-
-    async def _refresh_retrieval_hint_index(self, buckets):
-        if not getattr(self, "_retrieval_hints_enabled", False) or time.monotonic() < self._retrieval_hints_check_at:
-            return
-        self._retrieval_hints_check_at = time.monotonic() + 5.0
-        try:
-            rows = await asyncio.to_thread(self._retrieval_hints_store.published_snapshot)
-            old = self._retrieval_hint_rows
-            changed = {bid for bid in set(old) | set(rows)
-                       if old.get(bid, {}).get("version") != rows.get(bid, {}).get("version")}
-            self._retrieval_hint_rows = rows
-            dictionary_changed = False
-            if self._retrieval_dict_enabled:
-                stat = (self._retrieval_hints_store.directory / "userdict.txt").stat()
-                stamp = (stat.st_mtime_ns, stat.st_size)
-                dictionary_changed = stamp != self._retrieval_dict_stamp
-                self._retrieval_dict_stamp = stamp
-            # A batch/dictionary change uses the existing off-thread generation
-            # builder; never do hundreds of COW updates on the chat event loop.
-            if dictionary_changed or len(changed) > 8:
-                self._mark_bm25_dirty()
-                return
-            for bucket in buckets:
-                if str(bucket.get("id", "")) in changed:
-                    if not self._apply_bm25_incremental(bucket=bucket, visible=True):
-                        self._mark_bm25_dirty()
-                        break
-        except Exception as exc:
-            logger.warning("retrieval hints refresh deferred: %s", type(exc).__name__)
 
     def _lock_for(self, bucket_id: str) -> asyncio.Lock:
         lock = self._bucket_locks.get(bucket_id)
@@ -990,7 +886,6 @@ class BucketManager:
                     "content": str(bucket.get("content", "")),
                     "path": str(bucket.get("path", "")),
                 }
-                delta_bucket = self._attach_retrieval_hints(delta_bucket)
             fresh = self._bm25_with_delta(
                 current,
                 bucket=delta_bucket,
@@ -1184,8 +1079,8 @@ class BucketManager:
         }
 
     @staticmethod
-    def _build_bm25_index(buckets: list[dict], *, tokenizer=None, hints_enabled=False) -> BM25Index:
-        index = BM25Index(tokenizer=tokenizer, hints_enabled=hints_enabled) if (tokenizer or hints_enabled) else BM25Index()
+    def _build_bm25_index(buckets: list[dict]) -> BM25Index:
+        index = BM25Index()
         index.build(buckets)
         # Validate literal navigation keys beside the same complete BM25
         # generation. Requests then scan a small resident key table instead of
@@ -1326,6 +1221,169 @@ class BucketManager:
                 exact_scores[bucket_id] = max(cheap_score, body_score)
         return exact_scores
 
+    @staticmethod
+    def _keyword_live_prune_enabled() -> bool:
+        raw = os.environ.get("OMBRE_KEYWORD_LIVE_PRUNE", "0").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    def _bounded_topic_scores_live(
+        self,
+        query: str,
+        candidates: list[dict],
+        *,
+        bm25_scores: dict[str, float],
+        limit: int,
+        query_valence: float | None = None,
+        query_arousal: float | None = None,
+    ) -> dict[str, float]:
+        """2026-09-18 第十四版：BM25 live 模式下的精确剪枝（OMBRE_KEYWORD_LIVE_PRUNE=1）。
+
+        上游 `_bounded_topic_scores` 在 live 模式被关掉（BM25 改变了 relevance 分），
+        于是每句都对 16k 桶逐个跑 `_calc_topic_score_from_row`，再把 16k 桶全部塞进
+        主循环各拷一份（floor=0）——keyword_search 段 0.5～0.9s 全在这。
+
+        live 分 = max(bm25, topic*0.6)*100，钥匙命中 = 100，stale ×0.3，mood ×[1-w, 1+w]。
+        topic = max(cheap, body*0.8)，cheap 只看名字/标签/域（批量 cdist 一次算完），
+        body 上界 0.8。于是每桶有确定的下界 lower 与上界 upper；第 k 大的 lower 记 L，
+        upper < L - tie_band 的桶不可能进 top-k、也进不了 band 重排，剪掉不改输出。
+        剩下的桶里 cheap < 0.8 的才对正文跑一次 cdist(partial_ratio)。返回值只含保留桶，
+        值是与 `_calc_topic_score_from_row` 逐位相同的 topic 分。
+        """
+        query_text = str(query or "")
+        query_lower = query_text.lower()
+        query_casefold = query_text.casefold()
+        query_parts = self._query_parts_for_search(query_lower)
+        rows: list[tuple[str, dict, dict]] = []
+        for bucket in candidates:
+            bucket_id = str(bucket.get("id", ""))
+            if not bucket_id:
+                continue
+            rows.append((bucket_id, self._keyword_score_row_for_bucket(bucket), bucket))
+        if not rows:
+            return {}
+
+        import numpy as np
+
+        # cdist 默认 float32，与逐个 fuzz.ratio 的 float64 在 round(…, 2) 边界会翻转，必须双精度。
+        cdist_kwargs = {"workers": -1, "dtype": np.float64}
+        names = [row["name"] if row["name_present"] else "" for _b, row, _x in rows]
+        name_ratio = process.cdist([query_text], names, scorer=fuzz.ratio, **cdist_kwargs)[0]
+        unique_tags = sorted({tag for _b, row, _x in rows for tag in row["tags"]})
+        tag_ratio: dict[str, float] = {}
+        if unique_tags:
+            arr = process.cdist([query_text], unique_tags, scorer=fuzz.ratio, **cdist_kwargs)[0]
+            tag_ratio = {tag: float(value) for tag, value in zip(unique_tags, arr)}
+        unique_domains = sorted({value for _b, row, _x in rows for value in row["domain"]})
+        domain_ratio: dict[str, float] = {}
+        if unique_domains:
+            arr = process.cdist([query_text], unique_domains, scorer=fuzz.ratio, **cdist_kwargs)[0]
+            domain_ratio = {value: float(score) for value, score in zip(unique_domains, arr)}
+
+        z_historical = self._z_historical_ids()
+        mood_w = (
+            self._mood_congruent_weight()
+            if query_valence is not None and query_arousal is not None
+            else 0.0
+        )
+        cheap_scores: list[float] = []
+        lower: list[float] = []
+        upper: list[float] = []
+        for index, (bucket_id, row, bucket) in enumerate(rows):
+            keys = row["retrieval_keys"]
+            name_lower = row["name_lower"]
+            tags_lower = row["tags_lower"]
+            if any(key in query_lower for key in keys) or query_lower in name_lower or any(
+                query_lower in tag for tag in tags_lower
+            ):
+                cheap = 1.0
+            else:
+                hit_count = 0
+                for part in query_parts:
+                    if name_lower and part in name_lower:
+                        hit_count += 1
+                        continue
+                    if any(tag and part in tag for tag in tags_lower):
+                        hit_count += 1
+                partial_hit = hit_count / len(query_parts) if query_parts else 0.0
+                name_score = float(name_ratio[index]) / 100.0 if row["name_present"] else 0.0
+                domain_score = (
+                    max([domain_ratio.get(value, 0.0) for value in row["domain"]] + [0.0]) / 100.0
+                    if row["domain"] else 0.0
+                )
+                tag_score = (
+                    max([tag_ratio.get(tag, 0.0) for tag in row["tags"]] + [0.0]) / 100.0
+                    if row["tags"] else 0.0
+                )
+                cheap = max(partial_hit, name_score, tag_score, domain_score * 0.9)
+            cheap_scores.append(cheap)
+            meta = bucket.get("metadata", {}) or {}
+            stale = 0.3 if (
+                meta.get("resolved", False)
+                or str(meta.get("id", "")).strip() in z_historical
+            ) else 1.0
+            bm25 = float(bm25_scores.get(bucket_id, 0.0))
+            if keys and any(key in query_casefold for key in keys):
+                low = high = 100.0
+            else:
+                low = max(bm25, cheap * 0.6) * 100.0
+                high = max(bm25, max(cheap, 0.8) * 0.6) * 100.0
+            lower.append(low * stale * (1.0 - mood_w))
+            upper.append(high * (1.0 + mood_w))
+
+        kth_index = min(max(1, int(limit)), len(rows)) - 1
+        kth_lower_bound = sorted(lower, reverse=True)[kth_index]
+        # 主循环把分数 round(…, 2)，两头各 0.005 的舍入用 0.011 吃掉。
+        threshold = kth_lower_bound - self.keyword_relevance_tie_band - 0.011
+        kept = [index for index in range(len(rows)) if upper[index] >= threshold]
+        body_indices = [
+            index for index in kept
+            if cheap_scores[index] < 0.8 and rows[index][1]["content"]
+        ]
+        body_scores: dict[int, float] = {}
+        if body_indices:
+            # body 只在 body*0.8*0.6*100*(1+w) ≥ threshold 时才可能改变结果。
+            body_cutoff = max(0.0, min(100.0, threshold / (1.0 + mood_w) / 0.48))
+            arr = process.cdist(
+                [query_text],
+                [rows[index][1]["content"] for index in body_indices],
+                scorer=fuzz.partial_ratio,
+                score_cutoff=body_cutoff,
+                **cdist_kwargs,
+            )[0]
+            body_scores = {
+                index: float(score) / 100.0 * 0.8
+                for index, score in zip(body_indices, arr)
+            }
+        # 第二遍：保留桶的 topic 已精确，按精确分再收一次 top-k 界。稀有词（宅舞/蚊子）
+        # 第一遍 L≈0 时几乎全保留，这一遍把主循环压回几十个桶，判据与第一遍相同。
+        exact_topic = {
+            index: max(cheap_scores[index], body_scores.get(index, 0.0))
+            for index in kept
+        }
+        final_lower: list[float] = []
+        final_upper: dict[int, float] = {}
+        for index in kept:
+            bucket_id, row, bucket = rows[index]
+            meta = bucket.get("metadata", {}) or {}
+            stale = 0.3 if (
+                meta.get("resolved", False)
+                or str(meta.get("id", "")).strip() in z_historical
+            ) else 1.0
+            keys = row["retrieval_keys"]
+            if keys and any(key in query_casefold for key in keys):
+                base = 100.0
+            else:
+                base = max(float(bm25_scores.get(bucket_id, 0.0)), exact_topic[index] * 0.6) * 100.0
+            final_lower.append(base * stale * (1.0 - mood_w))
+            final_upper[index] = base * (1.0 + mood_w)
+        kth_index = min(max(1, int(limit)), len(kept)) - 1
+        threshold2 = sorted(final_lower, reverse=True)[kth_index] - self.keyword_relevance_tie_band - 0.011
+        return {
+            rows[index][0]: exact_topic[index]
+            for index in kept
+            if final_upper[index] >= threshold2
+        }
+
     async def _rebuild_bm25_async(
         self,
         buckets: list[dict],
@@ -1343,11 +1401,10 @@ class BucketManager:
             # Startup runs before requests exist, so an inline build avoids
             # jieba's extremely slow first-use path in a fresh worker thread.
             # Dirty live rebuilds retain the upstream worker-thread behavior.
-            builder = self._build_hinted_bm25_index if getattr(self, "_retrieval_hints_enabled", False) else self._build_bm25_index
             fresh = (
-                await asyncio.to_thread(builder, buckets)
+                await asyncio.to_thread(self._build_bm25_index, buckets)
                 if offload
-                else builder(buckets)
+                else self._build_bm25_index(buckets)
             )
             # A write may invalidate the snapshot while jieba is building it.
             # Never let that stale build clear the newer dirty generation.
@@ -1886,7 +1943,6 @@ class BucketManager:
                     bucket_id,
                     exc,
                 )
-        await self._queue_retrieval_hints(bucket_id)
         return bucket_id
 
     # ---------------------------------------------------------
@@ -2273,7 +2329,6 @@ class BucketManager:
                 return False
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
-        await self._queue_retrieval_hints(bucket_id)
         return True
 
     # ---------------------------------------------------------
@@ -2947,10 +3002,6 @@ class BucketManager:
         if not all_buckets:
             return []
 
-        if getattr(self, "_retrieval_attribution_enabled", False):
-            await self._refresh_retrieval_hint_index(all_buckets)
-            all_buckets = [b for b in all_buckets if self.retrieval_attribution_eligible(b)]
-
         # --- 修复域过滤的脆弱迭代 ---
         if domain_filter:
             filter_set = {str(d).lower() for d in domain_filter}
@@ -2995,10 +3046,8 @@ class BucketManager:
         # request.  The current query uses the last complete index while a
         # fresh index is built and swapped atomically in a background thread.
         bm25_scores: dict[str, float] = {}
-        hint_matches = {}
         bm25_shadow_ready = False
         if self._bm25_mode != "off" and self._bm25 is not None:
-            await self._refresh_retrieval_hint_index(all_buckets)
             if self._bm25_dirty and not self._bm25_rebuilding:
                 # Never build 13k rows on every dirty request. One timer owns the
                 # next generation while this request uses the old complete one.
@@ -3010,8 +3059,6 @@ class BucketManager:
                     getattr(self._bm25, "_index", None) is not None
                 )
                 bm25_scores = await asyncio.to_thread(self._bm25.score, query)
-                if getattr(self, "_retrieval_hints_enabled", False):
-                    hint_matches = self._bm25.hint_matches(query)
             except Exception as exc:
                 logger.warning("[bm25] score failed; skipping this dimension: %s", exc)
 
@@ -3053,6 +3100,35 @@ class BucketManager:
                     "[keyword] bounded topic scoring failed; using legacy scan: %s",
                     exc,
                 )
+        elif (
+            relevance_first
+            and keyword_rows_ready
+            and self._bm25_mode == "live"
+            and bm25_scores
+            and self._keyword_live_prune_enabled()
+        ):
+            # 2026-09-18 第十四版：live 模式的精确剪枝，见 _bounded_topic_scores_live。
+            try:
+                bounded_topic_scores = await asyncio.to_thread(
+                    self._bounded_topic_scores_live,
+                    query,
+                    list(candidates),
+                    bm25_scores=bm25_scores,
+                    limit=limit,
+                    query_valence=query_valence,
+                    query_arousal=query_arousal,
+                )
+                candidates = [
+                    bucket
+                    for bucket in candidates
+                    if str(bucket.get("id", "")) in bounded_topic_scores
+                ]
+            except Exception as exc:
+                bounded_topic_scores = None
+                logger.warning(
+                    "[keyword] live prune failed; using legacy scan: %s",
+                    exc,
+                )
 
         scored = []
         query_casefold = query.casefold()
@@ -3067,6 +3143,14 @@ class BucketManager:
                 row_keys: tuple = ()
                 if bounded_topic_scores is not None:
                     topic_score = bounded_topic_scores[bucket_id]
+                    if keyword_rows_ready:
+                        # live 剪枝路径仍要钥匙命中判定（下面 normalized = 100 那步）；
+                        # shadow/off 路径不读 row_keys，这里给它赋值不改任何输出。
+                        row_keys = (
+                            self._keyword_score_row_for_bucket(bucket).get(
+                                "retrieval_keys", ()
+                            ) or ()
+                        )
                 elif keyword_rows_ready:
                     _score_row = self._keyword_score_row_for_bucket(bucket)
                     row_keys = _score_row.get("retrieval_keys", ()) or ()
@@ -3175,8 +3259,6 @@ class BucketManager:
                             normalized *= mood_factor
                     scored_bucket = dict(bucket)
                     scored_bucket["score"] = round(normalized, 2)
-                    if str(bucket.get("id", "")) in hint_matches:
-                        scored_bucket["hint_match"] = list(hint_matches[str(bucket["id"])])
                     if mood_factor != 1.0:
                         scored_bucket["_mood_congruent_factor"] = round(mood_factor, 4)
                     if relevance_first:
