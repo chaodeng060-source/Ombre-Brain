@@ -20,10 +20,20 @@ No unaccepted focus experiments or dirty IDF changes are included.
   including JSON escaping. Truncation/omission is visible; a truncated prefix is not a complete quote.
 
 Verification uses synthetic responses through the actual parser, cache, selection and HTTP bridge:
-12 new tests plus 58 adjacent cache/noise/timing checks pass. No live provider calls were made.
+25 reason tests plus 58 adjacent cache/noise/timing checks pass. No live provider calls were made.
 The optional `TWIN_GATE_REASON_SOURCE_ROOT` test connects the actual provider HTTP result to the
 Twin consumer and actual trace writer, asserting original reasons and 0600 file permissions.
 This proves local wiring, not production loading or a measured reduction in false rejections.
+
+Review correction (rollback: `68049c8bf247237efca5b96e2b82502f4a8928f7`):
+the reviewer's two unchanged index-guard tests first reproduced `IndexError`, then passed.
+Missing scores use the selector's existing zero fallback and an `unparsable` reason; missing
+reason slots are also `unparsable`. Batch combination pads/trims reasons within each batch,
+so one malformed vector cannot shift another candidate's reason. The capture call is isolated:
+an unexpected diagnostic exception preserves selection and logs only its type, not private text.
+Eight vector-length combinations compare selection to the original source; a fault-injection
+case checks the exception boundary, and two batch cases check reason alignment. These are
+local reproducible defects, not evidence that production previously encountered them.
 
 Delivery requires both local repository patches and the assigned Claude review. No push, deployment,
 restart or NAS modification is authorized by this implementation receipt.

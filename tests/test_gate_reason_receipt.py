@@ -219,3 +219,68 @@ async def test_invalid_unicode_reason_does_not_change_successful_gate():
     _, state = await run_gate(load(Client(raw(("\ud800", "safe")))))
     assert state["receipt"]["items"][0]["reason_status"] == "unparsable"
     assert state["receipt"]["items"][1]["reason"] == "safe"
+
+
+@pytest.mark.parametrize("bucket_count,score_count,reason_count", [
+    (0, 0, 0), (3, 0, 0), (3, 0, 3), (3, 1, 0),
+    (3, 1, 1), (3, 3, 1), (3, 3, 5), (1, 3, 3),
+])
+def test_mismatched_vectors_keep_baseline_selection_and_reason_alignment(
+    monkeypatch, bucket_count, score_count, reason_count,
+):
+    monkeypatch.setenv("OMBRE_DS_GATE_REASONS_ENABLED", "1")
+    source = subprocess.check_output(["git", "show", f"{BASE}:server.py"], cwd=ROOT, text=True)
+    old, new = load(Client(""), source), load(Client(""))
+    values = [80 if i % 2 == 0 else 20 for i in range(score_count)]
+    reasons = [{"reason": f"reason-{i}", "reason_status": "provided", "reason_truncated": False}
+               for i in range(reason_count)]
+    scores = receipt.Scores(values, reasons)
+    expected = old["_ds_score_mode_select"](buckets(bucket_count), values, set(), 3)
+    state, token = receipt.begin()
+    try:
+        actual = new["_ds_score_mode_select"](buckets(bucket_count), scores, set(), 3)
+        assert actual == expected
+        result = state["receipt"]
+        rejected = [i for i in range(bucket_count) if i >= score_count or values[i] < 70]
+        assert result["omitted"] == 0
+        assert [r["id"] for r in result["items"]] == [f"bucket{i}" for i in rejected]
+        for i, row in zip(rejected, result["items"]):
+            assert row["score"] == (values[i] if i < score_count else 0)
+            if i < score_count and i < reason_count:
+                assert row["reason"] == f"reason-{i}"
+                assert row["reason_status"] == "provided"
+            else:
+                assert row["reason"] is None
+                assert row["reason_status"] == "unparsable"
+    finally:
+        receipt.reset(token)
+
+
+def test_diagnostic_failure_does_not_change_gate_or_log_private_text(monkeypatch, caplog):
+    source = subprocess.check_output(["git", "show", f"{BASE}:server.py"], cwd=ROOT, text=True)
+    old, new = load(Client(""), source), load(Client(""))
+    expected = old["_ds_score_mode_select"](buckets(), [80, 20], set(), 3)
+
+    def broken_capture(*args):
+        raise RuntimeError("private candidate body must not reach operational logs")
+
+    monkeypatch.setattr(receipt, "record_rejections", broken_capture)
+    with caplog.at_level(logging.WARNING, logger="reason-test"):
+        actual = new["_ds_score_mode_select"](buckets(), [80, 20], set(), 3)
+    assert actual == expected
+    assert "DS gate reason receipt unavailable (RuntimeError)" in caplog.text
+    assert "private candidate body" not in caplog.text
+
+
+@pytest.mark.parametrize("first_reason_count", [1, 3])
+def test_mismatched_batch_reasons_cannot_shift_into_another_candidate(monkeypatch, first_reason_count):
+    monkeypatch.setenv("OMBRE_DS_GATE_REASONS_ENABLED", "1")
+    reasons = [{"reason": f"first-{i}", "reason_status": "provided", "reason_truncated": False}
+               for i in range(first_reason_count)]
+    second = {"reason": "second-batch", "reason_status": "provided", "reason_truncated": False}
+    combined = receipt.combine([receipt.Scores([10, 20], reasons), receipt.Scores([30], [second])])
+    assert combined == [10, 20, 30]
+    assert len(combined.reasons) == 3
+    assert combined.reasons[0] == reasons[0]
+    assert combined.reasons[1] == (reasons[1] if first_reason_count > 1 else receipt.missing("unparsable"))
+    assert combined.reasons[2] == second

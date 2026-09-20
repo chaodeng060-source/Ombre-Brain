@@ -3353,7 +3353,12 @@ def _ds_score_mode_select(
             decorated.append((-final, index, bucket))
     decorated.sort(key=lambda row: (row[0], row[1]))
     selected = [row[2] for row in decorated]
-    gate_reason_receipt.record_rejections(buckets, scores, threshold)
+    try:
+        gate_reason_receipt.record_rejections(buckets, scores, threshold)
+    except Exception as exc:
+        # Optional diagnostics must not change selection. Exception messages
+        # can contain candidate/reason text, so log only the exception type.
+        logger.warning("DS gate reason receipt unavailable (%s)", type(exc).__name__)
     logger.info(
         "DS gate score verdict input=%d passed=%d threshold=%d raw=%s finals=%s keyed=%d ids=%s",
         len(buckets), len(selected), threshold,

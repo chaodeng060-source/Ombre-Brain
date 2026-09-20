@@ -84,7 +84,10 @@ def combine(parts):
     values = [value for part in parts for value in part]
     if not enabled():
         return values
-    reasons = [row for part in parts for row in getattr(part, "reasons", [missing("unparsable") for _ in part])]
+    reasons = []
+    for part in parts:
+        rows = getattr(part, "reasons", [])
+        reasons.extend(rows[i] if i < len(rows) else missing("unparsable") for i in range(len(part)))
     return Scores(values, reasons)
 
 
@@ -92,13 +95,17 @@ def record_rejections(buckets, scores, threshold):
     state = current()
     if not enabled() or state is None:
         return
-    reasons = getattr(scores, "reasons", [missing("unparsable") for _ in scores])
+    reasons = getattr(scores, "reasons", [])
     rejected = [i for i, bucket in enumerate(buckets) if bucket["_ds_gate_final"] < threshold]
     receipt = {"schema_version": 1, "items": [], "omitted": len(rejected)}
     for i in rejected[:MAX_ITEMS]:
         bucket = buckets[i]
-        row = {"id": str(bucket.get("id") or "")[:64], "score": int(scores[i]),
-               "final": int(bucket["_ds_gate_final"]), **reasons[i]}
+        # Match the selector's existing missing-score fallback; never attach a
+        # reason to a missing score or shift another candidate's reason over.
+        score = scores[i] if i < len(scores) else 0
+        reason = reasons[i] if i < len(scores) and i < len(reasons) else missing("unparsable")
+        row = {"id": str(bucket.get("id") or "")[:64], "score": int(score),
+               "final": int(bucket["_ds_gate_final"]), **reason}
         receipt["items"].append(row)
         receipt["omitted"] -= 1
         if len(json.dumps(receipt, ensure_ascii=False).encode("utf-8")) > MAX_BYTES:
