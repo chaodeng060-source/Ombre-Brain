@@ -217,6 +217,7 @@ from recall_history import (
     default_content_fingerprint,
     recall_identity,
 )
+import gate_reason_receipt
 from recall_timing import (
     begin_recall_timing,
     finish_recall_timing,
@@ -3222,9 +3223,9 @@ async def _ds_score_one_batch(
     ttl, max_entries = _ds_select_cache_config()
     cached = _DS_SELECT_CACHE.get(cache_key)
     if ttl > 0 and cached is not None and cached[0] + ttl >= time.monotonic():
-        scores = list(cached[1])
+        scores = gate_reason_receipt.restore(cached)
         del _DS_SELECT_CACHE[cache_key]
-        _DS_SELECT_CACHE[cache_key] = (cached[0], scores)
+        _DS_SELECT_CACHE[cache_key] = gate_reason_receipt.cache_entry(cached[0], scores)
         return scores
     resp = await client.chat.completions.create(
         model=model,
@@ -3248,7 +3249,7 @@ async def _ds_score_one_batch(
     if ttl > 0:
         if len(_DS_SELECT_CACHE) >= max_entries:
             _DS_SELECT_CACHE.pop(next(iter(_DS_SELECT_CACHE)))
-        _DS_SELECT_CACHE[cache_key] = (time.monotonic(), list(scores))
+        _DS_SELECT_CACHE[cache_key] = gate_reason_receipt.cache_entry(time.monotonic(), scores)
     return scores
 
 
@@ -3326,7 +3327,7 @@ def _parse_ds_score_verdicts(raw: str, count: int) -> list[int] | None:
                 break
             by_index[index] = value
         if valid and len(by_index) == count:
-            parsed = [by_index[i] for i in range(count)]
+            parsed = gate_reason_receipt.with_reasons([by_index[i] for i in range(count)], scores)
     return parsed
 
 
@@ -3352,6 +3353,7 @@ def _ds_score_mode_select(
             decorated.append((-final, index, bucket))
     decorated.sort(key=lambda row: (row[0], row[1]))
     selected = [row[2] for row in decorated]
+    gate_reason_receipt.record_rejections(buckets, scores, threshold)
     logger.info(
         "DS gate score verdict input=%d passed=%d threshold=%d raw=%s finals=%s keyed=%d ids=%s",
         len(buckets), len(selected), threshold,
@@ -3584,7 +3586,7 @@ async def _ds_semantic_select(
                 provider_kwargs=provider_kwargs, full_body_windows=full_body_windows,
             ) for batch in batches
         ))
-        scores: list[int] = [s for part in parts for s in part]
+        scores: list[int] = gate_reason_receipt.combine(parts)
         logger.info("DS gate score split input=%d batches=%d", len(buckets), len(batches))
         return _ds_score_mode_select(buckets, scores, keep, max_results)
     lines = []
@@ -3670,9 +3672,9 @@ async def _ds_semantic_select(
     idxs: list[int] | None = None
     cached = _DS_SELECT_CACHE.get(cache_key)
     if ttl > 0 and cached is not None and cached[0] + ttl >= time.monotonic():
-        idxs = list(cached[1])
+        idxs = gate_reason_receipt.restore(cached) if score_mode else list(cached[1])
         del _DS_SELECT_CACHE[cache_key]  # 命中即续位（LRU）
-        _DS_SELECT_CACHE[cache_key] = (cached[0], idxs)
+        _DS_SELECT_CACHE[cache_key] = gate_reason_receipt.cache_entry(cached[0], idxs)
         logger.info(
             "DS filter cache hit key=%s keep=%d entries=%d",
             cache_key[:12], len(idxs), len(_DS_SELECT_CACHE),
@@ -3736,9 +3738,9 @@ async def _ds_semantic_select(
         if ttl > 0:
             if len(_DS_SELECT_CACHE) >= max_entries:
                 _DS_SELECT_CACHE.pop(next(iter(_DS_SELECT_CACHE)))
-            _DS_SELECT_CACHE[cache_key] = (time.monotonic(), list(idxs))
+            _DS_SELECT_CACHE[cache_key] = gate_reason_receipt.cache_entry(time.monotonic(), idxs)
     if score_mode:
-        return _ds_score_mode_select(buckets, list(idxs), keep, max_results)
+        return _ds_score_mode_select(buckets, idxs, keep, max_results)
     keep_idx = set(idxs)
     selected = [
         b for i, b in enumerate(buckets)
@@ -12870,6 +12872,7 @@ async def api_breath(request):
     gate_arg = str(body.get("gate") or "").strip()
     timing_token = begin_recall_timing()
     e_chord_response_capture: dict[str, object] = {}
+    gate_reason_capture, gate_reason_token = gate_reason_receipt.begin()
     e_chord_capture_token = _e_chord_shadow_response_capture.set(
         e_chord_response_capture
     )
@@ -12949,6 +12952,7 @@ async def api_breath(request):
     finally:
         _e_chord_shadow_response_capture.reset(e_chord_capture_token)
         _breath_gate_skip_capture.reset(gate_skip_capture_token)
+        gate_reason_receipt.reset(gate_reason_token)
         reset_recall_timing(timing_token)
 
     if isinstance(result, str):
@@ -12975,6 +12979,8 @@ async def api_breath(request):
     gate_candidates = gate_skip_capture.get("candidates")
     if isinstance(gate_candidates, list):
         response_payload["candidates"] = gate_candidates
+    if gate_reason_receipt.enabled() and "receipt" in gate_reason_capture:
+        response_payload["gate_rejections"] = gate_reason_capture["receipt"]
     return JSONResponse(response_payload)
 
 
