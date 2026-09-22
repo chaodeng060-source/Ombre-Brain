@@ -276,6 +276,25 @@ class BucketManager:
         # 当前是否处于涩涩 world（switch_world 维护）；list_all 默认跟随它决定是否加载涩涩目录
         self.nsfw_active = (config.get("current_world", "") or "").strip() == "涩涩"
         matching_cfg = config.get("matching", {}) or {}
+        # Optional native first loop; env=0 overrides a config opt-in for rollback.
+        self._keyword_cython_compute = None
+        self._keyword_backend_logged = False
+        use_cython = str(os.environ.get(
+            "OMBRE_KEYWORD_CYTHON", matching_cfg.get("keyword_cython", False)
+        )).strip().lower() in {"1", "true", "yes", "on"}
+        if use_cython:
+            try:
+                from keyword_kernel import compute, __file__ as kernel_path
+            except (ImportError, OSError) as exc:
+                logging.getLogger(__name__).warning(
+                    "keyword_cython unavailable pid=%s error=%s; using Python",
+                    os.getpid(), type(exc).__name__,
+                )
+            else:
+                self._keyword_cython_compute = compute
+                logging.getLogger(__name__).info(
+                    "keyword_cython ready pid=%s module=%s", os.getpid(), kernel_path,
+                )
         self.fuzzy_threshold = matching_cfg.get("fuzzy_threshold", 50)
         self.max_results = matching_cfg.get("max_results", 5)
         self.keyword_relevance_tie_band = max(
@@ -425,6 +444,110 @@ class BucketManager:
                 config.get("audit", {}),
             )
         self._bucket_locks: dict[str, asyncio.Lock] = {}
+        from retrieval_hints import enabled as hints_enabled
+        self._retrieval_hints_enabled = hints_enabled()
+        self._retrieval_attribution_enabled = self._retrieval_hints_enabled and hints_enabled("OMBRE_RETRIEVAL_ATTRIBUTION_ENABLED")
+        self._retrieval_hints_store = None
+        self._retrieval_hint_rows = {}
+        self._retrieval_hints_check_at = 0.0
+        self._retrieval_dict_stamp = None
+        self._retrieval_dict_enabled = False
+        if self._retrieval_hints_enabled:
+            from retrieval_hints_storage import HintsStore
+            self._retrieval_hints_store = HintsStore(os.path.join(self.base_dir, ".retrieval_hints"))
+            self._retrieval_dict_enabled = hints_enabled("OMBRE_PRIVATE_RECALL_DICT_ENABLED")
+
+    async def _queue_retrieval_hints(self, bucket_id: str) -> None:
+        if not getattr(self, "_retrieval_hints_enabled", False):
+            return
+        def register():
+            path = self._find_bucket_file(bucket_id)
+            bucket = self._load_bucket(path) if path else None
+            if bucket:
+                self._retrieval_hints_store.register(bucket, kind="new_write",
+                    schema_version=3)
+        try:
+            # Only bounded local registration, never network/model work. If
+            # interrupted or busy, the night difference scan repairs the gap.
+            await asyncio.wait_for(asyncio.to_thread(register), timeout=.15)
+        except Exception as exc:
+            logger.warning("retrieval hints registration deferred: %s", type(exc).__name__)
+
+    async def stage_proposed_retrieval_hints(self, bucket_id, payload, source_context, *, proposer_provenance):
+        if not getattr(self, "_retrieval_attribution_enabled", False):
+            return None
+        from retrieval_hints import Generation
+        def stage():
+            path = self._find_bucket_file(bucket_id)
+            bucket = self._load_bucket(path) if path else None
+            if not bucket:
+                return None
+            return self._retrieval_hints_store.stage(bucket, Generation(
+                "ok", payload, requested_model=str(proposer_provenance.get("model", "")),
+                source_context=source_context, generation_provenance=proposer_provenance))
+        return await asyncio.to_thread(stage)
+
+    def _attach_retrieval_hints(self, bucket, rows=None):
+        if not getattr(self, "_retrieval_hints_enabled", False):
+            return bucket
+        from retrieval_hints import content_hash
+        row = (self._retrieval_hint_rows if rows is None else rows).get(str(bucket.get("id", "")))
+        if row and row["source_content_sha256"] == content_hash(bucket.get("content") or ""):
+            return {**bucket, "retrieval_hints_v1": row}
+        return bucket
+
+    def retrieval_attribution_eligible(self, bucket):
+        """Only published, source-current quoted=true excludes a candidate."""
+        if not getattr(self, "_retrieval_attribution_enabled", False):
+            return True
+        row = self._retrieval_hint_rows.get(str(bucket.get("id", "")))
+        if not row or row.get("payload", {}).get("quoted") is not True:
+            return True
+        from retrieval_hints_storage import HintsStore, SourceChanged
+        try:
+            HintsStore._check_source(row, bucket)
+        except SourceChanged:
+            return True  # A changed source is unknown, never a stale exclusion.
+        return False
+
+    def _build_hinted_bm25_index(self, buckets):
+        from retrieval_tokenizer import RetrievalTokenizer
+        rows = self._retrieval_hints_store.published_snapshot()
+        tokenizer = (RetrievalTokenizer.from_file(self._retrieval_hints_store.directory / "userdict.txt")
+                     if self._retrieval_dict_enabled else None)
+        return self._build_bm25_index(
+            [self._attach_retrieval_hints(bucket, rows) for bucket in buckets],
+            tokenizer=tokenizer, hints_enabled=True,
+        )
+
+    async def _refresh_retrieval_hint_index(self, buckets):
+        if not getattr(self, "_retrieval_hints_enabled", False) or time.monotonic() < self._retrieval_hints_check_at:
+            return
+        self._retrieval_hints_check_at = time.monotonic() + 5.0
+        try:
+            rows = await asyncio.to_thread(self._retrieval_hints_store.published_snapshot)
+            old = self._retrieval_hint_rows
+            changed = {bid for bid in set(old) | set(rows)
+                       if old.get(bid, {}).get("version") != rows.get(bid, {}).get("version")}
+            self._retrieval_hint_rows = rows
+            dictionary_changed = False
+            if self._retrieval_dict_enabled:
+                stat = (self._retrieval_hints_store.directory / "userdict.txt").stat()
+                stamp = (stat.st_mtime_ns, stat.st_size)
+                dictionary_changed = stamp != self._retrieval_dict_stamp
+                self._retrieval_dict_stamp = stamp
+            # A batch/dictionary change uses the existing off-thread generation
+            # builder; never do hundreds of COW updates on the chat event loop.
+            if dictionary_changed or len(changed) > 8:
+                self._mark_bm25_dirty()
+                return
+            for bucket in buckets:
+                if str(bucket.get("id", "")) in changed:
+                    if not self._apply_bm25_incremental(bucket=bucket, visible=True):
+                        self._mark_bm25_dirty()
+                        break
+        except Exception as exc:
+            logger.warning("retrieval hints refresh deferred: %s", type(exc).__name__)
 
     def _lock_for(self, bucket_id: str) -> asyncio.Lock:
         lock = self._bucket_locks.get(bucket_id)
@@ -886,6 +1009,7 @@ class BucketManager:
                     "content": str(bucket.get("content", "")),
                     "path": str(bucket.get("path", "")),
                 }
+                delta_bucket = self._attach_retrieval_hints(delta_bucket)
             fresh = self._bm25_with_delta(
                 current,
                 bucket=delta_bucket,
@@ -1079,8 +1203,8 @@ class BucketManager:
         }
 
     @staticmethod
-    def _build_bm25_index(buckets: list[dict]) -> BM25Index:
-        index = BM25Index()
+    def _build_bm25_index(buckets: list[dict], *, tokenizer=None, hints_enabled=False) -> BM25Index:
+        index = BM25Index(tokenizer=tokenizer, hints_enabled=hints_enabled) if (tokenizer or hints_enabled) else BM25Index()
         index.build(buckets)
         # Validate literal navigation keys beside the same complete BM25
         # generation. Requests then scan a small resident key table instead of
@@ -1285,50 +1409,79 @@ class BucketManager:
             if query_valence is not None and query_arousal is not None
             else 0.0
         )
-        cheap_scores: list[float] = []
-        lower: list[float] = []
-        upper: list[float] = []
-        for index, (bucket_id, row, bucket) in enumerate(rows):
-            keys = row["retrieval_keys"]
-            name_lower = row["name_lower"]
-            tags_lower = row["tags_lower"]
-            if any(key in query_lower for key in keys) or query_lower in name_lower or any(
-                query_lower in tag for tag in tags_lower
-            ):
-                cheap = 1.0
-            else:
-                hit_count = 0
-                for part in query_parts:
-                    if name_lower and part in name_lower:
-                        hit_count += 1
-                        continue
-                    if any(tag and part in tag for tag in tags_lower):
-                        hit_count += 1
-                partial_hit = hit_count / len(query_parts) if query_parts else 0.0
-                name_score = float(name_ratio[index]) / 100.0 if row["name_present"] else 0.0
-                domain_score = (
-                    max([domain_ratio.get(value, 0.0) for value in row["domain"]] + [0.0]) / 100.0
-                    if row["domain"] else 0.0
+        native_scores = None
+        if self._keyword_cython_compute is not None:
+            try:
+                native_scores = self._keyword_cython_compute(
+                    query_lower, query_casefold, query_parts, rows, name_ratio,
+                    tag_ratio, domain_ratio, z_historical, mood_w, bm25_scores,
                 )
-                tag_score = (
-                    max([tag_ratio.get(tag, 0.0) for tag in row["tags"]] + [0.0]) / 100.0
-                    if row["tags"] else 0.0
+            except Exception as exc:
+                # Disable this optional backend once; retain the unchanged Python path.
+                self._keyword_cython_compute = None
+                self._keyword_backend_logged = False
+                logging.getLogger(__name__).warning(
+                    "keyword_cython disabled pid=%s error=%s; using Python",
+                    os.getpid(), type(exc).__name__,
                 )
-                cheap = max(partial_hit, name_score, tag_score, domain_score * 0.9)
-            cheap_scores.append(cheap)
-            meta = bucket.get("metadata", {}) or {}
-            stale = 0.3 if (
-                meta.get("resolved", False)
-                or str(meta.get("id", "")).strip() in z_historical
-            ) else 1.0
-            bm25 = float(bm25_scores.get(bucket_id, 0.0))
-            if keys and any(key in query_casefold for key in keys):
-                low = high = 100.0
             else:
-                low = max(bm25, cheap * 0.6) * 100.0
-                high = max(bm25, max(cheap, 0.8) * 0.6) * 100.0
-            lower.append(low * stale * (1.0 - mood_w))
-            upper.append(high * (1.0 + mood_w))
+                if not self._keyword_backend_logged:
+                    self._keyword_backend_logged = True
+                    logging.getLogger(__name__).info(
+                        "keyword_cython active pid=%s rows=%s", os.getpid(), len(rows),
+                    )
+        if native_scores is None:
+            if not self._keyword_backend_logged:
+                self._keyword_backend_logged = True
+                logging.getLogger(__name__).info(
+                    "keyword_cython python_active pid=%s rows=%s", os.getpid(), len(rows),
+                )
+            cheap_scores: list[float] = []
+            lower: list[float] = []
+            upper: list[float] = []
+            for index, (bucket_id, row, bucket) in enumerate(rows):
+                keys = row["retrieval_keys"]
+                name_lower = row["name_lower"]
+                tags_lower = row["tags_lower"]
+                if any(key in query_lower for key in keys) or query_lower in name_lower or any(
+                    query_lower in tag for tag in tags_lower
+                ):
+                    cheap = 1.0
+                else:
+                    hit_count = 0
+                    for part in query_parts:
+                        if name_lower and part in name_lower:
+                            hit_count += 1
+                            continue
+                        if any(tag and part in tag for tag in tags_lower):
+                            hit_count += 1
+                    partial_hit = hit_count / len(query_parts) if query_parts else 0.0
+                    name_score = float(name_ratio[index]) / 100.0 if row["name_present"] else 0.0
+                    domain_score = (
+                        max([domain_ratio.get(value, 0.0) for value in row["domain"]] + [0.0]) / 100.0
+                        if row["domain"] else 0.0
+                    )
+                    tag_score = (
+                        max([tag_ratio.get(tag, 0.0) for tag in row["tags"]] + [0.0]) / 100.0
+                        if row["tags"] else 0.0
+                    )
+                    cheap = max(partial_hit, name_score, tag_score, domain_score * 0.9)
+                cheap_scores.append(cheap)
+                meta = bucket.get("metadata", {}) or {}
+                stale = 0.3 if (
+                    meta.get("resolved", False)
+                    or str(meta.get("id", "")).strip() in z_historical
+                ) else 1.0
+                bm25 = float(bm25_scores.get(bucket_id, 0.0))
+                if keys and any(key in query_casefold for key in keys):
+                    low = high = 100.0
+                else:
+                    low = max(bm25, cheap * 0.6) * 100.0
+                    high = max(bm25, max(cheap, 0.8) * 0.6) * 100.0
+                lower.append(low * stale * (1.0 - mood_w))
+                upper.append(high * (1.0 + mood_w))
+        else:
+            cheap_scores, lower, upper = native_scores
 
         kth_index = min(max(1, int(limit)), len(rows)) - 1
         kth_lower_bound = sorted(lower, reverse=True)[kth_index]
@@ -1401,10 +1554,11 @@ class BucketManager:
             # Startup runs before requests exist, so an inline build avoids
             # jieba's extremely slow first-use path in a fresh worker thread.
             # Dirty live rebuilds retain the upstream worker-thread behavior.
+            builder = self._build_hinted_bm25_index if getattr(self, "_retrieval_hints_enabled", False) else self._build_bm25_index
             fresh = (
-                await asyncio.to_thread(self._build_bm25_index, buckets)
+                await asyncio.to_thread(builder, buckets)
                 if offload
-                else self._build_bm25_index(buckets)
+                else builder(buckets)
             )
             # A write may invalidate the snapshot while jieba is building it.
             # Never let that stale build clear the newer dirty generation.
@@ -1943,6 +2097,7 @@ class BucketManager:
                     bucket_id,
                     exc,
                 )
+        await self._queue_retrieval_hints(bucket_id)
         return bucket_id
 
     # ---------------------------------------------------------
@@ -2329,6 +2484,7 @@ class BucketManager:
                 return False
 
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
+        await self._queue_retrieval_hints(bucket_id)
         return True
 
     # ---------------------------------------------------------
@@ -3002,6 +3158,10 @@ class BucketManager:
         if not all_buckets:
             return []
 
+        if getattr(self, "_retrieval_attribution_enabled", False):
+            await self._refresh_retrieval_hint_index(all_buckets)
+            all_buckets = [b for b in all_buckets if self.retrieval_attribution_eligible(b)]
+
         # --- 修复域过滤的脆弱迭代 ---
         if domain_filter:
             filter_set = {str(d).lower() for d in domain_filter}
@@ -3046,8 +3206,10 @@ class BucketManager:
         # request.  The current query uses the last complete index while a
         # fresh index is built and swapped atomically in a background thread.
         bm25_scores: dict[str, float] = {}
+        hint_matches = {}
         bm25_shadow_ready = False
         if self._bm25_mode != "off" and self._bm25 is not None:
+            await self._refresh_retrieval_hint_index(all_buckets)
             if self._bm25_dirty and not self._bm25_rebuilding:
                 # Never build 13k rows on every dirty request. One timer owns the
                 # next generation while this request uses the old complete one.
@@ -3059,6 +3221,8 @@ class BucketManager:
                     getattr(self._bm25, "_index", None) is not None
                 )
                 bm25_scores = await asyncio.to_thread(self._bm25.score, query)
+                if getattr(self, "_retrieval_hints_enabled", False):
+                    hint_matches = self._bm25.hint_matches(query)
             except Exception as exc:
                 logger.warning("[bm25] score failed; skipping this dimension: %s", exc)
 
@@ -3259,6 +3423,8 @@ class BucketManager:
                             normalized *= mood_factor
                     scored_bucket = dict(bucket)
                     scored_bucket["score"] = round(normalized, 2)
+                    if str(bucket.get("id", "")) in hint_matches:
+                        scored_bucket["hint_match"] = list(hint_matches[str(bucket["id"])])
                     if mood_factor != 1.0:
                         scored_bucket["_mood_congruent_factor"] = round(mood_factor, 4)
                     if relevance_first:
