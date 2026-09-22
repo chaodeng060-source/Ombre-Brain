@@ -49,6 +49,11 @@ import re
 import time
 import httpx
 import jieba
+from candidate_diagnostics import (
+    CandidateDiagnostics, current as candidate_diagnostic,
+    enabled as candidate_diagnostics_enabled,
+    observe as observe_candidates, reject as reject_candidate,
+)
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
@@ -1128,17 +1133,21 @@ def _passes_nonkeyword_recall_filters(
 ) -> bool:
     """Mirror BucketManager.search authority filters for side channels."""
     if not _is_main_recall_bucket(bucket):
+        reject_candidate(bucket, "nonkeyword_not_main")
         return False
     metadata = bucket.get("metadata", {}) or {}
     if exclude_core and (metadata.get("pinned") or metadata.get("protected")):
+        reject_candidate(bucket, "nonkeyword_core")
         return False
     if world_filter_set is not None and not world_matches(
         metadata.get("world", ""), world_filter_set
     ):
+        reject_candidate(bucket, "nonkeyword_world")
         return False
     if created_after is not None or created_before is not None:
         from bucket_manager import _bucket_in_time_range
         if not _bucket_in_time_range(bucket, created_after, created_before):
+            reject_candidate(bucket, "nonkeyword_time")
             return False
     if domain_filter:
         bucket_domains = metadata.get("domain", [])
@@ -1148,6 +1157,7 @@ def _passes_nonkeyword_recall_filters(
             bucket_domains = []
         requested = {str(value).lower() for value in domain_filter}
         if not ({str(value).lower() for value in bucket_domains} & requested):
+            reject_candidate(bucket, "nonkeyword_domain")
             return False
     return True
 
@@ -4141,6 +4151,8 @@ async def _e_axis_rows_cached(e_recall_cfg) -> dict:
     the winner's rows.  Key semantics unchanged: snapshot token + cfg, any
     bucket write still invalidates naturally.
     """
+    if candidate_diagnostic.get() is not None:
+        return group_primary_authored_buckets(await _borrow_recall_buckets(), e_recall_cfg)
     token_fn = getattr(bucket_mgr, "recall_snapshot_token", None)
     if not callable(token_fn):
         token_fn = getattr(bucket_mgr, "list_all_snapshot_token", None)
@@ -6196,11 +6208,15 @@ async def breath(
     gate: str = "",
 ) -> str | list[TextContent | ImageContent]:
     """检索/浮现记忆。gate="skip" 且 OMBRE_BREATH_GATE_SKIP_ENABLED=1 时,search 模式跳过语义门卫,把候选池结构化导出(见 _capture_breath_gate_skip_candidates),不改变其余检索行为;省略或开关关时无效果。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认6000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制注入数量上限(默认8,最大50; 内部仍先召回20条给过滤器)。world=过滤世界:留空走全局current_world(日常时只出日常+通用、角色扮演时只出该世界+通用),"all"跳过过滤,"旧世界"/"当前世界"等显式指定。world="通用"的桶永远跟着出。relation_depth=沿安全关系边双向召回邻居的跳数(默认1,0=关闭,最大2)，关联证据单独列出且不改变主排序。since/until=按桶 created 时间范围过滤,接受 ISO 8601("2026-05-01"/"2026-05-01T12:00:00")、关键字("now"/"today"/"yesterday")、相对偏移("-7d"/"-3h"/"-30m"/"+1d"),浮现模式不过滤 pinned/protected。session_id=同一会话内对已浮现动态桶去重。include_images=True时,白名单图桶会随文本返回 MCP image content。include_body_state=False时只关闭外部身体状态块,不改变记忆检索。reset_body_state=True时先清零 v0 外部身体状态,用于 A/B 盲测卫生。"""
-    with recall_stage("setup"):
-        await _ensure_decay_background()
-        await _ensure_consolidation_background()
-        await episode_engine.ensure_started()
-        _maybe_start_backfill()
+    diagnostic = candidate_diagnostic.get()
+    if diagnostic is None:
+        with recall_stage("setup"):
+            await _ensure_decay_background()
+            await _ensure_consolidation_background()
+            await episode_engine.ensure_started()
+            _maybe_start_backfill()
+    elif not query.strip() or domain.strip().lower() == "feel":
+        raise ValueError("candidate_search_query_required")
     max_results = max(1, min(max_results, 50))
     max_tokens = max(1000, min(max_tokens, 20000))
     recall_limit = max(BREATH_RECALL_POOL_SIZE, max_results)
@@ -6499,7 +6515,7 @@ async def breath(
     qe_cfg = config.get("query_expansion", {}) or {}
     qe_allowed = set(qe_cfg.get("allowed_intents") or ["recall", "relation", "temporal"])
     with recall_stage("expansion"):
-        if qe_cfg.get("enabled", False) and intent_policy.get("intent") in qe_allowed:
+        if diagnostic is None and qe_cfg.get("enabled", False) and intent_policy.get("intent") in qe_allowed:
             try:
                 query_angles = await expand_query(
                     recall_query,
@@ -6580,6 +6596,7 @@ async def breath(
                 query=recall_query,
                 intent=intent_policy["intent"],
             )
+            observe_candidates("keyword_main_and_z", keyword_matches)
         except Exception as e:
             logger.error(
                 "Keyword search failed / 关键词检索失败: %s",
@@ -6610,21 +6627,32 @@ async def breath(
                     "search_similar_with_selected_scores",
                     None,
                 )
+                diagnostic_vector = None
+                if diagnostic is not None:
+                    diagnostic_vector = await embedding_engine.search_similar_diagnostic(
+                        angle, top_k=intent_policy["vector_top_k"],
+                        target_ids=diagnostic.target_ids,
+                        score_bucket_ids=(e_rows_by_bucket if e_recall_cfg is not None
+                                          and e_recall_cfg.semantic_resonance_enabled else ()),
+                    )
+                    vector_hits, vector_status, selected_scores, diagnostic.vector = diagnostic_vector
+                    observe_candidates("vector_raw_top_k", vector_hits, status=vector_status)
                 if (
                     angle_index == 0
                     and e_recall_cfg is not None
                     and e_recall_cfg.semantic_resonance_enabled
                     and callable(selected_score_search)
                 ):
-                    (
-                        vector_hits,
-                        vector_status,
-                        selected_scores,
-                    ) = await selected_score_search(
-                        angle,
-                        top_k=intent_policy["vector_top_k"],
-                        score_bucket_ids=e_rows_by_bucket,
-                    )
+                    if diagnostic_vector is None:
+                        (
+                            vector_hits,
+                            vector_status,
+                            selected_scores,
+                        ) = await selected_score_search(
+                            angle,
+                            top_k=intent_policy["vector_top_k"],
+                            score_bucket_ids=e_rows_by_bucket,
+                        )
                     for bucket_id, similarity in selected_scores.items():
                         normalized_id = str(bucket_id)
                         rows = e_rows_by_bucket.get(normalized_id)
@@ -6640,6 +6668,8 @@ async def breath(
                         ) is None:
                             continue
                         e_semantic_scores[normalized_id] = normalized_similarity
+                elif diagnostic_vector is not None:
+                    pass
                 elif callable(status_search):
                     vector_hits, vector_status = await status_search(
                         angle,
@@ -6675,6 +6705,7 @@ async def breath(
                     if angle_index == 0 and sim > original_vector_scores.get(bid, 0.0):
                         original_vector_scores[bid] = sim
             vector_ranked = list(vector_scores.items())
+            observe_candidates("vector_similarity_floor", vector_ranked)
         except Exception as e:
             logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
             if _strict_recall_errors.get():
@@ -6846,6 +6877,8 @@ async def breath(
             if lexical_mode == "shadow"
             else await lexical_search
         )
+        observe_candidates("curated_lexical_raw", [(str(h.bucket_id), h.score) for h in lexical_hits],
+                           status=lexical_mode)
         for hit in lexical_hits:
             bid = str(hit.bucket_id)
             bucket = (
@@ -6898,6 +6931,7 @@ async def breath(
     except Exception as exc:
         if lexical_mode == "shadow" and isinstance(exc, TimeoutError):
             record_recall_metric("curated_lexical_shadow_timeouts", 1)
+        observe_candidates("curated_lexical_raw", [], status="timeout" if isinstance(exc, TimeoutError) else "error")
         logger.warning(
             "Curated lexical cascade failed; keeping existing channels: %s",
             type(exc).__name__,
@@ -6906,6 +6940,7 @@ async def breath(
         lexical_ranked = []
         lexical_original_support = {}
 
+    observe_candidates("curated_lexical_authority_and_support", lexical_ranked)
     lexical_shadow_bucket_cache = dict(lexical_bucket_cache)
     lexical_shadow_ranked = list(lexical_ranked)
     lexical_shadow_original_support = dict(lexical_original_support)
@@ -6918,6 +6953,7 @@ async def breath(
         lexical_bucket_cache = {}
         lexical_ranked = []
         lexical_original_support = {}
+    observe_candidates("curated_lexical_live_only", lexical_ranked, status=lexical_mode)
 
     # ripgrep exact-substring channel over the bucket files (朝灯 2026-09-08
     # 19:59「有现成的好东西不用非得用差的」).  The PG literal channel above is
@@ -6947,6 +6983,9 @@ async def breath(
     entity_store = _get_entity_store(initialize=False)
     entity_bucket_cache: dict[str, dict] = {}
     entity_ranked: list[tuple[str, float]] = []
+    observe_candidates("entity_raw", raw_entity_ranked,
+                       status="available" if entity_store is not None else "unavailable_or_disabled")
+    observe_candidates("entity_top_k", raw_entity_ranked[:entity_top_k])
     for bid, score in raw_entity_ranked[:entity_top_k]:
         try:
             bucket = keyword_by_id.get(bid) or await bucket_mgr.get(bid)
@@ -6961,6 +7000,7 @@ async def breath(
             if entity_store is None or not entity_store.link_is_current(
                 bid, bucket.get("content", "")
             ):
+                reject_candidate(bucket, "entity_missing_store_or_stale_link")
                 continue
             if not entity_guard_enabled:
                 state_seed_by_id[str(bid)] = bucket
@@ -6978,6 +7018,10 @@ async def breath(
                 type(exc).__name__,
             )
 
+    observe_candidates("entity_validated", entity_ranked)
+    observe_candidates("entity_fusion_vote", entity_ranked if not entity_guard_enabled and entity_weight > 0 else [],
+                       status="guarded" if entity_guard_enabled else "ok")
+    observe_candidates("rg_literal", [(str(h.bucket_id), h.score) for h in rg_literal_hits])
     # RRF fusion of keyword + vector + the optional entity channel.
     rrf_cfg = config.get("rrf", {})
     keyword_scores = {
@@ -7022,9 +7066,11 @@ async def breath(
         channels,
         k=rrf_cfg.get("k", 60),
     )
+    observe_candidates("rrf_fusion", fused_pairs)
     fused_pairs = _demote_evidenceless_candidates(
         fused_pairs, vector_ranked, entity_ranked
     )
+    observe_candidates("rrf_evidence_demotion", fused_pairs)
 
     # Passive upstream comparison. It reuses the candidate IDs and scores
     # already produced for this natural recall turn; it does not retrieve,
@@ -7034,7 +7080,7 @@ async def breath(
     fusion_shadow_enabled = str(
         os.environ.get("OMBRE_UPSTREAM_FUSION_SHADOW", "0") or "0"
     ).strip().lower() in {"1", "true", "yes", "on"}
-    if fusion_shadow_enabled:
+    if diagnostic is None and fusion_shadow_enabled:
         fusion_shadow_started_at = time.perf_counter()
         shadow_keyword_scores = {
             str(bucket["id"]): float(
@@ -7238,6 +7284,7 @@ async def breath(
             b.pop("_keyword_channel_match", None)
         matches.append(b)
 
+    observe_candidates("fusion_materialized_authority_z", matches)
     # Generated expansion angles may improve ranking, but cannot introduce a
     # candidate that neither the original words nor original embedding support.
     matches = retain_original_query_supported_candidates(
@@ -7251,7 +7298,10 @@ async def breath(
             0,
         ),
         literal_floor=literal_candidate_floor,
-    )[:recall_limit]
+    )
+    observe_candidates("original_support_threshold", matches)
+    matches = matches[:recall_limit]
+    observe_candidates("recall_pool_cutoff", matches)
 
     # Restore a strong original-query vector candidate if it was lost only to
     # fusion position, original-support retention, or the recall cutoff.
@@ -7355,6 +7405,7 @@ async def breath(
         if rg_added:
             logger.info("rg literal escorts=%d", rg_added)
 
+    observe_candidates("vector_and_literal_escorts", matches)
     # Relevance is the first ordering key.  Forgetting curve, sense and intent
     # remain useful, but may only adjust candidates inside one narrow fused
     # relevance band.
@@ -7491,7 +7542,9 @@ async def breath(
             time.perf_counter() - post_e_freeze_started_at
         ) * 1000
 
+    observe_candidates("relevance_tie_rank", matches)
     matches, content_suppressed, content_fingerprint_errors = _dedupe_recall_content(matches)
+    observe_candidates("content_dedup", matches)
     if content_suppressed or content_fingerprint_errors:
         logger.info(
             "Recall content dedup: suppressed=%d fingerprint_errors=%d",
@@ -7503,17 +7556,21 @@ async def breath(
         matches = _filter_session_seen(matches, session_id)
     else:
         logger.info("Session seen filter skipped for policy=%s", recall_policy)
+    observe_candidates("session_seen", matches, status="applied" if seen_filter_on else "skipped_policy")
     record_recall_stage("candidate_processing", time.perf_counter() - candidate_started_at)
     with recall_stage("anchor_gate"):
         matches = _filter_anchor_policy_candidates(matches, recall_policy)
+    observe_candidates("anchor_threshold", matches)
     # 2026-09-18 根因第二层：自动召回口径不给工程流水桶进池（默认关＝基线）。
     matches = _drop_worklog_candidates(matches, recall_policy)
+    observe_candidates("engineering_filter", matches)
     candidate_started_at = time.perf_counter()
     matches = align_fact_state_candidates(
         matches,
         profile=state_profile,
         registry=_fact_slot_registry(),
     )
+    observe_candidates("fact_state_alignment", matches)
     state_link_budget = min(
         int(state_profile.get("state_link_limit", 0) or 0),
         max(0, max_results - (1 if matches else 0)),
@@ -7536,17 +7593,22 @@ async def breath(
         ),
         limit=state_link_budget,
     )
+    observe_candidates("state_link_raw", state_link_candidates)
     if seen_filter_on:
         state_link_candidates = _filter_session_seen(state_link_candidates, session_id)
+    observe_candidates("state_link_seen", state_link_candidates,
+                       status="applied" if seen_filter_on else "skipped_policy")
     record_recall_stage("candidate_processing", time.perf_counter() - candidate_started_at)
     with recall_stage("anchor_gate"):
         state_link_candidates = _filter_anchor_policy_candidates(
             state_link_candidates,
             recall_policy,
         )
+    observe_candidates("state_link_anchor", state_link_candidates)
     # 2026-09-18 第八版：状态链候选是另一条进池通道，第七版只在主候选上过了工程流水判定，
     # 「记忆召回丢失排查」「主AI体验」从这里绕进来（10:2x 台式探针）。同一把尺子再过一次。
     state_link_candidates = _drop_worklog_candidates(state_link_candidates, recall_policy)[:state_link_budget]
+    observe_candidates("state_link_engineering_and_budget", state_link_candidates)
     ds_max_results = max(0, max_results - len(state_link_candidates))
     ds_force_keep_ids = _exact_retrieval_key_ids(recall_query, matches)
     # 2026-09-17 15:36 边牧现行：稀有词整词命中排第一也被门卫砍。默认关
@@ -7555,6 +7617,9 @@ async def breath(
     # P3 同主题去重（2026-09-17，默认关 OMBRE_RRF_TOPIC_DEDUP_MAX=0）：RRF 融合后、
     # 门卫前，恒等映射直到显式开启。
     matches = _dedupe_recall_topics(matches, force_keep_ids=ds_force_keep_ids)
+    observe_candidates("topic_dedup_pre_gate", matches)
+    if diagnostic is not None:
+        return diagnostic.finish(matches, state_link_candidates)
     pre_ds_partial_matches = matches
     if (
         _ds_gate_enabled("search")
@@ -12835,6 +12900,60 @@ def _breath_deadline_sec() -> float:
     except (TypeError, ValueError):
         value = 11.0
     return max(0.1, min(value, 13.0))
+
+
+@mcp.custom_route("/api/breath-candidates", methods=["POST"])
+async def api_breath_candidates(request):
+    """ID-only pre-gate trace in breath itself; independent default-OFF switch.
+
+    Uses the same API bearer middleware as /api/breath. The single permitted
+    provider operation is the existing redacted query embedding. No gate,
+    dehydration, assembly, seen writes, background setup or shadow runs.
+    """
+    from starlette.responses import JSONResponse
+    if not candidate_diagnostics_enabled():
+        return JSONResponse({"error": "candidates_diagnostics_disabled"}, status_code=404)
+    try:
+        body = await _read_bounded_json_object(request, max_bytes=64 * 1024)
+        query = body.get("query")
+        targets = body.get("target_ids")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("query_required")
+        if (not isinstance(targets, list) or not 1 <= len(targets) <= 64
+                or any(not isinstance(bid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", bid)
+                       for bid in targets)):
+            raise ValueError("target_ids_required")
+        args = {key: str(body.get(key) or "") for key in (
+            "domain", "world", "since", "until", "session_id",
+        )}
+        if args["domain"].strip().lower() == "feel":
+            raise ValueError("search_mode_required")
+        args["policy"] = _normalize_anchor_recall_policy(str(body.get("policy") or "search"))
+        args["max_results"] = int(body.get("max_results", BREATH_DEFAULT_MAX_RESULTS))
+        args["relation_depth"] = int(body.get("relation_depth", 1))
+        for key in ("valence", "arousal", "self_valence", "self_arousal"):
+            args[key] = float(body.get(key, -1))
+            if not math.isfinite(args[key]):
+                raise ValueError("finite_coordinates_required")
+    except (ValueError, TypeError, OverflowError):
+        return JSONResponse({"error": "invalid_candidate_request"}, status_code=400)
+
+    diagnostic = CandidateDiagnostics(targets)
+    token = candidate_diagnostic.set(diagnostic)
+    strict_token = _strict_recall_errors.set(True)
+    seen_token = _breath_session_seen_writes_enabled.set(False)
+    try:
+        result = await breath(query=query, **args, include_images=False, include_body_state=False)
+        if not isinstance(result, dict) or result.get("mode") != "candidates_only":
+            raise RuntimeError("candidate_trace_incomplete")
+        return JSONResponse(result)
+    except Exception:
+        # Never serialize exception strings: providers/DBs can echo private input.
+        return JSONResponse({"error": "candidate_trace_failed", "completed": False}, status_code=503)
+    finally:
+        _breath_session_seen_writes_enabled.reset(seen_token)
+        _strict_recall_errors.reset(strict_token)
+        candidate_diagnostic.reset(token)
 
 
 @mcp.custom_route("/api/breath", methods=["POST"])

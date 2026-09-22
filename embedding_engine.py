@@ -34,6 +34,99 @@ from redact import redact_embedding_input
 logger = logging.getLogger("ombre_brain.embedding")
 
 
+class _CandidateVectorDiagnosticCollector:
+    """Collect numeric-only, read-only evidence for one candidate vector query.
+
+    The collector intentionally stores no query text, bucket text, titles,
+    vectors or credentials.  It only carries enum/numeric observations so the
+    snapshot can be returned across the recall boundary safely.  It is passed
+    into the normal ranking core to make that core reuse the exact same
+    embedding, ranking and selected-score machinery, while suppressing the
+    background shadow and any persistent write.
+    """
+
+    def __init__(self, target_ids, score_bucket_ids=()):
+        self.target_ids = tuple(
+            dict.fromkeys(
+                str(bucket_id) for bucket_id in target_ids if str(bucket_id)
+            )
+        )
+        self.e_ids = tuple(
+            dict.fromkeys(
+                str(bucket_id)
+                for bucket_id in score_bucket_ids
+                if str(bucket_id)
+            )
+        )
+        # Scoring covers the union, but only targets are reported per id.
+        ordered = list(self.target_ids)
+        ordered.extend(bucket for bucket in self.e_ids if bucket not in ordered)
+        self.required_ids = tuple(ordered)
+        self.backend = "none"
+        self.rank_scope = "none"
+        self.status = "error"
+        self.returned: list[tuple[str, float]] = []
+        self.full_scan: list[tuple[str, float]] | None = None
+        self.raw_ids: frozenset[str] | None = None
+        self.selected_scores: dict[str, float] = {}
+        self.selected_scoring_failed = False
+        self.membership_checked = False
+
+    def snapshot(self, status: str) -> dict:
+        returned_ranks = {
+            bucket_id: rank
+            for rank, (bucket_id, _score) in enumerate(self.returned, start=1)
+        }
+        full_ranks = None
+        if self.full_scan is not None:
+            full_ranks = {
+                bucket_id: rank
+                for rank, (bucket_id, _score) in enumerate(
+                    self.full_scan, start=1
+                )
+            }
+        targets = {}
+        for bucket_id in self.target_ids:
+            selected_score = self.selected_scores.get(bucket_id)
+            if self.raw_ids is not None:
+                # Full read-only scan: membership is exact and is based on the
+                # raw stored row ids, so a present-but-unscorable row is never
+                # reported absent.
+                index_member = bucket_id in self.raw_ids
+                scorable = index_member and bucket_id in (full_ranks or {})
+            elif bucket_id in returned_ranks or selected_score is not None:
+                index_member = True
+                scorable = True
+            elif self.membership_checked:
+                index_member = False
+                scorable = False
+            else:
+                index_member = None
+                scorable = None
+            targets[bucket_id] = {
+                "index_member": index_member,
+                "returned_rank": returned_ranks.get(bucket_id),
+                "selected_score": (
+                    float(selected_score)
+                    if selected_score is not None
+                    else None
+                ),
+                "scan_rank": (
+                    full_ranks.get(bucket_id)
+                    if full_ranks is not None
+                    else None
+                ),
+                "scorable": scorable,
+            }
+        return {
+            "backend": self.backend,
+            "rank_scope": self.rank_scope,
+            "status": status,
+            "selected_scoring_status": "error" if self.selected_scoring_failed else "ok",
+            "targets": targets,
+        }
+
+
 class EmbeddingEngine:
     """
     Embedding generation + SQLite vector storage + cosine search.
@@ -207,7 +300,7 @@ class EmbeddingEngine:
         embedding, _status = await self._generate_embedding_with_status(text)
         return embedding
 
-    async def _generate_embedding_with_status(self, text: str) -> tuple[list[float], str]:
+    async def _generate_embedding_with_status(self, text: str, *, diagnostic: bool = False) -> tuple[list[float], str]:
         """Generate one query/document vector with an explicit health status.
 
         Existing callers keep using ``_generate_embedding`` and retain the same
@@ -223,24 +316,32 @@ class EmbeddingEngine:
 
         truncated = redact_embedding_input(text)[:2000]
         try:
+            # A request-local SDK copy disables hidden retries without changing
+            # the shared client's policy or another concurrent recall request.
+            client = self.client.with_options(max_retries=0) if diagnostic else self.client
             # The SDK/httpx timeout is per socket phase, not a total
             # wall-clock budget.  Keep the existing configured timeout as the
             # single source of truth, and add an asyncio total deadline around
             # the exact same request.  Once the event loop is healthy this
             # guarantees a stalled endpoint fails soft before breath's budget.
             response = await asyncio.wait_for(
-                self.client.embeddings.create(
+                client.embeddings.create(
                     model=self.model,
                     input=truncated,
                 ),
                 timeout=self.timeout,
             )
-            self._consec_fail = 0  # success resets the breaker
+            if not diagnostic:
+                self._consec_fail = 0  # success resets the breaker
             if response.data and len(response.data) > 0:
                 embedding = response.data[0].embedding
                 return (embedding, "ok") if embedding else ([], "empty")
             return [], "empty"
         except Exception as e:
+            if diagnostic:
+                logger.warning("Diagnostic embedding failed: %s", type(e).__name__)
+                is_timeout = isinstance(e, (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException))
+                return [], "timeout" if is_timeout else "error"
             self._consec_fail += 1
             if self._consec_fail >= self._circuit_threshold and self._circuit_until <= time.time():
                 self._circuit_until = time.time() + self._circuit_cooldown
@@ -391,6 +492,63 @@ class EmbeddingEngine:
             score_bucket_ids=selected_ids,
         )
 
+    async def search_similar_diagnostic(
+        self,
+        query: str,
+        top_k: int = 10,
+        *,
+        target_ids,
+        score_bucket_ids=(),
+        cooperative_yield_every: int = 16,
+    ) -> tuple[
+        list[tuple[str, float]],
+        str,
+        dict[str, float],
+        dict,
+    ]:
+        """Read-only candidate vector diagnostics over the normal ranking core.
+
+        Runs the exact same single ``_generate_embedding_with_status(query)``
+        call and the same normal ranking/selected-score core as recall, then
+        adds a numeric-only report for ``target_ids`` and E-axis
+        ``score_bucket_ids``.  The diagnostic never widens ``normal_hits``,
+        never schedules the PG shadow, and never performs a persistent write.
+
+        The returned dict carries only enum/numeric data: ``backend``
+        (``pg_hnsw``/``pg_exact``/``sqlite``/``none``), ``rank_scope``,
+        ``status`` and per-id ``index_member`` (true/false/None=unknown),
+        ``returned_rank`` (one-based in the actual returned list or null),
+        ``selected_score`` and ``scan_rank`` (real full-scan rank, SQLite
+        only).  No query, text, title, credential or vector is ever included.
+        """
+        collector = _CandidateVectorDiagnosticCollector(
+            target_ids,
+            score_bucket_ids,
+        )
+        try:
+            normal_hits, status, selected_scores = (
+                await self._search_similar_with_status_and_scores(
+                    query,
+                    top_k,
+                    cooperative_yield_every=cooperative_yield_every,
+                    score_bucket_ids=frozenset(collector.required_ids),
+                    diagnostic=collector,
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Candidate vector diagnostic failed without changing live "
+                "result",
+                exc_info=True,
+            )
+            normal_hits, status, selected_scores = [], "error", {}
+        return (
+            normal_hits,
+            status,
+            selected_scores,
+            collector.snapshot(status),
+        )
+
     async def _search_similar_with_status_and_scores(
         self,
         query: str,
@@ -398,6 +556,7 @@ class EmbeddingEngine:
         *,
         cooperative_yield_every: int,
         score_bucket_ids: frozenset[str],
+        diagnostic: _CandidateVectorDiagnosticCollector | None = None,
     ) -> tuple[list[tuple[str, float]], str, dict[str, float]]:
         if (
             type(cooperative_yield_every) is not int
@@ -405,56 +564,128 @@ class EmbeddingEngine:
         ):
             raise ValueError("cooperative_yield_every must be a positive integer")
         if not self.enabled:
+            if diagnostic is not None:
+                diagnostic.status = "error"
             return [], "error", {}
 
         try:
             with recall_stage("embedding"):
-                query_embedding, status = await self._generate_embedding_with_status(query)
+                if diagnostic is None:
+                    query_embedding, status = await self._generate_embedding_with_status(query)
+                else:
+                    query_embedding, status = await self._generate_embedding_with_status(query, diagnostic=True)
                 if not query_embedding:
+                    if diagnostic is not None:
+                        diagnostic.status = status
                     return [], status, {}
         except Exception as e:
             logger.warning(f"Query embedding failed: {e}")
+            if diagnostic is not None:
+                diagnostic.status = "error"
             return [], "error", {}
 
+        # A supplied collector switches this core to read-only diagnostic mode:
+        # the same ranking/selected-score code runs, but the background shadow
+        # is suppressed and the vector stores are only read.  Ordinary callers
+        # must keep the exact historical helper signatures, so the read-only
+        # kwargs are only ever passed on the diagnostic branch.
         # PG 快路径：ivfflat 索引一次查询，替代下面对全库逐桶的 O(n) 余弦扫描。
         # 实测 11903 桶 / 12610 段：扫表中位 3530ms → PG 154ms（快 23 倍）。
         # 任何异常都回落到扫表，绝不让召回因为镜像库出问题而失败。
         if self._pg_recall_enabled():
+            pg_mode = self._pg_recall_mode() if diagnostic is not None else None
             if score_bucket_ids:
-                pg_results, selected_scores = (
-                    await self._search_similar_pg_with_selected_scores(
-                        query_embedding,
-                        top_k,
-                        score_bucket_ids,
+                if diagnostic is not None:
+                    pg_results, selected_scores = (
+                        await self._search_similar_pg_with_selected_scores(
+                            query_embedding,
+                            top_k,
+                            score_bucket_ids,
+                            read_only=True,
+                            diagnostic=diagnostic,
+                        )
                     )
-                )
+                else:
+                    pg_results, selected_scores = (
+                        await self._search_similar_pg_with_selected_scores(
+                            query_embedding,
+                            top_k,
+                            score_bucket_ids,
+                        )
+                    )
             else:
                 # Preserve the long-standing override seam used by rollout
                 # probes and lightweight integrations when no side scores are
                 # requested.
-                pg_results = await self._search_similar_pg(
-                    query_embedding,
-                    top_k,
-                )
+                if diagnostic is not None:
+                    pg_results = await self._search_similar_pg(
+                        query_embedding,
+                        top_k,
+                        read_only=True,
+                    )
+                else:
+                    pg_results = await self._search_similar_pg(
+                        query_embedding,
+                        top_k,
+                    )
                 selected_scores = {}
             if pg_results is not None:
-                self._schedule_pg_vector_shadow(
-                    query,
-                    query_embedding,
-                    pg_results,
-                    top_k,
-                )
+                if diagnostic is None:
+                    self._schedule_pg_vector_shadow(
+                        query,
+                        query_embedding,
+                        pg_results,
+                        top_k,
+                    )
+                else:
+                    diagnostic.backend = (
+                        "pg_hnsw" if pg_mode == "hnsw" else "pg_exact"
+                    )
+                    diagnostic.rank_scope = (
+                        "ann_topk" if pg_mode == "hnsw" else "pg_exact_topk"
+                    )
+                    diagnostic.status = "ok"
+                    diagnostic.returned = [
+                        (str(bucket_id), float(score))
+                        for bucket_id, score in pg_results
+                    ]
+                    diagnostic.selected_scores = dict(selected_scores)
+                    diagnostic.membership_checked = (
+                        bool(score_bucket_ids)
+                        and not diagnostic.selected_scoring_failed
+                    )
                 return pg_results, "ok", selected_scores
 
-        with recall_stage("vector_cache_load"):
-            entries = await self._get_cached_vectors()
-        if not entries:
-            return [], "ok", {}
+        if diagnostic is not None:
+            loaded = await self._load_readonly_vector_entries()
+            if loaded is None:
+                # The store could not be read at all.  Report an error with
+                # unknown membership instead of claiming the targets are absent.
+                diagnostic.backend = "none"
+                diagnostic.rank_scope = "none"
+                diagnostic.status = "error"
+                return [], "error", {}
+            entries, raw_ids = loaded
+            diagnostic.backend = "sqlite"
+            diagnostic.rank_scope = "sqlite_full_scan"
+            diagnostic.raw_ids = raw_ids
+        else:
+            with recall_stage("vector_cache_load"):
+                entries = await self._get_cached_vectors()
+            if not entries:
+                return [], "ok", {}
 
         with recall_stage("vector_query_prepare"):
             try:
                 prepared_query = self._prepare_embedding_record(query_embedding)
             except Exception:
+                if diagnostic is not None:
+                    # A malformed query cannot be scored against the store, so
+                    # every target axis stays unknown rather than looking absent.
+                    diagnostic.status = "error"
+                    diagnostic.rank_scope = "none"
+                    diagnostic.raw_ids = None
+                    return [], "error", {}
                 return [], "ok", {}
         record_recall_metric("vector_dimension", len(prepared_query[0][0]))
 
@@ -489,7 +720,56 @@ class EmbeddingEngine:
             record_recall_metric("vector_invalid_rows", invalid_rows)
         with recall_stage("vector_sort"):
             results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k], "ok", selected_scores
+        normal_hits = results[:top_k]
+        if diagnostic is not None:
+            diagnostic.status = "ok"
+            diagnostic.full_scan = [
+                (str(bucket_id), float(sim)) for bucket_id, sim in results
+            ]
+            diagnostic.returned = [
+                (str(bucket_id), float(sim)) for bucket_id, sim in normal_hits
+            ]
+            diagnostic.selected_scores = dict(selected_scores)
+            diagnostic.membership_checked = True
+        return normal_hits, "ok", selected_scores
+
+    async def _load_readonly_vector_entries(self):
+        """Read existing SQLite vectors read-only for one diagnostic query.
+
+        Returns ``None`` when the store cannot be opened (missing file or
+        table) so membership can be reported as unknown instead of inventing
+        absence.  Otherwise returns ``(entries, raw_ids)``: ``entries`` holds
+        only parseable ``(id, prepared)`` rows for ranking, while ``raw_ids``
+        is every stored row id (so a corrupt/unscorable row still counts as a
+        member and is never reported absent).  Never creates the schema,
+        warms/invalidates the cache, or persists anything.
+        """
+        try:
+            uri = Path(self.db_path).resolve().as_uri() + "?mode=ro"
+        except ValueError:
+            return None
+        try:
+            with closing(sqlite3.connect(uri, uri=True)) as conn:
+                rows = conn.execute(
+                    "SELECT bucket_id, embedding FROM embeddings ORDER BY rowid"
+                ).fetchall()
+        except sqlite3.Error:
+            return None
+        entries = []
+        raw_ids = []
+        for index, (bucket_id, raw_embedding) in enumerate(rows, start=1):
+            if index % 16 == 0:
+                await asyncio.sleep(0)
+            normalized_id = str(bucket_id)
+            raw_ids.append(normalized_id)
+            try:
+                prepared = self._prepare_embedding_record(
+                    json.loads(raw_embedding)
+                )
+            except Exception:
+                continue
+            entries.append((normalized_id, prepared))
+        return entries, frozenset(raw_ids)
 
     def _pg_recall_enabled(self) -> bool:
         """PG 召回快路径的总开关，默认关。
@@ -677,13 +957,14 @@ class EmbeddingEngine:
         ]
 
     async def _search_similar_pg(
-        self, query_embedding, top_k: int
+        self, query_embedding, top_k: int, *, read_only: bool = False
     ) -> list[tuple[str, float]] | None:
         results, _selected_scores = (
             await self._search_similar_pg_with_selected_scores(
                 query_embedding,
                 top_k,
                 frozenset(),
+                **({"read_only": True} if read_only else {}),
             )
         )
         return results
@@ -693,6 +974,9 @@ class EmbeddingEngine:
         query_embedding,
         top_k: int,
         score_bucket_ids: frozenset[str],
+        *,
+        read_only: bool = False,
+        diagnostic: _CandidateVectorDiagnosticCollector | None = None,
     ) -> tuple[list[tuple[str, float]] | None, dict[str, float]]:
         """Use an indexable segment ANN query, with exact PG as rollback.
 
@@ -724,10 +1008,16 @@ class EmbeddingEngine:
         rows = None
         selected_rows = []
         selected_query_failed = False
+        connect_kwargs: dict = {"connect_timeout": 5}
+        if read_only:
+            # Diagnostic access must never mutate the mirror.  Enforce the
+            # read-only posture at the connection level so every statement on
+            # this short-lived connection is a pure read.
+            connect_kwargs["options"] = "-c default_transaction_read_only=on"
         try:
             with recall_stage("vector_pg_query"):
                 async with await psycopg.AsyncConnection.connect(
-                    dsn, connect_timeout=5
+                    dsn, **connect_kwargs
                 ) as conn:
                     async with conn.cursor() as cur:
                         if mode == "hnsw":
@@ -772,6 +1062,10 @@ class EmbeddingEngine:
                             except Exception as exc:              # noqa: BLE001
                                 selected_query_failed = True
                                 selected_rows = []
+                                if diagnostic is not None:
+                                    # A failed membership probe is unknown, not
+                                    # proof the target is absent.
+                                    diagnostic.selected_scoring_failed = True
                                 logger.warning(
                                     "PG selected-vector scoring failed without "
                                     "changing live result: %s",

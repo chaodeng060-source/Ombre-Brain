@@ -63,6 +63,7 @@ from review_queue import (
 from unknown_person_gate import mentions_needing_review
 from timeline_axis import normalize_thread
 from bm25_index import BM25Index
+from candidate_diagnostics import current as candidate_diagnostic, observe as observe_candidates
 from relation_graph import (
     normalize_generation_method,
     normalize_relation_evidence,
@@ -912,6 +913,10 @@ class BucketManager:
     ) -> tuple[dict, ...]:
         """Return the resident immutable recall tuple without scanning/copying."""
         cache_key = self._recall_cache_key(include_archive, include_nsfw)
+        if candidate_diagnostic.get() is not None:
+            if cache_key not in self._recall_snapshot_cache:
+                raise RuntimeError("candidate_snapshot_not_ready")
+            return self._recall_snapshot_cache[cache_key]
         if cache_key not in self._recall_snapshot_cache:
             await self.prewarm_recall_snapshot(
                 include_archive=cache_key[0],
@@ -3145,6 +3150,7 @@ class BucketManager:
         relevance_candidate_floor: float = None,
         preloaded_buckets: list[dict] | None = None,
     ) -> list[dict]:
+        diagnostic = candidate_diagnostic.get()
         if not query or not query.strip():
             return []
 
@@ -3158,9 +3164,12 @@ class BucketManager:
         if not all_buckets:
             return []
 
+        observe_candidates("keyword_resident", all_buckets)
         if getattr(self, "_retrieval_attribution_enabled", False):
-            await self._refresh_retrieval_hint_index(all_buckets)
+            if diagnostic is None:
+                await self._refresh_retrieval_hint_index(all_buckets)
             all_buckets = [b for b in all_buckets if self.retrieval_attribution_eligible(b)]
+        observe_candidates("keyword_attribution", all_buckets)
 
         # --- 修复域过滤的脆弱迭代 ---
         if domain_filter:
@@ -3180,9 +3189,11 @@ class BucketManager:
                 logger.info(
                     f"domain_filter {domain_filter} matched no buckets, returning empty"
                 )
+                observe_candidates("keyword_domain", candidates)
                 return []
         else:
             candidates = all_buckets
+        observe_candidates("keyword_domain", candidates)
 
         # --- World 过滤：world_filter=None 跳过；否则按 world 字段过滤 ---
         # 桶 world="通用" 在任何 world_filter 下都通过；world_filter 为空列表
@@ -3195,6 +3206,7 @@ class BucketManager:
             ]
 
         # --- Created time range filter ---
+        observe_candidates("keyword_world", candidates)
         # --- 创建时间范围过滤：用 frontmatter 的 created 字段，无法解析的桶不过滤掉 ---
         if created_after is not None or created_before is not None:
             candidates = [
@@ -3203,14 +3215,17 @@ class BucketManager:
             ]
 
         # Exact upstream behavior: never await a full-vault rebuild in the
+        observe_candidates("keyword_time", candidates)
         # request.  The current query uses the last complete index while a
         # fresh index is built and swapped atomically in a background thread.
         bm25_scores: dict[str, float] = {}
         hint_matches = {}
         bm25_shadow_ready = False
+        bm25_score_status = "not_run"
         if self._bm25_mode != "off" and self._bm25 is not None:
-            await self._refresh_retrieval_hint_index(all_buckets)
-            if self._bm25_dirty and not self._bm25_rebuilding:
+            if diagnostic is None:
+                await self._refresh_retrieval_hint_index(all_buckets)
+            if diagnostic is None and self._bm25_dirty and not self._bm25_rebuilding:
                 # Never build 13k rows on every dirty request. One timer owns the
                 # next generation while this request uses the old complete one.
                 self._schedule_bm25_rebuild()
@@ -3221,10 +3236,28 @@ class BucketManager:
                     getattr(self._bm25, "_index", None) is not None
                 )
                 bm25_scores = await asyncio.to_thread(self._bm25.score, query)
+                bm25_score_status = "ok"
                 if getattr(self, "_retrieval_hints_enabled", False):
                     hint_matches = self._bm25.hint_matches(query)
             except Exception as exc:
+                bm25_score_status = "error"
                 logger.warning("[bm25] score failed; skipping this dimension: %s", exc)
+
+        if diagnostic is not None:
+            index_ids = set(getattr(self._bm25, "_ids", ())) if self._bm25 is not None else None
+            ranked_ids = {bid: rank for rank, (bid, _) in enumerate(
+                sorted(bm25_scores.items(), key=lambda item: item[1], reverse=True), 1)}
+            diagnostic.bm25 = {
+                "mode": self._bm25_mode, "ready": bm25_shadow_ready, "status": bm25_score_status,
+                "dirty": bool(self._bm25_dirty),
+                "rank_scope": "bm25_scored_corpus_not_fused_keyword_rank",
+                "targets": {bid: {
+                    "index_member": bid in index_ids if index_ids is not None else None,
+                    "score": (bm25_scores.get(bid, 0.0) if bm25_shadow_ready
+                              and bm25_score_status == "ok" and bid in (index_ids or ()) else None),
+                    "rank": ranked_ids.get(bid),
+                } for bid in diagnostic.target_ids},
+            }
 
         keyword_rows_ready = bool(
             bm25_shadow_ready
@@ -3294,6 +3327,7 @@ class BucketManager:
                     exc,
                 )
 
+        observe_candidates("keyword_exact_prune", candidates)
         scored = []
         query_casefold = query.casefold()
         z_historical = self._z_historical_ids()
@@ -3460,7 +3494,11 @@ class BucketManager:
                                     4,
                                 )
                     scored.append(scored_bucket)
+                elif diagnostic is not None:
+                    diagnostic.reject(bucket, "keyword_threshold")
             except Exception as e:
+                if diagnostic is not None:
+                    diagnostic.reject(bucket, "keyword_scoring_error")
                 logger.warning(
                     f"Scoring failed for bucket {bucket.get('id', '?')} / "
                     f"桶评分失败: {e}"
@@ -3479,6 +3517,8 @@ class BucketManager:
             )
         else:
             scored.sort(key=lambda x: x["score"], reverse=True)
+        observe_candidates("keyword_threshold_ranked", scored)
+        observe_candidates("keyword_top_k", scored[:limit])
         return scored[:limit]
 
     # ---------------------------------------------------------
