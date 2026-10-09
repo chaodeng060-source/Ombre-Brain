@@ -857,7 +857,7 @@ async def test_hold_keeps_legacy_path_without_self_containment_gate(monkeypatch)
 
     result = await server.hold("她去那里")
 
-    assert result.startswith("新建→hold旧路径")
+    assert result.startswith("新建→[bucket_id:hold-bucket] hold旧路径")
     assert captured["content"] == "她去那里"
     assert captured.get("require_self_contained", False) is False
 
