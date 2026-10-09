@@ -2,7 +2,7 @@
 # 2026-10-09 read-only inventory of NAS production container ombre-brain.
 # Image: ombre-deploy-ombre-brain; container started 2026-10-06T04:39:27Z.
 # Git source checkout: 6b15c4862b8285ee6a2071ee13d3bf863fcee91f. Production Python files: 64; source files: 90.
-# Runtime mismatches not reviewed: 7 (5 modified, 2 source-only, 0 production-only).
+# Runtime mismatches not reviewed: 6 (5 modified, 1 source-only, 0 production-only).
 # Any UNRECONCILED source anchor blocks deployment; do not replace it without reviewing the exact diff.
 # Reviewed E-axis production deltas on 2026-10-09: curated scan and key fallback;
 # focused tests: 69 passed, 8 subtests passed. Production remains unchanged.
@@ -37,6 +37,8 @@
 # BM25 module is absent from production; no live recall-quality claim. bucket_manager.py remains unresolved.
 # Reviewed source-only ripgrep literal recall module; timeout cleanup regression; 31 focused tests passed.
 # Production remains unchanged; server.py integration is still unresolved.
+# Reviewed source-only E-chord shadow/receipt module; 88 focused tests passed; config and bypass default off.
+# Production remains unchanged; server.py integration is still unresolved.
 backfill_created.py	cb27aeda3bae2a19b066c01e276ac2c31eca8ce09e273ea87d5c4b6a77185a64	cb27aeda3bae2a19b066c01e276ac2c31eca8ce09e273ea87d5c4b6a77185a64
 backfill_embeddings.py	e5087c6c9d452f64427eae1c1c200cab776643dac96583ffee40d3ecbc53740b	e5087c6c9d452f64427eae1c1c200cab776643dac96583ffee40d3ecbc53740b
 backfill_senses.py	c485f5e5f3ecf7de82659ebb17e1ec49e9dece00d13f0729c3b5b35b3355035a	c485f5e5f3ecf7de82659ebb17e1ec49e9dece00d13f0729c3b5b35b3355035a
@@ -55,7 +57,7 @@ e_axis_recall.py	c57f10a7f24c7cfb63b9604664415c26de7fc36b3e0b11e344949edcee71c93
 e_axis_shadow.py	aae0694cafa195f18b579d253ae325367fcdcacbc87453d3f6be4457d95b4eec	aae0694cafa195f18b579d253ae325367fcdcacbc87453d3f6be4457d95b4eec
 e_axis_storage.py	99f8926df447f75e855a1295b84c24735b62674db0d14eba32cd7ff52bd03a01	99f8926df447f75e855a1295b84c24735b62674db0d14eba32cd7ff52bd03a01
 e_axis_trigger.py	4f12355e62cd9c616e89facaf69ec3c04afda7a84c99b9aa04e3c4a8d0cb1917	4f12355e62cd9c616e89facaf69ec3c04afda7a84c99b9aa04e3c4a8d0cb1917
-e_chord_shadow.py	ABSENT	UNRECONCILED
+e_chord_shadow.py	ABSENT	e47da7af181fee7569e7b5c53e2300fb8f6af52ada8315375671f350d7dc20bf
 embedding_engine.py	fad197f15dba7024e8f94b218809fbc6a2b760e4eb060b30a5b74e1883328b94	UNRECONCILED
 entity_store.py	cbf2bdffee87a9b961f5f82264a5baae2ec006848ae1c23f066d1b147a34fc55	cbf2bdffee87a9b961f5f82264a5baae2ec006848ae1c23f066d1b147a34fc55
 episode_engine.py	2132bebb31a7dcbae8371d6bddcd0cedb049d855c56d43e7f96a54e81a0e5174	91759f4b0ccdc8e4dabdb7355220c5a0db5a73680f5e7946c84e9d942a265f24
