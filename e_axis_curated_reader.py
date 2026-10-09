@@ -641,12 +641,20 @@ def iter_curated_subjects(
             )
             try:
                 for raw in _iter_markdown_bytes(source_fd):
-                    subject, skip_reason, bucket_id = _subject_from_file(
-                        raw,
-                        legacy_naive_timestamps_utc=(
-                            legacy_naive_timestamps_utc
-                        ),
-                    )
+                    try:
+                        subject, skip_reason, bucket_id = _subject_from_file(
+                            raw,
+                            legacy_naive_timestamps_utc=(
+                                legacy_naive_timestamps_utc
+                            ),
+                        )
+                    except EAxisCuratedError as exc:
+                        # 单桶字段坏不让整批夜跑停：转 skip 并把 code 计入
+                        # skip_reasons，后续从 skip_reasons 追具体坏桶。
+                        scanned += 1
+                        skipped += 1
+                        skip_reasons[str(exc)] += 1
+                        continue
                     if bucket_id in seen_ids:
                         raise EAxisCuratedError("curated.duplicate_id")
                     seen_ids.add(bucket_id)

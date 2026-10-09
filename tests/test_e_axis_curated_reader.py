@@ -53,6 +53,21 @@ def _subjects(root: Path, *, legacy_naive_timestamps_utc: bool = False):
     )
 
 
+def _assert_one_bucket_skipped(
+    root: Path,
+    reason: str,
+    *,
+    legacy_naive_timestamps_utc: bool = False,
+) -> None:
+    subjects, scanned, skipped, reasons = _subjects(
+        root,
+        legacy_naive_timestamps_utc=legacy_naive_timestamps_utc,
+    )
+    assert subjects == ()
+    assert scanned == skipped == 1
+    assert reasons == {reason: 1}
+
+
 def test_scans_only_five_authoritative_roots(tmp_path):
     for ordinal, root_name in enumerate(CURATED_BUCKET_ROOTS, start=1):
         _write_bucket(
@@ -166,7 +181,7 @@ def test_oldest_first_uses_aware_timestamp_in_utc(tmp_path):
 
 
 @pytest.mark.parametrize("explicit_false", [False, True])
-def test_naive_timestamp_is_rejected_without_enabled_compatibility(
+def test_naive_timestamp_is_counted_as_skipped_without_enabled_compatibility(
     tmp_path,
     explicit_false,
 ):
@@ -177,14 +192,17 @@ def test_naive_timestamp_is_rejected_without_enabled_compatibility(
         extra="semantic_type: preference\n",
     )
 
-    with pytest.raises(
-        EAxisCuratedError,
-        match="curated.created_at_timezone_missing",
-    ):
-        if explicit_false:
-            _subjects(tmp_path, legacy_naive_timestamps_utc=False)
-        else:
-            _subjects(tmp_path)
+    if explicit_false:
+        _assert_one_bucket_skipped(
+            tmp_path,
+            "curated.created_at_timezone_missing",
+            legacy_naive_timestamps_utc=False,
+        )
+    else:
+        _assert_one_bucket_skipped(
+            tmp_path,
+            "curated.created_at_timezone_missing",
+        )
 
 
 def test_legacy_naive_utc_accepts_full_seconds_sorts_and_stays_read_only(
@@ -267,7 +285,7 @@ def test_legacy_naive_utc_accepts_full_seconds_sorts_and_stays_read_only(
         "created: '2026-07-31T00:00'\n",
     ],
 )
-def test_legacy_naive_utc_still_rejects_date_or_missing_seconds(
+def test_legacy_naive_utc_counts_date_or_missing_seconds_as_skipped(
     tmp_path,
     created_line,
 ):
@@ -286,14 +304,14 @@ def test_legacy_naive_utc_still_rejects_date_or_missing_seconds(
         encoding="utf-8",
     )
 
-    with pytest.raises(
-        EAxisCuratedError,
-        match="curated.created_at_timezone_missing",
-    ):
-        _subjects(tmp_path, legacy_naive_timestamps_utc=True)
+    _assert_one_bucket_skipped(
+        tmp_path,
+        "curated.created_at_timezone_missing",
+        legacy_naive_timestamps_utc=True,
+    )
 
 
-def test_legacy_naive_utc_still_rejects_whitespace_pollution(tmp_path):
+def test_legacy_naive_utc_counts_whitespace_pollution_as_skipped(tmp_path):
     path = tmp_path / "dynamic" / "bad.md"
     path.parent.mkdir(parents=True)
     path.write_text(
@@ -309,11 +327,11 @@ def test_legacy_naive_utc_still_rejects_whitespace_pollution(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(
-        EAxisCuratedError,
-        match="curated.created_at_invalid",
-    ):
-        _subjects(tmp_path, legacy_naive_timestamps_utc=True)
+    _assert_one_bucket_skipped(
+        tmp_path,
+        "curated.created_at_invalid",
+        legacy_naive_timestamps_utc=True,
+    )
 
 
 @pytest.mark.parametrize(
@@ -335,8 +353,11 @@ def test_timestamp_strings_require_strict_t_and_seconds_even_when_aware(
         extra="semantic_type: preference\n",
     )
 
-    with pytest.raises(EAxisCuratedError):
-        _subjects(tmp_path, legacy_naive_timestamps_utc=True)
+    _assert_one_bucket_skipped(
+        tmp_path,
+        "curated.created_at_invalid",
+        legacy_naive_timestamps_utc=True,
+    )
 
 
 def test_digest_binds_only_canonical_e_input_and_run_id_is_stable(tmp_path):
@@ -663,38 +684,63 @@ def test_configured_root_replacement_during_scan_fails_closed(
 
 
 @pytest.mark.parametrize(
-    "header,body",
+    "header,body,reason",
     [
         (
             "id: duplicate\nid: duplicate\nname: bad\ntype: dynamic\n"
             "created: '2026-07-31T00:00:00+00:00'\ntags: []\n",
             "焦虑",
+            "curated.frontmatter_duplicate_key",
         ),
         (
             "id: naive\nname: bad\ntype: dynamic\n"
             "created: '2026-07-31T00:00:00'\ntags: []\n",
             "焦虑",
+            "curated.created_at_timezone_missing",
         ),
         (
             "id: scalar-tags\nname: bad\ntype: dynamic\n"
             "created: '2026-07-31T00:00:00+00:00'\ntags: event\n",
             "焦虑",
+            "curated.tags_invalid",
         ),
         (
             "id: bad-relations\nname: bad\ntype: dynamic\n"
             "created: '2026-07-31T00:00:00+00:00'\ntags: []\n"
             "relations: [42]\n",
             "焦虑",
+            "curated.relations_invalid",
         ),
     ],
 )
-def test_rejects_dirty_frontmatter(tmp_path, header, body):
+def test_skips_dirty_frontmatter_and_records_reason(
+    tmp_path, header, body, reason
+):
     path = tmp_path / "dynamic" / "bad.md"
     path.parent.mkdir(parents=True)
     path.write_text(f"---\n{header}---\n{body}", encoding="utf-8")
 
-    with pytest.raises(EAxisCuratedError):
-        _subjects(tmp_path)
+    _assert_one_bucket_skipped(tmp_path, reason)
+
+
+def test_scan_skips_one_malformed_bucket_and_continues(tmp_path):
+    _write_bucket(
+        tmp_path / "dynamic" / "0_bad.md",
+        bucket_id="bad-frontmatter",
+        tags="event",
+    )
+    _write_bucket(
+        tmp_path / "dynamic" / "1_good.md",
+        bucket_id="valid-memory",
+        extra="semantic_type: preference\n",
+    )
+
+    subjects, scanned, skipped, reasons = _subjects(tmp_path)
+
+    assert scanned == 2
+    assert skipped == 1
+    assert reasons == {"curated.tags_invalid": 1}
+    assert [item.source_id for item in subjects] == ["bucket:valid-memory"]
 
 
 def test_rejects_duplicate_bucket_ids(tmp_path):

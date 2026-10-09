@@ -93,6 +93,7 @@ reported by `docker diff`.  The 2026-08-31 inventory includes at least:
 - Z current/historical weighting;
 - vector escort, raw-head, and gate-empty behavior;
 - vector synchronization ignores `.merged-*` archived bucket directories;
+- the E-axis curated scan skips a malformed bucket and continues the batch;
 - `memory_signal.py`;
 - grow bucket-ID receipts;
 - runtime dependencies including `rank-bm25` and `psycopg`.
