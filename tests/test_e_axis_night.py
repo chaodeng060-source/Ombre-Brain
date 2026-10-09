@@ -1001,6 +1001,94 @@ class EAxisRuntimeConfigTests(unittest.TestCase):
         self.assertIs(captured["disable_thinking"], True)
         self.assertIs(captured["json_object"], True)
 
+    def test_e_runtime_uses_independent_api_key_fallbacks(self):
+        def build_key(config_key, env):
+            captured = {}
+
+            class ProviderSpy:
+                def __init__(self, **kwargs):
+                    captured.update(kwargs)
+
+                def __call__(self, _prompt):
+                    return {}
+
+            config = {
+                "buckets_dir": "/safe/test/root",
+                "dehydration": {
+                    "api_key": "dehydration-key",
+                    "base_url": "https://example.invalid/v1",
+                    "model": "test-model",
+                },
+                "e_axis_shadow": {
+                    "enabled": True,
+                    "provider_name": "test-provider",
+                    "api_key": config_key,
+                    "max_tokens": 512,
+                },
+            }
+            with (
+                mock.patch.dict("os.environ", env, clear=True),
+                mock.patch.object(
+                    e_axis_night_module,
+                    "OpenAIChatProvider",
+                    ProviderSpy,
+                ),
+                mock.patch.object(
+                    e_axis_night_module,
+                    "ReadOnlyLMC5CandidateLedger",
+                    lambda *_args, **_kwargs: object(),
+                ),
+                mock.patch.object(
+                    e_axis_night_module,
+                    "EAxisShadowStore",
+                    lambda *_args, **_kwargs: object(),
+                ),
+                mock.patch.object(
+                    e_axis_night_module,
+                    "EAxisRunJournal",
+                    lambda *_args, **_kwargs: object(),
+                ),
+            ):
+                build_e_axis_runtime(config)
+            return captured["api_key"]
+
+        self.assertEqual(
+            build_key(
+                "config-key",
+                {
+                    "OMBRE_API_KEY": "dehydration-env-key",
+                    "OMBRE_E_AXIS_API_KEY": "e-axis-env-key",
+                    "OMBRE_DS_FILTER_API_KEY": "gate-env-key",
+                },
+            ),
+            "config-key",
+        )
+        self.assertEqual(
+            build_key(
+                "",
+                {
+                    "OMBRE_API_KEY": "dehydration-env-key",
+                    "OMBRE_E_AXIS_API_KEY": "e-axis-env-key",
+                    "OMBRE_DS_FILTER_API_KEY": "gate-env-key",
+                },
+            ),
+            "e-axis-env-key",
+        )
+        self.assertEqual(
+            build_key(
+                "",
+                {
+                    "OMBRE_API_KEY": "dehydration-env-key",
+                    "OMBRE_DS_FILTER_API_KEY": "gate-env-key",
+                },
+            ),
+            "gate-env-key",
+        )
+        self.assertEqual(
+            build_key("", {"OMBRE_API_KEY": "dehydration-env-key"}),
+            "",
+        )
+
     def test_non_stop_provider_responses_remain_retryable_failures(self):
         for finish_reason in ("length", "content_filter"):
             with self.subTest(finish_reason=finish_reason):

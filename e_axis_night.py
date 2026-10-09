@@ -1063,9 +1063,14 @@ def build_e_axis_runtime(
     )
     try:
         provider = OpenAIChatProvider(
+            # config 里未配时用环境变量兜底；先 e_axis 专属，再门卫 key。
+            # 不继承 dehydration.api_key：dehydration 已经被 OMBRE_API_KEY 覆盖
+            # 走 apiroute 线，跟 e_axis 用的 DeepSeek 官方线不是同一份凭据。
+            # 缺一份独立 key 就借门卫的（同为 DeepSeek 官方线，配额并到门卫账下）。
             api_key=str(
                 section.get("api_key")
-                or dehydration.get("api_key")
+                or os.environ.get("OMBRE_E_AXIS_API_KEY")
+                or os.environ.get("OMBRE_DS_FILTER_API_KEY")
                 or ""
             ),
             base_url=base_url,
