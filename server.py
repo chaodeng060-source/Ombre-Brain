@@ -1107,10 +1107,14 @@ def _path_under_archive(raw_path: str, archive_dir: str) -> bool:
         return False
 
 
-def _is_main_recall_bucket(bucket: dict) -> bool:
+def _is_main_recall_bucket(bucket: dict, *, include_quoted: bool = False) -> bool:
     """Reject archive/cold material even when a stale index returns its id."""
     if not isinstance(bucket, dict):
         return False
+    if not include_quoted:
+        checker = getattr(bucket_mgr, "retrieval_attribution_eligible", None)
+        if callable(checker) and not checker(bucket):
+            return False
     metadata = bucket.get("metadata", {}) or {}
     if str(metadata.get("type") or "").strip().lower() == "archived":
         return False
@@ -1346,7 +1350,8 @@ def _relation_recall_neighbors(
     candidates = [
         bucket
         for bucket in buckets
-        if isinstance(bucket, dict) and _is_main_recall_bucket(bucket)
+        if isinstance(bucket, dict)
+        and _is_main_recall_bucket(bucket)
     ]
     wf_set = {str(value).strip() for value in world_filter} if world_filter is not None else None
     domain_set = {str(value).strip().lower() for value in (domain_filter or [])}
@@ -1509,7 +1514,9 @@ def _timeline_recall_neighbors(
     # checks: an RP request must not stat thousands of unrelated daily paths.
     candidates = [
         bucket for bucket in buckets
-        if isinstance(bucket, dict) and eligible(bucket) and _is_main_recall_bucket(bucket)
+        if isinstance(bucket, dict)
+        and eligible(bucket)
+        and _is_main_recall_bucket(bucket)
     ]
     candidates = _filter_z_fact_candidates(
         candidates,
@@ -7233,6 +7240,8 @@ async def breath(
             ):
                 continue
             b["vector_match"] = True
+        if not _is_main_recall_bucket(b):
+            continue
         b.pop("entity_match", None)
         if not entity_guard_enabled and bid in entity_bucket_cache:
             b["entity_match"] = True
@@ -13234,11 +13243,11 @@ async def api_hold_status(request):
 
     try:
         for bucket in await _borrow_recall_buckets():
-            if not matches(bucket) or not _is_main_recall_bucket(bucket):
+            if not matches(bucket) or not _is_main_recall_bucket(bucket, include_quoted=True):
                 continue
             # A stale resident match alone cannot prove durable storage.
             stored = await bucket_mgr.get(str(bucket.get("id") or ""))
-            if matches(stored) and _is_main_recall_bucket(stored):
+            if matches(stored) and _is_main_recall_bucket(stored, include_quoted=True):
                 return JSONResponse({**result, "state": "stored", "bucket_id": stored["id"]})
     except Exception as exc:
         logger.warning("Hold confirmation unavailable: %s", type(exc).__name__)

@@ -65,6 +65,41 @@ async def test_lexical_search_filters_even_without_bm25(manager):
     assert [b['id'] for b in result] == ['unknown']
 
 
+def test_timeline_expansion_cannot_reintroduce_quoted_candidate(monkeypatch):
+    def bucket(bucket_id, event_at):
+        return {
+            'id': bucket_id,
+            'content': bucket_id,
+            'path': '',
+            'metadata': {
+                'id': bucket_id,
+                'name': bucket_id,
+                'type': 'dynamic',
+                'world': 'daily',
+                'domain': ['生活'],
+                'thread': 'project line',
+                'event_at': event_at,
+            },
+        }
+
+    seed = bucket('seed', '2026-01-01T00:00:00+00:00')
+    quoted = bucket('quoted', '2026-01-02T00:00:00+00:00')
+    graph = SimpleNamespace(
+        archive_dir='',
+        retrieval_attribution_eligible=lambda candidate: candidate['id'] != 'quoted',
+    )
+    monkeypatch.setattr(server, 'bucket_mgr', graph)
+    monkeypatch.setattr(server, 'config', {'timeline_recall': {'enabled': True}})
+
+    result = server._timeline_recall_neighbors(
+        [seed, quoted], ['seed'], query='project line', intent='default',
+        world_filter={'daily'}, domain_filter=None, created_after=None,
+        created_before=None, max_results=1,
+    )
+
+    assert result == []
+
+
 @pytest.mark.asyncio
 async def test_real_breath_merge_force_keep_and_relation_cannot_reintroduce_quoted(manager, monkeypatch, tmp_path):
     main = {**source_bucket(), 'id': 'main', 'score': 100.0}

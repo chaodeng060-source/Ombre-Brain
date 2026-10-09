@@ -15,8 +15,10 @@ the deployment owner has connected the real worker and approved the pilot.
 - `lmc5_proposer.py`, `night_run_coordinator.py`, `night_run_runtime.py`: reuse the
   existing proposal response, stage hints after a successful original write.
   There is no second model call for those fields. Publishing still requires PG.
-- `server.py`: reject source-confirmed quoted candidates at the existing main
-  and borrowed-candidate boundaries. Unknown does not mean quoted or certified self.
+- `server.py`: reject source-confirmed quoted candidates at the final main-result
+  boundary and on borrowed state, timeline, and relation candidates. Exact hold
+  confirmation can still confirm stored content. Unknown does not mean quoted or
+  certified self.
 - `tools/retrieval_hints_{prepare,batch,export,compare,rollback}.py`: pilot tools.
 
 The code baseline is `4d55e84`. The live server has independent changes. Apply
