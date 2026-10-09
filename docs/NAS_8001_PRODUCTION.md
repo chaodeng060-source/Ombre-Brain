@@ -76,6 +76,11 @@ Also set
 `OMBRE_PUBLIC_HEALTH_URL=https://memory.zhaodeng.xyz/health`; installation
 requires that endpoint to stay healthy after `ombre-brain` is stopped.
 
+The `night_run_trigger.py` host-cron helper reads the API refusal code from a
+JSON error response.  `run.busy` and `run.raced` mean another night run is
+already active, so the helper exits successfully; other HTTP refusals remain
+failures and include the bounded server code in its diagnostic.
+
 ## Rebuild gate
 
 Do not build or stop 8001 until a full top-level `/app/*.py` manifest has been

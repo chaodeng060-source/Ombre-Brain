@@ -22,9 +22,11 @@ RESPONSE_TIMEOUT_SECONDS = 2 * 60 * 60
 
 
 class NightTriggerHTTPError(RuntimeError):
-    def __init__(self, status: int) -> None:
+    def __init__(self, status: int, code: str = "") -> None:
         self.status = status
-        super().__init__(f"night trigger returned HTTP {status}")
+        self.code = code
+        detail = f" ({code})" if code else ""
+        super().__init__(f"night trigger returned HTTP {status}{detail}")
 
 
 def _connection_target() -> tuple[str, int]:
@@ -58,6 +60,21 @@ def _safe_summary(payload: object) -> dict[str, object]:
     return {key: payload[key] for key in allowed if key in payload}
 
 
+def _response_code(payload: bytes) -> str:
+    """Read the server's refusal code without trusting the body's shape."""
+    try:
+        parsed = json.loads(payload)
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    if type(parsed) is not dict:
+        return ""
+    code = parsed.get("code")
+    if not isinstance(code, str):
+        return ""
+    code = code.strip()
+    return code if 0 < len(code) <= 64 else ""
+
+
 def trigger() -> dict[str, object]:
     token = os.environ.get("OMBRE_API_TOKEN", "")
     if not token:
@@ -86,7 +103,10 @@ def trigger() -> dict[str, object]:
     finally:
         connection.close()
     if status != 200:
-        raise NightTriggerHTTPError(status)
+        # 服务端把拒绝原因放在 body 的 code 里（run.busy / night.unavailable …）。
+        # 以前这里直接丢掉 body，日志只剩一个光秃秃的状态码，事后谁都判不了
+        # 「是真故障还是撞上了正在跑的一轮」——2026-09-20 查这条 503 时卡在这。
+        raise NightTriggerHTTPError(status, _response_code(payload))
     if content_type.split(";", 1)[0].strip().lower() != "application/json":
         raise RuntimeError("night response content type is invalid")
     if len(payload) > MAX_RESPONSE_BYTES:
@@ -102,8 +122,19 @@ def main() -> int:
     try:
         summary = trigger()
     except NightTriggerHTTPError as exc:
+        # 另一轮正在跑不是故障：single-flight 锁挡住这次调用，说明夜跑本身
+        # 是活的。以前这里一律 return 1，cron 每撞上一次就记一笔「失败」，
+        # 而容器日志里那一轮其实跑得好好的（2026-09-20 实测：昨夜跑了 5 轮，
+        # proposer 积压从 1690 降到 9），把健康的工作记成了坏账。
+        if exc.code in {"run.busy", "run.raced"}:
+            print(
+                f"LMC-5 night run already in flight ({exc.code}); not a failure",
+                file=sys.stderr,
+            )
+            return 0
+        detail = f" code={exc.code}" if exc.code else ""
         print(
-            f"LMC-5 night trigger failed: HTTP {exc.status}",
+            f"LMC-5 night trigger failed: HTTP {exc.status}{detail}",
             file=sys.stderr,
         )
         return 1
