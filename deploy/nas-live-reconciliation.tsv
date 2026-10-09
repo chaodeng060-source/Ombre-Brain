@@ -2,7 +2,7 @@
 # 2026-10-09 read-only inventory of NAS production container ombre-brain.
 # Image: ombre-deploy-ombre-brain; container started 2026-10-06T04:39:27Z.
 # Git source checkout: 6b15c4862b8285ee6a2071ee13d3bf863fcee91f. Production Python files: 64; source files: 90.
-# Runtime mismatches not reviewed: 8 (5 modified, 3 source-only, 0 production-only).
+# Runtime mismatches not reviewed: 7 (5 modified, 2 source-only, 0 production-only).
 # Any UNRECONCILED source anchor blocks deployment; do not replace it without reviewing the exact diff.
 # Reviewed E-axis production deltas on 2026-10-09: curated scan and key fallback;
 # focused tests: 69 passed, 8 subtests passed. Production remains unchanged.
@@ -35,6 +35,8 @@
 # Source module is absent from production. bucket_manager.py remains unresolved pending full-delta review.
 # Reviewed standalone BM25 index/token/DF helpers and copy-on-write parity; 36 focused tests passed.
 # BM25 module is absent from production; no live recall-quality claim. bucket_manager.py remains unresolved.
+# Reviewed source-only ripgrep literal recall module; timeout cleanup regression; 31 focused tests passed.
+# Production remains unchanged; server.py integration is still unresolved.
 backfill_created.py	cb27aeda3bae2a19b066c01e276ac2c31eca8ce09e273ea87d5c4b6a77185a64	cb27aeda3bae2a19b066c01e276ac2c31eca8ce09e273ea87d5c4b6a77185a64
 backfill_embeddings.py	e5087c6c9d452f64427eae1c1c200cab776643dac96583ffee40d3ecbc53740b	e5087c6c9d452f64427eae1c1c200cab776643dac96583ffee40d3ecbc53740b
 backfill_senses.py	c485f5e5f3ecf7de82659ebb17e1ec49e9dece00d13f0729c3b5b35b3355035a	c485f5e5f3ecf7de82659ebb17e1ec49e9dece00d13f0729c3b5b35b3355035a
@@ -92,7 +94,7 @@ relation_approval.py	ab70f7af61fd0fcf068b30c5bcf1e8527dd37550ce052e4d040071fa332
 relation_backfill.py	ABSENT	c8af7e33bfe2be3a3b6ccef23b3c6474fb859d5c4e0840d5042b0c99d9386ada
 relation_graph.py	ABSENT	4bb6ae2cdd9a1c8ac9767a1d836ba3e375783334e9a04b40ed6eed0731245b66
 review_queue.py	af90c26a432e704870fec50d2d705611af9944badad8f7135689935b192a1d73	UNRECONCILED
-rg_literal_recall.py	ABSENT	UNRECONCILED
+rg_literal_recall.py	ABSENT	81e3ccc315395ae22bf8b43c3acb819e3bda274296c88b98e52034899cff2bb2
 saga_engine.py	ed8d6584b1778f0b7e9c4babc0291adae49b7ece76e50d6f84954305331230c2	ed8d6584b1778f0b7e9c4babc0291adae49b7ece76e50d6f84954305331230c2
 sense_tagger.py	3d725b32ce81c0ec6588bd6e97d0a3e2636bd6bc7f281d948170b687f19f460c	3d725b32ce81c0ec6588bd6e97d0a3e2636bd6bc7f281d948170b687f19f460c
 sensory_engine.py	1cbfa28da0c54f02ca7fed4fb822e24f31bb04415b94fb50656992a59363e24f	1cbfa28da0c54f02ca7fed4fb822e24f31bb04415b94fb50656992a59363e24f

@@ -249,6 +249,10 @@ async def _rg_multi(
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except (asyncio.TimeoutError, TimeoutError):
         proc.kill()
+        # Reap the child and drain the pipes after the cancelled communicate.
+        # Without the second communicate, repeated slow scans can leave child
+        # processes and pipe transports alive until loop shutdown.
+        await proc.communicate()
         return {}
     by_term = {t.casefold(): t for t in terms}
     files: dict[str, dict[str, int]] = {}

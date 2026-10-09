@@ -77,6 +77,34 @@ def test_timeout_returns_empty(tmp_path, monkeypatch):
     assert asyncio.run(rg.search_rg_literal("婷易", buckets_dir=str(tmp_path))) == []
 
 
+def test_rg_timeout_kills_and_reaps_child(tmp_path, monkeypatch):
+    class _SlowProcess:
+        def __init__(self):
+            self.calls = 0
+            self.killed = False
+
+        async def communicate(self):
+            self.calls += 1
+            if self.calls == 1:
+                await asyncio.sleep(1)
+            return b"", b""
+
+        def kill(self):
+            self.killed = True
+
+    process = _SlowProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(rg.shutil, "which", lambda _name: "/usr/bin/rg")
+    monkeypatch.setattr(rg.asyncio, "create_subprocess_exec", create_process)
+
+    assert asyncio.run(rg._rg_multi(["婷易"], str(tmp_path), timeout=0.01)) == {}
+    assert process.killed is True
+    assert process.calls == 2
+
+
 # --- 2 字词闸（2026-09-09）------------------------------------------------
 # 这条通道 9/8 上线时 2 字词一律放行，指望虚词表和 120 文件上限兜住普通词。
 # 实测没兜住：她 22:49 问「为什么 NAS 那边你说不能装」，「那边」「不能」
