@@ -2,7 +2,7 @@
 # 2026-10-09 read-only inventory of NAS production container ombre-brain.
 # Image: ombre-deploy-ombre-brain; container started 2026-10-06T04:39:27Z.
 # Git source checkout: 6b15c4862b8285ee6a2071ee13d3bf863fcee91f. Production Python files: 64; source files: 90.
-# Runtime mismatches not reviewed: 5 (4 modified, 1 source-only, 0 production-only).
+# Runtime mismatches not reviewed: 4 (3 modified, 1 source-only, 0 production-only).
 # Any UNRECONCILED source anchor blocks deployment; do not replace it without reviewing the exact diff.
 # Reviewed E-axis production deltas on 2026-10-09: curated scan and key fallback;
 # focused tests: 69 passed, 8 subtests passed. Production remains unchanged.
@@ -41,13 +41,15 @@
 # Production remains unchanged; server.py integration is still unresolved.
 # Reviewed the 45-line unknown-person review-queue addition; 13 focused tests passed.
 # Production queue remains unchanged; bucket_manager.py integration is still unresolved.
+# Reviewed vectorized full/incremental duplicate scan against exact live source; 111 parity tests passed.
+# Report behavior unchanged; production remains untouched.
 backfill_created.py	cb27aeda3bae2a19b066c01e276ac2c31eca8ce09e273ea87d5c4b6a77185a64	cb27aeda3bae2a19b066c01e276ac2c31eca8ce09e273ea87d5c4b6a77185a64
 backfill_embeddings.py	e5087c6c9d452f64427eae1c1c200cab776643dac96583ffee40d3ecbc53740b	e5087c6c9d452f64427eae1c1c200cab776643dac96583ffee40d3ecbc53740b
 backfill_senses.py	c485f5e5f3ecf7de82659ebb17e1ec49e9dece00d13f0729c3b5b35b3355035a	c485f5e5f3ecf7de82659ebb17e1ec49e9dece00d13f0729c3b5b35b3355035a
 bm25_index.py	ABSENT	211f136a791f1806cce4466ee730910bab5a57e4c34e4fb8c78dc777e158263a
 bucket_manager.py	b5f3d47aac695bb02c1afbdc5b9791b5c080ff502ee2bdb4d3452ea25dd5118d	UNRECONCILED
 check_buckets.py	e851cb543c989d91bc264796a6c2f131a653e29d899ef6899343075c5291d63c	e851cb543c989d91bc264796a6c2f131a653e29d899ef6899343075c5291d63c
-consolidation_engine.py	1128ec06ad11d57f074981f4d17caab02a01484a447d8061356e1f0ed5cecb10	UNRECONCILED
+consolidation_engine.py	1128ec06ad11d57f074981f4d17caab02a01484a447d8061356e1f0ed5cecb10	d695ba8291dbefe278c1301bd943c07defa1611c08894a97e769d0cab9d8a2b0
 conversation_activity.py	de3315a7c1b995a21add5ed4667c369728b9faca3d36fc5af9b3e2994b870dfa	de3315a7c1b995a21add5ed4667c369728b9faca3d36fc5af9b3e2994b870dfa
 curated_lexical_recall.py	ABSENT	e943a346b06ec94bdc649d76b495f85403cf7b79c70d243b4e4dbfebd902120c
 curated_writer.py	3ba0da4f9b47d965e2e9dd555b9bd52293dca02b9a0059839da47fd1326fb850	de6353f144d71257aea87960f7a80499a7399212f685f16a542616ce36339684
