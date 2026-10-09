@@ -2,7 +2,7 @@
 # 2026-10-09 read-only inventory of NAS production container ombre-brain.
 # Image: ombre-deploy-ombre-brain; container started 2026-10-06T04:39:27Z.
 # Git source checkout: 6b15c4862b8285ee6a2071ee13d3bf863fcee91f. Production Python files: 64; source files: 90.
-# Runtime mismatches not reviewed: 4 (3 modified, 1 source-only, 0 production-only).
+# Runtime mismatches not reviewed: 3 (3 modified, 0 source-only, 0 production-only).
 # Any UNRECONCILED source anchor blocks deployment; do not replace it without reviewing the exact diff.
 # Reviewed E-axis production deltas on 2026-10-09: curated scan and key fallback;
 # focused tests: 69 passed, 8 subtests passed. Production remains unchanged.
@@ -46,6 +46,9 @@
 # Restored the production-matching PG mirror write and worker hooks in source; default remains off.
 # Focused mirror/write/recall tests: 42 passed. Broader bucket_manager.py, embedding_engine.py,
 # and server.py differences remain unresolved; production remains unchanged.
+# Reviewed source-only vector repair cron: inventory, dry-run, execute, and empty-mount guard; 4 tests passed.
+# It repairs ombre_vectors and prunes ghosts; it does not refresh ombre_bodies, and scheduler setup is unverified.
+# Production remains unchanged.
 backfill_created.py	cb27aeda3bae2a19b066c01e276ac2c31eca8ce09e273ea87d5c4b6a77185a64	cb27aeda3bae2a19b066c01e276ac2c31eca8ce09e273ea87d5c4b6a77185a64
 backfill_embeddings.py	e5087c6c9d452f64427eae1c1c200cab776643dac96583ffee40d3ecbc53740b	e5087c6c9d452f64427eae1c1c200cab776643dac96583ffee40d3ecbc53740b
 backfill_senses.py	c485f5e5f3ecf7de82659ebb17e1ec49e9dece00d13f0729c3b5b35b3355035a	c485f5e5f3ecf7de82659ebb17e1ec49e9dece00d13f0729c3b5b35b3355035a
@@ -86,7 +89,7 @@ mutation_audit.py	2866ab59ff77dcd40b4b2d114ccc233d588591d5e8815d40e935d051ceda44
 night_run_coordinator.py	d8f10bc153878184fa011009224844878e1256e9accedcf5d1b14922180da7a5	af0e6aecd53a353fcf721aecf2d8452b0d4ea38c2c58fd835b88bd40711172a2
 night_run_runtime.py	f2aa97355838c038895d57bc3e12075410420224139e97f6bd4dd5bd61c3562b	9b6bc438da19932b56619a4458434d0761e04ed44356415b70123b62d5a296f0
 night_run_trigger.py	bb164cd315948cb36cd925dc387b61c6d18de8d7db8c25044ddfeae87aadc836	a882112344c91d57837275e6243ed260f63b449dd3bd9436cde0491c89dbf132
-ombre_vector_sync_cron.py	ABSENT	UNRECONCILED
+ombre_vector_sync_cron.py	ABSENT	1ab80a9e5bb078dbf6674a3323f5351eaed08b64583364e3012f2c911a6101b6
 patrol.py	a48ed6a6fecd0523a51af4311e9dd1cecc6691a969b68d1eef4d9ba0e86a17c6	5ebe3f1c9fac1dc449e24d809367d8025c834b2ecdbb26eee94d0e0d5d55a8d2
 patrol_night.py	c76b14976c262658aaab1e92049d83d16e0cf5bded13e0af824ddfa5854772ad	c76b14976c262658aaab1e92049d83d16e0cf5bded13e0af824ddfa5854772ad
 pg_mirror_queue.py	1962663b26b15de9d735b8a0daa2ad48719f353cde715bc30d3cab0a7f6fc800	1962663b26b15de9d735b8a0daa2ad48719f353cde715bc30d3cab0a7f6fc800
