@@ -525,8 +525,40 @@ def test_openai_provider_can_request_strict_non_thinking_json() -> None:
 
     provider("strict prompt")
 
-    assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert captured["extra_body"] == {
+        "thinking": {"type": "disabled"},
+        "reasoning_effort": "none",
+    }
     assert captured["response_format"] == {"type": "json_object"}
+
+
+def test_openai_provider_adds_opencode_go_session_header(monkeypatch) -> None:
+    import openai
+
+    captured: dict[str, Any] = {}
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **_: None),
+        )
+    )
+
+    def make_client(**kwargs):
+        captured.update(kwargs)
+        return client
+
+    monkeypatch.setattr(openai, "OpenAI", make_client)
+    OpenAIChatProvider(
+        api_key="test-key",
+        base_url="https://opencode.ai/zen/go/v1",
+        model="test-model",
+        max_tokens=512,
+        temperature=0.0,
+        timeout_seconds=5,
+    )
+
+    assert captured["default_headers"] == {
+        "x-opencode-session": "ombre-brain-night-run"
+    }
 
 
 def test_proposer_budget_is_independent_from_dehydration_budget() -> None:

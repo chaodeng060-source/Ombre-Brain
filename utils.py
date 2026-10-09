@@ -760,3 +760,16 @@ def rrf_fuse(
         bid = item[0]
         scores[bid] = scores.get(bid, 0.0) + vector_weight / (k + rank)
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
+def llm_default_headers(base_url: object, purpose: str) -> dict | None:
+    """Return provider-specific headers for OpenAI-compatible clients."""
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit(str(base_url or "").strip())
+    except ValueError:
+        return None
+    if parsed.hostname == "opencode.ai" and parsed.path.startswith("/zen/go"):
+        return {"x-opencode-session": f"ombre-brain-{purpose}"}
+    return None

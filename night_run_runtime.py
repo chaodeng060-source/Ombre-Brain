@@ -284,10 +284,13 @@ class OpenAIChatProvider:
         if client is None:
             from openai import OpenAI
 
+            from utils import llm_default_headers
+
             client = OpenAI(
                 api_key=api_key,
                 base_url=base_url.strip(),
                 timeout=float(timeout_seconds),
+                default_headers=llm_default_headers(base_url, "night-run"),
             )
         self._client = client
         self.model = model.strip()
@@ -304,7 +307,8 @@ class OpenAIChatProvider:
             "temperature": self.temperature,
         }
         if self.disable_thinking:
-            request["extra_body"] = {"thinking": {"type": "disabled"}}
+            # 2026-09-28 实测：Go 的 deepseek-v4.1-flash 只认 reasoning_effort=none，thinking.disabled 不生效。
+            request["extra_body"] = {"thinking": {"type": "disabled"}, "reasoning_effort": "none"}
         if self.json_object:
             request["response_format"] = {"type": "json_object"}
         response = self._client.chat.completions.create(**request)
