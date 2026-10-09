@@ -62,7 +62,8 @@ if [[ -n "${OMBRE_CONTRACT_TEST_ROOT:-}" ]]; then
 else
   [[ "$(realpath "$OMBRE_ACTIVE_DIR")" == "/vol1/ombre-migrate/code" ]]
   [[ "$(realpath "$OMBRE_DATA_DIR")" == "/vol1/ombre-migrate/data" ]]
-  [[ "$(realpath "$OMBRE_BACKUP_ROOT")" == "/home/zhaodeng/ombre-backups/ombre-vps-mirror" ]]
+  expected_backup_root="$(realpath -m "/home/zhaodeng/ombre-backups/ombre-vps-mirror")"
+  [[ "$(realpath -m "$OMBRE_BACKUP_ROOT")" == "$expected_backup_root" ]]
   [[ "$(realpath "$(dirname "$OMBRE_DEPLOYMENT_ANCHOR_FILE")")" == "/vol1/ombre-migrate" ]]
   [[ "$(basename "$OMBRE_DEPLOYMENT_ANCHOR_FILE")" == "deployment-anchor.env" ]]
   [[ "$OMBRE_MUTATION_LOCK_FILE" == "/vol1/ombre-migrate/ombre-production.lock" ]]
