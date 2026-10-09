@@ -2,7 +2,7 @@
 # 2026-10-09 read-only inventory of NAS production container ombre-brain.
 # Image: ombre-deploy-ombre-brain; container started 2026-10-06T04:39:27Z.
 # Git source checkout: 6b15c4862b8285ee6a2071ee13d3bf863fcee91f. Production Python files: 64; source files: 90.
-# Runtime mismatches not reviewed: 30 (20 modified, 10 source-only, 0 production-only).
+# Runtime mismatches not reviewed: 9 (5 modified, 4 source-only, 0 production-only).
 # Any UNRECONCILED source anchor blocks deployment; do not replace it without reviewing the exact diff.
 # Reviewed E-axis production deltas on 2026-10-09: curated scan and key fallback;
 # focused tests: 69 passed, 8 subtests passed. Production remains unchanged.
@@ -31,6 +31,8 @@
 # Reviewed opt-in E semantic resonance and outcome display; default off; 10 tests passed.
 # Reviewed default-off PostgreSQL lexical adapter; six mocked contract tests passed.
 # Read-only parameterized queries with bounded timeouts; no live DB or recall-quality claim.
+# Reviewed unknown-person gate parser, roster, and bucket-create queue contract; 11 focused tests passed.
+# Source module is absent from production. bucket_manager.py remains unresolved pending full-delta review.
 backfill_created.py	cb27aeda3bae2a19b066c01e276ac2c31eca8ce09e273ea87d5c4b6a77185a64	cb27aeda3bae2a19b066c01e276ac2c31eca8ce09e273ea87d5c4b6a77185a64
 backfill_embeddings.py	e5087c6c9d452f64427eae1c1c200cab776643dac96583ffee40d3ecbc53740b	e5087c6c9d452f64427eae1c1c200cab776643dac96583ffee40d3ecbc53740b
 backfill_senses.py	c485f5e5f3ecf7de82659ebb17e1ec49e9dece00d13f0729c3b5b35b3355035a	c485f5e5f3ecf7de82659ebb17e1ec49e9dece00d13f0729c3b5b35b3355035a
@@ -115,7 +117,7 @@ test_z_lifecycle_chain.py	ABSENT	58ae98a9500adae4b3c34b557ec29da73b6ad9a7ebf33ef
 test_z_review_20260819.py	ABSENT	528f48e2c67770c2ad0823a9d4cee8340515dd60db5bceafe675e7615a7e906d
 timeline_axis.py	d4e49b3d6781b7bfe9c5731ff2ba7166e99d831c92e67f0b370e61d4284e4887	d4e49b3d6781b7bfe9c5731ff2ba7166e99d831c92e67f0b370e61d4284e4887
 timeline_sweep_cli.py	86df333bc13b1eea09bd9823a92763c0dd3e188ed49ec0e326fb5f7897d753ba	86df333bc13b1eea09bd9823a92763c0dd3e188ed49ec0e326fb5f7897d753ba
-unknown_person_gate.py	ABSENT	UNRECONCILED
+unknown_person_gate.py	ABSENT	986c81f00293b6c897f0f0f5fdd36c819421b5a62829fbed5c522db3da7eb46b
 utils.py	8f66a9dadec0c860b68ae6747c14486bfee393bbe8647bc44177cbcb3365e9da	7668927341629462aea56a8119a436a57833d597e9a68972e06a51c1673ae17c
 write_memory.py	427262414b64e9a5405b8c01dad47b16d41f5b168ee4f3986a9d24417bae7368	427262414b64e9a5405b8c01dad47b16d41f5b168ee4f3986a9d24417bae7368
 x_provenance.py	70cfd62a838763526cba2edec5bb4dc00f2318df8e574587154841981b231e35	70cfd62a838763526cba2edec5bb4dc00f2318df8e574587154841981b231e35
