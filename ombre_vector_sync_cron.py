@@ -39,6 +39,9 @@ _ID_RE = re.compile(r"_([0-9a-f]{12})\.md$")
 def bucket_ids_on_disk() -> set[str]:
     out: set[str] = set()
     for p in BUCKETS_DIR.rglob("*.md"):
+        # Merged originals and rollback evidence are not active memories.
+        if any(part.startswith(".merged-") for part in p.relative_to(BUCKETS_DIR).parts[:-1]):
+            continue
         m = _ID_RE.search(p.name)
         if m:
             out.add(m.group(1))

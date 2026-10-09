@@ -92,6 +92,7 @@ reported by `docker diff`.  The 2026-08-31 inventory includes at least:
 - max-win scoring and literal key forcing;
 - Z current/historical weighting;
 - vector escort, raw-head, and gate-empty behavior;
+- vector synchronization ignores `.merged-*` archived bucket directories;
 - `memory_signal.py`;
 - grow bucket-ID receipts;
 - runtime dependencies including `rank-bm25` and `psycopg`.
