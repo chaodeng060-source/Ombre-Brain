@@ -2,7 +2,7 @@
 # 2026-10-09 read-only inventory of NAS production container ombre-brain.
 # Image: ombre-deploy-ombre-brain; container started 2026-10-06T04:39:27Z.
 # Git source checkout: 6b15c4862b8285ee6a2071ee13d3bf863fcee91f. Production Python files: 64; source files: 90.
-# Runtime mismatches not reviewed: 9 (5 modified, 4 source-only, 0 production-only).
+# Runtime mismatches not reviewed: 8 (5 modified, 3 source-only, 0 production-only).
 # Any UNRECONCILED source anchor blocks deployment; do not replace it without reviewing the exact diff.
 # Reviewed E-axis production deltas on 2026-10-09: curated scan and key fallback;
 # focused tests: 69 passed, 8 subtests passed. Production remains unchanged.
@@ -33,10 +33,12 @@
 # Read-only parameterized queries with bounded timeouts; no live DB or recall-quality claim.
 # Reviewed unknown-person gate parser, roster, and bucket-create queue contract; 11 focused tests passed.
 # Source module is absent from production. bucket_manager.py remains unresolved pending full-delta review.
+# Reviewed standalone BM25 index/token/DF helpers and copy-on-write parity; 36 focused tests passed.
+# BM25 module is absent from production; no live recall-quality claim. bucket_manager.py remains unresolved.
 backfill_created.py	cb27aeda3bae2a19b066c01e276ac2c31eca8ce09e273ea87d5c4b6a77185a64	cb27aeda3bae2a19b066c01e276ac2c31eca8ce09e273ea87d5c4b6a77185a64
 backfill_embeddings.py	e5087c6c9d452f64427eae1c1c200cab776643dac96583ffee40d3ecbc53740b	e5087c6c9d452f64427eae1c1c200cab776643dac96583ffee40d3ecbc53740b
 backfill_senses.py	c485f5e5f3ecf7de82659ebb17e1ec49e9dece00d13f0729c3b5b35b3355035a	c485f5e5f3ecf7de82659ebb17e1ec49e9dece00d13f0729c3b5b35b3355035a
-bm25_index.py	ABSENT	UNRECONCILED
+bm25_index.py	ABSENT	211f136a791f1806cce4466ee730910bab5a57e4c34e4fb8c78dc777e158263a
 bucket_manager.py	b5f3d47aac695bb02c1afbdc5b9791b5c080ff502ee2bdb4d3452ea25dd5118d	UNRECONCILED
 check_buckets.py	e851cb543c989d91bc264796a6c2f131a653e29d899ef6899343075c5291d63c	e851cb543c989d91bc264796a6c2f131a653e29d899ef6899343075c5291d63c
 consolidation_engine.py	1128ec06ad11d57f074981f4d17caab02a01484a447d8061356e1f0ed5cecb10	UNRECONCILED
