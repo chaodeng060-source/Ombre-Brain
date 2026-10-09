@@ -343,6 +343,18 @@ def load_config(config_path: str = None) -> dict:
     if env_model:
         config.setdefault("dehydration", {})["model"] = env_model
 
+    # 2026-09-28: the container env pins the dehydration line (ApiRoute) and
+    # recreating the container would drop the hot patches in its writable
+    # layer.  ``dehydration.prefer_config: true`` lets config.yaml's own
+    # api_key/base_url/model win again, so the line can move by editing the
+    # bind-mounted file and restarting.
+    file_dehydration = file_config.get("dehydration") if isinstance(file_config, dict) else None
+    if isinstance(file_dehydration, dict) and file_dehydration.get("prefer_config") is True:
+        for field in ("api_key", "base_url", "model"):
+            value = file_dehydration.get(field)
+            if isinstance(value, str) and value.strip():
+                config.setdefault("dehydration", {})[field] = value.strip()
+
     # --- Embedding env overrides (independent from dehydration) ---
     env_embed_api_key = os.environ.get("OMBRE_EMBED_API_KEY", "")
     if env_embed_api_key:
@@ -763,7 +775,12 @@ def rrf_fuse(
 
 
 def llm_default_headers(base_url: object, purpose: str) -> dict | None:
-    """Return provider-specific headers for OpenAI-compatible clients."""
+    """Extra headers an OpenAI-compatible client needs for its provider.
+
+    OpenCode Go rejects requests without ``x-opencode-session`` (400
+    MissingSessionID); its docs ask clients to send a stable session id per
+    conversation for routing and prompt caching.  Other providers get none.
+    """
     from urllib.parse import urlsplit
 
     try:

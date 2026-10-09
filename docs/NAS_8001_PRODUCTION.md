@@ -96,6 +96,7 @@ reported by `docker diff`.  The 2026-08-31 inventory includes at least:
 - the E-axis curated scan skips a malformed bucket and continues the batch;
 - E-axis API-key selection stays separate from the dehydration API key;
 - the night-run OpenCode Go client sends a stable session header and requests no reasoning;
+- `dehydration.prefer_config: true` lets the mounted config override provider environment values;
 - `memory_signal.py`;
 - grow bucket-ID receipts;
 - runtime dependencies including `rank-bm25` and `psycopg`.
