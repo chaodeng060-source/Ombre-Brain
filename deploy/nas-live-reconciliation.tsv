@@ -8,6 +8,8 @@
 # focused tests: 69 passed, 8 subtests passed. Production remains unchanged.
 # Reviewed night-run trigger busy/raced handling on 2026-10-09;
 # focused runtime/trigger/coordinator tests: 141 passed. Production unchanged.
+# Reviewed stable row-id scan after the retry-priority page on 2026-10-09;
+# focused night-run tests: 142 passed. Production remains unchanged.
 # Reviewed report-only patrol bucket filename audit on 2026-10-09;
 # focused patrol/hold tests: 28 passed. Production unchanged.
 # Reviewed config override, provider headers, and E-outcome errors in utils.py;
@@ -64,7 +66,7 @@ mcp_auth.py	97be3d16887b882e72e61b3b8b6351fee3d4eafec809dfd49d0263f96d8c208c	97b
 memory_signal.py	ABSENT	f18186949e7204be204b1053c2fa35be18e54d4c53aac37a356dfb6210f9d00b
 migrate_to_domains.py	5f36152169e7c02108db0ab946aa8953dbf3d57ccc3d07c826e6d048e1920db5	5f36152169e7c02108db0ab946aa8953dbf3d57ccc3d07c826e6d048e1920db5
 mutation_audit.py	2866ab59ff77dcd40b4b2d114ccc233d588591d5e8815d40e935d051ceda4483	2866ab59ff77dcd40b4b2d114ccc233d588591d5e8815d40e935d051ceda4483
-night_run_coordinator.py	d8f10bc153878184fa011009224844878e1256e9accedcf5d1b14922180da7a5	UNRECONCILED
+night_run_coordinator.py	d8f10bc153878184fa011009224844878e1256e9accedcf5d1b14922180da7a5	af0e6aecd53a353fcf721aecf2d8452b0d4ea38c2c58fd835b88bd40711172a2
 night_run_runtime.py	f2aa97355838c038895d57bc3e12075410420224139e97f6bd4dd5bd61c3562b	9b6bc438da19932b56619a4458434d0761e04ed44356415b70123b62d5a296f0
 night_run_trigger.py	bb164cd315948cb36cd925dc387b61c6d18de8d7db8c25044ddfeae87aadc836	a882112344c91d57837275e6243ed260f63b449dd3bd9436cde0491c89dbf132
 ombre_vector_sync_cron.py	ABSENT	UNRECONCILED

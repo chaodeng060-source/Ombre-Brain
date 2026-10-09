@@ -810,6 +810,48 @@ async def test_proposer_cap_defers_then_next_run_drains_without_repeats(
 
 
 @pytest.mark.asyncio
+async def test_retry_priority_page_does_not_skip_interleaved_pending_rows(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(
+        tmp_path,
+        empty_provider=True,
+        policy=NightRunPolicy(
+            pending_page_size=2,
+            proposer_max_chunks_per_run=3,
+        ),
+    )
+    for index in range(3):
+        event_id = f"event-{index}"
+        payload = json.dumps({"text": f"retry-page-{index}"})
+        harness.ledger.append_raw_event("room-main", event_id, payload)
+        harness.ledger.record_event_chunk(
+            f"chunk-{index}",
+            payload,
+            [("room-main", event_id)],
+        )
+    # The first prioritized page contains the two zero-retry rows at positions
+    # 1 and 3, so continuing from its maximum row id would skip position 2.
+    harness.ledger.record_chunk_proposer_outcome(
+        "preexisting-retry",
+        "chunk-1",
+        "retryable_error",
+        error_code="provider.timeout",
+    )
+
+    counts: dict[str, int] = {}
+    await harness.coordinator._propose_pending(
+        "night-priority-page",
+        counts,
+        watermark=harness.ledger.proposer_watermark(),
+    )
+
+    assert counts["proposer_attempted"] == 3
+    assert counts["proposer_pending_after"] == 0
+    assert len(harness.provider.prompts) == 3
+
+
+@pytest.mark.asyncio
 async def test_proposer_concurrency_parallelizes_independent_chunks(
     tmp_path: Path,
 ) -> None:

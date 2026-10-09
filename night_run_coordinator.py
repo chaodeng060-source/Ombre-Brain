@@ -686,6 +686,7 @@ class NightRunCoordinator:
             if loop.time() >= deadline:
                 counts["proposer_wall_budget_exhausted"] = 1
                 break
+            priority_page = first_page
             page = self.ledger.list_pending_proposer_chunks(
                 limit=self.policy.pending_page_size,
                 after=(None if first_page else cursor),
@@ -696,7 +697,12 @@ class NightRunCoordinator:
             if not page:
                 break
             page_max = max(chunk.row_id for chunk in page)
-            cursor = page_max if cursor is None else max(cursor, page_max)
+            if not priority_page:
+                # Retry ordering is not row-id ordering. Restart the stable
+                # row-id scan at the beginning after this one priority page;
+                # seen_events drops duplicates while ensuring interleaved
+                # pending rows are not skipped by a jumped cursor.
+                cursor = page_max if cursor is None else max(cursor, page_max)
             for chunk in page:
                 if loop.time() >= deadline:
                     counts["proposer_wall_budget_exhausted"] = 1
