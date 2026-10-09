@@ -177,6 +177,7 @@ from e_axis_recall import (
     select_current_annotation,
 )
 from r2_storage import r2_storage
+from pg_mirror_queue import PgMirrorWorker
 from sensory_engine import SensoryEngine, format_body_state_block, senses_from_sensory
 from utils import (
     load_config, setup_logging, strip_wikilinks, count_tokens_approx,
@@ -272,6 +273,7 @@ bucket_mgr = BucketManager(config)                  # Bucket manager / 记忆桶
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 embedding_engine = EmbeddingEngine(config)            # Embedding engine / 向量化引擎
+pg_mirror_worker = PgMirrorWorker(bucket_mgr.pg_mirror_queue)
 
 
 def _delete_pg_mirror_rows(bucket_id: str) -> None:
@@ -1520,12 +1522,14 @@ def _recall_prefix(
 @asynccontextmanager
 async def _server_lifespan(_server):
     """Warm recall state, then own process-wide background tasks."""
+    await pg_mirror_worker.start()
     await _prewarm_recall_state()
     await _start_briefing_cache_refresh()
     try:
         yield {}
     finally:
         await _stop_briefing_cache_refresh()
+        await pg_mirror_worker.stop()
 
 
 mcp = FastMCP(
@@ -12313,12 +12317,14 @@ if __name__ == "__main__":
         @asynccontextmanager
         async def _uvicorn_lifespan(app):
             async with _transport_lifespan(app):
+                await pg_mirror_worker.start()
                 await _prewarm_recall_state()
                 await _start_briefing_cache_refresh()
                 try:
                     yield
                 finally:
                     await _stop_briefing_cache_refresh()
+                    await pg_mirror_worker.stop()
 
         _app.router.lifespan_context = _uvicorn_lifespan
 

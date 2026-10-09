@@ -63,6 +63,7 @@ from review_queue import (
 from unknown_person_gate import mentions_needing_review
 from timeline_axis import normalize_thread
 from bm25_index import BM25Index
+from pg_mirror_queue import PgMirrorQueue
 from relation_graph import (
     normalize_generation_method,
     normalize_relation_evidence,
@@ -419,6 +420,7 @@ class BucketManager:
             os.path.join(self.base_dir, "review_queue.jsonl"),
             maintenance_root=self.base_dir,
         )
+        self.pg_mirror_queue = PgMirrorQueue(config)
         with self._maintenance_barrier.shared():
             self.audit_log = MutationAuditLog(
                 self.base_dir,
@@ -461,6 +463,16 @@ class BucketManager:
         bm25_content_changed: bool = True,
     ) -> None:
         atomic_write_post(file_path, post)
+        # PostgreSQL is a derived vector/body mirror. Queue only after the
+        # authoritative Markdown replacement succeeds; a queue outage must not
+        # change the result of the memory write.
+        mirror_queue = getattr(self, "pg_mirror_queue", None)
+        if mirror_queue is not None:
+            mirror_queue.enqueue(
+                str(post.metadata.get("id") or ""),
+                action="dirty",
+                source="bucket_manager:after-write",
+            )
         incremental_applied = False
         bucket_id = str(post.get("id", ""))
         if bm25_content_changed and bucket_id:

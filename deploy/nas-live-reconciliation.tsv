@@ -43,6 +43,9 @@
 # Production queue remains unchanged; bucket_manager.py integration is still unresolved.
 # Reviewed vectorized full/incremental duplicate scan against exact live source; 111 parity tests passed.
 # Report behavior unchanged; production remains untouched.
+# Restored the production-matching PG mirror write and worker hooks in source; default remains off.
+# Focused mirror/write/recall tests: 42 passed. Broader bucket_manager.py, embedding_engine.py,
+# and server.py differences remain unresolved; production remains unchanged.
 backfill_created.py	cb27aeda3bae2a19b066c01e276ac2c31eca8ce09e273ea87d5c4b6a77185a64	cb27aeda3bae2a19b066c01e276ac2c31eca8ce09e273ea87d5c4b6a77185a64
 backfill_embeddings.py	e5087c6c9d452f64427eae1c1c200cab776643dac96583ffee40d3ecbc53740b	e5087c6c9d452f64427eae1c1c200cab776643dac96583ffee40d3ecbc53740b
 backfill_senses.py	c485f5e5f3ecf7de82659ebb17e1ec49e9dece00d13f0729c3b5b35b3355035a	c485f5e5f3ecf7de82659ebb17e1ec49e9dece00d13f0729c3b5b35b3355035a
