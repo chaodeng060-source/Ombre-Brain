@@ -66,6 +66,7 @@ from review_queue import (
     make_z_pair_entry,
 )
 from redact import redact_obj
+from memory_omission_policy import filter_memory_text
 from snapshot_manager import SnapshotManager, SnapshotResult
 from bucket_manager import bucket_revision_hash
 from timeline_axis import run_timeline_sweep
@@ -288,6 +289,20 @@ def _slim_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _memory_payload(raw: dict[str, Any]) -> dict[str, Any]:
+    """Project memory eligibility without changing append-only chat evidence."""
+    if raw.get("sender") in {"user", "human", "朝灯"}:
+        return raw
+    text = raw.get("text")
+    if not isinstance(text, str):
+        return raw
+    meta = raw.get("resultMeta")
+    meta = meta if isinstance(meta, dict) else {}
+    backend = raw.get("memory_backend") or meta.get("memory_backend")
+    filtered = filter_memory_text(text, backend=backend)
+    return {**raw, "text": filtered} if filtered != text else raw
+
+
 def _redacted_slim_envelope(record: RawEventRecord) -> dict[str, Any]:
     """Build the one canonical envelope shape shared by chunking and proposing.
 
@@ -299,7 +314,7 @@ def _redacted_slim_envelope(record: RawEventRecord) -> dict[str, Any]:
     """
 
     raw = _load_json_object(record.payload, code="raw.invalid_json")
-    redacted = redact_obj(raw)
+    redacted = redact_obj(_memory_payload(raw))
     return {
         "payload": _slim_payload(redacted),
         "recorded_at": record.recorded_at,
@@ -739,6 +754,21 @@ class NightRunCoordinator:
                     for member in group
                     if member.chunk_id != representative.chunk_id
                 )
+                raw_record = self.ledger.get_raw_event(event_id)
+                raw = _load_json_object(raw_record.payload, code="raw.invalid_json")
+                projected = _memory_payload(raw)
+                if projected is not raw and not projected.get("text", "").strip():
+                    # An owner omission is a local terminal decision, not a
+                    # successful model call or a retryable provider failure.
+                    with self.ledger.transaction() as tx:
+                        for member in group:
+                            tx.record_chunk_proposer_outcome(
+                                "memory-omission:v1:" + member.chunk_id,
+                                member.chunk_id, "zero_candidates",
+                            )
+                    counts["memory_omitted_events"] = counts.get("memory_omitted_events", 0) + 1
+                    counts["proposer_omitted_chunks"] = counts.get("proposer_omitted_chunks", 0) + len(group)
+                    continue
                 text, truncated, has_text = self._slim_proposer_text(event_id)
                 counts["proposer_events"] += 1
                 if truncated:
@@ -1264,7 +1294,16 @@ class NightRunCoordinator:
         ):
             raise NightRunCoordinatorError("candidate.persisted_invalid")
 
+        sanitized = self._memory_x_content(content, session_id, event_ids)
+        if not sanitized.strip():
+            self._defer(record, "memory.owner_omitted", counts)
+            return
+        if sanitized != content:
+            payload = {**payload, "draft": {**draft, "content": sanitized}}
         result = await self._write_x_payload(payload)
+        if result.status == "omitted":
+            self._defer(record, "memory.owner_omitted", counts)
+            return
         if not self._x_result_is_complete(result):
             raise NightRunCoordinatorError("x.write_retryable")
         result_value = asdict(result)
@@ -1284,6 +1323,22 @@ class NightRunCoordinator:
                 expected_status="pending",
             )
         counts["x_ready"] = counts.get("x_ready", 0) + 1
+
+    def _memory_x_content(self, content: str, session_id: str, event_ids: list[str]) -> str:
+        """Recheck cached candidates against their original sources on replay."""
+        changed_source = False
+        omitted_sources = 0
+        for event_id in event_ids:
+            record = self.ledger.get_raw_event(EventIdentity(session_id, event_id))
+            raw = _load_json_object(record.payload, code="raw.invalid_json")
+            projected = _memory_payload(raw)
+            if projected is not raw:
+                changed_source = True
+                if not projected.get("text", "").strip():
+                    omitted_sources += 1
+        if omitted_sources == len(event_ids):
+            return ""
+        return filter_memory_text(content, backend="kiro" if changed_source else None)
 
     async def _write_x_payload(
         self,
@@ -1732,7 +1787,7 @@ class NightRunCoordinator:
         if (
             model_calls > self.policy.proposer_max_chunks_per_run
             or attempted != succeeded + retryable
-            or pending_before != succeeded + pending_after
+            or pending_before != succeeded + counts.get("proposer_omitted_chunks", 0) + pending_after
         ):
             raise NightRunCoordinatorError("validation.proposer_counts")
         backlog = self.ledger.proposer_backlog_stats(

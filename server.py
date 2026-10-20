@@ -7821,6 +7821,11 @@ async def hold(
 ) -> str:
     """存储单条记忆,自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被消化的记忆桶ID(feel模式下,标记源记忆为已消化)。image_base64=可选,base64编码的图片数据,会上传到R2并把URL插入正文(允许此条记忆带图)。image_filename=图片名称提示(默认image)。world=显式指定世界归属,留空时走全局current_world(日常聊天=空,角色扮演=具体世界名),"通用"表示跨世界设定。feel桶不归属世界。chord_tag=可选和弦记号串(如"Em(maj7) → A13#11 · 92bpm · f"),作为情绪色调索引,只用于跨窗口标记,不参与表达。紧张系和弦(m(maj7)/♭9/dim等)加动作词disambiguator(盯/压/憋/狂),一行最多4个和弦,段落切换用"; "分隔,详见 INTERNALS.md 5.12。feel桶不打chord_tag。merge时若新带chord_tag会覆盖旧桶。domain=显式指定主题域(csv),非空时override dehydrator 自动推断,用于跨 Agent 工程日志隔离(如 hajimi-工程)。feel/pinned 路径同样适用。"""
     # --- Input validation / 输入校验 ---
+    from memory_omission_policy import filter_memory_text
+    if isinstance(content, str) and content.strip():
+        content = filter_memory_text(content)
+        if not content.strip():
+            return "已按记忆存入规则跳过，未写入。"
     if not content or not content.strip():
         return "内容为空，无法存储。"
 
@@ -8190,6 +8195,11 @@ async def e_outcome(
 @mcp.tool()
 async def grow(content: str, world: str = "", chord_tag: str = "") -> str:
     """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。world留空走全局current_world。chord_tag=可选和弦记号串作为整段日记的色调,会打到所有子桶上(子桶共用同一色调)。"""
+    from memory_omission_policy import filter_memory_text
+    if isinstance(content, str) and content.strip():
+        content = filter_memory_text(content)
+        if not content.strip():
+            return "已按记忆存入规则跳过，未写入。"
     _grow_t0 = time.perf_counter()
     _content_len = len(content.strip()) if content else 0
     await _ensure_decay_background()

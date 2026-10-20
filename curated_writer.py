@@ -575,6 +575,17 @@ class CuratedWriteCoordinator:
         bucket_options: dict[str, Any] | None = None,
         actor: str = "lmc5:curated",
     ) -> CuratedWriteResult:
+        from memory_omission_policy import filter_memory_text
+
+        if isinstance(content, str) and content.strip():
+            filtered = filter_memory_text(content)
+            if not filtered.strip():
+                return CuratedWriteResult(
+                    success=True, status="omitted", bucket_id=None,
+                    vector_policy=vector_policy, recall_state="absent",
+                    error_code="memory.owner_omitted",
+                )
+            content = filtered.strip() if filtered != content else content
         async with self._maintenance_barrier.shared_async():
             return await self._write_locked(
                 idempotency_key=idempotency_key,
