@@ -1672,6 +1672,62 @@ class LMC5Ledger:
         finally:
             connection.close()
 
+    def resolve_raw_event_id(
+        self, source_event_id: str, *, conv_id: str | None = None
+    ) -> RawEventRecord | None:
+        """Read one globally unique event id, without guessing its session.
+
+        Missing ids, ids present in multiple sessions, and conflicting
+        conversation metadata are unresolved. No time-based fallback is used.
+        """
+        safe_source = _identifier(source_event_id, "source_event_id")
+        safe_conv = _identifier(conv_id, "conv_id") if conv_id is not None else None
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT id, session_id, source_event_id, payload,
+                       payload_digest, recorded_at
+                FROM raw_events WHERE source_event_id = ? LIMIT 2
+                """,
+                (safe_source,),
+            ).fetchall()
+            if len(rows) != 1:
+                return None
+            row = rows[0]
+            payload = bytes(row["payload"])
+            if _sha256(payload) != row["payload_digest"]:
+                raise LedgerCorruptionError("persisted raw-event digest does not match")
+            try:
+                message = json.loads(payload)
+            except (ValueError, UnicodeError):
+                return None
+            if type(message) is not dict:
+                return None
+            nested = message.get("payload")
+            objects = (message, nested) if type(nested) is dict else (message,)
+            conversations = {
+                obj[key]
+                for obj in objects
+                for key in ("convId", "conv_id")
+                if type(obj.get(key)) is str and obj[key]
+            }
+            if len(conversations) > 1 or (
+                safe_conv is not None and conversations and safe_conv not in conversations
+            ):
+                return None
+            return RawEventRecord(
+                row_id=int(row["id"]),
+                identity=EventIdentity(row["session_id"], row["source_event_id"]),
+                payload=payload,
+                payload_digest=row["payload_digest"],
+                recorded_at=row["recorded_at"],
+            )
+        except sqlite3.DatabaseError as exc:
+            raise LedgerCorruptionError("unable to resolve raw event id") from exc
+        finally:
+            connection.close()
+
     def list_pending_proposer_chunks(
         self,
         *,

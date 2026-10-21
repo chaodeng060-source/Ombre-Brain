@@ -70,6 +70,7 @@ from memory_omission_policy import filter_memory_text
 from snapshot_manager import SnapshotManager, SnapshotResult
 from bucket_manager import bucket_revision_hash
 from timeline_axis import run_timeline_sweep
+from x_provenance import normalize_source_ref
 
 
 logger = logging.getLogger("ombre_brain.night_run_coordinator")
@@ -772,7 +773,11 @@ class NightRunCoordinator:
                 text, truncated, has_text = self._slim_proposer_text(event_id)
                 counts["proposer_events"] += 1
                 if truncated:
-                    counts["proposer_slim_truncated"] += 1
+                    self._record_source_review(
+                        run_id, representative, siblings, counts,
+                        reason="source.input_over_limit",
+                    )
+                    continue
                 if not has_text:
                     # Observation only (2026-09-15 correction): an earlier
                     # version skipped the model call here entirely.  Every
@@ -860,6 +865,13 @@ class NightRunCoordinator:
                         if consecutive_errors >= 3:
                             counts["proposer_circuit_breaker"] = 1
                         continue
+                    if isinstance(result, ProposerContractError) and result.code == "prompt_too_large":
+                        counts["proposer_model_calls"] -= 1
+                        self._record_source_review(
+                            run_id, representative, siblings, counts,
+                            reason="source.input_over_limit",
+                        )
+                        continue
                     if isinstance(result, ProposerContractError):
                         self._record_proposer_error(
                             run_id, representative, result.code
@@ -898,12 +910,81 @@ class NightRunCoordinator:
         counts.setdefault("proposer_errors", 0)
         counts.setdefault("proposer_chunks", 0)
 
+    def _source_records(
+        self, identity: EventIdentity
+    ) -> tuple[tuple[RawEventRecord, ...], bool]:
+        primary = self.ledger.get_raw_event(identity)
+        raw = _load_json_object(primary.payload, code="raw.invalid_json")
+        payload = raw.get("payload", raw)
+        payload = payload if type(payload) is dict else {}
+        conv_id = payload.get("convId") or payload.get("conv_id")
+        conv_id = conv_id if type(conv_id) is str and conv_id else None
+        parent_ids = dict.fromkeys(
+            value for value in (payload.get("parentMessageId"), payload.get("rootChainId"))
+            if type(value) is str and value and value != identity.source_event_id
+        )
+        records = [primary]
+        unresolved = False
+        for parent_id in parent_ids:
+            parent = self.ledger.resolve_raw_event_id(parent_id, conv_id=conv_id)
+            if parent is None:
+                unresolved = True
+            else:
+                records.append(parent)
+        return tuple(records), unresolved
+
+    def _source_ref(self, records: Sequence[RawEventRecord]) -> dict[str, Any]:
+        return normalize_source_ref({
+            "database": str(self.ledger.path),
+            "table": "raw_events",
+            "raw_events": [
+                {
+                    "row_id": record.row_id,
+                    "session_id": record.identity.session_id,
+                    "source_event_id": record.identity.source_event_id,
+                }
+                for record in records
+            ],
+        })
+
+    def _record_source_review(
+        self, run_id: str, representative: PendingProposerChunk,
+        siblings: tuple[PendingProposerChunk, ...], counts: dict[str, int], *, reason: str,
+    ) -> None:
+        records, _unresolved = self._source_records(representative.source_event_ids[0])
+        payload = _canonical_bytes({
+            "schema": "ombre.lmc5-source-review/v1",
+            "reason": reason,
+            "origin_run_id": run_id,
+            "source_ref": self._source_ref(records),
+        }, code="candidate.payload_invalid")
+        key = "source-review:v1:" + _sha256(payload)
+        with self.ledger.transaction() as tx:
+            tx.record_candidate(key, "X", payload, (representative.chunk_id,), status="review")
+            tx.record_chunk_proposer_outcome(
+                key, representative.chunk_id, "candidates_persisted", candidate_keys=(key,),
+            )
+            for sibling in siblings:
+                tx.record_chunk_proposer_outcome(
+                    self._sibling_outcome_key(
+                        run_id=run_id, representative=representative, sibling=sibling,
+                    ), sibling.chunk_id, "zero_candidates",
+                )
+        counts["proposer_source_review"] = counts.get("proposer_source_review", 0) + 1
+        counts["proposer_succeeded"] += 1 + len(siblings)
+        counts["proposer_attempted"] += 1 + len(siblings)
+        counts["proposer_chunks"] = counts["proposer_succeeded"]
+        counts["proposer_sibling_chunks_closed"] += len(siblings)
+        counts["candidates"] = counts.get("candidates", 0) + 1
+
     def _slim_proposer_text(
         self, identity: EventIdentity
     ) -> tuple[str, bool, bool]:
         """Rebuild one event's model input fresh from ``raw_events``.
 
-        Returns ``(text, truncated, has_text)``.  ``text`` is always the
+        Returns ``(text, over_limit, has_text)``. The original message and
+        exact parent/root messages remain whole; ``over_limit`` means the
+        complete model input exceeds the upstream 256 KiB bound. ``text`` is the
         slimmed envelope encoded as the model input string -- every event
         spends exactly one real model call now, whether or not it has a
         non-blank top-level ``text`` field.  (2026-09-15 correction: an
@@ -919,19 +1000,25 @@ class NightRunCoordinator:
         before and after the _CHUNK_SCHEMA v2 slimming change.
         """
 
-        record = self.ledger.get_raw_event(identity)
+        records, unresolved = self._source_records(identity)
+        record = records[0]
         envelope = _redacted_slim_envelope(record)
+        if len(records) > 1:
+            model_view = globals().get("_proposer_model_view", dict)
+            envelope["context_events"] = [
+                model_view(_redacted_slim_envelope(parent)) for parent in records[1:]
+            ]
+        if unresolved:
+            envelope["context_status"] = "unresolved"
         canonical = _canonical_bytes(envelope, code="raw.invalid_value")
-        truncated = len(canonical) > self.policy.chunk_bytes
-        if truncated:
-            canonical = _split_utf8(canonical, self.policy.chunk_bytes)[0]
+        over_limit = len(canonical) > 256 * 1024
         try:
             text = canonical.decode("utf-8", errors="strict")
         except UnicodeError as exc:
             raise NightRunCoordinatorError("proposer.chunk_utf8") from exc
         spoken = envelope["payload"].get("text")
         has_text = isinstance(spoken, str) and bool(spoken.strip())
-        return text, truncated, has_text
+        return text, over_limit, has_text
 
     def _finalize_event_success(
         self,
@@ -1049,12 +1136,17 @@ class NightRunCoordinator:
         batch: ProposerBatch,
     ) -> tuple[tuple[str, str, bytes], ...]:
         source = pending.source_event_ids[0]
+        records, unresolved_parent = self._source_records(source)
+        source_ref = self._source_ref(records)
         specs: list[tuple[str, str, bytes]] = []
         for ordinal, draft in enumerate(batch.candidates):
             if draft.source_chunk_ids != (pending.chunk_id,):
                 raise NightRunCoordinatorError("proposer.source_mismatch")
+            draft_payload = _draft_json(draft)
+            if unresolved_parent:
+                draft_payload["risk"] = "review"
             base = {
-                "draft": _draft_json(draft),
+                "draft": draft_payload,
                 "origin_run_id": run_id,
                 "proposer": {
                     "model": batch.model,
@@ -1078,6 +1170,7 @@ class NightRunCoordinator:
                         code="candidate.source_invalid",
                     ),
                     "source_event_ids": [source.source_event_id],
+                    "source_ref": source_ref,
                 },
             }
             base_digest = _canonical_digest(
@@ -1301,6 +1394,7 @@ class NightRunCoordinator:
         if sanitized != content:
             payload = {**payload, "draft": {**draft, "content": sanitized}}
         result = await self._write_x_payload(payload)
+        await self._complete_legacy_source_ref(payload, result)
         if result.status == "omitted":
             self._defer(record, "memory.owner_omitted", counts)
             return
@@ -1355,6 +1449,20 @@ class NightRunCoordinator:
         session_id = source.get("session_id")
         event_ids = source.get("source_event_ids")
         source_digest = source.get("source_digest")
+        source_ref = source.get("source_ref")
+        if source_ref is not None:
+            try:
+                source_ref = normalize_source_ref(source_ref)
+            except ValueError as exc:
+                raise NightRunCoordinatorError("candidate.persisted_invalid") from exc
+            pairs = {
+                (item["session_id"], item["source_event_id"])
+                for item in source_ref["raw_events"]
+            }
+            if type(event_ids) is not list or not all(
+                (session_id, event_id) in pairs for event_id in event_ids
+            ):
+                raise NightRunCoordinatorError("candidate.persisted_invalid")
         write_key = payload.get("x_write_key")
         if (
             type(content) is not str
@@ -1388,10 +1496,40 @@ class NightRunCoordinator:
                     "source_session": session_id,
                     "source_event_ids": event_ids,
                     "source_digest": source_digest,
+                    **({"source_ref": source_ref} if source_ref is not None else {}),
                 },
             },
             actor="lmc5:night",
         )
+
+    async def _complete_legacy_source_ref(
+        self, payload: dict[str, Any], result: CuratedWriteResult
+    ) -> None:
+        """Add only a missing pointer after an unchanged legacy receipt replay."""
+        source = payload.get("source")
+        if (
+            type(source) is not dict or source.get("source_ref") is not None
+            or not self._x_result_is_complete(result) or self.bucket_manager is None
+        ):
+            return
+        bucket = await self.bucket_manager.get(str(result.bucket_id))
+        if bucket is None:
+            raise NightRunCoordinatorError("x.write_retryable")
+        metadata = bucket.get("metadata") or {}
+        if metadata.get("source_ref") is not None:
+            return
+        records = {}
+        for event_id in source["source_event_ids"]:
+            event_records, _unresolved = self._source_records(
+                EventIdentity(source["session_id"], event_id)
+            )
+            for record in event_records:
+                records[record.identity] = record
+        if not await self.bucket_manager.update(
+            str(result.bucket_id), actor="lmc5:source-ref",
+            source_ref=self._source_ref(tuple(records.values())),
+        ):
+            raise NightRunCoordinatorError("x.write_retryable")
 
     async def _dispatch_y(
         self,
@@ -1411,6 +1549,7 @@ class NightRunCoordinator:
             self._defer(record, "y.relation_pair_unavailable", counts)
             return
         result = await self._write_x_payload(payload)
+        await self._complete_legacy_source_ref(payload, result)
         if not self._x_result_is_complete(result):
             raise NightRunCoordinatorError("y.source_write_retryable")
         source_id = str(result.bucket_id)
@@ -1487,6 +1626,7 @@ class NightRunCoordinator:
             self._defer(record, "z.human_review_required", counts)
             return
         result = await self._write_x_payload(payload)
+        await self._complete_legacy_source_ref(payload, result)
         if not self._x_result_is_complete(result):
             raise NightRunCoordinatorError("z.source_write_retryable")
         new_bucket = await self.bucket_manager.get(str(result.bucket_id))
@@ -1580,6 +1720,7 @@ class NightRunCoordinator:
             self._defer(record, "e.human_review_required", counts)
             return
         result = await self._write_x_payload(payload)
+        await self._complete_legacy_source_ref(payload, result)
         if not self._x_result_is_complete(result):
             raise NightRunCoordinatorError("e.source_write_retryable")
         importance = draft.get("importance")

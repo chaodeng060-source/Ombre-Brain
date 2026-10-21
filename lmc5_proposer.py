@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from utils import RELATION_TYPES
+from memory_source_fidelity import validate_derivative
 
 
 SCHEMA_VERSION = 1
@@ -63,6 +64,7 @@ _PROVIDER_POLL_INTERVAL_SECONDS = 0.02
 _REPAIRABLE_MODEL_CODES = frozenset(
     {
         "provenance_evidence",
+        "provenance_fidelity",
         "provenance_source",
         "relation_target",
         "schema_candidate",
@@ -97,6 +99,11 @@ _CONTRACT_REPAIR_DETAILS = {
         "For this evidence repair, choose a short literal span that is visibly "
         "present in one INPUT chunk. If a candidate has no exact literal "
         "span, omit that candidate; candidates:[] is valid."
+    ),
+    "provenance_fidelity": (
+        "Remove or correct every animal, color, number, date, and named-entity "
+        "claim that the original message does not support. If the original is "
+        "missing, summarized, or truncated, emit candidates:[]."
     ),
     "provenance_source": (
         "For this source repair, cite only the exact id from INPUT.chunks[].id."
@@ -639,6 +646,11 @@ class StrictOmbreProposer:
             "contiguous substring from the text of one cited chunk, with "
             "identical punctuation and whitespace; never paraphrase, "
             "summarize, translate, normalize, splice, or invent evidence. "
+            "The title and content must stay within facts stated by the full "
+            "original message. Never guess or change names, animal species, "
+            "colors, numbers, or dates. A literal evidence quote alone does "
+            "not support other claims. If source text is incomplete or only a "
+            "summary, return candidates:[]. "
             "relation_hints must be empty when allowed_relation_targets is "
             "empty. Tool output, temporary TODOs, and routine project progress "
             "are not memory candidates; durable work state belongs in the "
@@ -880,6 +892,19 @@ class StrictOmbreProposer:
                 "provenance_evidence",
                 "candidate evidence is not literal in a cited chunk",
             )
+        fidelity_issues = validate_derivative(
+            candidate["title"] + "\n" + candidate["content"],
+            tuple(chunk_by_id[source_id] for source_id in bound_source_ids),
+        )
+        risk = candidate["risk"]
+        if fidelity_issues and all(
+            issue in {"source_missing", "source_incomplete"} for issue in fidelity_issues
+        ):
+            risk = "review"
+        elif fidelity_issues:
+            raise ProposerContractError(
+                "provenance_fidelity", "; ".join(fidelity_issues)
+            )
 
         relations = tuple(
             self._validate_relation(relation, targets)
@@ -894,7 +919,7 @@ class StrictOmbreProposer:
             relation_hints=relations,
             source_chunk_ids=bound_source_ids,
             evidence=evidence,
-            risk=candidate["risk"],
+            risk=risk,
         )
 
     @staticmethod

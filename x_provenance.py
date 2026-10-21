@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Any, Mapping
 
 from utils import normalize_event_at
@@ -35,6 +36,7 @@ _INPUT_FIELDS = frozenset({
     "source_event_ids",
     "source_digest",
     "source_chunk_ordinal",
+    "source_ref",
 })
 X_METADATA_FIELDS = frozenset({
     "x_schema_version",
@@ -54,6 +56,7 @@ _FIELDS_BY_KIND = {
         "source_session",
         "source_thread",
         "source_event_ids",
+        "source_ref",
     }),
     "conversation": frozenset({
         "source_digest",
@@ -62,6 +65,7 @@ _FIELDS_BY_KIND = {
         "source_session",
         "source_thread",
         "source_event_ids",
+        "source_ref",
     }),
     "external": frozenset({
         "source_digest",
@@ -118,6 +122,42 @@ def _clean_span(start: Any, end: Any) -> tuple[str, str]:
     return normalized_start, normalized_end
 
 
+def normalize_source_ref(value: Any) -> dict[str, Any]:
+    """Validate a portable raw-events locator with exact compound keys."""
+    if type(value) is not dict or set(value) != {"database", "table", "raw_events"}:
+        raise ValueError("source_ref must contain database, table and raw_events")
+    database = _clean_text(value["database"], field="source_ref.database", max_length=4096)
+    if not PurePosixPath(database).is_absolute() or value["table"] != "raw_events":
+        raise ValueError("source_ref must address an absolute raw_events database")
+    rows = value["raw_events"]
+    if type(rows) is not list or not rows or len(rows) > 4096:
+        raise ValueError("source_ref.raw_events must be a non-empty bounded array")
+    normalized = []
+    seen = set()
+    for row in rows:
+        if type(row) is not dict or set(row) not in (
+            {"session_id", "source_event_id"},
+            {"session_id", "source_event_id", "row_id"},
+        ):
+            raise ValueError("source_ref event must contain exact event/session keys")
+        clean = {
+            key: _clean_text(row[key], field=f"source_ref.{key}")
+            for key in ("session_id", "source_event_id")
+        }
+        if any(item.lower() in {"unknown", "none", "null"} for item in clean.values()):
+            raise ValueError("source_ref event/session cannot be unknown")
+        pair = (clean["session_id"], clean["source_event_id"])
+        if pair in seen:
+            raise ValueError("source_ref must not repeat a compound event key")
+        seen.add(pair)
+        if "row_id" in row:
+            if type(row["row_id"]) is not int or row["row_id"] <= 0:
+                raise ValueError("source_ref.row_id must be a positive integer")
+            clean["row_id"] = row["row_id"]
+        normalized.append(clean)
+    return {"database": database, "table": "raw_events", "raw_events": normalized}
+
+
 def normalize_x_provenance(value: Mapping[str, Any]) -> dict[str, Any]:
     """Validate and flatten a creation-time X provenance declaration.
 
@@ -157,6 +197,9 @@ def normalize_x_provenance(value: Mapping[str, Any]) -> dict[str, Any]:
         if field in value:
             result[field] = _clean_text(value[field], field=field)
 
+    if "source_ref" in value:
+        result["source_ref"] = normalize_source_ref(value["source_ref"])
+
     has_start = "span_start" in value
     has_end = "span_end" in value
     if has_start != has_end:
@@ -194,7 +237,7 @@ def normalize_x_provenance(value: Mapping[str, Any]) -> dict[str, Any]:
         required = set()
         if not any(
             field in result
-            for field in ("source_session", "source_thread", "source_event_ids")
+            for field in ("source_session", "source_thread", "source_event_ids", "source_ref")
         ):
             raise ValueError(
                 "conversation provenance needs a real session, thread, or event id"
@@ -224,6 +267,24 @@ def validate_x_provenance_update(
 
     touched = set(updates) & X_METADATA_FIELDS
     immutable = touched & _IMMUTABLE_UPDATE_FIELDS
+    if "source_ref" in immutable and "source_ref" not in metadata:
+        reference = normalize_source_ref(updates["source_ref"])
+        pairs = {
+            (row["session_id"], row["source_event_id"])
+            for row in reference["raw_events"]
+        }
+        legacy_ids = _clean_id_list(metadata.get("source_event_ids"), field="source_event_ids")
+        session = _clean_text(metadata.get("source_session"), field="source_session")
+        if (
+            metadata.get("x_schema_version") == X_SCHEMA_VERSION
+            and metadata.get("source_kind") == "conversation"
+            and metadata.get("curated_write_key")
+            and metadata.get("lmc5_recall_state") in {"ready_vector", "ready_fts"}
+            and all((session, event_id) in pairs for event_id in legacy_ids)
+        ):
+            # A completed legacy bucket may acquire its missing compound
+            # pointer once. Its existing X fields and receipt stay immutable.
+            immutable -= {"source_ref"}
     if immutable:
         raise ValueError(
             f"X provenance is immutable after creation: {sorted(immutable)}"

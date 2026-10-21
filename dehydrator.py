@@ -40,6 +40,8 @@ from e_axis_shadow import strict_json_loads
 from utils import count_tokens_approx
 from redact import redact_embedding_input  # 出本地去外部 LLM 前脱敏
 
+from source_summary_fidelity import SUMMARY_FACT_RULES, guarded_summary
+
 logger = logging.getLogger("ombre_brain.dehydrator")
 
 MIN_DEHYDRATION_SUMMARY_CHARS = 10
@@ -455,6 +457,8 @@ DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水�
   "keywords": ["关键词1", "关键词2"],
   "summary": "50字以内的核心总结"
 }"""
+
+DEHYDRATE_PROMPT += SUMMARY_FACT_RULES
 
 
 # --- Diary digest prompt: split daily notes into independent memory entries ---
@@ -2067,7 +2071,7 @@ class Dehydrator:
 
         if not response.choices:
             return ""
-        return response.choices[0].message.content or ""
+        return guarded_summary(response.choices[0].message.content or "", content)
 
     # ---------------------------------------------------------
     # API call: merge

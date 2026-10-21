@@ -1,0 +1,834 @@
+diff --git a/lmc5_ledger.py b/lmc5_ledger.py
+--- a/lmc5_ledger.py
++++ b/lmc5_ledger.py
+@@ -1672,6 +1672,62 @@
+         finally:
+             connection.close()
+ 
++    def resolve_raw_event_id(
++        self, source_event_id: str, *, conv_id: str | None = None
++    ) -> RawEventRecord | None:
++        """Read one globally unique event id, without guessing its session.
++
++        Missing ids, ids present in multiple sessions, and conflicting
++        conversation metadata are unresolved. No time-based fallback is used.
++        """
++        safe_source = _identifier(source_event_id, "source_event_id")
++        safe_conv = _identifier(conv_id, "conv_id") if conv_id is not None else None
++        connection = self._connect()
++        try:
++            rows = connection.execute(
++                """
++                SELECT id, session_id, source_event_id, payload,
++                       payload_digest, recorded_at
++                FROM raw_events WHERE source_event_id = ? LIMIT 2
++                """,
++                (safe_source,),
++            ).fetchall()
++            if len(rows) != 1:
++                return None
++            row = rows[0]
++            payload = bytes(row["payload"])
++            if _sha256(payload) != row["payload_digest"]:
++                raise LedgerCorruptionError("persisted raw-event digest does not match")
++            try:
++                message = json.loads(payload)
++            except (ValueError, UnicodeError):
++                return None
++            if type(message) is not dict:
++                return None
++            nested = message.get("payload")
++            objects = (message, nested) if type(nested) is dict else (message,)
++            conversations = {
++                obj[key]
++                for obj in objects
++                for key in ("convId", "conv_id")
++                if type(obj.get(key)) is str and obj[key]
++            }
++            if len(conversations) > 1 or (
++                safe_conv is not None and conversations and safe_conv not in conversations
++            ):
++                return None
++            return RawEventRecord(
++                row_id=int(row["id"]),
++                identity=EventIdentity(row["session_id"], row["source_event_id"]),
++                payload=payload,
++                payload_digest=row["payload_digest"],
++                recorded_at=row["recorded_at"],
++            )
++        except sqlite3.DatabaseError as exc:
++            raise LedgerCorruptionError("unable to resolve raw event id") from exc
++        finally:
++            connection.close()
++
+     def list_pending_proposer_chunks(
+         self,
+         *,
+diff --git a/x_provenance.py b/x_provenance.py
+--- a/x_provenance.py
++++ b/x_provenance.py
+@@ -10,6 +10,7 @@
+ 
+ import re
+ from datetime import datetime
++from pathlib import PurePosixPath
+ from typing import Any, Mapping
+ 
+ from utils import normalize_event_at
+@@ -35,6 +36,7 @@
+     "source_event_ids",
+     "source_digest",
+     "source_chunk_ordinal",
++    "source_ref",
+ })
+ X_METADATA_FIELDS = frozenset({
+     "x_schema_version",
+@@ -54,6 +56,7 @@
+         "source_session",
+         "source_thread",
+         "source_event_ids",
++        "source_ref",
+     }),
+     "conversation": frozenset({
+         "source_digest",
+@@ -62,6 +65,7 @@
+         "source_session",
+         "source_thread",
+         "source_event_ids",
++        "source_ref",
+     }),
+     "external": frozenset({
+         "source_digest",
+@@ -118,6 +122,42 @@
+     return normalized_start, normalized_end
+ 
+ 
++def normalize_source_ref(value: Any) -> dict[str, Any]:
++    """Validate a portable raw-events locator with exact compound keys."""
++    if type(value) is not dict or set(value) != {"database", "table", "raw_events"}:
++        raise ValueError("source_ref must contain database, table and raw_events")
++    database = _clean_text(value["database"], field="source_ref.database", max_length=4096)
++    if not PurePosixPath(database).is_absolute() or value["table"] != "raw_events":
++        raise ValueError("source_ref must address an absolute raw_events database")
++    rows = value["raw_events"]
++    if type(rows) is not list or not rows or len(rows) > 4096:
++        raise ValueError("source_ref.raw_events must be a non-empty bounded array")
++    normalized = []
++    seen = set()
++    for row in rows:
++        if type(row) is not dict or set(row) not in (
++            {"session_id", "source_event_id"},
++            {"session_id", "source_event_id", "row_id"},
++        ):
++            raise ValueError("source_ref event must contain exact event/session keys")
++        clean = {
++            key: _clean_text(row[key], field=f"source_ref.{key}")
++            for key in ("session_id", "source_event_id")
++        }
++        if any(item.lower() in {"unknown", "none", "null"} for item in clean.values()):
++            raise ValueError("source_ref event/session cannot be unknown")
++        pair = (clean["session_id"], clean["source_event_id"])
++        if pair in seen:
++            raise ValueError("source_ref must not repeat a compound event key")
++        seen.add(pair)
++        if "row_id" in row:
++            if type(row["row_id"]) is not int or row["row_id"] <= 0:
++                raise ValueError("source_ref.row_id must be a positive integer")
++            clean["row_id"] = row["row_id"]
++        normalized.append(clean)
++    return {"database": database, "table": "raw_events", "raw_events": normalized}
++
++
+ def normalize_x_provenance(value: Mapping[str, Any]) -> dict[str, Any]:
+     """Validate and flatten a creation-time X provenance declaration.
+ 
+@@ -156,6 +196,9 @@
+     for field in ("source_session", "source_thread"):
+         if field in value:
+             result[field] = _clean_text(value[field], field=field)
++
++    if "source_ref" in value:
++        result["source_ref"] = normalize_source_ref(value["source_ref"])
+ 
+     has_start = "span_start" in value
+     has_end = "span_end" in value
+@@ -194,7 +237,7 @@
+         required = set()
+         if not any(
+             field in result
+-            for field in ("source_session", "source_thread", "source_event_ids")
++            for field in ("source_session", "source_thread", "source_event_ids", "source_ref")
+         ):
+             raise ValueError(
+                 "conversation provenance needs a real session, thread, or event id"
+@@ -224,6 +267,24 @@
+ 
+     touched = set(updates) & X_METADATA_FIELDS
+     immutable = touched & _IMMUTABLE_UPDATE_FIELDS
++    if "source_ref" in immutable and "source_ref" not in metadata:
++        reference = normalize_source_ref(updates["source_ref"])
++        pairs = {
++            (row["session_id"], row["source_event_id"])
++            for row in reference["raw_events"]
++        }
++        legacy_ids = _clean_id_list(metadata.get("source_event_ids"), field="source_event_ids")
++        session = _clean_text(metadata.get("source_session"), field="source_session")
++        if (
++            metadata.get("x_schema_version") == X_SCHEMA_VERSION
++            and metadata.get("source_kind") == "conversation"
++            and metadata.get("curated_write_key")
++            and metadata.get("lmc5_recall_state") in {"ready_vector", "ready_fts"}
++            and all((session, event_id) in pairs for event_id in legacy_ids)
++        ):
++            # A completed legacy bucket may acquire its missing compound
++            # pointer once. Its existing X fields and receipt stay immutable.
++            immutable -= {"source_ref"}
+     if immutable:
+         raise ValueError(
+             f"X provenance is immutable after creation: {sorted(immutable)}"
+diff --git a/lmc5_proposer.py b/lmc5_proposer.py
+--- a/lmc5_proposer.py
++++ b/lmc5_proposer.py
+@@ -18,6 +18,7 @@
+ from typing import Any
+ 
+ from utils import RELATION_TYPES
++from memory_source_fidelity import validate_derivative
+ 
+ 
+ SCHEMA_VERSION = 1
+@@ -63,6 +64,7 @@
+ _REPAIRABLE_MODEL_CODES = frozenset(
+     {
+         "provenance_evidence",
++        "provenance_fidelity",
+         "provenance_source",
+         "relation_target",
+         "schema_candidate",
+@@ -97,6 +99,11 @@
+         "For this evidence repair, choose a short literal span that is visibly "
+         "present in one INPUT chunk. If a candidate has no exact literal "
+         "span, omit that candidate; candidates:[] is valid."
++    ),
++    "provenance_fidelity": (
++        "Remove or correct every animal, color, number, date, and named-entity "
++        "claim that the original message does not support. If the original is "
++        "missing, summarized, or truncated, emit candidates:[]."
+     ),
+     "provenance_source": (
+         "For this source repair, cite only the exact id from INPUT.chunks[].id."
+@@ -655,6 +662,11 @@
+             "contiguous substring from the text of one cited chunk, with "
+             "identical punctuation and whitespace; never paraphrase, "
+             "summarize, translate, normalize, splice, or invent evidence. "
++            "The title and content must stay within facts stated by the full "
++            "original message. Never guess or change names, animal species, "
++            "colors, numbers, or dates. A literal evidence quote alone does "
++            "not support other claims. If source text is incomplete or only a "
++            "summary, return candidates:[]. "
+             "relation_hints must be empty when allowed_relation_targets is "
+             "empty. Tool output, temporary TODOs, and routine project progress "
+             "are not memory candidates; durable work state belongs in the "
+@@ -896,6 +908,19 @@
+                 "provenance_evidence",
+                 "candidate evidence is not literal in a cited chunk",
+             )
++        fidelity_issues = validate_derivative(
++            candidate["title"] + "\n" + candidate["content"],
++            tuple(chunk_by_id[source_id] for source_id in bound_source_ids),
++        )
++        risk = candidate["risk"]
++        if fidelity_issues and all(
++            issue in {"source_missing", "source_incomplete"} for issue in fidelity_issues
++        ):
++            risk = "review"
++        elif fidelity_issues:
++            raise ProposerContractError(
++                "provenance_fidelity", "; ".join(fidelity_issues)
++            )
+ 
+         relations = tuple(
+             self._validate_relation(relation, targets)
+@@ -910,7 +935,7 @@
+             relation_hints=relations,
+             source_chunk_ids=bound_source_ids,
+             evidence=evidence,
+-            risk=candidate["risk"],
++            risk=risk,
+         )
+ 
+     @staticmethod
+diff --git a/night_run_coordinator.py b/night_run_coordinator.py
+--- a/night_run_coordinator.py
++++ b/night_run_coordinator.py
+@@ -71,6 +71,7 @@
+ from snapshot_manager import SnapshotManager, SnapshotResult
+ from bucket_manager import bucket_revision_hash
+ from timeline_axis import run_timeline_sweep
++from x_provenance import normalize_source_ref
+ 
+ 
+ logger = logging.getLogger("ombre_brain.night_run_coordinator")
+@@ -942,7 +943,11 @@
+                 text, truncated, has_text = self._slim_proposer_text(event_id)
+                 counts["proposer_events"] += 1
+                 if truncated:
+-                    counts["proposer_slim_truncated"] += 1
++                    self._record_source_review(
++                        run_id, representative, siblings, counts,
++                        reason="source.input_over_limit",
++                    )
++                    continue
+                 if not has_text:
+                     # Observation only (2026-09-15 correction): an earlier
+                     # version skipped the model call here entirely.  Every
+@@ -1030,6 +1035,13 @@
+                         if consecutive_errors >= 3:
+                             counts["proposer_circuit_breaker"] = 1
+                         continue
++                    if isinstance(result, ProposerContractError) and result.code == "prompt_too_large":
++                        counts["proposer_model_calls"] -= 1
++                        self._record_source_review(
++                            run_id, representative, siblings, counts,
++                            reason="source.input_over_limit",
++                        )
++                        continue
+                     if isinstance(result, ProposerContractError):
+                         self._record_proposer_error(
+                             run_id, representative, result.code
+@@ -1068,12 +1080,81 @@
+         counts.setdefault("proposer_errors", 0)
+         counts.setdefault("proposer_chunks", 0)
+ 
++    def _source_records(
++        self, identity: EventIdentity
++    ) -> tuple[tuple[RawEventRecord, ...], bool]:
++        primary = self.ledger.get_raw_event(identity)
++        raw = _load_json_object(primary.payload, code="raw.invalid_json")
++        payload = raw.get("payload", raw)
++        payload = payload if type(payload) is dict else {}
++        conv_id = payload.get("convId") or payload.get("conv_id")
++        conv_id = conv_id if type(conv_id) is str and conv_id else None
++        parent_ids = dict.fromkeys(
++            value for value in (payload.get("parentMessageId"), payload.get("rootChainId"))
++            if type(value) is str and value and value != identity.source_event_id
++        )
++        records = [primary]
++        unresolved = False
++        for parent_id in parent_ids:
++            parent = self.ledger.resolve_raw_event_id(parent_id, conv_id=conv_id)
++            if parent is None:
++                unresolved = True
++            else:
++                records.append(parent)
++        return tuple(records), unresolved
++
++    def _source_ref(self, records: Sequence[RawEventRecord]) -> dict[str, Any]:
++        return normalize_source_ref({
++            "database": str(self.ledger.path),
++            "table": "raw_events",
++            "raw_events": [
++                {
++                    "row_id": record.row_id,
++                    "session_id": record.identity.session_id,
++                    "source_event_id": record.identity.source_event_id,
++                }
++                for record in records
++            ],
++        })
++
++    def _record_source_review(
++        self, run_id: str, representative: PendingProposerChunk,
++        siblings: tuple[PendingProposerChunk, ...], counts: dict[str, int], *, reason: str,
++    ) -> None:
++        records, _unresolved = self._source_records(representative.source_event_ids[0])
++        payload = _canonical_bytes({
++            "schema": "ombre.lmc5-source-review/v1",
++            "reason": reason,
++            "origin_run_id": run_id,
++            "source_ref": self._source_ref(records),
++        }, code="candidate.payload_invalid")
++        key = "source-review:v1:" + _sha256(payload)
++        with self.ledger.transaction() as tx:
++            tx.record_candidate(key, "X", payload, (representative.chunk_id,), status="review")
++            tx.record_chunk_proposer_outcome(
++                key, representative.chunk_id, "candidates_persisted", candidate_keys=(key,),
++            )
++            for sibling in siblings:
++                tx.record_chunk_proposer_outcome(
++                    self._sibling_outcome_key(
++                        run_id=run_id, representative=representative, sibling=sibling,
++                    ), sibling.chunk_id, "zero_candidates",
++                )
++        counts["proposer_source_review"] = counts.get("proposer_source_review", 0) + 1
++        counts["proposer_succeeded"] += 1 + len(siblings)
++        counts["proposer_attempted"] += 1 + len(siblings)
++        counts["proposer_chunks"] = counts["proposer_succeeded"]
++        counts["proposer_sibling_chunks_closed"] += len(siblings)
++        counts["candidates"] = counts.get("candidates", 0) + 1
++
+     def _slim_proposer_text(
+         self, identity: EventIdentity
+     ) -> tuple[str, bool, bool]:
+         """Rebuild one event's model input fresh from ``raw_events``.
+ 
+-        Returns ``(text, truncated, has_text)``.  ``text`` is always the
++        Returns ``(text, over_limit, has_text)``. The original message and
++        exact parent/root messages remain whole; ``over_limit`` means the
++        complete model input exceeds the upstream 256 KiB bound. ``text`` is the
+         slimmed envelope encoded as the model input string -- every event
+         spends exactly one real model call now, whether or not it has a
+         non-blank top-level ``text`` field.  (2026-09-15 correction: an
+@@ -1089,21 +1170,27 @@
+         before and after the _CHUNK_SCHEMA v2 slimming change.
+         """
+ 
+-        record = self.ledger.get_raw_event(identity)
++        records, unresolved = self._source_records(identity)
++        record = records[0]
+         envelope = _redacted_slim_envelope(record)
++        if len(records) > 1:
++            model_view = globals().get("_proposer_model_view", dict)
++            envelope["context_events"] = [
++                model_view(_redacted_slim_envelope(parent)) for parent in records[1:]
++            ]
++        if unresolved:
++            envelope["context_status"] = "unresolved"
+         canonical = _canonical_bytes(
+             _proposer_model_view(envelope), code="raw.invalid_value"
+         )
+-        truncated = len(canonical) > self.policy.chunk_bytes
+-        if truncated:
+-            canonical = _split_utf8(canonical, self.policy.chunk_bytes)[0]
++        over_limit = len(canonical) > 256 * 1024
+         try:
+             text = canonical.decode("utf-8", errors="strict")
+         except UnicodeError as exc:
+             raise NightRunCoordinatorError("proposer.chunk_utf8") from exc
+         spoken = envelope["payload"].get("text")
+         has_text = isinstance(spoken, str) and bool(spoken.strip())
+-        return text, truncated, has_text
++        return text, over_limit, has_text
+ 
+     def _finalize_event_success(
+         self,
+@@ -1230,14 +1317,19 @@
+         batch: ProposerBatch,
+     ) -> tuple[tuple[str, str, bytes], ...]:
+         source = pending.source_event_ids[0]
++        records, unresolved_parent = self._source_records(source)
++        source_ref = self._source_ref(records)
+         specs: list[tuple[str, str, bytes]] = []
+         for ordinal, draft in enumerate(batch.candidates):
+             if draft.source_chunk_ids != (pending.chunk_id,):
+                 raise NightRunCoordinatorError("proposer.source_mismatch")
+             if _memory_voice_rejection(draft) is not None:
+                 continue
++            draft_payload = _draft_json(draft)
++            if unresolved_parent:
++                draft_payload["risk"] = "review"
+             base = {
+-                "draft": _draft_json(draft),
++                "draft": draft_payload,
+                 "origin_run_id": run_id,
+                 "proposer": {
+                     "model": batch.model,
+@@ -1261,6 +1353,7 @@
+                         code="candidate.source_invalid",
+                     ),
+                     "source_event_ids": [source.source_event_id],
++                    "source_ref": source_ref,
+                 },
+             }
+             base_digest = _canonical_digest(
+@@ -1484,6 +1577,7 @@
+         if sanitized != content:
+             payload = {**payload, "draft": {**draft, "content": sanitized}}
+         result = await self._write_x_payload(payload)
++        await self._complete_legacy_source_ref(payload, result)
+         if result.status == "omitted":
+             self._defer(record, "memory.owner_omitted", counts)
+             return
+@@ -1538,6 +1632,20 @@
+         session_id = source.get("session_id")
+         event_ids = source.get("source_event_ids")
+         source_digest = source.get("source_digest")
++        source_ref = source.get("source_ref")
++        if source_ref is not None:
++            try:
++                source_ref = normalize_source_ref(source_ref)
++            except ValueError as exc:
++                raise NightRunCoordinatorError("candidate.persisted_invalid") from exc
++            pairs = {
++                (item["session_id"], item["source_event_id"])
++                for item in source_ref["raw_events"]
++            }
++            if type(event_ids) is not list or not all(
++                (session_id, event_id) in pairs for event_id in event_ids
++            ):
++                raise NightRunCoordinatorError("candidate.persisted_invalid")
+         write_key = payload.get("x_write_key")
+         if (
+             type(content) is not str
+@@ -1571,6 +1679,7 @@
+                     "source_session": session_id,
+                     "source_event_ids": event_ids,
+                     "source_digest": source_digest,
++                    **({"source_ref": source_ref} if source_ref is not None else {}),
+                 },
+             },
+             actor="lmc5:night",
+@@ -1620,6 +1729,35 @@
+                 type(exc).__name__,
+             )
+ 
++    async def _complete_legacy_source_ref(
++        self, payload: dict[str, Any], result: CuratedWriteResult
++    ) -> None:
++        """Add only a missing pointer after an unchanged legacy receipt replay."""
++        source = payload.get("source")
++        if (
++            type(source) is not dict or source.get("source_ref") is not None
++            or not self._x_result_is_complete(result) or self.bucket_manager is None
++        ):
++            return
++        bucket = await self.bucket_manager.get(str(result.bucket_id))
++        if bucket is None:
++            raise NightRunCoordinatorError("x.write_retryable")
++        metadata = bucket.get("metadata") or {}
++        if metadata.get("source_ref") is not None:
++            return
++        records = {}
++        for event_id in source["source_event_ids"]:
++            event_records, _unresolved = self._source_records(
++                EventIdentity(source["session_id"], event_id)
++            )
++            for record in event_records:
++                records[record.identity] = record
++        if not await self.bucket_manager.update(
++            str(result.bucket_id), actor="lmc5:source-ref",
++            source_ref=self._source_ref(tuple(records.values())),
++        ):
++            raise NightRunCoordinatorError("x.write_retryable")
++
+     async def _dispatch_y(
+         self,
+         record: CandidateRecord,
+@@ -1638,6 +1776,7 @@
+             self._defer(record, "y.relation_pair_unavailable", counts)
+             return
+         result = await self._write_x_payload(payload)
++        await self._complete_legacy_source_ref(payload, result)
+         if not self._x_result_is_complete(result):
+             raise NightRunCoordinatorError("y.source_write_retryable")
+         source_id = str(result.bucket_id)
+@@ -1714,6 +1853,7 @@
+             self._defer(record, "z.human_review_required", counts)
+             return
+         result = await self._write_x_payload(payload)
++        await self._complete_legacy_source_ref(payload, result)
+         if not self._x_result_is_complete(result):
+             raise NightRunCoordinatorError("z.source_write_retryable")
+         new_bucket = await self.bucket_manager.get(str(result.bucket_id))
+@@ -1807,6 +1947,7 @@
+             self._defer(record, "e.human_review_required", counts)
+             return
+         result = await self._write_x_payload(payload)
++        await self._complete_legacy_source_ref(payload, result)
+         if not self._x_result_is_complete(result):
+             raise NightRunCoordinatorError("e.source_write_retryable")
+         importance = draft.get("importance")
+diff --git a/memory_source_fidelity.py b/memory_source_fidelity.py
+new file mode 100644
+--- /dev/null
++++ b/memory_source_fidelity.py
+@@ -0,0 +1,231 @@
++"""Deterministic, deliberately limited checks for generated memory text.
++
++An empty result means only that these local lexical checks found no issue; it
++is not a semantic proof that a derivative is fully supported.
++"""
++
++from __future__ import annotations
++
++import json
++import re
++from collections.abc import Sequence
++from datetime import datetime, timedelta, timezone
++from typing import Any
++
++
++_ANIMAL_GROUPS = {
++    "dog": ("边境牧羊犬", "边牧", "法斗", "柯基", "金毛", "拉布拉多", "柴犬", "萨摩耶", "哈士奇", "阿拉斯加", "狗狗", "狗子", "狗", "犬"),
++    "cat": ("猫咪", "猫猫", "猫", "喵"),
++    "rabbit": ("兔子", "兔兔", "家兔"),
++    "bird": ("鹦鹉", "鸟儿", "小鸟"),
++    "fox": ("狐狸",),
++    "horse": ("马儿", "骏马", "一匹马"),
++    "pig": ("猪猪", "小猪", "家猪", "野猪"),
++    "cow": ("奶牛", "牛犊", "一头牛"),
++    "hamster": ("仓鼠",),
++    "turtle": ("乌龟", "海龟"),
++    "fish": ("金鱼", "小鱼", "鲤鱼"),
++}
++_COLOR_PATTERNS = (
++    ("red", re.compile(r"红(?:色|毛|棕|白|黑|陨石)")),
++    ("orange", re.compile(r"(?:橘|橙)(?:色|黄|白|猫)")),
++    ("yellow", re.compile(r"黄(?:色|毛|白|黑)")),
++    ("green", re.compile(r"绿(?:色|毛)")),
++    ("blue", re.compile(r"蓝(?:色|毛|灰)")),
++    ("purple", re.compile(r"紫(?:色|毛)")),
++    ("brown", re.compile(r"棕(?:色|白|黑|毛|褐)|咖啡色|奶咖色|巧克力色")),
++    ("black", re.compile(r"黑(?:色|白|棕|灰|毛|眼圈)")),
++    ("white", re.compile(r"白(?:色|毛|尾|爪|脸|肚|屁股|花|棕|黑)")),
++    ("gray", re.compile(r"灰(?:色|白|黑|毛)|银灰色")),
++)
++_NUMBER = re.compile(
++    r"(?:\d{4}[-/.年]\d{1,2}(?:[-/.月]\d{1,2}日?)?|"
++    r"\d+(?:\.\d+)?(?:岁|年|个月|月|天|日|次|只|张|个|条|分钟|小时)?|"
++    r"[零〇一二两三四五六七八九十百千万]+(?:岁|年|个月|月|天|日|次|只|张|个|条|分钟|小时))"
++)
++_CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
++_UNIT = {"十": 10, "百": 100, "千": 1000, "万": 10000}
++_NAMING = re.compile(r"(?:名叫|叫作|叫|名字是|名字叫|取名为|称为)\s*[「『“‘]?([\w\u4e00-\u9fff]{1,16})")
++_QUOTED_NAME = re.compile(r"[「『“‘]([\w\u4e00-\u9fff]{1,16})[」』”’]")
++_INCOMPLETE_MARKERS = (
++    "[source_incomplete]",
++    "[原文不完整]",
++    "[截断原文]",
++    "[summary_only]",
++)
++
++
++def _envelope_date(envelope: dict, payload: dict) -> str:
++    for value in (
++        envelope.get("speaker_date"),
++        payload.get("recordedAt"),
++        payload.get("ts"),
++        envelope.get("recordedAt"),
++        envelope.get("recorded_at"),
++    ):
++        if value is None or isinstance(value, bool):
++            continue
++        try:
++            if isinstance(value, (int, float)):
++                seconds = value / 1000 if value > 1e11 else value
++                moment = datetime.fromtimestamp(seconds, tz=timezone.utc)
++            else:
++                moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
++            if moment.tzinfo is None:
++                moment = moment.replace(tzinfo=timezone.utc)
++            return moment.astimezone(timezone(timedelta(hours=8))).date().isoformat()
++        except (ValueError, OverflowError, OSError):
++            continue
++    return ""
++
++
++def _envelope_text(envelope: dict) -> tuple[str, bool]:
++    payload = envelope.get("payload")
++    payload = payload if type(payload) is dict else envelope
++    if any(
++        obj.get("truncated") is True or obj.get("is_summary") is True
++        for obj in (envelope, payload)
++    ):
++        return "", False
++    spoken = next(
++        (payload[field] for field in ("text", "message", "content", "body")
++         if type(payload.get(field)) is str and payload[field].strip()),
++        "",
++    )
++    if not spoken:
++        return "", False
++    parts = [spoken]
++    source_date = _envelope_date(envelope, payload)
++    if source_date:
++        parts.append(source_date)
++    contexts = envelope.get("context_events", [])
++    if type(contexts) is not list:
++        return "", False
++    for context in contexts:
++        if type(context) is not dict:
++            return "", False
++        text, complete = _envelope_text(context)
++        if not complete:
++            return "", False
++        parts.append(text)
++    return "\n".join(parts), True
++
++
++def _dialogue_text(value: str) -> tuple[str, bool]:
++    stripped = value.strip()
++    if not stripped:
++        return "", False
++    try:
++        parsed: Any = json.loads(stripped)
++    except (json.JSONDecodeError, ValueError):
++        # A serialized event envelope cut off mid-JSON is not complete source.
++        if stripped.startswith("{") and '"payload"' in stripped:
++            return "", False
++        return stripped, True
++    if type(parsed) is not dict:
++        return stripped, True
++    return _envelope_text(parsed)
++
++
++def _chinese_number(value: str) -> int | None:
++    if not value:
++        return None
++    if all(char in _CN_DIGITS for char in value):
++        return int("".join(str(_CN_DIGITS[char]) for char in value))
++    total = section = number = 0
++    for char in value:
++        if char in _CN_DIGITS:
++            number = _CN_DIGITS[char]
++        elif char in _UNIT:
++            unit = _UNIT[char]
++            if unit == 10000:
++                section = (section + (number or 1)) * unit
++                total += section
++                section = number = 0
++            else:
++                section += (number or 1) * unit
++                number = 0
++        else:
++            return None
++    return total + section + number
++
++
++def _normalized_number(token: str) -> str:
++    date_match = re.fullmatch(r"(\d{4})[-/.年](\d{1,2})(?:[-/.月](\d{1,2})日?)?", token)
++    if date_match:
++        year, month, day = date_match.groups()
++        return f"{year}-{int(month):02d}" + (
++            f"-{int(day):02d}" if day is not None else ""
++        )
++    match = re.fullmatch(r"([零〇一二两三四五六七八九十百千万]+)(.*)", token)
++    if match:
++        number = _chinese_number(match.group(1))
++        if number is not None:
++            return f"{number}{match.group(2)}"
++    return token.replace("／", "/")
++
++
++def _animal_groups(text: str) -> set[str]:
++    return {
++        group
++        for group, terms in _ANIMAL_GROUPS.items()
++        if any(term in text for term in terms)
++    }
++
++
++def _colors(text: str) -> set[str]:
++    found: set[str] = set()
++    for color, pattern in _COLOR_PATTERNS:
++        if pattern.search(text):
++            found.add(color)
++    return found
++
++
++def _numbers(text: str) -> set[str]:
++    return {_normalized_number(match.group(0)) for match in _NUMBER.finditer(text)}
++
++
++def _named_entities(text: str) -> set[str]:
++    return {match.group(1).rstrip("，。！？；：、") for pattern in (_NAMING, _QUOTED_NAME) for match in pattern.finditer(text)}
++
++
++def validate_derivative(text: str, originals: Sequence[str]) -> list[str]:
++    """Return deterministic support issues for animal, color, number and name facts.
++
++    ``originals`` must contain full raw message text or full serialized LMC-5
++    event envelopes. Missing, malformed or explicitly incomplete source is
++    reported as insufficient evidence. No model or paid service is called.
++    """
++
++    if type(text) is not str or not text.strip():
++        return ["derivative_missing"]
++    if isinstance(originals, (str, bytes)) or not isinstance(originals, Sequence) or not originals:
++        return ["source_missing"]
++    source_parts: list[str] = []
++    for original in originals:
++        if type(original) is not str or any(marker in original.lower() for marker in _INCOMPLETE_MARKERS):
++            return ["source_incomplete"]
++        part, complete = _dialogue_text(original)
++        if not complete or not part.strip():
++            return ["source_incomplete"]
++        source_parts.append(part)
++    source = "\n".join(source_parts)
++    issues: list[str] = []
++    unsupported_animals = _animal_groups(text) - _animal_groups(source)
++    if unsupported_animals:
++        issues.append("unsupported_animal:" + ",".join(sorted(unsupported_animals)))
++    unsupported_colors = _colors(text) - _colors(source)
++    if unsupported_colors:
++        issues.append("unsupported_color:" + ",".join(sorted(unsupported_colors)))
++    unsupported_numbers = _numbers(text) - _numbers(source)
++    if unsupported_numbers:
++        issues.append("unsupported_number:" + ",".join(sorted(unsupported_numbers)))
++    unsupported_names = {
++        name for name in _named_entities(text) if name not in source
++    }
++    if unsupported_names:
++        issues.append("unsupported_named_entity:" + ",".join(sorted(unsupported_names)))
++    return issues
++
++
++__all__ = ["validate_derivative"]
+
+--- a/dehydrator.py
++++ b/dehydrator.py
+@@ -39,6 +39,8 @@
+ from e_axis_shadow import strict_json_loads
+ from utils import count_tokens_approx
+ from redact import redact_embedding_input  # 出本地去外部 LLM 前脱敏
++
++from source_summary_fidelity import SUMMARY_FACT_RULES, guarded_summary
+ 
+ logger = logging.getLogger("ombre_brain.dehydrator")
+ 
+@@ -433,6 +435,8 @@
+ # --- 脱水提示词：指导廉价 LLM 压缩信息 ---
+ DEHYDRATE_PROMPT_PREVIOUS = '你是一个信息压缩专家。请将以下内容脱水为紧凑摘要。\n\n压缩规则：\n1. 提取所有核心事实，去除冗余修饰和重复\n2. 保留最新的情绪状态和态度\n3. 保留所有待办/未完成事项\n4. 关键数字、日期、名称必须保留\n5. 目标压缩率 > 70%\n6. core_facts 用「时间 + 主体 + 事件/动作 + 对象 + 影响」写清楚，避免“讨论了X”“提到Y”这类空摘要\n7. 如果原文没有明确时间，就保留可见时间线索（如“上一窗”“5.21上午”）；不要编日期\n8. summary 必须落到具体事件，不写泛化主题词；示例：“5.21朝灯定下海马体减噪三层方案”优于“讨论记忆库优化”\n9. 情绪脚手架字段只在原文明确支持时输出；纯工程笔记类内容不要产出这些字段，不许为了填字段编需求/痛点\n10. 如果原文是 feel/底色/哥哥第一人称感受沉淀，省略全部情绪脚手架字段；feel 只保留事实、情绪和沉淀本身\n11. sample_voice 是唯一逐字引用字段，必须来自原文里朝灯的原话；其他情绪脚手架字段是提炼解读，不能写成可逐字引述的事实\n\n输出格式（纯 JSON，无其他内容；可选字段不适用时整个 key 省略，不要输出 null/空串/空数组）：\n{\n  "core_facts": ["事实1", "事实2"],\n  "emotion_state": "当前情绪关键词",\n  "body_signal": "可选，≤30字：身体感/气压/紧绷或松下来的方式",\n  "unspoken_need": "可选，≤30字：当时真正需要、但没说出口的回应",\n  "sore_point": "可选，≤30字：容易被碰痛的点",\n  "response_rule": "可选，≤40字：下次召回这条该怎么靠近",\n  "do_not": ["可选，最多3条，每条≤20字：明确不要怎么说/做"],\n  "sample_voice": ["可选，最多3条：素材里逐字出现的朝灯原话"],\n  "todos": ["待办1", "待办2"],\n  "keywords": ["关键词1", "关键词2"],\n  "summary": "50字以内的核心总结"\n}'
+ DEHYDRATE_PROMPT = DEHYDRATE_PROMPT_PREVIOUS + '\n\n来源与说话者规则（必须保真）：\n1. 原始证据、原始对话、原话留痕中，每一段的说话者标签优先；标题、整理摘要和模型归纳不是当事人原话。候选原话未独立回查时，不得将其升级为独立核实的事实。\n2. 对话里的我/你必须逐段按说话者解释：朝灯/user说的我=朝灯、你=该段接收者；哥哥/Claude说的我=哥哥、你=朝灯；小卷、DSF、哈基米等说的我=该说话者。不能把所有第一人称统一映射到朝灯，也不能把其他AI写的体验算给哥哥。\n3. 每条事实分清说话者、执行动作的人、对象、被讨论的第三人。阿禾等讨论对象不自动成为说话者。被谁批评、谁批评谁，不能交换。\n4. 提议、建议、询问、授权、选择、承诺、执行中、已完成分别保留；你决定不等于朝灯本人选择了助手随后提出的具体方案。应该、可能、如果、确认后等条件或推测不能改成已经发生。\n5. sample_voice只能逐字摘取带明确朝灯/user标签的原话；哥哥或其他AI的原话、转述、整理摘要和推测不放进sample_voice。找不到朝灯的明确原话时省略此字段，绝不补造。\n6. 虚构剧情始终标明是剧情方案，不能当作现实经历；不得为了摘要完整而把第三人的发言、AI的感觉或AI提出的方案写成朝灯本人说过、感到或已经同意。\n7. 来源不足就只保留有依据的部分并保留不确定性；不要从旧摘要循环提炼出新的确定事实。输出必须是完整合法JSON，字符串内部使用正确转义或中文引号。\n'
++
++DEHYDRATE_PROMPT += SUMMARY_FACT_RULES
+ SUMMARY_SOURCE_ATTRIBUTION_VERSION = 2
+ 
+ 
+@@ -1852,16 +1856,16 @@
+         if not write_cache:
+             cached = self._get_read_only_memory_summary(content)
+             if cached:
+-                return _result(self._format_output(cached, metadata), "cached")
++                return _result(self._format_output(_summary_user_quotes(cached, content), metadata), "cached")
+             cached = self._get_recall_cached_summary(content)
+             if cached:
+                 self._set_read_only_memory_summary(content, cached)
+-                return _result(self._format_output(cached, metadata), "cached")
++                return _result(self._format_output(_summary_user_quotes(cached, content), metadata), "cached")
+             cached = self._get_v1_recall_cached_summary(content)
+             if cached:
+                 self._set_recall_cached_summary(content, cached)
+                 self._set_read_only_memory_summary(content, cached)
+-                return _result(self._format_output(cached, metadata), "cached")
++                return _result(self._format_output(_summary_user_quotes(cached, content), metadata), "cached")
+ 
+         cached = None
+         if write_cache:
+@@ -1884,7 +1888,7 @@
+             if not write_cache:
+                 self._set_recall_cached_summary(content, cached)
+                 self._set_read_only_memory_summary(content, cached)
+-            return _result(self._format_output(cached, metadata), "cached")
++            return _result(self._format_output(_summary_user_quotes(cached, content), metadata), "cached")
+         # --- API dehydration (no local fallback) ---
+         # --- API 脱水（无本地降级）---
+         if not self.api_available:
+@@ -2951,6 +2955,7 @@
+ 
+ 
+ def _summary_user_quotes(summary: str, source: str) -> str:
++    summary = guarded_summary(summary, source)
+     import re
+     candidate = summary.strip()
+     if candidate.startswith("```") and "\n" in candidate:
