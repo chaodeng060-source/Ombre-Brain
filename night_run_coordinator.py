@@ -1482,6 +1482,15 @@ class NightRunCoordinator:
             or type(write_key) is not str
         ):
             raise NightRunCoordinatorError("candidate.persisted_invalid")
+        # Persisted drafts from before the proposer fix must pass the same
+        # source check before they can write, including legacy queued rows.
+        from memory_source_fidelity import validate_derivative
+        originals = [
+            self._slim_proposer_text(EventIdentity(session_id, event_id))[0]
+            for event_id in event_ids
+        ]
+        if validate_derivative(title + "\n" + content, originals):
+            raise NightRunCoordinatorError("candidate.source_fidelity")
         return await self.curated.write(
             idempotency_key=write_key,
             content=content,

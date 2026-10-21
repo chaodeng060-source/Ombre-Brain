@@ -454,6 +454,17 @@ def _real_write_case(bucket_mgr):
 
 
 @pytest.mark.asyncio
+async def test_legacy_persisted_bad_species_cannot_bypass_proposer_fix(bucket_mgr):
+    coordinator, _, payload = _real_write_case(bucket_mgr)
+    payload['source'].pop('source_ref', None)
+    payload['draft']['title'] = '九岁猫'
+    payload['draft']['content'] = '咖啡是九岁多的黑白猫。'
+    with pytest.raises(Exception, match='candidate.source_fidelity'):
+        await coordinator._write_x_payload(payload)
+    assert coordinator.curated.embedding_engine.stored == set()
+
+
+@pytest.mark.asyncio
 async def test_new_bucket_has_compound_source_ref_in_first_atomic_create(bucket_mgr, monkeypatch):
     coordinator, _, payload = _real_write_case(bucket_mgr)
     original_create = bucket_mgr.create

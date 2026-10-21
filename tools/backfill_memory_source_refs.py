@@ -26,6 +26,13 @@ def run(plan: dict, apply: bool) -> dict:
               'written': 0, 'pending': [], 'raw_event_mutations': 0, 'body_mutations': 0}
     backup = Path('/snapshots/memory-fidelity-20261021/buckets')
     prepared = []
+    supplied_events = plan.get('source_events') or []
+    recovered = {e['event_id']: e for e in supplied_events}
+    recovered_refs = {}
+    if supplied_events and apply:
+        from repair_memory_fidelity import mirror_sources
+        mirrored = mirror_sources(root, supplied_events)
+        recovered_refs = {r['source_event_id']: r for r in mirrored['raw_events']}
     with sqlite3.connect(f'file:{ledger}?mode=ro', uri=True) as db:
         db.row_factory = sqlite3.Row
         by_event = {}
@@ -48,13 +55,21 @@ def run(plan: dict, apply: bool) -> dict:
             continue
         ids = post.get('source_event_ids') or []
         refs = []
+        recovered_only = False
         for eid in ids:
             row = by_identity.get((post.get('source_session'), eid))
             if row is None:
                 matches = by_event.get(eid, [])
                 row = matches[0] if len(matches) == 1 else None
             if row is None:
-                break
+                if eid not in recovered:
+                    break
+                recovered_only = True
+                if apply:
+                    refs.append(recovered_refs[eid])
+                else:
+                    refs.append({'source_event_id': eid})
+                continue
             refs.append({'row_id': row['id'], 'session_id': row['session_id'],
                          'source_event_id': row['source_event_id'],
                          'payload_digest': row['payload_digest']})
@@ -62,7 +77,11 @@ def run(plan: dict, apply: bool) -> dict:
             result['pending'].append({'id': bid, 'source_path': record['source_path'],
                                       'event_ids': ids, 'reason': 'declared_original_missing_or_ambiguous'})
             continue
-        source_ref = {'database': str(ledger), 'table': 'raw_events', 'raw_events': refs}
+        if recovered_only and any(eid not in recovered for eid in ids):
+            result['pending'].append({'id': bid, 'reason': 'mixed_original_stores_need_explicit_review'})
+            continue
+        source_ref = {'database': str(root / 'provenance/raw_events.sqlite3') if recovered_only else str(ledger),
+                      'table': 'raw_events', 'raw_events': refs}
         result['resolved'] += 1
         if apply:
             prepared.append((bid, path, hashlib.sha256(path.read_bytes()).hexdigest(), source_ref))

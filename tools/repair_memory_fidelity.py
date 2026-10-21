@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -42,21 +43,46 @@ def mirror_sources(root: Path, originals: list[dict]) -> dict:
             payload_digest TEXT NOT NULL, recorded_at TEXT NOT NULL,
             UNIQUE(session_id, source_event_id, payload_digest))''')
         db.execute('CREATE INDEX IF NOT EXISTS raw_events_event_id ON raw_events(source_event_id)')
+        db.execute('''CREATE TABLE IF NOT EXISTS raw_event_origins (
+            raw_event_id INTEGER NOT NULL, origin TEXT NOT NULL,
+            locator TEXT NOT NULL, source_session TEXT NOT NULL,
+            UNIQUE(raw_event_id,origin,locator,source_session))''')
+        db.execute('''CREATE TABLE IF NOT EXISTS raw_event_assets (
+            raw_event_id INTEGER NOT NULL, sha256 TEXT NOT NULL, path TEXT NOT NULL,
+            UNIQUE(raw_event_id,sha256))''')
         for event in originals:
             eid, text = event['event_id'], event['text']
-            if not eid or not text or event.get('sender') in {None, '', 'unknown'}:
+            if not eid or (not text and not event.get('attachments')) or event.get('sender') in {None, '', 'unknown'}:
                 raise ValueError('original event identity or author missing')
             session = event.get('session_id') or event.get('session_ref') or event.get('conv_id') or eid
             payload = json.dumps({k: event.get(k) for k in (
                 'event_id', 'sender', 'text', 'conv_id', 'recorded_at', 'origin', 'origin_locator'
             )}, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
             sha = digest(payload)
-            db.execute('INSERT OR IGNORE INTO raw_events(session_id,source_event_id,payload,payload_digest,recorded_at) VALUES(?,?,?,?,?)',
-                       (session, eid, payload, sha, event.get('recorded_at') or ''))
-            rowid = db.execute('SELECT id FROM raw_events WHERE session_id=? AND source_event_id=? AND payload_digest=?',
-                               (session, eid, sha)).fetchone()[0]
-            refs.append({'row_id': rowid, 'session_id': session, 'source_event_id': eid,
-                         'payload_digest': sha, 'text_sha256': digest(text)})
+            existing = None
+            for old in db.execute('SELECT id,session_id,payload,payload_digest FROM raw_events WHERE source_event_id=?', (eid,)):
+                value = json.loads(old[2])
+                if value.get('text') == text and value.get('sender') == event['sender']:
+                    existing = old
+                    break
+            if existing:
+                rowid, stored_session, _, sha = existing
+            else:
+                db.execute('INSERT OR IGNORE INTO raw_events(session_id,source_event_id,payload,payload_digest,recorded_at) VALUES(?,?,?,?,?)',
+                           (session, eid, payload, sha, event.get('recorded_at') or ''))
+                rowid = db.execute('SELECT id FROM raw_events WHERE session_id=? AND source_event_id=? AND payload_digest=?',
+                                   (session, eid, sha)).fetchone()[0]
+                stored_session = session
+            db.execute('INSERT OR IGNORE INTO raw_event_origins(raw_event_id,origin,locator,source_session) VALUES(?,?,?,?)',
+                       (rowid, event.get('origin') or '', event.get('origin_locator') or '', session))
+            ref = {'row_id': rowid, 'session_id': stored_session, 'source_event_id': eid,
+                   'payload_digest': sha, 'text_sha256': digest(text)}
+            for asset in event.get('attachments') or []:
+                db.execute('INSERT OR IGNORE INTO raw_event_assets(raw_event_id,sha256,path) VALUES(?,?,?)',
+                           (rowid, asset['sha256'], asset['path']))
+            if event.get('attachments'):
+                ref['assets'] = event['attachments']
+            refs.append(ref)
     path.chmod(0o600)
     return {'database': str(path), 'table': 'raw_events', 'raw_events': refs}
 
@@ -114,7 +140,7 @@ async def run(plan: dict, apply: bool) -> dict:
     if len({r['id'] for r in records}) != len(records):
         raise ValueError('duplicate targets')
     options = candidate_options(root, {r.get('curated_write_key') for r in records if r.get('curated_write_key')})
-    prepared, conflicts = [], []
+    prepared, conflicts, annotated_existing = [], [], []
     ledger_path = root / '.curated_writes.db'
     with sqlite3.connect(f'file:{ledger_path}?mode=ro', uri=True) as db:
         db.row_factory = sqlite3.Row
@@ -131,28 +157,36 @@ async def run(plan: dict, apply: bool) -> dict:
                 conflicts.append({'id': row['id'], 'reason': 'body_changed_since_review'})
                 continue
             if post.get('e_authored_by') and row['body'] != post.content:
+                annotation = post.get('fidelity_source_correction') or {}
+                if annotation.get('accepted_content_sha256') == digest(row['body']):
+                    annotated_existing.append(row['id'])
+                    continue
                 conflicts.append({'id': row['id'], 'reason': 'primary_authored_E_requires_successor'})
                 continue
             if row.get('review', {}).get('verdict') != 'accept' or not row.get('originals'):
                 raise ValueError('unreviewed correction')
-            opt = options.get(post.get('curated_write_key'))
+            opt = row.get('original_options') or options.get(post.get('curated_write_key'))
             receipt = None
             if post.get('curated_write_key'):
                 receipt = db.execute('SELECT * FROM curated_writes WHERE idempotency_key=? AND bucket_id=?',
                                      (post['curated_write_key'], row['id'])).fetchone()
-                if receipt:
+                if receipt and row['body'] != post.content:
                     if not opt:
                         conflicts.append({'id': row['id'], 'reason': 'original_curated_options_missing'})
                         continue
                     opt = CuratedWriteCoordinator._normalize_options(opt)
                     old_digest = _payload_digest(content=post.content, vector_policy=receipt['vector_policy'], bucket_options=opt)
                     if old_digest != receipt['payload_sha256']:
-                        conflicts.append({'id': row['id'], 'reason': 'original_curated_options_mismatch'})
-                        continue
+                        original_request = row.get('receipt_original_request_content')
+                        if not original_request or _payload_digest(content=original_request,
+                                vector_policy=receipt['vector_policy'], bucket_options=opt) != receipt['payload_sha256']:
+                            conflicts.append({'id': row['id'], 'reason': 'original_curated_options_mismatch'})
+                            continue
             prepared.append((row, path, post, opt, dict(receipt) if receipt else None))
     result = {'status': 'dry-run', 'targets': len(records), 'prepared': len(prepared),
               'conflicts': conflicts, 'applied': 0, 'changed_bodies': 0, 'summaries_rebuilt': 0,
               'cache_rows_removed': 0, 'embedding_requests': 0}
+    result['annotated_existing'] = annotated_existing
     if not apply or not prepared:
         return result
 
@@ -167,6 +201,21 @@ async def run(plan: dict, apply: bool) -> dict:
     if not engine.enabled:
         raise RuntimeError('embedding engine disabled')
     receipts_path = backup / 'applied.jsonl'
+    assets_root = root / 'provenance/assets'
+    if plan.get('source_assets'):
+        assets_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for asset in plan.get('source_assets') or []:
+        raw = base64.b64decode(asset['base64'], validate=True)
+        if digest(raw) != asset['sha256']:
+            raise ValueError('source image checksum mismatch')
+        path = assets_root / asset['filename']
+        if not path.resolve().is_relative_to(assets_root.resolve()):
+            raise ValueError('source image target mismatch')
+        if path.exists():
+            if digest(path.read_bytes()) != asset['sha256']:
+                raise ValueError('stored original image differs')
+        else:
+            path.write_bytes(raw); path.chmod(0o600)
     for row, path, old_post, opt, ledger in prepared:
         bid = row['id']
         changed = row['body'] != old_post.content
@@ -199,13 +248,14 @@ async def run(plan: dict, apply: bool) -> dict:
             current['fidelity_review_source'] = row['review']['artifact']
             current['dehydrated_summary'] = summary
             current['dehydrated_content_hash'] = digest(row['body'])
-            current['name'] = row['name']
+            if row.get('source_basis') != 'primary_document':
+                current['name'] = row['name']
             source_text = '\n'.join(e['text'] for e in row['originals'])
             structural = [t for t in current.get('tags', []) if t in {'lmc5', 'night', 'event', 'relationship_moment', 'fact', 'preference', 'decision'} or (isinstance(t, str) and t in source_text)]
             if 'lmc5' in current.get('tags', []):
                 current['tags'] = list(dict.fromkeys(structural + row['keywords']))
             current['retrieval_keys'] = row['keywords']
-            if ledger:
+            if ledger and changed:
                 new_hash = _payload_digest(content=row['body'], vector_policy=ledger['vector_policy'], bucket_options=opt)
                 current['curated_payload_sha256'] = new_hash
             audit_id = manager.audit_log.begin(actor='xiaojuan:owner-source-fidelity-repair', action='update',
@@ -215,7 +265,7 @@ async def run(plan: dict, apply: bool) -> dict:
             if vector is not None:
                 engine._store_embedding(bid, vector)
             manager._atomic_write_post(path, current, bm25_content_changed=True)
-            if ledger:
+            if ledger and changed:
                 with sqlite3.connect(ledger_path) as db:
                     db.execute('UPDATE curated_writes SET payload_sha256=?,updated_at=? WHERE idempotency_key=? AND bucket_id=?',
                                (new_hash, now, ledger['idempotency_key'], bid))

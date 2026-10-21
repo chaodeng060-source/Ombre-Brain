@@ -40,3 +40,16 @@ def test_pointer_is_small_not_embedded_original_session(tmp_path):
     pointer = json.dumps(refs, ensure_ascii=False)
     assert len(pointer) < 800
     assert text not in pointer
+
+
+def test_second_source_locator_does_not_copy_the_same_original_again(tmp_path):
+    first = {'event_id': 'one-original', 'session_id': 'first-source-session',
+             'sender': 'user', 'text': '咖啡是边牧。', 'origin': 'audited-raw'}
+    second = dict(first, session_id='second-source-session', origin='retained-raw',
+                  origin_locator='/original/raw_events.sqlite3#one-original')
+    one = maintenance.mirror_sources(tmp_path, [first])
+    two = maintenance.mirror_sources(tmp_path, [second])
+    assert one == two
+    with sqlite3.connect(one['database']) as db:
+        assert db.execute('SELECT count(*) FROM raw_events').fetchone()[0] == 1
+        assert db.execute('SELECT count(*) FROM raw_event_origins').fetchone()[0] == 2
