@@ -67,6 +67,7 @@ from review_queue import (
 )
 from redact import redact_obj
 from memory_omission_policy import filter_memory_text
+from memory_input_policy import auxiliary_reason
 from snapshot_manager import SnapshotManager, SnapshotResult
 from bucket_manager import bucket_revision_hash
 from timeline_axis import run_timeline_sweep
@@ -292,6 +293,10 @@ def _slim_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 def _memory_payload(raw: dict[str, Any]) -> dict[str, Any]:
     """Project memory eligibility without changing append-only chat evidence."""
+    if auxiliary_reason(raw):
+        # Keep the raw event and source pointers. Auxiliary generation must not
+        # spend a proposer call or become evidence of something Chaodeng said.
+        return {**raw, "text": ""}
     if raw.get("sender") in {"user", "human", "朝灯"}:
         return raw
     text = raw.get("text")
