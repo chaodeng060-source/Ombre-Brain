@@ -102,7 +102,9 @@ _CONTRACT_REPAIR_DETAILS = {
     ),
     "provenance_fidelity": (
         "Remove or correct every animal, color, number, date, and named-entity "
-        "claim that the original message does not support. If the original is "
+        "claim that the original message does not support. Omit unsupported "
+        "claims silently; do not replace them with source-audit commentary or "
+        "explanations of missing evidence. If the original is "
         "missing, summarized, or truncated, emit candidates:[]."
     ),
     "provenance_source": (
@@ -648,7 +650,15 @@ class StrictOmbreProposer:
             "summarize, translate, normalize, splice, or invent evidence. "
             "The title and content must stay within facts stated by the full "
             "original message. Never guess or change names, animal species, "
-            "colors, numbers, or dates. A literal evidence quote alone does "
+            "colors, numbers, dates, speakers, or action ownership. Preserve "
+            "speaker-attributed plans as plans. Omit missing or unsupported "
+            "claims silently. Never add editorial source audits, explanations "
+            "of absent quotes, or verification/completion caveats to any "
+            "memory field. Audit explanations belong outside recalled memory. "
+            "Absence from a snippet is not a global denial of promises, "
+            "feelings, or completion. If the original conversation itself "
+            "discusses an audit, preserve that speech with its attribution. "
+            "A literal evidence quote alone does "
             "not support other claims. If source text is incomplete or only a "
             "summary, return candidates:[]. "
             "relation_hints must be empty when allowed_relation_targets is "

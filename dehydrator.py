@@ -40,7 +40,7 @@ from e_axis_shadow import strict_json_loads
 from utils import count_tokens_approx
 from redact import redact_embedding_input  # 出本地去外部 LLM 前脱敏
 
-from source_summary_fidelity import SUMMARY_FACT_RULES, guarded_summary
+from source_summary_fidelity import MEMORY_PROSE_RULES, SUMMARY_FACT_RULES, guarded_summary
 
 logger = logging.getLogger("ombre_brain.dehydrator")
 
@@ -513,6 +513,8 @@ importance: 1-10，根据内容重要程度判断
 valence: 0~1（0=消极, 0.5=中性, 1=积极）
 arousal: 0~1（0=平静, 0.5=普通, 1=激动）"""
 
+DIGEST_PROMPT += MEMORY_PROSE_RULES
+
 
 # --- Grow write preprocessor: make each stored fact self-contained ---
 # --- grow 写入预处理：把待写事实改成可脱离上下文理解的自包含文本 ---
@@ -557,6 +559,8 @@ MERGE_PROMPT = """你是一个信息合并专家。请将旧记忆与新内容�
 7. 对健康、情绪、承诺、关系史等语义上可能是并行情境而非纠错的内容，不能确定时保留为按时间排列的两条事实，不要臆断一个赢家
 
 直接输出合并后的文本，不要加额外说明。"""
+
+MERGE_PROMPT += MEMORY_PROSE_RULES
 
 
 # --- Auto-tagging prompt: analyze content for domain and emotion coords ---
@@ -1899,13 +1903,15 @@ class Dehydrator:
 
     async def _compute_recall_summary(self, snapshot: _RecallSummaryRequest, *, background: bool) -> str:
         try:
+            request = json.loads(snapshot.request_json)
             async with self._recall_summary_backfill_sem if background else nullcontext():
                 self._log_recall_summary("provider_start", snapshot.key)
-                response = await snapshot.client.chat.completions.create(**json.loads(snapshot.request_json))
+                response = await snapshot.client.chat.completions.create(**request)
             result = response.choices[0].message.content if response.choices else ""
             result = self._normalize_dehydration_summary(result)
             if not self._is_usable_dehydration_summary(result):
                 raise RuntimeError("脱水 API 返回空或过短摘要")
+            result = guarded_summary(result, request["messages"][1]["content"])
             # Only the disposable sidecar is written. Never write the legacy DB
             # or a bucket; the same frozen key labels both request and result.
             self._set_recall_cached_summary("", result, snapshot=snapshot)

@@ -53,6 +53,15 @@ _INCOMPLETE_MARKERS = (
     "[截断原文]",
     "[summary_only]",
 )
+# Deliberately narrow source-audit constructions, not ordinary denials or
+# uncertainty. Check generated clauses against original dialogue; never strip
+# text or treat an audit phrase in metadata as original speech.
+_EDITORIAL_SOURCE_AUDIT = re.compile(
+    r"(?:(?:原话|原文|原始对话|来源文本)(?:中|里)?(?:并|也)?"
+    r"(?:没有|未|无法|不能|不足以)"
+    r"|(?:不能|无法|不足以)(?:据此|由此)(?:确认|认定|推断|证明))"
+    r"[^。！？；\n]*"
+)
 
 
 def _envelope_date(envelope: dict, payload: dict) -> str:
@@ -190,7 +199,7 @@ def _named_entities(text: str) -> set[str]:
 
 
 def validate_derivative(text: str, originals: Sequence[str]) -> list[str]:
-    """Return deterministic support issues for animal, color, number and name facts.
+    """Check bounded fact classes and added source-audit commentary.
 
     ``originals`` must contain full raw message text or full serialized LMC-5
     event envelopes. Missing, malformed or explicitly incomplete source is
@@ -211,6 +220,11 @@ def validate_derivative(text: str, originals: Sequence[str]) -> list[str]:
         source_parts.append(part)
     source = "\n".join(source_parts)
     issues: list[str] = []
+    for match in _EDITORIAL_SOURCE_AUDIT.finditer(text):
+        clause = match.group(0).rstrip(' \t\r\"\'”’」』）)]')
+        if not any(clause in part for part in source_parts):
+            issues.append("unsupported_editorial_note")
+            break
     unsupported_animals = _animal_groups(text) - _animal_groups(source)
     if unsupported_animals:
         issues.append("unsupported_animal:" + ",".join(sorted(unsupported_animals)))

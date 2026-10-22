@@ -3,12 +3,20 @@ from __future__ import annotations
 
 import json
 
+MEMORY_PROSE_RULES = (
+    '\n记忆正文和摘要只描述原话支持的事实、感受和注明说话者的计划。'
+    '缺失或无依据的说法直接省略，不附加来源审校、证据不足或完成状态核验的解释。'
+    '这类审校解释只能放在记忆之外的独立诊断/审计信息中，不进入本次记忆输出的任何字段。'
+    '片段未提及某事，不代表从未承诺、没有感情或事情没有完成。'
+    '若原对话本就在讨论审校，按原说话者归属保留实际说过的审校内容。\n'
+)
+
 SUMMARY_FACT_RULES = (
     '\n事实保真：姓名、动物名、物种、颜色、数字、说话者与动作归属只能取自本次原话。'
     '同名对象不自动合并；狗不能写成猫；提议、推测不能写成既成事实。'
     '摘要的每条事实直接对照原话，不以旧摘要或改写正文作为独立证据。'
     '没有依据的具体属性省略，不补猜，不编造情绪需求。\n'
-)
+) + MEMORY_PROSE_RULES
 
 
 def guarded_summary(summary: str, source: str) -> str:
@@ -26,7 +34,11 @@ def guarded_summary(summary: str, source: str) -> str:
     except (TypeError, ValueError):
         parsed = summary
     if isinstance(parsed, dict):
-        keys = ('core_facts', 'summary', 'keywords', 'todos', 'sample_voice')
+        keys = (
+            'core_facts', 'summary', 'keywords', 'todos', 'sample_voice',
+            'emotion_state', 'body_signal', 'unspoken_need', 'sore_point',
+            'response_rule', 'do_not',
+        )
         claims = '\n'.join(
             item
             for key in keys
