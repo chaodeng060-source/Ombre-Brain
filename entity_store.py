@@ -820,6 +820,38 @@ class EntityStore:
     def canonicalize_query(self, query: str) -> str:
         return self.resolve_query(query).canonical_query
 
+    def catalog(self, entity_type: str = "person") -> list[EntityRecord]:
+        """Read declared identities and aliases without inventing new ones."""
+        self._validate_type(entity_type)
+        try:
+            conn = self._connect_read()
+        except (OSError, sqlite3.Error, EntityStoreError):
+            return []
+        try:
+            rows = conn.execute(
+                """SELECT e.entity_id, e.canonical_name, e.entity_type, a.alias
+                     FROM entities e LEFT JOIN entity_aliases a
+                       ON e.entity_id = a.entity_id
+                    WHERE e.entity_type = ?
+                    ORDER BY e.canonical_norm, e.entity_id, a.alias_norm""",
+                (entity_type,),
+            ).fetchall()
+            records: dict[str, dict] = {}
+            for row in rows:
+                item = records.setdefault(row["entity_id"], {
+                    "entity_id": row["entity_id"],
+                    "canonical_name": row["canonical_name"],
+                    "entity_type": row["entity_type"], "aliases": [],
+                })
+                if row["alias"]:
+                    item["aliases"].append(row["alias"])
+            return [EntityRecord(**{**item, "aliases": tuple(item["aliases"])})
+                    for item in records.values()]
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+
     def linked_bucket_ids(
         self,
         query: str | None = None,
@@ -862,6 +894,65 @@ class EntityStore:
             return []
         finally:
             conn.close()
+
+    def linked_sources(self, entity_ids: Iterable[str] | None = None) -> dict[str, str]:
+        """One read-only snapshot of linked bodies, avoiding one DB open per hit."""
+        ids = None if entity_ids is None else sorted(set(
+            [entity_ids] if isinstance(entity_ids, str) else entity_ids
+        ))
+        if ids == []:
+            return {}
+        try:
+            conn = self._connect_read()
+        except (OSError, sqlite3.Error, EntityStoreError):
+            return {}
+        try:
+            where = " WHERE entity_id IN (" + ",".join("?" for _ in ids) + ")" if ids else ""
+            rows = conn.execute(
+                "SELECT bucket_id, content_sha256 FROM bucket_entities" + where,
+                tuple(ids or ()),
+            ).fetchall()
+            result, invalid = {}, set()
+            for row in rows:
+                key, digest = row["bucket_id"], row["content_sha256"]
+                if key in result and result[key] != digest:
+                    invalid.add(key)
+                result[key] = digest
+            return {key: value for key, value in result.items() if key not in invalid}
+        except sqlite3.Error:
+            return {}
+        finally:
+            conn.close()
+
+    def refresh_declared_links(self, records: Sequence[tuple[str, str]]) -> int:
+        """Batch-rebuild links using only names already declared in this vault."""
+        if not records:
+            return 0
+        conn = self._connect_write()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            catalog = self._alias_catalog(conn)
+            for bucket_id, content in records:
+                mentions = self._select_mentions(_normalize_text(content), catalog) if content.strip() else []
+                ids = set()
+                for _start, _end, _alias, rows in mentions:
+                    owners = {row["entity_id"] for row in rows}
+                    if len(owners) == 1:
+                        ids.update(owners)
+                conn.execute("DELETE FROM bucket_entities WHERE bucket_id = ?", (bucket_id,))
+                digest = content_sha256(content)
+                conn.executemany(
+                    "INSERT INTO bucket_entities (bucket_id, entity_id, content_sha256, linked_at) VALUES (?, ?, ?, ?)",
+                    [(bucket_id, entity_id, digest, _now()) for entity_id in sorted(ids)],
+                )
+            conn.execute("COMMIT")
+            return len(records)
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+            self._enforce_write_modes()
 
     def link_is_current(self, bucket_id: str, content: str) -> bool:
         """Return true only when the bucket has links for this exact content."""

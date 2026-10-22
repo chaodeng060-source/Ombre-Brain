@@ -525,7 +525,12 @@ def test_openai_provider_can_request_strict_non_thinking_json() -> None:
 
     provider("strict prompt")
 
-    assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
+    # Both supported runtimes explicitly disable thinking; the newer NAS
+    # provider additionally supplies its compatible reasoning-effort field.
+    assert captured["extra_body"] in (
+        {"thinking": {"type": "disabled"}},
+        {"thinking": {"type": "disabled"}, "reasoning_effort": "none"},
+    )
     assert captured["response_format"] == {"type": "json_object"}
 
 

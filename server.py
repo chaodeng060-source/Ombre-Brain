@@ -94,6 +94,7 @@ from saga_engine import SagaEngine
 from sense_tagger import detect_senses, union_senses
 from embedding_engine import EmbeddingEngine
 from entity_store import EntityStore, entity_mention_present
+from people_memory import build_people_cards, evidence_ranked_ids, wants_people_profile
 from import_memory import ImportEngine
 from intent_recall import bucket_intent_score_multiplier, resolve_intent_recall_policy
 from fact_conflicts import build_supersedes_audit
@@ -1063,6 +1064,8 @@ def _is_main_recall_bucket(bucket: dict) -> bool:
     if not isinstance(bucket, dict):
         return False
     metadata = bucket.get("metadata", {}) or {}
+    if metadata.get("exact_duplicate_of"):
+        return False
     if str(metadata.get("type") or "").strip().lower() == "archived":
         return False
 
@@ -3876,6 +3879,8 @@ def _passes_merge_candidate_filters(
     incoming_chord_tag: str = "",
 ) -> bool:
     meta = bucket.get("metadata", {}) or {}
+    if meta.get("exact_duplicate_of"):
+        return False
     if _is_merge_protected_bucket(bucket, domain, incoming_chord_tag):
         return False
     if world_filter is not None:
@@ -5799,6 +5804,23 @@ async def breath(
     entity_top_k, entity_weight = _entity_recall_settings()
     entity_guard_enabled = _entity_score_guard_enabled()
     entity_store = _get_entity_store(initialize=False)
+    people_ranked = []
+    if wants_people_profile(query) and entity_store is not None:
+        try:
+            people = await build_people_cards(
+                entity_store, bucket_mgr, query=query, world_filter=world_filter,
+                limit=10, evidence_limit=min(20, recall_limit),
+            )
+            for bid, score in evidence_ranked_ids(people):
+                candidate = await bucket_mgr.get(bid)
+                if candidate and _passes_nonkeyword_recall_filters(
+                    candidate, world_filter_set=wf_set, domain_filter=domain_filter,
+                    created_after=created_after, created_before=created_before,
+                    exclude_core=False,
+                ) and _filter_z_fact_candidates([candidate], query=recall_query, intent=intent_policy["intent"]):
+                    people_ranked.append((bid, score))
+        except Exception as exc:
+            logger.warning("People evidence view unavailable: %s", type(exc).__name__)
     entity_bucket_cache: dict[str, dict] = {}
     entity_ranked: list[tuple[str, float]] = []
     for bid, score in raw_entity_ranked[:entity_top_k]:
@@ -5869,6 +5891,8 @@ async def breath(
     ]
     if not entity_guard_enabled and entity_ranked and entity_weight > 0:
         channels.append((entity_ranked, entity_weight))
+    if people_ranked:
+        channels.append((people_ranked, max(1.0, entity_weight)))
 
     # Compute the exact production baseline once. Shadow receipts below reuse
     # this same list; materialization continues to consume it unchanged.
@@ -5877,7 +5901,7 @@ async def breath(
         k=rrf_cfg.get("k", 60),
     )
     fused_pairs = _demote_evidenceless_candidates(
-        fused_pairs, vector_ranked, entity_ranked
+        fused_pairs, vector_ranked, [*entity_ranked, *people_ranked]
     )
 
     # Passive upstream comparison. It reuses the candidate IDs and scores
@@ -8946,6 +8970,7 @@ async def dream() -> str:
     candidates = [
         b for b in all_buckets
         if b["metadata"].get("type") not in ("permanent", "feel")
+        and not b["metadata"].get("exact_duplicate_of")
         and not b["metadata"].get("pinned", False)
         and not b["metadata"].get("protected", False)
     ]
@@ -9673,6 +9698,15 @@ def _get_briefing_cache_entry(profile: _BriefingProfile) -> dict | None:
         return _briefing_prebuilt_cache.get(profile)
 
 
+async def _briefing_cache_uses_exact_copy(entry: dict) -> bool:
+    """A night-run alias update must invalidate an older generated boot pack."""
+    for bucket in entry.get("buckets") or []:
+        current = await bucket_mgr.get(bucket["id"])
+        if current and (current.get("metadata") or {}).get("exact_duplicate_of"):
+            return True
+    return False
+
+
 def _store_briefing_cache_entry(
     profile: _BriefingProfile,
     *,
@@ -9914,7 +9948,7 @@ async def briefing(
     is_background_refresh = _briefing_background_refresh.get()
     if not deterministic and not is_background_refresh and not reset_body_state:
         cached = _get_briefing_cache_entry(profile)
-        if cached is not None:
+        if cached is not None and not await _briefing_cache_uses_exact_copy(cached):
             try:
                 return _render_briefing_cache_entry(
                     cached,
@@ -9935,6 +9969,8 @@ async def briefing(
         return "记忆系统暂时无法访问。"
 
     # --- Domain filter ---
+    all_buckets = [b for b in all_buckets
+                   if not (b.get("metadata") or {}).get("exact_duplicate_of")]
     domain_filter = [d.strip() for d in domain.split(",") if d.strip()]
     if domain_filter:
         def _domain_hit(b):
@@ -10294,6 +10330,24 @@ async def briefing(
 # Dashboard API endpoints (for lightweight Web UI)
 # 仪表板 API（轻量 Web UI 用）
 # =============================================================
+@mcp.custom_route("/api/people", methods=["GET"])
+async def api_people(request):
+    """Read source-backed people cards under the existing /api bearer boundary."""
+    from starlette.responses import JSONResponse
+    params = request.query_params
+    try:
+        return JSONResponse(await build_people_cards(
+            _get_entity_store(initialize=False), bucket_mgr,
+            query=str(params.get("q") or params.get("name") or ""),
+            world_filter=_resolve_world_filter(str(params.get("world") or ""), config.get("current_world", "")),
+            include_history=str(params.get("history", "0")).lower() in {"1", "true"},
+            limit=int(params.get("limit", 20)), offset=int(params.get("offset", 0)),
+            evidence_limit=int(params.get("evidence_limit", 6)),
+        ))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "invalid people view parameters"}, status_code=400)
+
+
 @mcp.custom_route("/api/buckets", methods=["GET"])
 async def api_buckets(request):
     """List all buckets with metadata (no content for efficiency)."""

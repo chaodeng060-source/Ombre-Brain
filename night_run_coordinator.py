@@ -8,7 +8,9 @@ The coordinator keeps every axis inside its production authority contract:
 * safe Y edges write idempotently while dangerous edges enter named review;
 * Z only proposes registered fact pairs; approval is a separate transaction;
 * E only proposes source material; a primary agent must author the E record;
-* M is a verified ``report_only`` computation and never mutates memory.
+* semantic M proposals remain verified ``report_only`` computations;
+* separately enabled exact-copy maintenance changes only audited alias markers,
+  preserving every original ID and body after the common snapshot.
 
 An interrupted run is evidence, not a resume token.  A caller must retry with
 a fresh ``run_id`` (and, at the scheduler layer, the same UTC cutoff).
@@ -131,8 +133,12 @@ class NightRunPolicy:
     # stays pending for the next run (terminal stage "deferred").
     dispatch_max_candidates_per_run: int = 500
     dispatch_wall_budget_seconds: int = 1800
+    people_refresh_enabled: bool = False
+    exact_dedup_enabled: bool = False
 
     def __post_init__(self) -> None:
+        if type(self.people_refresh_enabled) is not bool or type(self.exact_dedup_enabled) is not bool:
+            raise ValueError("derived maintenance flags must be booleans")
         for field in (
             "raw_page_size",
             "pending_page_size",
@@ -500,6 +506,7 @@ class NightRunCoordinator:
                 await self._run_timeline_sweep(counts)
 
                 await self._run_metabolism(counts)
+                await self._run_derived_maintenance(counts)
                 self._advance(
                     run_id,
                     "dispatched",
@@ -549,6 +556,29 @@ class NightRunCoordinator:
             if started:
                 self._mark_error(run_id, "run.internal", counts)
             raise NightRunCoordinatorError("run.internal") from exc
+
+    async def _run_derived_maintenance(self, counts: dict[str, int]) -> None:
+        """After the snapshot, maintain indexes and explicitly enabled exact copies.
+
+        Semantic M proposals keep their report-only contract. This separate
+        deterministic operation never rewrites or deletes a memory body.
+        """
+        if self.bucket_manager is None:
+            return
+        if self.policy.exact_dedup_enabled:
+            from exact_metabolism import run_exact_consolidation
+            result = await run_exact_consolidation(self.bucket_manager)
+            if result.get("failed") or result.get("errors") or result.get("status") == "blocked":
+                raise NightRunCoordinatorError("metabolism.exact_failed")
+            counts["m_exact_consolidated"] = len(result.get("applied", []))
+            counts["m_exact_deferred"] = int((result.get("plan") or {}).get("deferred", 0))
+        if self.policy.people_refresh_enabled:
+            from entity_store import EntityStore
+            from people_memory import refresh_people_links
+            store = EntityStore({"buckets_dir": str(self.bucket_manager.base_dir)}, initialize=False)
+            result = await refresh_people_links(store, self.bucket_manager)
+            counts["people_links_refreshed"] = result["refreshed"]
+            counts["people_sources_checked"] = result["checked"]
 
     def _assert_report_only(self) -> None:
         if getattr(self.decay_engine, "metabolism_mode", None) != "report_only":

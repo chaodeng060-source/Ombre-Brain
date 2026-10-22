@@ -584,6 +584,8 @@ def build_night_run_runtime(
             proposer_wall_budget_seconds=wall_budget_seconds,
             dispatch_max_candidates_per_run=dispatch_max_candidates,
             dispatch_wall_budget_seconds=dispatch_wall_budget_seconds,
+            people_refresh_enabled=(config.get("lmc5_night", {}) or {}).get("people_refresh_enabled", False),
+            exact_dedup_enabled=(config.get("lmc5_night", {}) or {}).get("exact_dedup_enabled", False),
         ),
     )
     return NightRunRuntime(

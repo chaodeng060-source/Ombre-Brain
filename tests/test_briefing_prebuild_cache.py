@@ -49,6 +49,10 @@ class _FakeMgr:
             raise AssertionError("cache hit must not reread the bucket library")
         return [_bucket()]
 
+    async def get(self, bucket_id):
+        # Cache validity checks inspect only its known source IDs, never scan.
+        return _bucket(bucket_id)
+
 
 class _GoodDehydrator:
     def __init__(self):

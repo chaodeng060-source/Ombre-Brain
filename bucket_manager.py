@@ -2835,6 +2835,10 @@ class BucketManager:
             if preloaded_buckets is not None
             else await self.list_all(include_archive=False)
         )
+        # Exact copies keep their original Markdown and direct-ID access,
+        # while the canonical copy is the sole ordinary retrieval entry.
+        all_buckets = [b for b in all_buckets
+                       if not (b.get("metadata") or {}).get("exact_duplicate_of")]
 
         if not all_buckets:
             return []
