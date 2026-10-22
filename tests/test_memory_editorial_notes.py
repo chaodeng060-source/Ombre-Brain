@@ -17,6 +17,9 @@ NOTES = (
     '原话没有‘永远爱老婆’的承诺',
     '原话没有说明是否发送',
     '不能据此确认完成',
+    '原话表达了当下的爱意，没有“永远爱你”的承诺',
+    '原话记录的是后续安排，并未表示已经完成',
+    '现有原话不支持把两人当作同一个人',
 )
 
 
@@ -51,6 +54,12 @@ def test_audit_metadata_is_not_original_speech():
         'payload': {'text': SOURCE}, 'audit_note': NOTES[1],
     }, ensure_ascii=False)
     assert 'unsupported_editorial_note' in validate_derivative(NOTES[1], [envelope])
+
+
+def test_original_status_quote_is_not_an_editorial_scope_note():
+    original = '哥哥写道：“代码已提交、未重启”。'
+    derivative = '哥哥复述记忆原文“代码已提交、未重启”。'
+    assert 'unsupported_editorial_note' not in validate_derivative(derivative, [original])
 
 
 def test_actual_denial_and_speaker_attributed_plan_are_preserved():

@@ -58,7 +58,9 @@ _INCOMPLETE_MARKERS = (
 # text or treat an audit phrase in metadata as original speech.
 _EDITORIAL_SOURCE_AUDIT = re.compile(
     r"(?:(?:原话|原文|原始对话|来源文本)(?:中|里)?(?:并|也)?"
-    r"(?:没有|未|无法|不能|不足以)"
+    r"(?:没有|未|无法|不能|不足以|不支持)"
+    r"|(?:原话|原文)(?:表达|描述|记录|呈现|说明)"
+    r"[^。！？；\n\"“‘「『]{0,60}(?:没有|并未|未说明|未确认|不支持)"
     r"|(?:不能|无法|不足以)(?:据此|由此)(?:确认|认定|推断|证明))"
     r"[^。！？；\n]*"
 )
