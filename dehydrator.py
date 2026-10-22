@@ -39,6 +39,7 @@ from openai import AsyncOpenAI
 from e_axis_shadow import strict_json_loads
 from utils import count_tokens_approx
 from redact import redact_embedding_input  # 出本地去外部 LLM 前脱敏
+from memory_source_fidelity import validate_derivative
 
 from source_summary_fidelity import MEMORY_PROSE_RULES, SUMMARY_FACT_RULES, guarded_summary
 
@@ -1135,7 +1136,7 @@ class Dehydrator:
                 len(summary),
             )
             return None
-        return summary
+        return guarded_summary(summary, content, editorial_only=True)
 
     @staticmethod
     def _legacy_recall_cache_is_compatible() -> bool:
@@ -1260,7 +1261,7 @@ class Dehydrator:
                 len(summary),
             )
             return None
-        return summary
+        return guarded_summary(summary, content, editorial_only=True)
 
     def _get_v1_recall_cached_summary(self, content: str) -> str | None:
         """Read only the exact deployed v1 row before binding it to v2."""
@@ -1289,7 +1290,7 @@ class Dehydrator:
         summary = self._normalize_dehydration_summary(row[0])
         if not self._is_usable_dehydration_summary(summary):
             return None
-        return summary
+        return guarded_summary(summary, content, editorial_only=True)
 
     def _recall_cache_has_content(self, content: str) -> bool:
         """Return whether this content was already bound to any new contract."""
@@ -1371,6 +1372,7 @@ class Dehydrator:
         summary = self._normalize_dehydration_summary(summary)
         if not self._is_usable_dehydration_summary(summary):
             return None
+        summary = guarded_summary(summary, content, editorial_only=True)
         self._read_only_summary_cache[cache_key] = summary
         return summary
 
@@ -2101,7 +2103,10 @@ class Dehydrator:
 
         if not response.choices:
             return ""
-        return response.choices[0].message.content or ""
+        result = response.choices[0].message.content or ""
+        if "unsupported_editorial_note" in validate_derivative(result, [old_content, new_content]):
+            raise RuntimeError("merge.unsupported_editorial_note")
+        return result
 
     # ---------------------------------------------------------
     # Output formatting
@@ -2403,6 +2408,13 @@ class Dehydrator:
                 )
                 continue
             if items:
+                # Reject the entire batch before any item can trigger another
+                # model call. This is not a repair retry or a fail-open skip.
+                for item in items:
+                    if "unsupported_editorial_note" in validate_derivative(
+                        item["name"] + "\n" + item["content"], [content]
+                    ):
+                        raise RuntimeError("digest.unsupported_editorial_note")
                 try:
                     validated: list[dict] = []
                     # Validate the whole batch before grow writes its first

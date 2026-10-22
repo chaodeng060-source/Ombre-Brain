@@ -19,13 +19,17 @@ SUMMARY_FACT_RULES = (
 ) + MEMORY_PROSE_RULES
 
 
-def guarded_summary(summary: str, source: str) -> str:
+def guarded_summary(summary: str, source: str, *, editorial_only: bool = False) -> str:
     """Return supported output, or a literal source excerpt on a detected drift.
 
     This deterministic check detects bounded classes of factual drift, not full
     semantic entailment. The backfill's independent original-text review is
     responsible for the latter. A cheap model's bad answer must not cause a
     second paid call or prevent a conversation from continuing.
+
+    Existing cache returns use ``editorial_only`` to reject added audit notes
+    without adding animal/name/number gates. Unusable source still falls back
+    literally because it cannot support a generated audit explanation.
     """
     from memory_source_fidelity import validate_derivative
 
@@ -49,6 +53,10 @@ def guarded_summary(summary: str, source: str) -> str:
     else:
         claims = str(parsed)
     issues = validate_derivative(claims, [source])
+    if editorial_only:
+        issues = [issue for issue in issues if issue in {
+            'unsupported_editorial_note', 'source_missing', 'source_incomplete',
+        }]
     if not issues:
         return summary
     excerpt = source.strip()[:400]
