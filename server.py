@@ -47,6 +47,7 @@ import math
 import re
 import time
 import httpx
+import jev_memory_gate
 import jieba
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -2567,6 +2568,17 @@ async def _ds_semantic_select(
     provider_override 传入时走备用线（主线失败后的第二次尝试），
     其余行为——提示词、解析、缓存键——与主线完全一致。
     """
+    if provider_override is None and jev_memory_gate.enabled(config):
+        batch = await jev_memory_gate.score(
+            config, query, buckets, redact=redact_embedding_input,
+            timeout=_ds_gate_timeout(),
+        )
+        # Current NAS builds already own threshold/bonuses/topic dedup here.
+        # Older source checkouts retain their forced-ID selection contract.
+        score_selector = globals().get("_ds_score_mode_select")
+        if score_selector is not None and _ds_gate_score_mode_enabled():
+            return score_selector(buckets, batch.scores, keep, max_results)
+        return jev_memory_gate.legacy_select(buckets, batch.scores, keep, max_results)
     provider, model, client, provider_kwargs = (
         provider_override if provider_override is not None else _ds_filter_provider()
     )
@@ -3310,6 +3322,7 @@ async def health_check(request):
             "status": "ok",
             "buckets": stats["permanent_count"] + stats["dynamic_count"],
             "decay_engine": "running" if decay_engine.is_running else "stopped",
+            "reranker": jev_memory_gate.status(config),
         })
     except Exception as e:
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
