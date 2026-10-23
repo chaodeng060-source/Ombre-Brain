@@ -141,6 +141,7 @@ async def score_candidates(
     cache_ttl: float = 600,
     cache_max: int = 512,
     deadline: float | None = None,
+    proxy: str | None = None,
 ) -> ScoreBatch:
     """Score the complete batch in input order, or cancel/drain and raise JEVError.
 
@@ -196,6 +197,10 @@ async def score_candidates(
             headers={"Authorization": "Bearer " + api_key},
             timeout=timeout,
             follow_redirects=False,
+            # An explicit proxy is the only egress control: environment proxy
+            # variables stay ignored so a host-wide VPN cannot silently reroute
+            # the paid endpoint.
+            proxy=proxy,
             trust_env=False,
             transport=httpx.AsyncHTTPTransport(retries=0, trust_env=False),
         ) as client:

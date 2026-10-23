@@ -491,6 +491,9 @@ jev_reranker:
   deadline_sec: 2.0
   # score_mode = 生产 NAS 那套阈值/加分/主题去重；legacy = 老源码的强制保留路径。
   selector: score_mode
+  # 显式出口：国内主机直连 TypeSafe 是 451，填 CONNECT 代理（例如
+  # http://172.19.0.1:3128，经 NAS→VPS 隧道到东京）。留空则直连，环境变量代理不生效。
+  proxy: ""
   concurrency: 4
   cache_ttl: 600
   cache_max: 512

@@ -451,3 +451,15 @@ def test_batch_deadline_fails_whole_batch(mock_http):
     with pytest.raises(jev.JEVError, match="deadline"):
         asyncio.run(jev.score_candidates("q", ["a", "b"], api_key="k", deadline=0.05))
     assert jev._CACHE == {}
+
+def test_explicit_proxy_is_the_only_egress_control(mock_http, monkeypatch):
+    """A configured proxy is passed to httpx; environment proxies stay ignored."""
+
+    async def fake_request(client, endpoint, model, query, candidate, timeout):
+        return jev._Score(100, "jev-1.14.0")
+
+    monkeypatch.setattr(jev, "_request_score", fake_request)
+    asyncio.run(jev.score_candidates("q", ["a"], api_key="k", proxy="http://172.19.0.1:3128",
+                                     cache_ttl=0, cache_max=0))
+    assert mock_http.client_options[-1]["proxy"] == "http://172.19.0.1:3128"
+    assert mock_http.client_options[-1]["trust_env"] is False

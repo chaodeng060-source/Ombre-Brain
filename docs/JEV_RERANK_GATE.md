@@ -156,3 +156,25 @@ five at or above 76 and drops the four at 54-64; that is consistent with the
 0-3 rubric's "partially answers" line, but it is a 9-candidate sample drawn
 from already-retrieved pools and must not be treated as a tuned threshold.
 Full calibration requires the same-question replay described above.
+
+
+## 2026-10-23 NAS egress: explicit CONNECT proxy
+
+The NAS sits behind a Chinese ISP; a direct call to `api.typesafe.ai` returns
+HTTP 451. A working route was verified end to end:
+
+- VPS (Tokyo) runs a loopback CONNECT proxy on `127.0.0.1:3128`.
+- The NAS reuses its existing greencloud SSH control socket to add
+  `-L 172.19.0.1:3128:127.0.0.1:3128`, so the Ombre container can reach the
+  proxy at the docker bridge gateway.
+- A synthetic score from inside the container returned HTTP 200,
+  `jev-1.14.0`, score 2.54, 348 input / 17 output tokens.
+
+`jev_reranker.proxy` is the only egress control: environment proxy variables
+remain ignored on purpose. `max_candidates`, `deadline_sec`, `selector` and
+`proxy` are all in `config.example.yaml`.
+
+Persistence caveat: both the VPS proxy and the NAS-side forward were started
+ad hoc. Making the route survive reboots needs a root-level unit on each side
+(or a line in the NAS reverse-tunnel self-heal script). Until then, the route
+is valid for evaluation, not for unattended production.

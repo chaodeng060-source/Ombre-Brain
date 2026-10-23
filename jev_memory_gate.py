@@ -91,6 +91,7 @@ async def score(config: dict, query: str, buckets: list[dict], *, redact, timeou
         cache_ttl=float(settings.get("cache_ttl", 600)),
         cache_max=int(settings.get("cache_max", 512)),
         deadline=deadline,
+        proxy=str(settings.get("proxy") or "").strip() or None,
     )
     _LAST.clear()
     _LAST.update(model=batch.model, candidates=len(candidates), requests=batch.requests,
