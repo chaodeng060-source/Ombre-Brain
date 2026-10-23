@@ -96,3 +96,39 @@ patch are local implementation decisions. The competition's financial ledger,
 for this existing recall service. The author's reported Luna/JEV/Clef noise
 percentages are not measurements of this installation; synthetic acceptance
 does not establish those percentages either.
+
+## 2026-10-23 deployment result: inactive on NAS
+
+Implementation commit `fe931af` passed 173 selected tests on both the Git
+checkout and a copy of the actual NAS runtime. The latter needed its vendor
+package/static packaging fixtures and one test-double `recall_policy` keyword
+to match the newer running API; assertions were unchanged. These are the same
+tests on two baselines, not 346 distinct tests.
+
+The direct credential works on the VPS: one synthetic score returned HTTP 200,
+resolved `jev-1.14.0`, 164 ms, 342 input/17 output tokens. NAS activation was
+then tested through the real authenticated recall hook. It returned HTTP 200
+but the JEV last-batch receipt stayed empty: the legacy fallback had answered.
+Server logs and a bounded direct probe identified HTTP 451, explicitly stating
+TypeSafe is not available in that region. This was not counted as successful
+JEV acceptance.
+
+The latest saved OpenCode credential is valid: both its Go and Zen model
+catalogs return 200. The older `.env`/Zen-profile keys returned 401. Official
+OpenCode supports the same protocol at the current
+`https://opencode.ai/inference/systemone/v1/systemone` endpoint, with
+`jev-1.13` / `jev-1.13-free`; see
+[OpenCode Console models](https://opencode.ai/v2/docs/console/models/#jev).
+At acceptance the paid model returned 402 (insufficient account funds); the
+free model returned 451 (endpoint unavailable) at both the current endpoint
+and the documented legacy Zen endpoint. Changing to a normal chat-completions
+request would not solve this protocol/service issue.
+
+Therefore the NAS original host entry point, container entry point and YAML
+configuration were restored from their separate exact snapshots. The installed
+new helper modules remain inert; no active gate change remains. The runtime
+feature is **blocked on a usable service route**, not marked delivered. No
+account top-up, region work-around, repeated paid retries or new proxy was
+performed. Future activation requires one successful NAS synthetic score,
+then a real recall receipt showing JEV requests and a second identical query
+showing cache hits. A healthy HTTP recall alone is insufficient evidence.
