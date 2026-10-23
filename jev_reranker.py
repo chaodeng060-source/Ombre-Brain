@@ -140,6 +140,7 @@ async def score_candidates(
     concurrency: int = 4,
     cache_ttl: float = 600,
     cache_max: int = 512,
+    deadline: float | None = None,
 ) -> ScoreBatch:
     """Score the complete batch in input order, or cancel/drain and raise JEVError.
 
@@ -159,6 +160,10 @@ async def score_candidates(
             raise JEVError(f"Invalid JEV {name}.")
     if timeout == 0:
         raise JEVError("Invalid JEV timeout.")
+    if deadline is not None and (
+        type(deadline) not in (int, float) or not math.isfinite(deadline) or deadline <= 0
+    ):
+        raise JEVError("Invalid JEV batch deadline.")
     if not candidates:
         return ScoreBatch([], model, 0, 0, 0, 0)
 
@@ -217,7 +222,20 @@ async def score_candidates(
 
             tasks = [asyncio.create_task(worker()) for _ in range(min(concurrency, len(missing)))]
             try:
-                await asyncio.gather(*tasks)
+                gathered = asyncio.gather(*tasks)
+                if deadline is None:
+                    await gathered
+                else:
+                    # The batch deadline is the caller's gate budget, not a per-request
+                    # timeout: a slow provider must fail the whole batch so the caller
+                    # can fall back inside its own budget instead of paying for a
+                    # half-finished rerank.
+                    await asyncio.wait_for(gathered, timeout=deadline)
+            except asyncio.TimeoutError:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise JEVError("JEV batch deadline exceeded.") from None
             except BaseException:
                 for task in tasks:
                     task.cancel()

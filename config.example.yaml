@@ -485,6 +485,12 @@ jev_reranker:
   model: jev-latest
   endpoint: https://api.typesafe.ai/v1/systemone
   api_key_file: /data/.secrets/jev-rerank.env
+  # 每次搜索最多付费评分多少条（上游 profile 上限 16）；列表按检索顺序截头。
+  max_candidates: 16
+  # 整批截止：超时整批失败、由 host 回退，不当半批付费半批返回。
+  deadline_sec: 2.0
+  # score_mode = 生产 NAS 那套阈值/加分/主题去重；legacy = 老源码的强制保留路径。
+  selector: score_mode
   concurrency: 4
   cache_ttl: 600
   cache_max: 512

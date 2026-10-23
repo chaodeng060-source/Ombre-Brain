@@ -438,3 +438,16 @@ async def test_invalid_resource_limits_do_not_send_or_hang(mock_http, options):
     with pytest.raises(jev.JEVError):
         await jev.score_candidates("q", ["a"], api_key="stub", **options)
     assert not mock_http.calls
+
+def test_batch_deadline_fails_whole_batch(mock_http):
+    """A slow provider must fail the batch, not return a half-scored pool."""
+
+    async def slow(request):
+        await asyncio.sleep(0.2)
+        return response()
+
+    mock_http.handler = slow
+
+    with pytest.raises(jev.JEVError, match="deadline"):
+        asyncio.run(jev.score_candidates("q", ["a", "b"], api_key="k", deadline=0.05))
+    assert jev._CACHE == {}

@@ -72,12 +72,12 @@ async def test_native_success_skips_legacy_provider_and_sorts(monkeypatch):
     def legacy():
         pytest.fail("successful JEV must not also call DeepSeek/Gemini")
     monkeypatch.setattr(server, "_ds_filter_provider", legacy)
+    items = [bucket("noise", "unrelated"), bucket("exact", "answer"), bucket("related", "related")]
     async def fake(*args, **kwargs):
-        return SimpleNamespace(scores=[20, 94, 82])
+        return gate.GateScore(items, [20, 94, 82], None)
     monkeypatch.setattr(gate, "score", fake)
     # Exercise the compatibility path even when the test is run on live NAS.
     monkeypatch.setattr(server, "_ds_score_mode_select", None, raising=False)
-    items = [bucket("noise", "unrelated"), bucket("exact", "answer"), bucket("related", "related")]
     result = await server._ds_semantic_select("question", items, set(), 2)
     assert [b["id"] for b in result] == ["exact", "related"]
 
@@ -87,7 +87,7 @@ async def test_production_retains_its_existing_score_selector(monkeypatch):
     monkeypatch.setitem(server.config, "jev_reranker", {"enabled": True})
     items = [bucket("a", "a"), bucket("b", "b")]
     async def fake(*args, **kwargs):
-        return SimpleNamespace(scores=[93, 20])
+        return gate.GateScore(items, [93, 20], None)
     monkeypatch.setattr(gate, "score", fake)
     received = []
     def existing(buckets, scores, keep, limit):
@@ -132,3 +132,49 @@ def test_disabled_status_never_serializes_config_secret():
     status = gate.status({"jev_reranker": {"api_key_file": "/private/secret", "api_key": "hidden"}})
     assert status["provider"] == "legacy"
     assert "hidden" not in str(status) and "/private" not in str(status)
+
+@pytest.mark.asyncio
+async def test_score_caps_candidates_and_passes_deadline(monkeypatch):
+    """Only the head of the retrieval-ordered list is paid for."""
+    monkeypatch.setenv("JEV_API_KEY", "stub")
+    captured = {}
+
+    async def fake(query, candidates, **kwargs):
+        captured.update(candidates=list(candidates), kwargs=dict(kwargs))
+        return SimpleNamespace(scores=[100] * len(candidates), model="jev-1.14.0",
+                               requests=len(candidates), cache_hits=0,
+                               input_tokens=10, output_tokens=1)
+
+    monkeypatch.setattr(gate.jev_reranker, "score_candidates", fake)
+    buckets = [bucket(f"b{i}", f"text {i}") for i in range(20)]
+    config = {"jev_reranker": {"max_candidates": 16, "deadline_sec": 2.0}}
+
+    scored = await gate.score(config, "q", buckets, redact=lambda s: s, timeout=8)
+
+    assert len(captured["candidates"]) == 16
+    assert captured["kwargs"]["deadline"] == 2.0
+    assert len(scored.buckets) == 16 and len(scored.scores) == 16
+    assert [b["id"] for b in scored.buckets] == [f"b{i}" for i in range(16)]
+
+
+def test_select_uses_host_score_mode_selector():
+    scored = gate.GateScore([bucket("a", "x")], [100], object())
+    called = {}
+
+    def score_mode_select(buckets, scores, keep, max_results):
+        called["args"] = (len(buckets), len(scores), keep, max_results)
+        return buckets
+
+    out = gate.select({}, scored, {"a"}, 5, score_mode_select=score_mode_select,
+                      score_mode_enabled=True)
+    assert out == scored.buckets
+    assert called["args"] == (1, 1, {"a"}, 5)
+
+
+def test_select_falls_back_to_legacy_and_rejects_unknown_mode():
+    scored = gate.GateScore([bucket("a", "x")], [100], object())
+    out = gate.select({"jev_reranker": {"selector": "legacy"}}, scored, set(), 5,
+                      score_mode_select=None, score_mode_enabled=False)
+    assert out == scored.buckets
+    with pytest.raises(ValueError, match="selector"):
+        gate.select({"jev_reranker": {"selector": "bogus"}}, scored, set(), 5)

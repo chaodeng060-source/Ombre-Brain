@@ -7,12 +7,24 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
 import jev_reranker
 
-REVISION = "jev-native-gate-v1"
+REVISION = "jev-native-gate-v2"
 _LAST: dict = {}
+DEFAULT_MAX_CANDIDATES = 16
+DEFAULT_DEADLINE_SEC = 2.0
+
+
+@dataclass(frozen=True)
+class GateScore:
+    """Scored slice of the candidate list plus the raw provider batch."""
+
+    buckets: list[dict]
+    scores: list[int]
+    batch: object
 _LOG = logging.getLogger(__name__)
 
 
@@ -51,10 +63,19 @@ def _key(config: dict) -> str:
 
 
 async def score(config: dict, query: str, buckets: list[dict], *, redact, timeout: float):
-    """All candidates are scored once, including content after the old 200-char cut."""
+    """Score the head of the candidate list, bounded by calls and a batch deadline.
+
+    The gate is subtractive and the list arrives in retrieval order, so the tail
+    beyond ``max_candidates`` is not scored and is not returned. This mirrors the
+    upstream profile (at most 16 paid calls per search) instead of paying for
+    every candidate.
+    """
     settings = _section(config)
+    limit = max(1, int(settings.get("max_candidates", DEFAULT_MAX_CANDIDATES)))
+    selected = list(buckets[:limit])
+    deadline = float(settings.get("deadline_sec", DEFAULT_DEADLINE_SEC))
     candidates = []
-    for bucket in buckets:
+    for bucket in selected:
         metadata = bucket.get("metadata") or {}
         # IDs, file paths, raw session pointers and other private metadata are
         # not needed for relevance. A human title + complete body is enough.
@@ -69,6 +90,7 @@ async def score(config: dict, query: str, buckets: list[dict], *, redact, timeou
         concurrency=int(settings.get("concurrency", 4)),
         cache_ttl=float(settings.get("cache_ttl", 600)),
         cache_max=int(settings.get("cache_max", 512)),
+        deadline=deadline,
     )
     _LAST.clear()
     _LAST.update(model=batch.model, candidates=len(candidates), requests=batch.requests,
@@ -77,7 +99,7 @@ async def score(config: dict, query: str, buckets: list[dict], *, redact, timeou
     _LOG.info("JEV rerank completed model=%s candidates=%d requests=%d cache_hits=%d input_tokens=%d output_tokens=%d",
               batch.model, len(candidates), batch.requests, batch.cache_hits,
               batch.input_tokens, batch.output_tokens)
-    return batch
+    return GateScore(selected, batch.scores, batch)
 
 
 def legacy_select(buckets: list[dict], scores: list[int], keep: set[str], max_results: int) -> list[dict]:
@@ -96,9 +118,31 @@ def legacy_select(buckets: list[dict], scores: list[int], keep: set[str], max_re
     return [bucket for bucket in eligible if id(bucket) in included][:max(0, max_results)]
 
 
+def selector_mode(config: dict) -> str:
+    """Which selector consumes the scores: the host's score-mode selector or legacy."""
+    raw = os.getenv("OMBRE_JEV_SELECTOR")
+    value = raw if raw is not None else _section(config).get("selector", "score_mode")
+    mode = str(value).strip().lower() or "score_mode"
+    if mode not in {"score_mode", "legacy"}:
+        raise ValueError("JEV selector must be score_mode or legacy")
+    return mode
+
+
+def select(config: dict, result: GateScore, keep: set[str], max_results: int, *,
+           score_mode_select=None, score_mode_enabled: bool = False) -> list[dict]:
+    """Apply the host's existing selection contract to the JEV scores."""
+    if selector_mode(config) == "score_mode" and score_mode_enabled and score_mode_select is not None:
+        return score_mode_select(result.buckets, result.scores, keep, max_results)
+    return legacy_select(result.buckets, result.scores, keep, max_results)
+
+
 def status(config: dict) -> dict:
     """Public readiness/version and aggregate counters, never credentials or text."""
     return {"provider": "jev" if enabled(config) else "legacy",
             "enabled": enabled(config), "revision": REVISION,
             "model": str(_section(config).get("model") or "jev-latest"),
+            "max_candidates": int(_section(config).get("max_candidates", DEFAULT_MAX_CANDIDATES)),
+            "deadline_sec": float(_section(config).get("deadline_sec", DEFAULT_DEADLINE_SEC)),
+            "selector": selector_mode(config),
+            "score_threshold": os.getenv("OMBRE_DS_GATE_SCORE_THRESHOLD", ""),
             "last_batch": dict(_LAST)}

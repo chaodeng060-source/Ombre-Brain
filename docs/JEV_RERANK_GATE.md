@@ -132,3 +132,27 @@ account top-up, region work-around, repeated paid retries or new proxy was
 performed. Future activation requires one successful NAS synthetic score,
 then a real recall receipt showing JEV requests and a second identical query
 showing cache hits. A healthy HTTP recall alone is insufficient evidence.
+
+## 2026-10-23 hardening before any activation
+
+- `max_candidates` (default 16) caps paid scoring to the head of the
+  retrieval-ordered list; the tail is not scored and is not returned. This
+  matches the upstream profile of at most 16 paid calls per search.
+- `deadline_sec` (default 2.0) bounds the whole batch. A slow provider fails
+  the batch and the host falls back inside its own gate budget instead of
+  paying for a half-scored pool.
+- `selector` (`score_mode` default, `legacy` opt-in) decides which selection
+  contract consumes the scores; an unknown value is rejected rather than
+  silently drifting between the two source lineages.
+- `health.reranker` now reports `max_candidates`, `deadline_sec`, `selector`
+  and the active `OMBRE_DS_GATE_SCORE_THRESHOLD`, so calibration is visible
+  without reading logs.
+
+Calibration sample (2026-10-23, VPS egress, real key, real recall candidates,
+no cache): 9 candidates over 5 turns scored 54, 59, 60, 64, 76, 87, 88, 93, 93
+(jev-1.14.0, 5032/85 tokens for the first five). Scores are continuous 0-3
+mapped to 0-100 per candidate, not only 0/33/67/100. A 70 threshold keeps the
+five at or above 76 and drops the four at 54-64; that is consistent with the
+0-3 rubric's "partially answers" line, but it is a 9-candidate sample drawn
+from already-retrieved pools and must not be treated as a tuned threshold.
+Full calibration requires the same-question replay described above.
